@@ -1,0 +1,8 @@
+# Real media clips (the integration corpus) are large and copyrighted —
+# keep them local, never commit them.
+/integration/*
+!/integration/.gitkeep
+!/integration/README.md
+
+# Tiny RPU .bin fixtures under fixtures/ ARE committed (metadata only, no picture
+# content), so they are intentionally NOT ignored here.

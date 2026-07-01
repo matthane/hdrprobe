@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Test corpus: real movie content is large and copyrighted — never commit it.
+# (fixtures/ holds tiny license-clean RPU .bin files and IS committed.)
+/testfiles/integration/
+
+# Tool logs / scratch
+*.log

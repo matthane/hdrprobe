@@ -1,0 +1,37 @@
+[package]
+name = "hdrprobe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Fast HDR / Dolby Vision metadata inspector"
+license = "MIT"
+repository = "https://github.com/matthane/hdrprobe"
+default-run = "hdrprobe"
+
+[[bin]]
+name = "hdrprobe"
+path = "src/main.rs"
+
+[dependencies]
+dolby_vision = { version = "3.3.2", features = ["xml", "serde"] }
+memmap2 = "0.9"
+rayon = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+owo-colors = "4"
+supports-color = "3"
+anyhow = "1"
+thiserror = "2"
+hdr10plus = { version = "2.1.5", features = ["json"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# unwind (the default), *not* abort — `dv::rpu::guard` relies on `catch_unwind`
+# to isolate panics from the third-party RPU/HDR10+ parsers on malformed input
+# so one corrupt file can't abort a whole directory scan.
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,35 @@
+# Configuration for `cargo about generate` — regenerates THIRD-PARTY-LICENSES.md.
+# See CLAUDE.md ("Third-party license attribution") for the full workflow and the
+# regenerate-and-diff check that keeps the committed file honest.
+
+# Licenses allowed to appear anywhere in the compiled dependency graph. Generation
+# FAILS if a crate uses a license not listed here, so a new dependency under an
+# unexpected (e.g. copyleft) license is caught at generate time instead of being
+# silently bundled into a release binary. Add a license here only after confirming
+# it is compatible with redistributing hdrprobe under MIT.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+]
+
+# Evaluate the dependency graph for every platform we publish binaries for, so the
+# notice is a faithful superset covering each shipped build (not just the host).
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
+# Attribution is only needed for third-party code. Local/unpublished crates (i.e.
+# hdrprobe itself) are covered by LICENSE, so skip them here.
+private = { ignore = true }
+
+# Dev-dependencies are used to test the crates, not compiled into the hdrprobe binary,
+# so they carry no redistribution obligation for us.
+ignore-dev-dependencies = true
