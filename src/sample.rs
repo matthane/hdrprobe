@@ -9,9 +9,10 @@ use std::collections::BTreeSet;
 use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use rayon::prelude::*;
 
+use crate::avc::nal as avc_nal;
 use crate::container::{Chunk, Codec, Demux, NalFormat};
 use crate::dv::levels::DvAggregate;
-use crate::dv::rpu::parse_hevc_rpu;
+use crate::dv::rpu::{parse_avc_rpu, parse_hevc_rpu};
 use crate::hdr::sei::{self, SeiFindings};
 use crate::hevc::nal::{self, NalRef};
 
@@ -90,6 +91,29 @@ fn extract_chunk(data: &[u8], chunk: Chunk, fmt: NalFormat, codec: &Codec) -> Ch
                         sei_findings.merge(&sei::parse_sei_nal(&slice[n.start..n.end]));
                     }
                     _ => {}
+                }
+            }
+        }
+        Codec::Avc => {
+            let mut nals: Vec<avc_nal::NalRef> = Vec::new();
+            match fmt {
+                NalFormat::AnnexB => avc_nal::split_annexb(slice, &mut nals),
+                NalFormat::LengthPrefixed(n) => avc_nal::split_length_prefixed(slice, n, &mut nals),
+            }
+            for n in nals {
+                let payload = &slice[n.start..n.end];
+                if n.nal_type == avc_nal::NAL_SEI {
+                    sei_findings.merge(&sei::parse_sei_nal_avc(payload));
+                } else if avc_nal::is_unspecified(n.nal_type) {
+                    // Content-verify before parsing: an unspecified NAL is only a
+                    // DV RPU if its payload starts with the `0x19` rpu_nal_prefix
+                    // (byte after the 1-byte NAL header). Guards against treating
+                    // some other unspecified NAL as an RPU.
+                    if payload.get(1) == Some(&0x19) {
+                        if let Some(rpu) = parse_avc_rpu(payload) {
+                            rpus.push(rpu);
+                        }
+                    }
                 }
             }
         }

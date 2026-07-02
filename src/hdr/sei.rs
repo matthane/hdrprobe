@@ -59,13 +59,25 @@ impl SeiFindings {
     }
 }
 
-/// Parse one SEI NAL (input includes the 2-byte NAL header) into findings.
+/// Parse one HEVC SEI NAL (input includes the 2-byte NAL header) into findings.
 pub fn parse_sei_nal(nal_with_header: &[u8]) -> SeiFindings {
+    parse_sei_nal_hdr(nal_with_header, 2)
+}
+
+/// Parse one AVC SEI NAL (input includes the 1-byte NAL header) into findings.
+/// The SEI RBSP (payloadType/payloadSize message loop) is identical across AVC
+/// and HEVC; only the NAL header length differs.
+pub fn parse_sei_nal_avc(nal_with_header: &[u8]) -> SeiFindings {
+    parse_sei_nal_hdr(nal_with_header, 1)
+}
+
+/// Shared SEI-RBSP parser; `hdr_len` is the codec's NAL header size in bytes.
+fn parse_sei_nal_hdr(nal_with_header: &[u8], hdr_len: usize) -> SeiFindings {
     let mut out = SeiFindings::default();
-    if nal_with_header.len() < 3 {
+    if nal_with_header.len() < hdr_len + 1 {
         return out;
     }
-    let rbsp = ebsp_to_rbsp(&nal_with_header[2..]);
+    let rbsp = ebsp_to_rbsp(&nal_with_header[hdr_len..]);
     let mut p = 0usize;
     let n = rbsp.len();
 

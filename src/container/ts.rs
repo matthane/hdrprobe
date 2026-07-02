@@ -21,6 +21,7 @@
 
 use anyhow::{bail, Context, Result};
 
+use crate::avc::nal as avc_nal;
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::{parse_sps, SpsInfo};
@@ -29,6 +30,7 @@ use crate::model::{Bitrate, ColorInfo};
 const SYNC: u8 = 0x47;
 const TS_UNIT: usize = 188;
 const PID_PAT: u16 = 0x0000;
+const STREAM_TYPE_AVC: u8 = 0x1B;
 const STREAM_TYPE_HEVC: u8 = 0x24;
 
 /// Bytes from the head the default (`sampled`) demux may read. TS carries no
@@ -128,21 +130,34 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     let layout = detect_layout(data).context("not a recognized TS/M2TS stream")?;
     let (pcr_pid, streams) = parse_psi(data, layout).context("no PMT / program map found")?;
 
-    // Video PIDs: standard HEVC streams plus any PID tagged as Dolby Vision
+    // Video PIDs: standard HEVC/AVC streams plus any PID tagged as Dolby Vision
     // (a Profile-7 enhancement layer rides its own PID with a DV descriptor).
     let video_pids: Vec<u16> = streams
         .iter()
-        .filter(|e| e.stream_type == STREAM_TYPE_HEVC || e.has_dovi)
+        .filter(|e| e.stream_type == STREAM_TYPE_HEVC || e.stream_type == STREAM_TYPE_AVC || e.has_dovi)
         .map(|e| e.pid)
         .collect();
     if video_pids.is_empty() {
-        bail!("no HEVC/Dolby Vision video PID in the program map");
+        bail!("no HEVC/AVC/Dolby Vision video PID in the program map");
     }
     let dv_config = streams.iter().find_map(|e| e.dv_config.clone());
 
+    // Codec of the base layer: the PMT stream_type is authoritative (0x1B AVC,
+    // 0x24 HEVC). A DV-only PID (EL, PES-private 0x06) carries no video type, so
+    // fall back to the DV profile — only profile 9 is AVC. HEVC wins a tie (an
+    // AVC EL alongside an HEVC BL is not a real configuration, but be explicit).
+    let has_type = |t: u8| streams.iter().any(|e| video_pids.contains(&e.pid) && e.stream_type == t);
+    let codec = if has_type(STREAM_TYPE_HEVC) {
+        Codec::Hevc
+    } else if has_type(STREAM_TYPE_AVC) || dv_config.as_ref().map(|c| c.profile) == Some(9) {
+        Codec::Avc
+    } else {
+        Codec::Hevc
+    };
+
     let limits = if full { Limits::full() } else { Limits::sampled() };
     let (buf, chunks) = reassemble(data, layout, &video_pids, &limits);
-    let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_metadata(&buf, &chunks);
+    let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_metadata(&buf, &chunks, &codec);
 
     // Duration from the transport clock (head+tail PCR delta). Prefer the PMT's
     // declared PCR PID, falling back to the video PID(s) — most streams carry the
@@ -169,7 +184,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
 
     Ok(Demux {
         container,
-        codec: Codec::Hevc,
+        codec,
         nal_format: NalFormat::AnnexB,
         width,
         height,
@@ -600,15 +615,47 @@ fn scan_pcr(
 
 // --- SPS metadata (no container box in TS) ----------------------------------
 
+/// Common SPS-derived metadata, codec-independent, so the HEVC and AVC scans
+/// converge on one shape.
+struct SpsCommon {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    chroma: String,
+    profile: String,
+    color: ColorInfo,
+    frame_rate: Option<f64>,
+}
+
 /// Recover resolution / bit depth / chroma / colour / frame rate from the widest
 /// SPS in the reassembled buffer (the base layer outranks a smaller enhancement
-/// layer). TS carries no container timing box, so the frame rate — like the
-/// colour — comes only from the SPS VUI.
+/// layer). TS carries no container box, so both colour and frame rate come only
+/// from the in-band SPS VUI — parsed with the codec's own SPS reader.
 #[allow(clippy::type_complexity)]
 fn sps_metadata(
     buf: &[u8],
     chunks: &[Chunk],
+    codec: &Codec,
 ) -> (u32, u32, Option<u8>, Option<String>, Option<String>, ColorInfo, Option<f64>) {
+    let best = match codec {
+        Codec::Avc => best_avc_sps(buf, chunks),
+        _ => best_hevc_sps(buf, chunks),
+    };
+    match best {
+        Some(c) => (
+            c.width,
+            c.height,
+            Some(c.bit_depth),
+            Some(c.chroma),
+            Some(c.profile),
+            c.color,
+            c.frame_rate,
+        ),
+        None => (0, 0, None, None, None, ColorInfo::default(), None),
+    }
+}
+
+fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
     let mut best: Option<SpsInfo> = None;
     let mut nals: Vec<NalRef> = Vec::new();
     for c in chunks {
@@ -632,25 +679,50 @@ fn sps_metadata(
             break;
         }
     }
-    match best {
-        Some(sps) => {
-            let color = sps
-                .color
-                .as_ref()
-                .map(crate::container::color_from_vui)
-                .unwrap_or_default();
-            (
-                sps.width,
-                sps.height,
-                Some(sps.bit_depth),
-                Some(sps.chroma_str().to_string()),
-                Some(sps.profile_label()),
-                color,
-                sps.frame_rate,
-            )
+    best.map(|sps| SpsCommon {
+        width: sps.width,
+        height: sps.height,
+        bit_depth: sps.bit_depth,
+        chroma: sps.chroma_str().to_string(),
+        profile: sps.profile_label(),
+        color: sps.color.as_ref().map(crate::container::color_from_vui).unwrap_or_default(),
+        frame_rate: sps.frame_rate,
+    })
+}
+
+fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
+    let mut best: Option<crate::avc::sps::SpsInfo> = None;
+    let mut nals: Vec<avc_nal::NalRef> = Vec::new();
+    for c in chunks {
+        let s = c.offset as usize;
+        let e = (c.offset + c.size) as usize;
+        if e > buf.len() {
+            continue;
         }
-        None => (0, 0, None, None, None, ColorInfo::default(), None),
+        nals.clear();
+        avc_nal::split_annexb(&buf[s..e], &mut nals);
+        for n in &nals {
+            if n.nal_type == avc_nal::NAL_SPS {
+                if let Some(sps) = crate::avc::sps::parse_sps(&buf[s + n.start..s + n.end]) {
+                    if best.as_ref().is_none_or(|b| sps.width > b.width) {
+                        best = Some(sps);
+                    }
+                }
+            }
+        }
+        if best.as_ref().is_some_and(|b| b.width >= 3840) {
+            break;
+        }
     }
+    best.map(|sps| SpsCommon {
+        width: sps.width,
+        height: sps.height,
+        bit_depth: sps.bit_depth,
+        chroma: sps.chroma_str().to_string(),
+        profile: sps.profile_label(),
+        color: sps.color.as_ref().map(crate::container::color_from_vui).unwrap_or_default(),
+        frame_rate: sps.frame_rate,
+    })
 }
 
 #[cfg(test)]

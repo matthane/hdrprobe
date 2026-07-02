@@ -294,6 +294,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let format = entry.typ;
     let codec = match &format {
         b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => Codec::Hevc,
+        b"avc1" | b"avc3" | b"dva1" | b"dvav" => Codec::Avc,
         b"av01" | b"dav1" => Codec::Av1,
         other => Codec::Other(String::from_utf8_lossy(other).to_string()),
     };
@@ -313,6 +314,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut mastering = None;
     let mut content_light = None;
     let mut hvcc_bytes: Option<&[u8]> = None;
+    let mut avcc_bytes: Option<&[u8]> = None;
     // A layered-HEVC config box (`lhvC`) beside the base `hvcC` marks MV-HEVC — the
     // multiview form of DV Profile 20 (for 3D / dual-view); its absence is the 2D
     // single-view form. Free to detect: the box is already a sample-entry child.
@@ -329,6 +331,15 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                     chroma = Some(h.chroma.to_string());
                     nal_len = h.nal_len;
                     codec_profile = Some(h.profile_str);
+                }
+            }
+            b"avcC" => {
+                avcc_bytes = Some(&data[c.payload..c.end]);
+                if let Some(a) = super::parse_avcc_record(&data[c.payload..c.end]) {
+                    bit_depth = Some(a.bit_depth);
+                    chroma = Some(a.chroma.to_string());
+                    nal_len = a.nal_len;
+                    codec_profile = Some(a.profile_str);
                 }
             }
             b"av1C" => {
@@ -360,10 +371,14 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         }
     }
 
-    // No `colr` box? Recover colour from the SPS in `hvcC`.
+    // No `colr` box? Recover colour from the SPS in `hvcC` / `avcC`.
     if color.transfer.is_none() {
         if let Some(h) = hvcc_bytes {
             if let Some(c) = super::color_from_hvcc(h) {
+                color = c;
+            }
+        } else if let Some(a) = avcc_bytes {
+            if let Some(c) = super::color_from_avcc(a) {
                 color = c;
             }
         }

@@ -18,6 +18,7 @@ use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Codec {
     Hevc,
+    Avc,
     Av1,
     Other(String),
 }
@@ -26,6 +27,7 @@ impl Codec {
     pub fn label(&self) -> String {
         match self {
             Codec::Hevc => "HEVC".to_string(),
+            Codec::Avc => "AVC".to_string(),
             Codec::Av1 => "AV1".to_string(),
             Codec::Other(s) => s.clone(),
         }
@@ -241,6 +243,27 @@ pub(crate) fn parse_hvcc_record(rec: &[u8]) -> Option<HvccInfo> {
     })
 }
 
+pub(crate) struct AvccInfo {
+    pub bit_depth: u8,
+    pub chroma: &'static str,
+    pub nal_len: u8,
+    pub profile_str: String,
+}
+
+/// Parse an AVCDecoderConfigurationRecord (`avcC` payload / MKV CodecPrivate).
+/// Unlike `hvcC`, the depth/chroma/profile are not in fixed header fields for
+/// every profile, so they come from the embedded SPS.
+pub(crate) fn parse_avcc_record(rec: &[u8]) -> Option<AvccInfo> {
+    let nal_len = crate::avc::nal::avcc_nal_len(rec)?;
+    let sps = crate::avc::sps::parse_sps(crate::avc::nal::find_sps_in_avcc(rec)?)?;
+    Some(AvccInfo {
+        bit_depth: sps.bit_depth,
+        chroma: sps.chroma_str(),
+        nal_len,
+        profile_str: sps.profile_label(),
+    })
+}
+
 /// Parse an AV1CodecConfigurationRecord (`av1C` box payload / MKV AV1
 /// CodecPrivate). Returns `(bit_depth, chroma, codec_profile_label)`.
 pub(crate) fn parse_av1c_record(rec: &[u8]) -> Option<(u8, &'static str, String)> {
@@ -284,6 +307,14 @@ pub(crate) fn color_from_vui(vui: &crate::hevc::sps::VuiColor) -> ColorInfo {
 pub(crate) fn color_from_hvcc(hvcc: &[u8]) -> Option<ColorInfo> {
     let sps = crate::hevc::sps::find_sps_in_hvcc(hvcc)?;
     let info = crate::hevc::sps::parse_sps(sps)?;
+    info.color.as_ref().map(color_from_vui)
+}
+
+/// Recover colour info from the SPS embedded in an `avcC` record, for AVC files
+/// whose container carries no explicit `colr` box (Profile 9's Rec.709 SDR base
+/// signals its VUI here).
+pub(crate) fn color_from_avcc(avcc: &[u8]) -> Option<ColorInfo> {
+    let info = crate::avc::sps::parse_sps(crate::avc::nal::find_sps_in_avcc(avcc)?)?;
     info.color.as_ref().map(color_from_vui)
 }
 
@@ -360,5 +391,28 @@ mod tests {
     #[test]
     fn cicp_matrix_names_dolby_ipt() {
         assert_eq!(cicp_matrix(15), Some("IPT-PQ-c2"));
+    }
+
+    #[test]
+    fn parse_avcc_high_profile() {
+        // A real `avcC` (AVCDecoderConfigurationRecord) from a Dolby Vision profile
+        // 9 MP4: High@L4, 4-byte NAL length prefix, one embedded SPS (1920×1080,
+        // 8-bit 4:2:0). Depth/chroma/profile come from that SPS.
+        let avcc = [
+            0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x1d, 0x67, 0x64, 0x00, 0x28, 0xac, 0xb2,
+            0x00, 0xf0, 0x04, 0x4f, 0xcb, 0x80, 0xb5, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0x03,
+            0x00, 0x40, 0x00, 0x00, 0x0c, 0x03, 0xc6, 0x0c, 0x92, 0x01, 0x00, 0x06, 0x68, 0xeb,
+            0xc3, 0xcb, 0x22, 0xc0, 0xfd, 0xf8, 0xf8, 0x00,
+        ];
+        let a = parse_avcc_record(&avcc).expect("valid avcC");
+        assert_eq!(a.bit_depth, 8);
+        assert_eq!(a.chroma, "4:2:0");
+        assert_eq!(a.nal_len, 4);
+        assert_eq!(a.profile_str, "High @ L4");
+        // Its embedded SPS also yields the Rec.709 base-layer colour.
+        let c = color_from_avcc(&avcc).expect("VUI colour");
+        assert_eq!(c.primaries.as_deref(), Some("BT.709"));
+        assert_eq!(c.transfer.as_deref(), Some("BT.709"));
+        assert_eq!(c.range.as_deref(), Some("limited"));
     }
 }

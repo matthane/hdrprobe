@@ -1,6 +1,7 @@
 //! hdrprobe — fast HDR / Dolby Vision metadata inspector.
 
 mod av1;
+mod avc;
 mod bits;
 mod container;
 mod dv;
