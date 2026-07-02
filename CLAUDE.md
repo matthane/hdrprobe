@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 53 unit tests
+cargo test                     # 54 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -92,7 +92,18 @@ excluded by config.
   `dvcC`/`dvvC` box, *not* the RPU. Everything dynamic (FEL/MEL, L5/L6/L9/L11/L254, trim
   targets) comes from the **RPU**, which rides the base layer / a DV-flagged track — the
   enhancement-layer *residual* is decode-only and never needed. This is why P7 dual-track
-  "just works" once the BL/DV track's RPU is parsed.
+  "just works" once the BL/DV track's RPU is parsed. The **compatibility id is `Option<u8>`**:
+  the older/compact 4-byte DV record (Profile-4 TS `0xB0` descriptors) omits the compat nibble,
+  so `parse_dovi_config` requires only 4 bytes and reads compat when present, else `None` — never
+  a guessed 0. **Profile 4 is dual-layer** (like P7): its EL presence and MEL/FEL tag come from
+  the config + RPU the same way, and its **SDR base is inferred from the profile** in
+  `hdr::assemble` (P4 is SDR-compatible by definition) since old P4 muxes carry neither a compat
+  id nor a base-layer transfer VUI.
+- **Extension dispatch falls back to content sniffing only on error.** `container::demux` picks a
+  backend by extension and returns immediately on success — sniffing never runs on the happy path
+  (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),
+  `sniff_demux` re-probes by magic bytes and is adopted only if a sniffed backend actually
+  succeeds; otherwise the original, more specific error is surfaced.
 - **Layer/track structure is observed, not assumed per-container.** The report's `Structure` line
   (`Single track, dual layer` vs `Dual track, dual layer`) is rendered only for dual-layer content
   (an EL is present, i.e. Profile 7) and is driven by `Demux::dv_dual_track`, which each backend
