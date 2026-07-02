@@ -147,15 +147,17 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 };
                 kv(&mut s, &c, "L11 content", &format!("{}{}", l11, rm));
             }
-            if !dv.trim_targets_nits.is_empty() {
-                let list = dv.trim_targets_nits.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
-                let tag = dv
-                    .trim_target_levels
+            if !dv.trim_targets.is_empty() {
+                let list = dv
+                    .trim_targets
                     .iter()
-                    .map(|l| format!("L{l}"))
+                    .map(|t| {
+                        let tag = t.levels.iter().map(|l| format!("L{l}")).collect::<Vec<_>>().join("/");
+                        format!("{} {}", t.nits, c.dim(&format!("[{tag}]")))
+                    })
                     .collect::<Vec<_>>()
-                    .join("/");
-                kv(&mut s, &c, "Trim targets", &format!("{} nit   {}", list, c.dim(&format!("[{tag}]"))));
+                    .join(", ");
+                kv(&mut s, &c, "Trim targets", &format!("{} nit", list));
             }
             if let Some(census) = &dv.census {
                 kv(&mut s, &c, "RPU count", &format!("{}   {}", dv.rpu_count, c.dim("[full scan]")));

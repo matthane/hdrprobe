@@ -89,10 +89,11 @@ excluded by config.
   in Profile 20) is defined by an L10 block in the same title**, so it's resolved from the title's
   L10 target-display map (`target_max_pq` -> nits) before the predefined index table; unknown with
   neither is dropped, never guessed (the `hdrprobe` table is preferred over libdovi's
-  `trim_target_nits()`, which guesses 100 for 255). The **`[L2/L8]` provenance tag is dynamic** —
-  `trim_target_levels` lists only the levels that actually produced a target (so an L8-only title
-  like Profile 20 reads `[L8]`, an L2-only one `[L2]`). **L10 is never in the tag**: it only
-  *defines* the display an L8 trim points at; the trim itself is L8.
+  `trim_target_nits()`, which guesses 100 for 255). The **provenance tag is per-value and dynamic** —
+  each target carries its own `levels` (`model::TrimTarget`), so a single value renders `600 [L2]`,
+  a value produced by both levels `100 [L2/L8]`, and an L8-only title like Profile 20 `300 [L8]`.
+  **L10 is never in the tag**: it only *defines* the display an L8 trim points at; the trim itself
+  is L8.
 - **DV facts and their sources.** BL **compatibility id** and DV **level** come from the
   `dvcC`/`dvvC` box, *not* the RPU. Everything dynamic (FEL/MEL, L5/L6/L9/L11/L254, trim
   targets) comes from the **RPU**, which rides the base layer / a DV-flagged track — the

@@ -11,7 +11,7 @@ use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlock;
 use dolby_vision::rpu::rpu_data_nlq::DoviELType;
 
 use crate::container::DvConfig;
-use crate::model::{ActiveArea, DolbyVision, DvCensus, L6Fallback, LevelPresence};
+use crate::model::{ActiveArea, DolbyVision, DvCensus, L6Fallback, LevelPresence, TrimTarget};
 
 /// Metadata levels we census, in report order.
 const CENSUS_LEVELS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 254];
@@ -219,25 +219,26 @@ impl DvAggregate {
         // Resolve L8 trim targets to nits: a custom index (e.g. 255) is defined by
         // an L10 block in this title; otherwise fall back to the predefined table.
         // An index with neither a definition nor a table entry can't be stated in
-        // nits, so it's dropped rather than guessed. Merged with the L2 targets.
-        let l2_contributed = !self.trim_targets.is_empty();
-        let mut trim_targets = self.trim_targets;
-        let mut l8_contributed = false;
+        // nits, so it's dropped rather than guessed. Merged with the L2 targets,
+        // but each nit value keeps the set of levels that produced it, so a value
+        // present in both L2 and L8 reads `[L2/L8]` while an L8-only one reads
+        // `[L8]`.
+        let mut target_levels: BTreeMap<u32, BTreeSet<u8>> = BTreeMap::new();
+        for nits in self.trim_targets {
+            target_levels.entry(nits).or_default().insert(2);
+        }
         for &idx in &self.l8_target_indices {
             if let Some(nits) = resolve_l8_nits(idx, &self.l10_targets) {
-                trim_targets.insert(nits);
-                l8_contributed = true;
+                target_levels.entry(nits).or_default().insert(8);
             }
         }
-        // Tag the trim targets with the levels that actually produced them, so a
-        // file with only L8 trims doesn't claim L2 (and vice versa).
-        let mut trim_target_levels = Vec::new();
-        if l2_contributed {
-            trim_target_levels.push(2);
-        }
-        if l8_contributed {
-            trim_target_levels.push(8);
-        }
+        let trim_targets = target_levels
+            .into_iter()
+            .map(|(nits, levels)| TrimTarget {
+                nits,
+                levels: levels.into_iter().collect(),
+            })
+            .collect();
 
         let census = full.then(|| DvCensus {
             scene_cuts: self.scene_cuts,
@@ -266,8 +267,7 @@ impl DvAggregate {
             l9_mastering: self.l9_primary.map(primary_name),
             l11_content: self.l11_content.map(content_type_name),
             l11_reference_mode: self.l11_ref_mode,
-            trim_targets_nits: trim_targets.into_iter().collect(),
-            trim_target_levels,
+            trim_targets,
             rpu_count: self.rpu_count,
             sampled: !full,
             census,
@@ -300,8 +300,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         l9_mastering: None,
         l11_content: None,
         l11_reference_mode: None,
-        trim_targets_nits: Vec::new(),
-        trim_target_levels: Vec::new(),
+        trim_targets: Vec::new(),
         rpu_count: 0,
         sampled: false,
         census: None,

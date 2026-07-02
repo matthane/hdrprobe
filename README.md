@@ -30,7 +30,7 @@ Dolby Vision
   RPU / DM         present · CM v2.9 · MEL
   L5 active area   3840×1608  (2.39:1)  ·  L0 R0 T276 B276   [sampled]
   L6 fallback      MaxCLL 737 · MaxFALL 130
-  Trim targets     100 nit   [L2]
+  Trim targets     100 [L2] nit
 
 HDR10+
   Profile          B

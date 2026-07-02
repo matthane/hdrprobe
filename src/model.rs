@@ -163,14 +163,10 @@ pub struct DolbyVision {
     pub l11_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l11_reference_mode: Option<bool>,
-    /// Distinct L2/L8 trim target nits (union across samples).
+    /// Distinct L2/L8 trim targets (union across samples), each tagged with the
+    /// level(s) that produced it so provenance is per-value rather than aggregate.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub trim_targets_nits: Vec<u32>,
-    /// Which trim levels actually produced the targets above — 2 and/or 8 — for
-    /// the provenance tag. (L8's target display may be *defined* by L10, but the
-    /// trim itself is still L8, so L10 is never listed here.)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub trim_target_levels: Vec<u8>,
+    pub trim_targets: Vec<TrimTarget>,
     /// Number of RPUs successfully parsed.
     pub rpu_count: usize,
     /// True when the report reflects sampling rather than a full scan.
@@ -196,6 +192,15 @@ pub struct DvCensus {
 pub struct LevelPresence {
     pub level: u8,
     pub rpus_with: usize,
+}
+
+/// One distinct trim target, in nits, plus the level(s) that produced it — 2
+/// and/or 8. (L8's target display may be *defined* by L10, but the trim itself
+/// is still L8, so L10 is never listed here.)
+#[derive(Debug, Serialize)]
+pub struct TrimTarget {
+    pub nits: u32,
+    pub levels: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
