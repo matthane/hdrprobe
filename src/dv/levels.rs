@@ -178,18 +178,8 @@ impl DvAggregate {
             DoviELType::MEL => "MEL".to_string(),
         });
 
-        // Dual-layer profiles (4 and 7) tag the enhancement-layer kind; single-layer
-        // profiles have no EL to qualify. Profile 4's MEL/FEL split is meaningful:
-        // an original P4 FEL may not render HDR on all devices (see the DV spec).
-        let profile_str = match profile {
-            4 | 7 => match self.el_type.as_ref() {
-                Some(DoviELType::FEL) => format!("{profile} (FEL)"),
-                Some(DoviELType::MEL) => format!("{profile} (MEL)"),
-                None => profile.to_string(),
-            },
-            8 => format!("8.{}", minor_from_compat(cfg)),
-            p => p.to_string(),
-        };
+        let compat_id = cfg.and_then(|c| c.bl_compatibility_id);
+        let profile_str = dv_profile_label(profile, compat_id, self.el_type.as_ref());
 
         // Presence: prefer explicit container flags, else derive from profile.
         let (bl, el, rpu) = match cfg {
@@ -214,7 +204,7 @@ impl DvAggregate {
 
         let cm_version = Some(if self.cm_v40 { "CM v4.0".to_string() } else { "CM v2.9".to_string() });
 
-        let compatibility = cfg.and_then(|c| c.bl_compatibility_id).and_then(compat_str);
+        let compatibility = compat_id.and_then(compat_str);
 
         // Resolve L8 trim targets to nits: a custom index (e.g. 255) is defined by
         // an L10 block in this title; otherwise fall back to the predefined table.
@@ -258,7 +248,7 @@ impl DvAggregate {
             el_present: el,
             rpu_present: rpu,
             el_type,
-            bl_compatibility_id: cfg.and_then(|c| c.bl_compatibility_id),
+            bl_compatibility_id: compat_id,
             compatibility,
             cm_version,
             l5_active_areas,
@@ -278,11 +268,8 @@ impl DvAggregate {
 /// Build a DV section from the container config alone (no RPU parse), as used
 /// by `--no-rpu`. Static levels are absent since they live in the RPU.
 pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
-    let profile_str = match cfg.profile {
-        7 => "7".to_string(),
-        8 => format!("8.{}", minor_from_compat(Some(cfg))),
-        p => p.to_string(),
-    };
+    // No RPU parse here, so the enhancement-layer kind (FEL/MEL) is unknown.
+    let profile_str = dv_profile_label(cfg.profile, cfg.bl_compatibility_id, None);
     DolbyVision {
         profile: profile_str,
         structure: structure_str(cfg.el_present, dual_track),
@@ -307,15 +294,31 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
     }
 }
 
-/// The dvcC `dv_bl_signal_compatibility_id` only constrains the minor digit
-/// when we can't read it from a container box. Fall back to "1" (the common
-/// 8.1 case) since the RPU alone doesn't store it.
-fn minor_from_compat(cfg: Option<&DvConfig>) -> u8 {
-    match cfg.and_then(|c| c.bl_compatibility_id) {
-        Some(1) => 1,
-        Some(2) => 2,
-        Some(4) => 4,
-        _ => 1,
+/// Format the Dolby Vision profile as `profile.compatibility` (e.g. `5.0`,
+/// `7.6`, `8.1`, `9.2`, `10.4`, `20.0`), tagging the enhancement-layer kind for
+/// the dual-layer profiles (4 and 7). The minor digit is the container's
+/// `dv_bl_signal_compatibility_id`, printed verbatim so an atypical id (e.g. the
+/// Blu-ray Profile 7 value 6) is reported rather than clamped.
+///
+/// Some inputs carry no container compat id; the minor digit is then taken from
+/// the profile's definition rather than guessed. Profile 8 mandates
+/// cross-compatibility signalling, so a raw P8 RPU (a `.bin`/`.xml` sidecar, or
+/// an AV1 P10 RPU libdovi reports as 8) is labelled `8.1` by convention, matching
+/// dovi_tool. Profile 4 is SDR-compatible by definition (CCID 2), so a legacy P4
+/// mux whose compact descriptor omits the nibble is labelled `4.2` — consistent
+/// with `hdr::assemble` inferring P4's SDR base from the profile. Any other
+/// profile without a compat id prints its bare number.
+fn dv_profile_label(profile: u8, compat: Option<u8>, el_type: Option<&DoviELType>) -> String {
+    let base = match compat {
+        Some(id) => format!("{profile}.{id}"),
+        None if profile == 8 => "8.1".to_string(),
+        None if profile == 4 => "4.2".to_string(),
+        None => profile.to_string(),
+    };
+    match (profile, el_type) {
+        (4 | 7, Some(DoviELType::FEL)) => format!("{base} (FEL)"),
+        (4 | 7, Some(DoviELType::MEL)) => format!("{base} (MEL)"),
+        _ => base,
     }
 }
 

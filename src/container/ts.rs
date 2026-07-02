@@ -344,7 +344,7 @@ fn scan_descriptors(d: &[u8]) -> (bool, Option<DvConfig>) {
             }
             0xB0 => {
                 has_dovi = true;
-                cfg = super::parse_dovi_config(body).or(cfg);
+                cfg = super::parse_dovi_ts_descriptor(body).or(cfg);
             }
             _ => {}
         }
@@ -768,14 +768,18 @@ mod tests {
     #[test]
     fn pmt_parses_hevc_and_dovi_streams() {
         // HEVC BL (0x1011, type 0x24) + a DV EL PID (0x1015, type 0x06) carrying a
-        // tag-0xB0 Dolby Vision descriptor whose body is a dvcC-shaped record:
-        // profile 7, level 6, rpu+el present, bl absent, compat 8.
-        let s: [u8; 33] = [
-            0x02, 0xB0, 0x1E, 0x00, 0x01, 0xC1, 0x00, 0x00, // table header
+        // tag-0xB0 DOVI_video_stream_descriptor for the secondary (EL/RPU) PID:
+        // profile 7, level 6, rpu+el present, bl absent. Because bl_present_flag
+        // is 0, a 16-bit dependency_pid+reserved block (0x80 0x8F) precedes the
+        // compat nibble, which is 6 (top nibble of 0x6F). These are the real bytes
+        // from testfiles dv7fel_dt_hevc.m2ts. Reading the pre-skip offset would
+        // wrongly yield compat 8.
+        let s: [u8; 35] = [
+            0x02, 0xB0, 0x20, 0x00, 0x01, 0xC1, 0x00, 0x00, // table header
             0xF0, 0x11, 0xF0, 0x00, // PCR PID 0x1011, program_info_length 0
             0x24, 0xF0, 0x11, 0xF0, 0x00, // ES1: HEVC PID 0x1011
-            0x06, 0xF0, 0x15, 0xF0, 0x07, // ES2: private PID 0x1015, es_info 7
-            0xB0, 0x05, 0x01, 0x00, 0x0E, 0x36, 0x80, // DV descriptor
+            0x06, 0xF0, 0x15, 0xF0, 0x09, // ES2: private PID 0x1015, es_info 9
+            0xB0, 0x07, 0x01, 0x00, 0x0E, 0x36, 0x80, 0x8F, 0x6F, // DV descriptor
             0x00, 0x00, 0x00, 0x00, // CRC
         ];
         let mut payload = vec![0x00];
@@ -791,7 +795,7 @@ mod tests {
         assert_eq!(cfg.profile, 7);
         assert_eq!(cfg.level, Some(6));
         assert!(cfg.rpu_present && cfg.el_present && !cfg.bl_present);
-        assert_eq!(cfg.bl_compatibility_id, Some(8));
+        assert_eq!(cfg.bl_compatibility_id, Some(6));
     }
 
     #[test]

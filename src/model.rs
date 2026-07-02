@@ -122,7 +122,7 @@ pub struct ContentLight {
 
 #[derive(Debug, Serialize)]
 pub struct DolbyVision {
-    /// e.g. "8.1", "7 (FEL)", "5".
+    /// `profile.compatibility`, e.g. "8.1", "7.6 (FEL)", "5.0", "10.4".
     pub profile: String,
     /// Layer/track layout, present only for dual-layer (Profile 7) content:
     /// "Single track, dual layer" (BL+EL interleaved in one track/stream) or

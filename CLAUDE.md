@@ -101,7 +101,14 @@ excluded by config.
   "just works" once the BL/DV track's RPU is parsed. The **compatibility id is `Option<u8>`**:
   the older/compact 4-byte DV record (Profile-4 TS `0xB0` descriptors) omits the compat nibble,
   so `parse_dovi_config` requires only 4 bytes and reads compat when present, else `None` — never
-  a guessed 0. **Profile 4 is dual-layer** (like P7): its EL presence and MEL/FEL tag come from
+  a guessed 0. The **TS `0xB0` descriptor is not byte-identical to the ISOBMFF `dvcC`**: per
+  Table 3-2 of the Dolby "MPEG-2 TS Format" spec it inserts a `dependency_pid`(13)+reserved(3)
+  block before the compat nibble **when `bl_present_flag == 0`** (the secondary EL/RPU PID of a
+  dual-PID stream, e.g. P7 dual-track M2TS). So the TS path parses through
+  `parse_dovi_ts_descriptor` (which skips that block), *not* `parse_dovi_config` — routing a TS
+  descriptor through the ISOBMFF parser reads the compat nibble 16 bits early (P7 dual-PID showed
+  a bogus `8` instead of `6`). The compat id becomes the profile's minor digit
+  (`levels::dv_profile_label`: `7.6`, `8.1`, `10.4`, …). **Profile 4 is dual-layer** (like P7): its EL presence and MEL/FEL tag come from
   the config + RPU the same way, and its **SDR base is inferred from the profile** in
   `hdr::assemble` (P4 is SDR-compatible by definition) since old P4 muxes carry neither a compat
   id nor a base-layer transfer VUI.
