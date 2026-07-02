@@ -48,11 +48,19 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
         // No independently viewable base — infer it from the DV BL compatibility id
         // (1=HDR10, 2=SDR, 4=HLG). Profiles 5 and 20 (compat 0) have no directly
         // viewable base, so we show no base tag.
-        match dv.bl_compatibility_id {
-            Some(1) => Some("HDR10 (fallback)"),
-            Some(2) => Some("SDR (fallback)"),
-            Some(4) => Some("HLG (fallback)"),
-            _ => None,
+        //
+        // Profile 4 is defined with an SDR (BT.709/BT.1886) base layer, so its base
+        // is SDR even when the container omits the compatibility id (older P4 TS
+        // descriptors carry no compat nibble) — infer it from the profile.
+        if dv.profile.starts_with('4') {
+            Some("SDR (fallback)")
+        } else {
+            match dv.bl_compatibility_id {
+                Some(1) => Some("HDR10 (fallback)"),
+                Some(2) => Some("SDR (fallback)"),
+                Some(4) => Some("HLG (fallback)"),
+                _ => None,
+            }
         }
     } else {
         Some("SDR")

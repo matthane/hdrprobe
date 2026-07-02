@@ -719,7 +719,7 @@ mod tests {
         assert_eq!(cfg.profile, 7);
         assert_eq!(cfg.level, Some(6));
         assert!(cfg.rpu_present && cfg.el_present && !cfg.bl_present);
-        assert_eq!(cfg.bl_compatibility_id, 8);
+        assert_eq!(cfg.bl_compatibility_id, Some(8));
     }
 
     #[test]

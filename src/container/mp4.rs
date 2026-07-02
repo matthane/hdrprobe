@@ -583,7 +583,7 @@ mod tests {
             bl_present: true,
             el_present: true,
             rpu_present: true,
-            bl_compatibility_id: 0,
+            bl_compatibility_id: Some(0),
         }
     }
 

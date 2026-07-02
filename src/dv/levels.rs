@@ -178,12 +178,17 @@ impl DvAggregate {
             DoviELType::MEL => "MEL".to_string(),
         });
 
-        let profile_str = match (profile, self.el_type.as_ref()) {
-            (7, Some(DoviELType::FEL)) => "7 (FEL)".to_string(),
-            (7, Some(DoviELType::MEL)) => "7 (MEL)".to_string(),
-            (7, _) => "7".to_string(),
-            (8, _) => format!("8.{}", minor_from_compat(cfg)),
-            (p, _) => p.to_string(),
+        // Dual-layer profiles (4 and 7) tag the enhancement-layer kind; single-layer
+        // profiles have no EL to qualify. Profile 4's MEL/FEL split is meaningful:
+        // an original P4 FEL may not render HDR on all devices (see the DV spec).
+        let profile_str = match profile {
+            4 | 7 => match self.el_type.as_ref() {
+                Some(DoviELType::FEL) => format!("{profile} (FEL)"),
+                Some(DoviELType::MEL) => format!("{profile} (MEL)"),
+                None => profile.to_string(),
+            },
+            8 => format!("8.{}", minor_from_compat(cfg)),
+            p => p.to_string(),
         };
 
         // Presence: prefer explicit container flags, else derive from profile.
@@ -209,7 +214,7 @@ impl DvAggregate {
 
         let cm_version = Some(if self.cm_v40 { "CM v4.0".to_string() } else { "CM v2.9".to_string() });
 
-        let compatibility = cfg.and_then(|c| compat_str(c.bl_compatibility_id));
+        let compatibility = cfg.and_then(|c| c.bl_compatibility_id).and_then(compat_str);
 
         // Resolve L8 trim targets to nits: a custom index (e.g. 255) is defined by
         // an L10 block in this title; otherwise fall back to the predefined table.
@@ -252,7 +257,7 @@ impl DvAggregate {
             el_present: el,
             rpu_present: rpu,
             el_type,
-            bl_compatibility_id: cfg.map(|c| c.bl_compatibility_id),
+            bl_compatibility_id: cfg.and_then(|c| c.bl_compatibility_id),
             compatibility,
             cm_version,
             l5_active_areas,
@@ -286,8 +291,8 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         el_present: cfg.el_present,
         rpu_present: cfg.rpu_present,
         el_type: None,
-        bl_compatibility_id: Some(cfg.bl_compatibility_id),
-        compatibility: compat_str(cfg.bl_compatibility_id),
+        bl_compatibility_id: cfg.bl_compatibility_id,
+        compatibility: cfg.bl_compatibility_id.and_then(compat_str),
         cm_version: None,
         l5_active_areas: Vec::new(),
         l5_assumed_canvas: None,
@@ -307,7 +312,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
 /// when we can't read it from a container box. Fall back to "1" (the common
 /// 8.1 case) since the RPU alone doesn't store it.
 fn minor_from_compat(cfg: Option<&DvConfig>) -> u8 {
-    match cfg.map(|c| c.bl_compatibility_id) {
+    match cfg.and_then(|c| c.bl_compatibility_id) {
         Some(1) => 1,
         Some(2) => 2,
         Some(4) => 4,

@@ -54,7 +54,10 @@ pub struct DvConfig {
     pub bl_present: bool,
     pub el_present: bool,
     pub rpu_present: bool,
-    pub bl_compatibility_id: u8,
+    /// `dv_bl_signal_compatibility_id` (0=none, 1=HDR10, 2=SDR, 4=HLG). `None`
+    /// when the record omits it — the compat nibble was added in a later revision,
+    /// so the compact 4-byte form used by older Profile-4 TS descriptors has no id.
+    pub bl_compatibility_id: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -105,33 +108,58 @@ pub fn demux(path: &Path, data: &[u8], full: bool) -> Result<Demux> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    match ext.as_str() {
-        "mp4" | "m4v" | "mov" | "m4a" => return mp4::demux(data),
-        "mkv" | "webm" | "mka" => return mkv::demux(data, full),
-        "hevc" | "h265" | "265" | "bin" => return annexb::demux(data, full),
-        "ivf" | "obu" => return av1::demux(data, full),
-        "ts" | "m2ts" | "mts" => return ts::demux(data, full),
-        _ => {}
+    let by_ext = match ext.as_str() {
+        "mp4" | "m4v" | "mov" | "m4a" => Some(mp4::demux(data)),
+        "mkv" | "webm" | "mka" => Some(mkv::demux(data, full)),
+        "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full)),
+        "ivf" | "obu" => Some(av1::demux(data, full)),
+        "ts" | "m2ts" | "mts" => Some(ts::demux(data, full)),
+        _ => None,
+    };
+
+    // A correctly-named file returns here immediately, so sniffing never runs on the
+    // happy path — no latency cost. If the extension-matched backend *failed*, the
+    // file may be misnamed (e.g. a TS carrying a .mkv extension): fall through to
+    // content sniffing and adopt it only if a sniffed backend actually succeeds,
+    // otherwise surface the original, more specific error.
+    match by_ext {
+        Some(Ok(demux)) => return Ok(demux),
+        Some(Err(e)) => {
+            if let Some(Ok(demux)) = sniff_demux(data, full) {
+                return Ok(demux);
+            }
+            return Err(e);
+        }
+        None => {}
     }
 
-    // Fall back to magic-byte sniffing.
-    if data.len() >= 12 && &data[4..8] == b"ftyp" {
-        return mp4::demux(data);
-    }
-    if starts_with_ebml(data) {
-        return mkv::demux(data, full);
-    }
-    if av1::is_ivf(data) || av1::is_obu_stream(data) {
-        return av1::demux(data, full);
-    }
-    if ts::detect_layout(data).is_some() {
-        return ts::demux(data, full);
-    }
-    if starts_with_start_code(data) {
-        return annexb::demux(data, full);
+    // Unknown extension: dispatch purely by magic bytes.
+    if let Some(res) = sniff_demux(data, full) {
+        return res;
     }
 
     bail!("unrecognized container (extension '{}')", ext)
+}
+
+/// Pick a backend from magic bytes / structural probes alone (extension ignored).
+/// `None` when nothing matches.
+fn sniff_demux(data: &[u8], full: bool) -> Option<Result<Demux>> {
+    if data.len() >= 12 && &data[4..8] == b"ftyp" {
+        return Some(mp4::demux(data));
+    }
+    if starts_with_ebml(data) {
+        return Some(mkv::demux(data, full));
+    }
+    if av1::is_ivf(data) || av1::is_obu_stream(data) {
+        return Some(av1::demux(data, full));
+    }
+    if ts::detect_layout(data).is_some() {
+        return Some(ts::demux(data, full));
+    }
+    if starts_with_start_code(data) {
+        return Some(annexb::demux(data, full));
+    }
+    None
 }
 
 fn starts_with_start_code(data: &[u8]) -> bool {
@@ -152,7 +180,9 @@ fn starts_with_ebml(data: &[u8]) -> bool {
 /// and carries the same record layout. `rec` starts at the `dv_version_major`
 /// byte.
 pub(crate) fn parse_dovi_config(rec: &[u8]) -> Option<DvConfig> {
-    if rec.len() < 5 {
+    // Minimum is the 4-byte compact form: major, minor, and a 16-bit bitfield of
+    // profile(7)+level(6)+rpu(1)+el(1)+bl(1). The full form adds the compat nibble.
+    if rec.len() < 4 {
         return None;
     }
     // rec[0]=major, [1]=minor, then bitfields from byte 2.
@@ -162,14 +192,17 @@ pub(crate) fn parse_dovi_config(rec: &[u8]) -> Option<DvConfig> {
     let rpu_present = r.read_bit()? == 1;
     let el_present = r.read_bit()? == 1;
     let bl_present = r.read_bit()? == 1;
-    let compat = r.read_bits(4)? as u8;
+    // `dv_bl_signal_compatibility_id` was added to the record in a later revision;
+    // the compact 4-byte form (older Profile-4 TS descriptors) omits it. Read it
+    // when present, else leave it unknown rather than guessing 0.
+    let bl_compatibility_id = r.read_bits(4).map(|v| v as u8);
     Some(DvConfig {
         profile,
         level: Some(level),
         bl_present,
         el_present,
         rpu_present,
-        bl_compatibility_id: compat,
+        bl_compatibility_id,
     })
 }
 
@@ -304,7 +337,24 @@ mod tests {
         assert!(cfg.rpu_present);
         assert!(!cfg.el_present);
         assert!(cfg.bl_present);
-        assert_eq!(cfg.bl_compatibility_id, 0);
+        assert_eq!(cfg.bl_compatibility_id, Some(0));
+    }
+
+    #[test]
+    fn compact_dovi_config_omits_compat_id() {
+        // The 4-byte DV video-stream descriptor of a real Profile-4 TS: major=1,
+        // minor=0, then profile=4/level=6/rpu=1/el=1/bl=1 packed in 16 bits with no
+        // compatibility nibble — matching mediainfo's "Profile 4, dvhe.04.06,
+        // BL+EL+RPU". The EL must survive (else the report reads BL+RPU) and the
+        // absent compat id must read as unknown, not a guessed 0.
+        let rec = [0x01, 0x00, 0x08, 0x37];
+        let cfg = parse_dovi_config(&rec).expect("valid compact record");
+        assert_eq!(cfg.profile, 4);
+        assert_eq!(cfg.level, Some(6));
+        assert!(cfg.rpu_present);
+        assert!(cfg.el_present);
+        assert!(cfg.bl_present);
+        assert_eq!(cfg.bl_compatibility_id, None);
     }
 
     #[test]
