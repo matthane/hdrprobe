@@ -2,14 +2,15 @@
 
 Fast HDR / Dolby Vision metadata inspector: one native Rust binary that memory-maps a video
 file, demuxes without decoding, samples RPUs, and prints a sectioned report in well under 2s.
-**`PLAN.md` is the source of truth** for design, milestones (M1–M8, all complete), and a
-detailed per-milestone implementation log — read it before non-trivial changes.
+It also parses metadata **sidecar** files (raw DV RPU, DV CM XML, HDR10+ JSON) into the same
+report. This file plus the module-level doc comments are the design reference — read the
+relevant section and the code it points at before non-trivial changes.
 
 ## Commands
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 37 unit tests
+cargo test                     # 47 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -45,7 +46,8 @@ excluded by config.
 
 ## Module map (`src/`)
 
-- `main.rs` — clap CLI, per-file dispatch, exit codes (0 ok / 1 usage / 2 unreadable).
+- `main.rs` — clap CLI, per-file dispatch (sidecar files first, then the video pipeline), exit
+  codes (0 ok / 1 usage / 2 unreadable).
 - `container/` — one hand-rolled demuxer per format: `mp4.rs`, `mkv.rs`, `ts.rs`, `annexb.rs`,
   `av1.rs`; `mod.rs` holds `Demux`/`Chunk`/`DvConfig` and the shared dvcC/hvcC/CICP decoders.
 - `hevc/` — `nal.rs` (Annex-B + length-prefixed NAL split), `sps.rs` (dims + VUI colour + VUI
@@ -53,6 +55,10 @@ excluded by config.
 - `av1/` — `obu.rs` (OBU walker, T.35 routing), `seq.rs` (sequence header).
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
 - `hdr/` — `mod.rs` (format classification), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer).
+- `sidecar/` — metadata-only inputs that bypass the video pipeline: `rpu_bin.rs` (raw DV RPU
+  `.bin`/`.rpu`), `dv_xml.rs` (DV CM XML), `hdr10plus_json.rs` (hdr10plus_tool JSON); `mod.rs`
+  detects by extension and renders through the ordinary `Report`. DV sidecars carry no
+  resolution, so L5 is sized against an assumed UHD canvas (`ASSUMED_CANVAS`) and labelled.
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
 - `prefetch.rs` — warms the metadata region with one pipelined positioned read before the
   mmap parse, so SMB/NFS scans don't fault it in over hundreds of round-trips. Timing only —
