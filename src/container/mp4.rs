@@ -83,6 +83,21 @@ pub fn moov_extent(data: &[u8]) -> Option<(usize, usize)> {
     find(&top, b"moov").map(|b| (b.payload, b.end))
 }
 
+/// QuickTime (`.mov`) and MP4 share the ISOBMFF box structure, so one backend
+/// reads both. They differ only in the `ftyp` major brand: a QuickTime-native
+/// mux stamps `qt  `, and MediaInfo labels such files "QuickTime". Report that
+/// distinction when the brand is present; otherwise (including a brandless
+/// legacy QuickTime file that opens straight into `moov`) fall back to the
+/// generic ISOBMFF label rather than guess.
+fn container_label(top: &[BoxHdr], data: &[u8]) -> &'static str {
+    match find(top, b"ftyp") {
+        Some(ftyp) if data.get(ftyp.payload..ftyp.payload + 4) == Some(b"qt  ") => {
+            "QuickTime (MOV)"
+        }
+        _ => "MP4 (ISOBMFF)",
+    }
+}
+
 pub fn demux(data: &[u8]) -> Result<Demux> {
     let top = iter_boxes(data, 0, data.len());
     let moov = find(&top, b"moov").context("no moov box (not a valid MP4)")?;
@@ -127,7 +142,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
     if tracks.is_empty() {
         bail!("no video track found in MP4");
     }
-    Ok(assemble_tracks(data, tracks))
+    Ok(assemble_tracks(data, tracks, container_label(&top, data)))
 }
 
 /// One parsed video track: its sample description plus a per-sample byte index.
@@ -144,7 +159,7 @@ struct VideoTrack {
 /// picture), the DV config comes from whichever track carries a dvcC/dvvC box (the
 /// EL), and both tracks' samples are concatenated so the RPU — which rides the EL —
 /// is scanned alongside the base layer.
-fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>) -> Demux {
+fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str) -> Demux {
     let primary = tracks
         .iter()
         .enumerate()
@@ -195,7 +210,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>) -> Demux {
     let dv_dual_track = tracks.len() > 1;
 
     Demux {
-        container: "MP4 (ISOBMFF)",
+        container,
         codec: p.sd.codec.clone(),
         nal_format: NalFormat::LengthPrefixed(nal_len),
         width: p.sd.width,
@@ -626,7 +641,7 @@ mod tests {
 
     #[test]
     fn single_track_passes_through() {
-        let d = assemble_tracks(&[], vec![track(3840, 2160, 4, Some(dv7()), 5)]);
+        let d = assemble_tracks(&[], vec![track(3840, 2160, 4, Some(dv7()), 5)], "MP4 (ISOBMFF)");
         assert_eq!((d.width, d.height), (3840, 2160));
         assert_eq!(d.dv_config.unwrap().profile, 7);
         assert_eq!(d.chunks.len(), 5);
@@ -638,7 +653,7 @@ mod tests {
         // Profile 7 dual-track MP4.
         let bl = track(3840, 2160, 4, None, 3);
         let el = track(1920, 1080, 4, Some(dv7()), 2);
-        let d = assemble_tracks(&[], vec![bl, el]);
+        let d = assemble_tracks(&[], vec![bl, el], "MP4 (ISOBMFF)");
         assert_eq!((d.width, d.height), (3840, 2160), "dims from the base layer");
         assert_eq!(d.dv_config.as_ref().unwrap().profile, 7, "DV config from the EL");
         assert_eq!(d.chunks.len(), 5, "BL + EL samples both scanned for the RPU");
@@ -650,7 +665,7 @@ mod tests {
         // must not be blindly appended; the DV config is still recovered.
         let bl = track(3840, 2160, 4, None, 3);
         let el = track(1920, 1080, 2, Some(dv7()), 2);
-        let d = assemble_tracks(&[], vec![bl, el]);
+        let d = assemble_tracks(&[], vec![bl, el], "MP4 (ISOBMFF)");
         assert_eq!(d.chunks.len(), 3, "mismatched-nal-len EL chunks skipped");
         assert!(d.dv_config.is_some());
         assert!(matches!(d.nal_format, NalFormat::LengthPrefixed(4)));
@@ -664,6 +679,26 @@ mod tests {
         assert_eq!(read_u16(&d, 2), 0);
         assert_eq!(read_u64(&d, 0), 0);
         assert_eq!(read_u16(&d, 0), 0xAABB);
+    }
+
+    #[test]
+    fn container_label_distinguishes_quicktime_from_mp4() {
+        // ftyp with major_brand 'qt  ' → QuickTime; anything else (or no ftyp)
+        // → the generic ISOBMFF label.
+        let mk = |brand: &[u8; 4]| {
+            let mut d = vec![0, 0, 0, 0x10]; // size 16
+            d.extend_from_slice(b"ftyp");
+            d.extend_from_slice(brand);
+            d.extend_from_slice(&[0, 0, 0, 0]); // minor version
+            let top = iter_boxes(&d, 0, d.len());
+            (d, top)
+        };
+        let (d, top) = mk(b"qt  ");
+        assert_eq!(container_label(&top, &d), "QuickTime (MOV)");
+        let (d, top) = mk(b"isom");
+        assert_eq!(container_label(&top, &d), "MP4 (ISOBMFF)");
+        // No ftyp at all (brandless legacy QuickTime) falls back, never guesses.
+        assert_eq!(container_label(&[], &[]), "MP4 (ISOBMFF)");
     }
 
     #[test]
