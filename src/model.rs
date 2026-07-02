@@ -37,6 +37,11 @@ pub struct General {
     pub bit_depth: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chroma: Option<String>,
+    /// Stereoscopic/multiview view structure, e.g. "Stereoscopic 3D (2 views)",
+    /// from the MP4 `vexu`/`stri` boxes of MV-HEVC (DV Profile 20). `None` for
+    /// ordinary monoscopic video.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stereo: Option<String>,
     pub color: ColorInfo,
 }
 
@@ -161,6 +166,11 @@ pub struct DolbyVision {
     /// Distinct L2/L8 trim target nits (union across samples).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trim_targets_nits: Vec<u32>,
+    /// Which trim levels actually produced the targets above — 2 and/or 8 — for
+    /// the provenance tag. (L8's target display may be *defined* by L10, but the
+    /// trim itself is still L8, so L10 is never listed here.)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trim_target_levels: Vec<u8>,
     /// Number of RPUs successfully parsed.
     pub rpu_count: usize,
     /// True when the report reflects sampling rather than a full scan.

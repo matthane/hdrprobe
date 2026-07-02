@@ -375,6 +375,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         bit_depth: track.bit_depth,
         chroma: track.chroma,
         codec_profile: track.codec_profile,
+        stereo: None,
         color: track.color,
         dv_config: track.dv_config,
         // Matroska interleaves the Profile-7 BL and EL in one track, so it is

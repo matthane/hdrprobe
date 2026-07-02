@@ -224,6 +224,7 @@ fn build_report(path: &Path, size: u64, container: &str, payload: Payload, start
             bitrate: None,
             bit_depth: None,
             chroma: None,
+            stereo: None,
             color: ColorInfo::default(),
         },
         hdr: None,

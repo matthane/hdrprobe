@@ -42,16 +42,18 @@ HDR10+
 ## What it reports
 
 - General and video: container, codec and profile, resolution, frame rate, bit depth, chroma
-  subsampling, and colour signalling (primaries, transfer, matrix, and range).
+  subsampling, colour signalling (primaries, transfer, matrix, and range), and stereoscopic /
+  multiview structure (MV-HEVC, e.g. Dolby Vision Profile 20).
 - HDR (static): classification across SDR, HDR10, HLG, HDR10+, and Dolby Vision, including
   their combinations, plus the mastering display (ST.2086) and MaxCLL / MaxFALL content light
   levels.
-- Dolby Vision: profile (5, 7 FEL/MEL, 8.1, 8.4, 10, and related variants), level, presence of
-  the base layer, enhancement layer, and RPU, base-layer compatibility, CM version (v2.9 or
+- Dolby Vision: profile (5, 7 FEL/MEL, 8.1, 8.4, 10, 20, and related variants), level, presence
+  of the base layer, enhancement layer, and RPU, base-layer compatibility, CM version (v2.9 or
   v4.0 via L254), and the title-stable dynamic levels: distinct L5 active areas, L6 fallback,
-  L9 mastering, L11 content type, and the set of L2/L8 trim targets. Per-frame values such as
-  L1 and per-shot trim values are deliberately omitted, since they are decode-time noise rather
-  than title-level facts.
+  L9 mastering, L11 content type, and the set of L2/L8 trim targets (an L8 trim's target display
+  may be defined by an L10 block, e.g. Profile 20 — its peak luminance is resolved from that
+  definition). Per-frame values such as L1 and per-shot trim values are deliberately omitted,
+  since they are decode-time noise rather than title-level facts.
 - HDR10+: presence, profile, application version, window count, and target display max
   luminance.
 
@@ -62,14 +64,14 @@ RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoi
 
 | Container | Codecs | Notes |
 |---|---|---|
-| MP4 / MOV | HEVC, AV1 | includes Profile 7 dual-track (separate BL and EL `trak` boxes) |
+| MP4 / MOV | HEVC, AV1 | includes Profile 7 dual-track (separate BL and EL `trak` boxes) and Profile 20 (MV-HEVC, `dvwC` config) |
 | MKV / WebM | HEVC, AV1 | single-track, and Profile 7 single-track dual-layer |
 | MPEG-TS / M2TS | HEVC | includes Profile 7 dual-PID (BL and EL on separate PIDs) |
 | Raw HEVC | Annex-B | profile inferred from the RPU |
 | Raw AV1 | IVF, low-overhead OBU | Dolby Vision Profile 10 |
 
-hdrprobe recognises HEVC Dolby Vision profiles 5, 7 (FEL and MEL), and 8.x, and AV1 Profile
-10.x.
+hdrprobe recognises HEVC Dolby Vision profiles 5, 7 (FEL and MEL), 8.x, and 20 (10-bit MV-HEVC
+for 3D / dual-view, BL+RPU), and AV1 Profile 10.x.
 
 ### Metadata sidecar files
 

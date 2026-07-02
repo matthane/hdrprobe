@@ -178,6 +178,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         bit_depth,
         chroma,
         codec_profile,
+        stereo: None,
         color,
         dv_config,
         // A Profile-7 EL rides its own PID, so more than one video PID means the

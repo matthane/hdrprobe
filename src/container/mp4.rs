@@ -1,5 +1,5 @@
 //! Minimal ISOBMFF (MP4/MOV) demuxer. Walks the box tree to recover the video
-//! track's codec config (hvcC/av1C), DV config (dvcC/dvvC), colour info, and a
+//! track's codec config (hvcC/av1C), DV config (dvcC/dvvC/dvwC), colour info, and a
 //! per-sample byte-range index from the `stbl` tables. Never reads sample
 //! payloads here — only their offsets/sizes.
 
@@ -205,6 +205,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>) -> Demux {
         bit_depth: p.sd.bit_depth,
         chroma: p.sd.chroma.clone(),
         codec_profile: p.sd.codec_profile.clone(),
+        stereo: tracks.iter().find_map(|t| t.sd.stereo.clone()),
         color,
         dv_config,
         dv_dual_track,
@@ -279,6 +280,7 @@ struct SampleDesc {
     nal_len: u8,
     color: ColorInfo,
     dv_config: Option<DvConfig>,
+    stereo: Option<String>,
     mastering: Option<MasteringDisplay>,
     content_light: Option<ContentLight>,
 }
@@ -311,6 +313,12 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut mastering = None;
     let mut content_light = None;
     let mut hvcc_bytes: Option<&[u8]> = None;
+    // A layered-HEVC config box (`lhvC`) beside the base `hvcC` marks MV-HEVC — the
+    // multiview form of DV Profile 20 (for 3D / dual-view); its absence is the 2D
+    // single-view form. Free to detect: the box is already a sample-entry child.
+    let mut layered = false;
+    // Stereo view structure from the `vexu` extended-usage box (also a child).
+    let mut stereo = None;
 
     for c in &children {
         match &c.typ {
@@ -330,11 +338,25 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                     codec_profile = Some(prof);
                 }
             }
-            b"dvcC" | b"dvvC" => dv_config = super::parse_dovi_config(&data[c.payload..c.end]),
+            // dvcC/dvvC carry the DV config for the usual single-view profiles;
+            // dvwC is Profile 20 (MV-HEVC, `dvh1` sample entry) — same record layout.
+            b"dvcC" | b"dvvC" | b"dvwC" => {
+                dv_config = super::parse_dovi_config(&data[c.payload..c.end])
+            }
+            b"lhvC" => layered = true,
+            b"vexu" => stereo = parse_stereo(data, c).or(stereo),
             b"colr" => color = parse_colr(data, c).unwrap_or(color),
             b"mdcv" | b"SmDm" => mastering = parse_mdcv(data, c).or(mastering),
             b"clli" | b"CoLL" => content_light = parse_clli(data, c).or(content_light),
             _ => {}
+        }
+    }
+
+    // Prefix the base profile ("Main 10, High tier @ L5") to match mediainfo's
+    // "Multiview Main 10@L5@High" when the second HEVC layer (`lhvC`) is present.
+    if layered {
+        if let Some(p) = codec_profile.take() {
+            codec_profile = Some(format!("Multiview {p}"));
         }
     }
 
@@ -357,9 +379,38 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         nal_len,
         color,
         dv_config,
+        stereo,
         mastering,
         content_light,
     })
+}
+
+/// Decode the stereoscopic view structure from a `vexu` (Video Extended Usage)
+/// box: descend to its `eyes` → `stri` (Stereo View Information) child and read
+/// the eye-view flags. MV-HEVC (DV Profile 20 for 3D) signals a stereo pair here.
+/// A plain container-box walk, all within the sample entry already in hand.
+fn parse_stereo(data: &[u8], vexu: &BoxHdr) -> Option<String> {
+    let eyes = iter_boxes(data, vexu.payload, vexu.end)
+        .into_iter()
+        .find(|b| &b.typ == b"eyes")?;
+    let stri = iter_boxes(data, eyes.payload, eyes.end)
+        .into_iter()
+        .find(|b| &b.typ == b"stri")?;
+    // stri is a FullBox: version(1)+flags(3), then one byte of eye-view flags —
+    // bit0 left, bit1 right, bit2 additional views present, bit3 views reversed.
+    let flags = *data.get(stri.payload + 4)?;
+    let left = flags & 0x01 != 0;
+    let right = flags & 0x02 != 0;
+    let additional = flags & 0x04 != 0;
+    if additional {
+        // More than a plain L/R pair; stri alone can't state the exact count.
+        return Some("Multiview 3D (2+ views)".to_string());
+    }
+    match (left, right) {
+        (true, true) => Some("Stereoscopic 3D (2 views)".to_string()),
+        (true, false) | (false, true) => Some("Monoscopic (1 view)".to_string()),
+        (false, false) => None,
+    }
 }
 
 /// Recover VUI colour from an in-band SPS in the first few samples of a track.
@@ -548,6 +599,7 @@ mod tests {
                 nal_len,
                 color: ColorInfo::default(),
                 dv_config: dv,
+                stereo: None,
                 mastering: None,
                 content_light: None,
             },
@@ -647,5 +699,24 @@ mod tests {
         assert_eq!(chunks.len(), 2, "only the two real sample sizes are indexed");
         assert_eq!(chunks[0].size, 10);
         assert_eq!(chunks[1].size, 20);
+    }
+
+    #[test]
+    fn vexu_stri_reports_stereoscopic_pair() {
+        // The exact vexu → eyes → stri box tree from the Profile 20 MV-HEVC sample:
+        // the stri eye-view byte 0x03 = left + right present → a stereo pair.
+        let vexu = hex_bytes("0000001d766578750000001565796573000000\
+                              0d737472690000000003");
+        let hdr = BoxHdr { typ: *b"vexu", payload: 8, end: vexu.len() };
+        assert_eq!(parse_stereo(&vexu, &hdr).as_deref(), Some("Stereoscopic 3D (2 views)"));
+
+        // A monoscopic file has no vexu; an empty/childless one yields no label.
+        let empty = BoxHdr { typ: *b"vexu", payload: 8, end: 8 };
+        assert_eq!(parse_stereo(&[0; 8], &empty), None);
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 }

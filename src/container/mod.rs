@@ -69,6 +69,9 @@ pub struct Demux {
     pub bit_depth: Option<u8>,
     pub chroma: Option<String>,
     pub codec_profile: Option<String>,
+    /// Stereoscopic/multiview view structure (MP4 `vexu`/`stri`); `None` for
+    /// ordinary monoscopic video. Only MV-HEVC (DV Profile 20) sets it today.
+    pub stereo: Option<String>,
     pub color: ColorInfo,
     pub dv_config: Option<DvConfig>,
     /// True when the base layer and Dolby Vision enhancement layer are carried on
@@ -144,8 +147,10 @@ fn starts_with_ebml(data: &[u8]) -> bool {
 
 // --- Shared codec/DV config decoders, used by every container backend. ---
 
-/// Parse a Dolby Vision configuration record (the `dvcC`/`dvvC` box payload, or
-/// the MKV `BlockAddIDExtraData`). `rec` starts at the `dv_version_major` byte.
+/// Parse a Dolby Vision configuration record (the `dvcC`/`dvvC`/`dvwC` box
+/// payload, or the MKV `BlockAddIDExtraData`). `dvwC` is Profile 20 (MV-HEVC)
+/// and carries the same record layout. `rec` starts at the `dv_version_major`
+/// byte.
 pub(crate) fn parse_dovi_config(rec: &[u8]) -> Option<DvConfig> {
     if rec.len() < 5 {
         return None;
@@ -277,6 +282,33 @@ pub(crate) fn cicp_matrix(v: u16) -> Option<&'static str> {
         1 => "BT.709",
         9 => "BT.2020 NCL",
         10 => "BT.2020 CL",
+        // Dolby's IPT-PQ-c2 colour space, signalled by Profile 20 (MV-HEVC) colr.
+        15 => "IPT-PQ-c2",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dvwc_decodes_profile_20() {
+        // The `dvwC` payload of a real Profile 20 (MV-HEVC) MP4: dv_version_major=3,
+        // minor=0, then profile=20/level=6/rpu=1/el=0/bl=1, compat=0 — matching
+        // mediainfo's "Profile 20, dvh1.20.06, BL+RPU". Same record layout as dvcC.
+        let rec = [0x03, 0x00, 0x28, 0x35, 0x00];
+        let cfg = parse_dovi_config(&rec).expect("valid dvwC record");
+        assert_eq!(cfg.profile, 20);
+        assert_eq!(cfg.level, Some(6));
+        assert!(cfg.rpu_present);
+        assert!(!cfg.el_present);
+        assert!(cfg.bl_present);
+        assert_eq!(cfg.bl_compatibility_id, 0);
+    }
+
+    #[test]
+    fn cicp_matrix_names_dolby_ipt() {
+        assert_eq!(cicp_matrix(15), Some("IPT-PQ-c2"));
+    }
 }

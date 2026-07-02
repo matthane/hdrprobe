@@ -273,6 +273,7 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
         bitrate: demux.bitrate,
         bit_depth: demux.bit_depth,
         chroma: demux.chroma.clone(),
+        stereo: demux.stereo.clone(),
         color,
     };
 

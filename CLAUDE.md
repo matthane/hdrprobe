@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 47 unit tests
+cargo test                     # 53 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -79,7 +79,15 @@ excluded by config.
 - **Report title-stable DV levels only.** Show profile/level/compat, L254 (CM version), L6, L9,
   L11, and the *set* of L2/L8 trim targets. Never emit L1 or per-shot trim *values*. **L5 is the
   deliberate exception**: it varies with aspect changes, so it's sampled and shown as the set of
-  distinct active areas, labelled `[sampled]` (vs `[full scan]` under `--full`).
+  distinct active areas, labelled `[sampled]` (vs `[full scan]` under `--full`). An L8 trim's
+  `target_display_index` maps to nits via `levels::resolve_l8_nits`: a **custom index (255, common
+  in Profile 20) is defined by an L10 block in the same title**, so it's resolved from the title's
+  L10 target-display map (`target_max_pq` -> nits) before the predefined index table; unknown with
+  neither is dropped, never guessed (the `hdrprobe` table is preferred over libdovi's
+  `trim_target_nits()`, which guesses 100 for 255). The **`[L2/L8]` provenance tag is dynamic** —
+  `trim_target_levels` lists only the levels that actually produced a target (so an L8-only title
+  like Profile 20 reads `[L8]`, an L2-only one `[L2]`). **L10 is never in the tag**: it only
+  *defines* the display an L8 trim points at; the trim itself is L8.
 - **DV facts and their sources.** BL **compatibility id** and DV **level** come from the
   `dvcC`/`dvvC` box, *not* the RPU. Everything dynamic (FEL/MEL, L5/L6/L9/L11/L254, trim
   targets) comes from the **RPU**, which rides the base layer / a DV-flagged track — the

@@ -149,7 +149,13 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             }
             if !dv.trim_targets_nits.is_empty() {
                 let list = dv.trim_targets_nits.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
-                kv(&mut s, &c, "Trim targets", &format!("{} nit   {}", list, c.dim("[L2/L8]")));
+                let tag = dv
+                    .trim_target_levels
+                    .iter()
+                    .map(|l| format!("L{l}"))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                kv(&mut s, &c, "Trim targets", &format!("{} nit   {}", list, c.dim(&format!("[{tag}]"))));
             }
             if let Some(census) = &dv.census {
                 kv(&mut s, &c, "RPU count", &format!("{}   {}", dv.rpu_count, c.dim("[full scan]")));
@@ -253,6 +259,9 @@ fn video_line(r: &Report) -> String {
     if !depth.is_empty() {
         parts.push(depth);
     }
+    if let Some(s) = &g.stereo {
+        parts.push(s.clone());
+    }
     parts.join(" · ")
 }
 
@@ -271,6 +280,12 @@ fn color_line(r: &Report) -> String {
         parts.push("BT.2020".to_string());
         parts.push("PQ (SMPTE ST 2084)".to_string());
     } else {
+        // Dolby's IPT-PQ-c2 (CICP matrix 15) is the one matrix coefficient worth
+        // naming: it identifies the colour space of Profile 20 (MV-HEVC) DV, which —
+        // unlike P5 — signals valid primaries/transfer/range in its colr box.
+        if cc.matrix.as_deref() == Some("IPT-PQ-c2") {
+            parts.push("IPT-PQ-c2".to_string());
+        }
         if let Some(p) = &cc.primaries {
             parts.push(p.clone());
         }

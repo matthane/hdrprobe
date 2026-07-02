@@ -62,6 +62,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         bit_depth,
         chroma,
         codec_profile,
+        stereo: None,
         color,
         dv_config: None,
         // A raw elementary stream is a single track; a Profile-7 EL, if present,

@@ -24,23 +24,30 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
         formats.push("HDR10+".to_string());
     }
 
-    let base = if is_pq {
+    // A base signalled in Dolby's IPT-PQ-c2 colour space (matrix 15, Profile 20 /
+    // MV-HEVC) is not a standard, independently viewable HDR10/HLG signal even
+    // though its colr carries PQ/HLG — like Profile 5, its cross-compatibility is
+    // governed solely by the DV compatibility id (0=none, 4=HLG). So don't let the
+    // raw transfer imply a fallback here; fall through to the compat-id branch.
+    let ipt_base = demux.color.matrix.as_deref() == Some("IPT-PQ-c2");
+
+    let base = if is_pq && !ipt_base {
         // HDR10 fallback is implied when DV rides on a PQ base layer.
         if dv.is_some() {
             Some("HDR10 (fallback)")
         } else {
             Some("HDR10")
         }
-    } else if is_hlg {
+    } else if is_hlg && !ipt_base {
         if dv.is_some() {
             Some("HLG (fallback)")
         } else {
             Some("HLG")
         }
     } else if let Some(dv) = dv {
-        // No container colour info — infer the base layer from the DV BL
-        // compatibility id (1=HDR10, 2=SDR, 4=HLG). Profile 5 (compat 0) has no
-        // directly viewable base, so we show no base tag.
+        // No independently viewable base — infer it from the DV BL compatibility id
+        // (1=HDR10, 2=SDR, 4=HLG). Profiles 5 and 20 (compat 0) have no directly
+        // viewable base, so we show no base tag.
         match dv.bl_compatibility_id {
             Some(1) => Some("HDR10 (fallback)"),
             Some(2) => Some("SDR (fallback)"),

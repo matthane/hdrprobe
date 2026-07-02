@@ -30,7 +30,13 @@ pub struct DvAggregate {
     l9_primary: Option<u8>,
     l11_content: Option<u8>,
     l11_ref_mode: Option<bool>,
+    /// L2 trim targets in nits (self-contained: L2 carries its own target_max_pq).
     trim_targets: BTreeSet<u32>,
+    /// Distinct L8 target-display indices seen; resolved to nits at finalize via
+    /// `l10_targets` (custom displays) or the predefined index table.
+    l8_target_indices: BTreeSet<u8>,
+    /// L10-defined custom target displays: target_display_index -> peak nits.
+    l10_targets: BTreeMap<u8, u32>,
     /// Scene-cut RPUs (scene_refresh_flag set) — shot count under `--full`.
     scene_cuts: usize,
     /// Per-level RPU presence counts (level -> #RPUs carrying it).
@@ -126,12 +132,20 @@ impl DvAggregate {
                 self.trim_targets.insert(snap_nits(pq12_to_nits(b.target_max_pq)));
             }
         }
-        // L8 trim targets: target_display_index -> nits (best-effort table).
+        // L8 trims reference a target display by index; record the indices and
+        // resolve them to nits at finalize — index 255 (and other custom indices)
+        // is defined by an L10 block in this title, not the predefined table.
         for block in dm.level_blocks_iter(8) {
             if let ExtMetadataBlock::Level8(b) = block {
-                if let Some(nits) = l8_index_to_nits(b.target_display_index) {
-                    self.trim_targets.insert(nits);
-                }
+                self.l8_target_indices.insert(b.target_display_index);
+            }
+        }
+        // L10 defines custom target displays: index -> peak luminance (12-bit PQ).
+        for block in dm.level_blocks_iter(10) {
+            if let ExtMetadataBlock::Level10(b) = block {
+                self.l10_targets
+                    .entry(b.target_display_index)
+                    .or_insert_with(|| snap_nits(pq12_to_nits(b.target_max_pq)));
             }
         }
     }
@@ -197,6 +211,29 @@ impl DvAggregate {
 
         let compatibility = cfg.and_then(|c| compat_str(c.bl_compatibility_id));
 
+        // Resolve L8 trim targets to nits: a custom index (e.g. 255) is defined by
+        // an L10 block in this title; otherwise fall back to the predefined table.
+        // An index with neither a definition nor a table entry can't be stated in
+        // nits, so it's dropped rather than guessed. Merged with the L2 targets.
+        let l2_contributed = !self.trim_targets.is_empty();
+        let mut trim_targets = self.trim_targets;
+        let mut l8_contributed = false;
+        for &idx in &self.l8_target_indices {
+            if let Some(nits) = resolve_l8_nits(idx, &self.l10_targets) {
+                trim_targets.insert(nits);
+                l8_contributed = true;
+            }
+        }
+        // Tag the trim targets with the levels that actually produced them, so a
+        // file with only L8 trims doesn't claim L2 (and vice versa).
+        let mut trim_target_levels = Vec::new();
+        if l2_contributed {
+            trim_target_levels.push(2);
+        }
+        if l8_contributed {
+            trim_target_levels.push(8);
+        }
+
         let census = full.then(|| DvCensus {
             scene_cuts: self.scene_cuts,
             dm_version_index: self.dm_version_index,
@@ -224,7 +261,8 @@ impl DvAggregate {
             l9_mastering: self.l9_primary.map(primary_name),
             l11_content: self.l11_content.map(content_type_name),
             l11_reference_mode: self.l11_ref_mode,
-            trim_targets_nits: self.trim_targets.into_iter().collect(),
+            trim_targets_nits: trim_targets.into_iter().collect(),
+            trim_target_levels,
             rpu_count: self.rpu_count,
             sampled: !full,
             census,
@@ -258,6 +296,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         l11_content: None,
         l11_reference_mode: None,
         trim_targets_nits: Vec::new(),
+        trim_target_levels: Vec::new(),
         rpu_count: 0,
         sampled: false,
         census: None,
@@ -385,4 +424,42 @@ fn l8_index_to_nits(idx: u8) -> Option<u32> {
         48 => 48,
         _ => return None,
     })
+}
+
+/// Resolve an L8 trim's `target_display_index` to a peak-nits value. A custom
+/// index (255, and any other display defined by an L10 block in this title) is
+/// looked up in the per-title L10 map; otherwise the predefined index table is
+/// used. `None` when neither knows it — the value is never guessed.
+fn resolve_l8_nits(idx: u8, l10_targets: &BTreeMap<u8, u32>) -> Option<u32> {
+    l10_targets.get(&idx).copied().or_else(|| l8_index_to_nits(idx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn l8_index_255_resolves_via_l10_definition() {
+        // Profile 20's L8 trims reference target display 255, which is defined by
+        // an L10 block (target_max_pq 2547 ≈ 300 nits) — not the predefined table.
+        let l10 = BTreeMap::from([(255u8, 300u32)]);
+        assert_eq!(resolve_l8_nits(255, &l10), Some(300), "custom index from L10");
+        assert_eq!(resolve_l8_nits(255, &BTreeMap::new()), None, "no L10 → not guessed");
+    }
+
+    #[test]
+    fn l8_predefined_index_still_resolves_without_l10() {
+        // A predefined index keeps its table value; an unknown one with no L10 def
+        // yields nothing rather than a made-up number.
+        assert_eq!(resolve_l8_nits(27, &BTreeMap::new()), Some(600));
+        assert_eq!(resolve_l8_nits(200, &BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn l10_definition_overrides_predefined_table() {
+        // If a title redefines a predefined index via L10, the title's own
+        // definition wins (it describes the actual target on this master).
+        let l10 = BTreeMap::from([(27u8, 1000u32)]);
+        assert_eq!(resolve_l8_nits(27, &l10), Some(1000));
+    }
 }

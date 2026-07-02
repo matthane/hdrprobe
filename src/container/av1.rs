@@ -236,6 +236,7 @@ fn build_demux(
         bit_depth,
         chroma,
         codec_profile,
+        stereo: None,
         color,
         dv_config: None,
         // AV1 Dolby Vision (Profile 10) is single-layer, single-track.
