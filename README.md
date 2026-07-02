@@ -25,7 +25,7 @@ HDR
 
 Dolby Vision
   Structure        Single track, dual layer
-  Profile          7 (MEL)   (BL+EL+RPU)
+  Profile          7.6 (MEL)   (BL+EL+RPU)
   Level            6   (max bit rate: 25 Mbps Main tier / 130 Mbps High tier)
   RPU / DM         present · CM v2.9 · MEL
   L5 active area   3840×1608  (2.39:1)  ·  L0 R0 T276 B276   [sampled]
@@ -41,21 +41,42 @@ HDR10+
 
 ## What it reports
 
-- General and video: container, codec and profile, resolution, frame rate, bit depth, chroma
+- **General and video:** container, codec and profile, resolution, frame rate, bit depth, chroma
   subsampling, colour signalling (primaries, transfer, matrix, and range), and stereoscopic /
-  multiview structure (MV-HEVC, e.g. Dolby Vision Profile 20).
-- HDR (static): classification across SDR, HDR10, HLG, HDR10+, and Dolby Vision, including
+  multiview structure (MV-HEVC, such as Dolby Vision Profile 20).
+- **HDR (static):** classification across SDR, HDR10, HLG, HDR10+, and Dolby Vision, including
   their combinations, plus the mastering display (ST.2086) and MaxCLL / MaxFALL content light
   levels.
-- Dolby Vision: profile (4 FEL/MEL, 5, 7 FEL/MEL, 8.1, 8.4, 9, 10, 20, and related variants), level,
-  presence of the base layer, enhancement layer, and RPU, base-layer compatibility, CM version (v2.9 or
-  v4.0 via L254), and the title-stable dynamic levels: distinct L5 active areas, L6 fallback,
-  L9 mastering, L11 content type, and the set of L2/L8 trim targets (an L8 trim's target display
-  may be defined by an L10 block, e.g. Profile 20 — its peak luminance is resolved from that
-  definition). Per-frame values such as L1 and per-shot trim values are deliberately omitted,
-  since they are decode-time noise rather than title-level facts.
-- HDR10+: presence, profile, application version, window count, and target display max
+- **HDR10+:** presence, profile, application version, window count, and target display max
   luminance.
+
+### Dolby Vision
+
+hdrprobe reports both the fixed identity of the stream and its title-stable dynamic metadata.
+
+**Identity.** The profile is reported in `profile.compatibility` form, where the second digit is
+the base layer's cross-compatibility id:
+
+| Profile | Codec | Reported format(s) |
+|---|---|---|
+| 4 | HEVC, dual-layer | `4.2` (FEL or MEL) |
+| 5 | HEVC | `5.0` |
+| 7 | HEVC, dual-layer | `7.6` (FEL or MEL) |
+| 8 | HEVC | `8.1`, `8.4` |
+| 9 | AVC | `9.2` |
+| 10 | AV1 | `10.0`, `10.1`, `10.4` |
+| 20 | MV-HEVC | `20.0`, `20.4` |
+
+Alongside the profile, hdrprobe reports the level, the presence of the base layer / enhancement
+layer / RPU, the base-layer compatibility, and the CM version (`v2.9`, or `v4.0` via L254).
+
+**Dynamic levels.** The distinct values seen across the title: `L5` active areas, `L6` fallback,
+`L9` mastering, `L11` content type, and the set of `L2` / `L8` trim targets. An `L8` trim's
+target display may be defined by an `L10` block (as in Profile `20`), whose peak luminance is
+then resolved from that definition.
+
+**Deliberately omitted.** Per-frame values such as `L1` and per-shot trim values. These are
+decode-time noise rather than title-level facts.
 
 RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoid/dovi_tool)
 (the `dolby_vision` crate); HDR10+ parsing uses the sibling `hdr10plus` crate.
@@ -72,13 +93,13 @@ RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoi
 
 hdrprobe recognises HEVC Dolby Vision profiles 4 (FEL and MEL), 5, 7 (FEL and MEL), 8.x, and 20
 (10-bit MV-HEVC for 3D / dual-view, BL+RPU); AVC Profile 9; and AV1 Profile 10.x. Profile 4 is a
-legacy dual-layer format with an SDR (Rec.709) base layer — its HDR is reconstructed by the RPU
-composer rather than carried in the base pixels — so hdrprobe reports its SDR base, dual-layer
+legacy dual-layer format with an SDR (Rec.709) base layer whose HDR is reconstructed by the RPU
+composer rather than carried in the base pixels. hdrprobe reports its SDR base, dual-layer
 structure, and FEL/MEL kind even for older muxes whose compact container descriptor omits the
 compatibility id.
 
 Profile 9 (`dvav.09`) is the AVC (H.264) profile: an 8-bit, single-layer, SDR-compatible
-Rec.709 base with the Dolby Vision RPU carried in-band as an unspecified NAL unit — the same
+Rec.709 base with the Dolby Vision RPU carried in-band as an unspecified NAL unit, the same
 role the RPU plays in the single-layer HEVC profiles (8.x), just wrapped for H.264. Because it
 has no enhancement layer and a directly viewable base, a non-Dolby-Vision player shows plain SDR
 while a capable display applies the per-scene metadata. hdrprobe parses the H.264 elementary
