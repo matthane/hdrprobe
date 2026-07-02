@@ -275,7 +275,16 @@ fn color_line(r: &Report) -> String {
     // (2/2/2) and only the range survives, leaving a bare "full". Any CICP a P5
     // stream did happen to carry would be noise, so state the fixed profile colour.
     let is_p5 = r.dolby_vision.as_ref().is_some_and(|dv| dv.profile == "5");
+    // Profile 4's base layer is defined as Rec.709 SDR (VUI 0,1,1,1,0). Older P4
+    // muxes omit the colour description entirely (colour_description_present_flag=0),
+    // so the SPS yields no primaries/transfer at all — like the P5 case, state the
+    // profile-defined base colour rather than leave it blank. A P4 stream that *does*
+    // signal a colour description keeps its own values (this only fills the gap).
+    let is_p4 = r.dolby_vision.as_ref().is_some_and(|dv| dv.profile.starts_with('4'));
+    let p4_colour_absent = is_p4 && cc.primaries.is_none() && cc.transfer.is_none();
     if is_p5 {
+        // P5 is the case that must *not* collapse: its encoding (PQ) genuinely
+        // differs from its colour space (IPT-PQ-c2 over BT.2020), so all three show.
         parts.push("IPT-PQ-c2".to_string());
         parts.push("BT.2020".to_string());
         parts.push("PQ (SMPTE ST 2084)".to_string());
@@ -286,15 +295,30 @@ fn color_line(r: &Report) -> String {
         if cc.matrix.as_deref() == Some("IPT-PQ-c2") {
             parts.push("IPT-PQ-c2".to_string());
         }
-        if let Some(p) = &cc.primaries {
-            parts.push(p.clone());
-        }
-        if let Some(t) = &cc.transfer {
-            parts.push(t.clone());
+        // Colour space (primaries) and encoding (transfer). For Profile 4 with no
+        // signalled colour description, both are the profile-defined Rec.709.
+        let primaries = if p4_colour_absent { Some("BT.709") } else { cc.primaries.as_deref() };
+        let transfer = if p4_colour_absent { Some("BT.709") } else { cc.transfer.as_deref() };
+        // When the colour space and encoding carry the same name (Rec.709 SDR: a
+        // BT.709 gamut with a BT.709 transfer), collapse the pair to one label
+        // instead of printing "BT.709 · BT.709". Distinct pairs (e.g. BT.2020 + PQ)
+        // both show.
+        match (primaries, transfer) {
+            (Some(p), Some(t)) if p == t => parts.push(p.to_string()),
+            _ => {
+                if let Some(p) = primaries {
+                    parts.push(p.to_string());
+                }
+                if let Some(t) = transfer {
+                    parts.push(t.to_string());
+                }
+            }
         }
     }
     if let Some(m) = &cc.range {
         parts.push(m.clone());
+    } else if p4_colour_absent {
+        parts.push("limited".to_string());
     }
     parts.join(" · ")
 }
