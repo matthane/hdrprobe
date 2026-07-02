@@ -166,6 +166,6 @@ excluded by config.
 ## Verifying changes
 
 Cross-check against `mediainfo --Output=JSON` / `ffprobe` / `dovi_tool info` (the ground truth
-used throughout). The corpus lives in `testfiles/integration/` (local-only, gitignored;
-`testfiles/README.md` documents the profile/container matrix). For robustness work, byte-mutation
+used throughout). The corpus lives in `testfiles/integration/` (the whole `testfiles/` tree is
+local-only and gitignored — nothing under it is committed). For robustness work, byte-mutation
 fuzz the release binary over the corpus and assert no `panicked`/exit codes outside {0,2}.

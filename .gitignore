@@ -2,8 +2,8 @@
 /target
 
 # Test corpus: real movie content is large and copyrighted — never commit it.
-# (fixtures/ holds tiny license-clean RPU .bin files and IS committed.)
-/testfiles/integration/
+# The whole testfiles/ tree is local-only and untracked.
+/testfiles/
 
 # Tool logs / scratch
 *.log
