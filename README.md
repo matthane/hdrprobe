@@ -9,32 +9,34 @@ path, writing temp files, or extracting a full RPU stream to disk first. It memo
 file and reads only the bytes it needs, so it stays fast regardless of file size.
 
 ```
-movie.mkv  (349.05 MiB)
+movie.mkv  (225.14 MiB)
 
 General
   Container        Matroska
   Duration         30s
-  Video            HEVC (Main 10) · 3840×2160 · 23.976 fps · 10-bit 4:2:0
+  Bitrate          46.08 Mb/s   (video stream)
+  Video            HEVC (Main 10, High tier @ L5.1) · 3840×2160 · 23.976 fps · 10-bit 4:2:0
   Color            BT.2020 · PQ (SMPTE ST 2084) · limited
 
 HDR
-  Format           Dolby Vision + HDR10 (fallback)
-  Mastering        max 1000  min 0.005 cd/m²
-  Content light    MaxCLL 3597 · MaxFALL 505
+  Format           Dolby Vision + HDR10+ + HDR10 (fallback)
+  Mastering        max 1000  min 0.0001 cd/m²
+  Content light    MaxCLL 737 · MaxFALL 130
 
 Dolby Vision
-  Profile          8.1   (BL+RPU · HDR10-compatible)
-  Level            6
-  RPU / DM         present · CM v4.0   [L254]
-  L5 active area   3840×2160  (1.78:1)   [sampled]
-  L6 fallback      MaxCLL 1005 · MaxFALL 360
-  L9 mastering     BT.2020
-  L11 content      Cinema · reference mode
-  Trim targets     100, 600, 1000 nit   [L2/L8]
+  Structure        Single track, dual layer
+  Profile          7 (MEL)   (BL+EL+RPU)
+  Level            6   (max bit rate: 25 Mbps Main tier / 130 Mbps High tier)
+  RPU / DM         present · CM v2.9 · MEL
+  L5 active area   3840×1608  (2.39:1)  ·  L0 R0 T276 B276   [sampled]
+  L6 fallback      MaxCLL 737 · MaxFALL 130
+  Trim targets     100 nit   [L2/L8]
 
-HDR10+           not present
-
-⚡ 9 ms
+HDR10+
+  Profile          B
+  Application      v1
+  Windows          1
+  Target           400 nits
 ```
 
 ## What it reports
@@ -50,7 +52,8 @@ HDR10+           not present
   L9 mastering, L11 content type, and the set of L2/L8 trim targets. Per-frame values such as
   L1 and per-shot trim values are deliberately omitted, since they are decode-time noise rather
   than title-level facts.
-- HDR10+: presence, application version, and window count.
+- HDR10+: presence, profile, application version, window count, and target display max
+  luminance.
 
 RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoid/dovi_tool)
 (the `dolby_vision` crate); HDR10+ parsing uses the sibling `hdr10plus` crate.
