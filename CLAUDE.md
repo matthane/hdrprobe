@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 54 unit tests
+cargo test                     # 61 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -52,6 +52,11 @@ excluded by config.
   `av1.rs`; `mod.rs` holds `Demux`/`Chunk`/`DvConfig` and the shared dvcC/hvcC/CICP decoders.
 - `hevc/` — `nal.rs` (Annex-B + length-prefixed NAL split), `sps.rs` (dims + VUI colour + VUI
   timing/frame rate).
+- `avc/` — the H.264 analogue, for Dolby Vision **Profile 9** (`dvav.09`: 8-bit AVC, single-layer,
+  SDR-compatible Rec.709 base). `nal.rs` (1-byte NAL header — `nal_type = byte & 0x1F`), `sps.rs`
+  (macroblock-based dims + the profile_idc-gated high-profile chroma/depth block + VUI colour + VUI
+  timing). Reuses `hevc::sps::VuiColor` so the shared `container::color_from_vui` plumbing is
+  unchanged.
 - `av1/` — `obu.rs` (OBU walker, T.35 routing), `seq.rs` (sequence header).
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
 - `hdr/` — `mod.rs` (format classification), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer).
@@ -115,6 +120,20 @@ excluded by config.
 - **Profile number authority.** libdovi's `dovi_profile` can't express AV1 P10 (returns 5/8),
   so `levels::finalize` takes the profile number from the container dvcC when present, else 10
   for AV1. Don't trust the RPU's profile field for the number.
+- **AVC (Profile 9) RPU is found by *content*, not by NAL number.** The DV RPU rides in an H.264
+  *unspecified* NAL (Dolby uses type 28; the range is 24..=31), payload = the RPU EBSP beginning
+  with the `rpu_nal_prefix` byte `0x19`. `sample.rs` treats an unspecified-range NAL as an RPU only
+  when `payload[1] == 0x19` **and** libdovi validates it (CRC): so an atypical mux using another
+  unspecified type still parses, and a non-DV unspecified NAL is never misread. libdovi has no
+  AVC entry point, but its parsing is codec-agnostic once the header is off — `dv::rpu::parse_avc_rpu`
+  strips the **1-byte** AVC header, clears emulation prevention (`bits::ebsp_to_rbsp`), and calls
+  `DoviRpu::parse_rpu` (which locates the `0x19` prefix). Don't route AVC through
+  `parse_unspec62_nalu` — that strips a **2-byte** HEVC header. **Codec authority:** MP4 from the
+  sample entry (`avc1`/`avc3`/`dva1`/`dvav` → `Codec::Avc`), TS from PMT `stream_type` (`0x1B` AVC vs
+  `0x24` HEVC), falling back to DV profile 9 ⇒ AVC only when no video `stream_type` is present (a
+  bare DV/EL PID). P9 has no EL and an SDR base (CCID 2 ⇒ `SDR (fallback)` in `hdr::assemble`, the
+  same branch Profile 4 uses); its Rec.709 VUI (`0,1,1,1,0`) collapses to a single `BT.709` label
+  because primaries == transfer (unlike P5, whose encoding differs from its colour space).
 - **`--full` changes demux behaviour, not just sampling.** It threads into `container::demux(..,
   full)`: TS reassembles the whole stream (vs a single head window of `ts::HEAD_SCAN_BYTES`), raw
   HEVC scans every byte (vs windowed), MKV indexes every cluster (vs a head byte-window of

@@ -47,7 +47,7 @@ HDR10+
 - HDR (static): classification across SDR, HDR10, HLG, HDR10+, and Dolby Vision, including
   their combinations, plus the mastering display (ST.2086) and MaxCLL / MaxFALL content light
   levels.
-- Dolby Vision: profile (4 FEL/MEL, 5, 7 FEL/MEL, 8.1, 8.4, 10, 20, and related variants), level,
+- Dolby Vision: profile (4 FEL/MEL, 5, 7 FEL/MEL, 8.1, 8.4, 9, 10, 20, and related variants), level,
   presence of the base layer, enhancement layer, and RPU, base-layer compatibility, CM version (v2.9 or
   v4.0 via L254), and the title-stable dynamic levels: distinct L5 active areas, L6 fallback,
   L9 mastering, L11 content type, and the set of L2/L8 trim targets (an L8 trim's target display
@@ -64,18 +64,26 @@ RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoi
 
 | Container | Codecs | Notes |
 |---|---|---|
-| MP4 / MOV | HEVC, AV1 | includes Profile 7 dual-track (separate BL and EL `trak` boxes) and Profile 20 (MV-HEVC, `dvwC` config) |
+| MP4 / MOV | HEVC, AVC, AV1 | includes Profile 7 dual-track (separate BL and EL `trak` boxes), Profile 20 (MV-HEVC, `dvwC` config), and Profile 9 (8-bit AVC, `avcC` + `dvcC`) |
 | MKV / WebM | HEVC, AV1 | single-track, and Profile 7 single-track dual-layer |
-| MPEG-TS / M2TS | HEVC | includes Profile 7 dual-PID (BL and EL on separate PIDs), and legacy Profile 4 (single-PID dual layer) |
+| MPEG-TS / M2TS | HEVC, AVC | includes Profile 7 dual-PID (BL and EL on separate PIDs), legacy Profile 4 (single-PID dual layer), and Profile 9 (8-bit AVC BL, `stream_type` 0x1B) |
 | Raw HEVC | Annex-B | profile inferred from the RPU |
 | Raw AV1 | IVF, low-overhead OBU | Dolby Vision Profile 10 |
 
 hdrprobe recognises HEVC Dolby Vision profiles 4 (FEL and MEL), 5, 7 (FEL and MEL), 8.x, and 20
-(10-bit MV-HEVC for 3D / dual-view, BL+RPU), and AV1 Profile 10.x. Profile 4 is a legacy
-dual-layer format with an SDR (Rec.709) base layer — its HDR is reconstructed by the RPU composer
-rather than carried in the base pixels — so hdrprobe reports its SDR base, dual-layer structure,
-and FEL/MEL kind even for older muxes whose compact container descriptor omits the compatibility
-id.
+(10-bit MV-HEVC for 3D / dual-view, BL+RPU); AVC Profile 9; and AV1 Profile 10.x. Profile 4 is a
+legacy dual-layer format with an SDR (Rec.709) base layer — its HDR is reconstructed by the RPU
+composer rather than carried in the base pixels — so hdrprobe reports its SDR base, dual-layer
+structure, and FEL/MEL kind even for older muxes whose compact container descriptor omits the
+compatibility id.
+
+Profile 9 (`dvav.09`) is the AVC (H.264) profile: an 8-bit, single-layer, SDR-compatible
+Rec.709 base with the Dolby Vision RPU carried in-band as an unspecified NAL unit — the same
+role the RPU plays in the single-layer HEVC profiles (8.x), just wrapped for H.264. Because it
+has no enhancement layer and a directly viewable base, a non-Dolby-Vision player shows plain SDR
+while a capable display applies the per-scene metadata. hdrprobe parses the H.264 elementary
+stream directly (dimensions, colour, and frame rate from the SPS; the RPU from its NAL), so it
+reports the same title-stable Dolby Vision levels for Profile 9 as for any other profile.
 
 Containers are matched by extension first, then by content: a file whose extension does not match
 its bytes (for example a Transport Stream saved as `.mkv`) is still recognised and parsed
