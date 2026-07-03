@@ -64,6 +64,11 @@ excluded by config.
   `.bin`/`.rpu`), `dv_xml.rs` (DV CM XML), `hdr10plus_json.rs` (hdr10plus_tool JSON); `mod.rs`
   detects by extension and renders through the ordinary `Report`. DV sidecars carry no
   resolution, so L5 is sized against an assumed UHD canvas (`ASSUMED_CANVAS`) and labelled.
+  A DV XML's Level-0 globals **frame rate** and **mastering display** are read straight from the
+  raw XML in `dv_xml.rs` (`<EditRate>`, `<MasteringDisplay>` peak/min), *not* from libdovi:
+  `CmXmlParser` never parses `<EditRate>` and folds the mastering display into a lossy PQ code, so
+  reading the XML gives exact values. Both elements sit in the file head, so it's cheap; keep them
+  off the libdovi path.
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
 - `prefetch.rs` — warms the metadata region with one pipelined positioned read before the
   mmap parse, so SMB/NFS scans don't fault it in over hundreds of round-trips. Timing only —
@@ -130,6 +135,17 @@ excluded by config.
 - **Profile number authority.** libdovi's `dovi_profile` can't express AV1 P10 (returns 5/8),
   so `levels::finalize` takes the profile number from the container dvcC when present, else 10
   for AV1. Don't trust the RPU's profile field for the number.
+- **The compat *minor* digit is container-only; a bare RPU can only assume it.** `get_dovi_profile`
+  gives the *major* (5/7/8) from the RPU header, but the minor is `dv_bl_signal_compatibility_id`
+  (the base-layer type: 8.1 HDR10 vs 8.4 HLG), which lives only in the dvcC/dvvC — the RPU can't
+  distinguish them. A metadata-only sidecar has no dvcC: a **DV XML declares its profile**
+  (`dv_xml.rs` maps `GenerateProfile` -> compat via `DvAggregate::set_compat_id`, so the minor is
+  real), but a **raw RPU bin has nothing**, so its minor is a convention default (P8 -> .1, P4 -> .2)
+  flagged `[compat assumed]` (`model::profile_compat_assumed`). That flag is gated to metadata-only
+  sidecars via `DvAggregate::mark_metadata_only`: a video input — **even a raw HEVC/AV1 elementary
+  stream with no dvcC** — has a base-layer VUI that officially backs the inference, so it's never
+  flagged. Don't widen the flag to `cfg.is_none()`; raw bitstreams share that state but aren't
+  metadata-only.
 - **AVC (Profile 9) RPU is found by *content*, not by NAL number.** The DV RPU rides in an H.264
   *unspecified* NAL (Dolby uses type 28; the range is 24..=31), payload = the RPU EBSP beginning
   with the `rpu_nal_prefix` byte `0x19`. `sample.rs` treats an unspecified-range NAL as an RPU only
