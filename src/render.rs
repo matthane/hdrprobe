@@ -158,6 +158,11 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 );
             }
             if !dv.trim_targets.is_empty() {
+                // The target set is a union over the RPUs actually read, and the
+                // L8 half is per-shot in real titles (a BD original whose head
+                // shots carry only the 100-nit L8 while later scenes add 600),
+                // so a sampled union may be incomplete — tagged like L5.
+                let scan_tag = if dv.sampled { "[sampled]" } else { "[full scan]" };
                 let list = dv
                     .trim_targets
                     .iter()
@@ -167,7 +172,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                kv(&mut s, &c, "Trim targets", &list);
+                kv(&mut s, &c, "Trim targets", &format!("{}   {}", list, c.dim(scan_tag)));
             }
             if !dv.l5_active_areas.is_empty() {
                 // The set of distinct active areas is shown inline (joined by

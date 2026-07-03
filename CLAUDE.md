@@ -123,7 +123,10 @@ excluded by config.
   `base` — the L6 mastering half is just the grade's display, already on the DV Mastering line);
   a *signalled* MDCV/CLL box or SEI still shows, and the JSON keeps `dolby_vision.l6` verbatim. **L5 is the
   deliberate exception**: it varies with aspect changes, so it's sampled and shown as the set of
-  distinct active areas, labelled `[sampled]` (vs `[full scan]` under `--full`). An L8 trim's
+  distinct active areas, labelled `[sampled]` (vs `[full scan]` under `--full`). The **trim-target
+  set carries the same `[sampled]`/`[full scan]` tag**: the L8 half is per-shot in real titles
+  (corpus-verified: a BD original whose head shots carry only the 100-nit L8 while other scenes
+  add 600), so a sampled union may be incomplete. An L8 trim's
   `target_display_index` maps to nits via `levels::resolve_l8_nits`: a **custom index (255, common
   in Profile 20) is defined by an L10 block in the same title**, so it's resolved from the title's
   L10 target-display map (`target_max_pq` -> nits) before the predefined index table; unknown with
