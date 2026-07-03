@@ -124,7 +124,9 @@ fn handle_payload(payload_type: u32, payload: &[u8], out: &mut SeiFindings) {
 
 /// mastering_display_colour_volume: G/B/R primaries + white point (x,y u16
 /// each, 0.00002 units), then max (32b) and min (32b) luminance in units of
-/// 0.0001 cd/m². The ISOBMFF `mdcv` box shares this layout and scaling.
+/// 0.0001 cd/m². The ISOBMFF `mdcv` box shares this layout and scaling. The
+/// AV1 `HDR_MDCV` OBU matches in *shape only* — its primary order and
+/// fixed-point scales differ, so it has its own parser below.
 pub(crate) fn parse_mastering(p: &[u8]) -> Option<MasteringDisplay> {
     if p.len() < 24 {
         return None;
@@ -146,6 +148,32 @@ pub(crate) fn parse_mastering(p: &[u8]) -> Option<MasteringDisplay> {
     })
 }
 
+/// AV1 `metadata_hdr_mdcv`: the same 24-byte shape as ST.2086 but different
+/// semantics — primaries in R/G/B order as 0.16 fixed-point chromaticities,
+/// `luminance_max` 24.8 and `luminance_min` 18.14 fixed point. Luminance is
+/// rounded to the 0.0001 cd/m² display quantum so a fixed-point min of
+/// 82/16384 prints as the 0.005 it encodes, matching the same title's
+/// container-carried value.
+pub(crate) fn parse_mastering_av1(p: &[u8]) -> Option<MasteringDisplay> {
+    if p.len() < 24 {
+        return None;
+    }
+    let xy = |i: usize| {
+        (
+            u16::from_be_bytes([p[i], p[i + 1]]) as f64 / 65536.0,
+            u16::from_be_bytes([p[i + 2], p[i + 3]]) as f64 / 65536.0,
+        )
+    };
+    let (r, g, b, wp) = (xy(0), xy(4), xy(8), xy(12));
+    let max_lum = u32::from_be_bytes([p[16], p[17], p[18], p[19]]) as f64 / 256.0;
+    let min_lum = u32::from_be_bytes([p[20], p[21], p[22], p[23]]) as f64 / 16384.0;
+    let quant = |v: f64| (v * 10000.0).round() / 10000.0;
+    Some(MasteringDisplay {
+        max_luminance: quant(max_lum),
+        min_luminance: quant(min_lum),
+        primaries: crate::hdr::primaries_label(r, g, b, wp).map(str::to_string),
+    })
+}
 
 /// content_light_level_info (MaxCLL/MaxFALL). Shared with the AV1 `HDR_CLL`
 /// metadata OBU, which has the same two big-endian u16 layout.

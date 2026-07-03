@@ -4,8 +4,10 @@
 //! access unit and pull metadata OBUs (`OBU_METADATA`, type 5) apart:
 //!   - ITU-T T.35 (metadata_type 4): Dolby Vision RPU (provider `0x003B`) →
 //!     libdovi, or HDR10+ (provider `0x003C`) → the `hdr10plus` crate;
-//!   - HDR content-light (metadata_type 1) and mastering-display (type 2),
-//!     which share their byte layout with the HEVC SEI equivalents.
+//!   - HDR content-light (metadata_type 1), byte-identical to the HEVC SEI
+//!     equivalent, and mastering-display (type 2), which shares the SEI's
+//!     24-byte shape but carries AV1's own primary order and fixed-point
+//!     scales (`sei::parse_mastering_av1`).
 
 use dolby_vision::rpu::dovi_rpu::DoviRpu;
 
@@ -100,7 +102,7 @@ fn handle_metadata(p: &[u8], out: &mut Av1Scan) {
             }
         }
         METADATA_TYPE_HDR_MDCV => {
-            if let Some(m) = sei::parse_mastering(body) {
+            if let Some(m) = sei::parse_mastering_av1(body) {
                 out.sei.mastering.get_or_insert(m);
             }
         }
@@ -171,16 +173,19 @@ mod tests {
     #[test]
     fn hdr_mdcv_metadata_obu_real_bytes() {
         // Real HDR_MDCV OBU from dv10_av1: header 0x2A, size 0x1A(26), payload =
-        // metadata_type 2 + 24-byte MDCV + trailing 0x80. luminance_max
-        // 0x00271000 = 2_560_000 → 256 cd/m²; luminance_min 0x52 = 82 → 0.0082.
+        // metadata_type 2 + 24-byte MDCV + trailing 0x80. AV1 fixed point:
+        // luminance_max 0x00271000 / 256 = 10000 cd/m²; luminance_min 0x52 = 82
+        // / 16384 ≈ 0.005. Primaries (R,G,B /65536): (0.708,0.292) (0.170,0.797)
+        // (0.131,0.046), white (0.3127,0.329) → BT.2020 D65.
         let obu = [
             0x2A, 0x1A, 0x02, 0xb5, 0x3f, 0x4a, 0xc1, 0x2b, 0x85, 0xcc, 0x08, 0x21, 0x89, 0x0b,
             0xc7, 0x50, 0x0d, 0x54, 0x39, 0x00, 0x27, 0x10, 0x00, 0x00, 0x00, 0x00, 0x52, 0x80,
         ];
         let scan = scan_obus(&obu);
         let m = scan.sei.mastering.expect("mastering from MDCV");
-        assert_eq!(m.max_luminance, 256.0);
-        assert_eq!(m.min_luminance, 0.0082);
+        assert_eq!(m.max_luminance, 10000.0);
+        assert_eq!(m.min_luminance, 0.005);
+        assert_eq!(m.primaries.as_deref(), Some("BT.2020"));
     }
 
     #[test]

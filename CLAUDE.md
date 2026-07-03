@@ -60,7 +60,11 @@ excluded by config.
 - `av1/` — `obu.rs` (OBU walker, T.35 routing), `seq.rs` (sequence header).
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
 - `hdr/` — `mod.rs` (format classification + `primaries_label`, the chromaticity→gamut matcher
-  behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer).
+  behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer). The AV1
+  `HDR_MDCV` OBU shares ST.2086's 24-byte shape but **not its semantics** — R/G/B (not G/B/R)
+  primary order, 0.16 fixed-point chromaticities, 24.8/18.14 fixed-point luminance — so it has
+  its own `sei::parse_mastering_av1`; routing it through `parse_mastering` mis-scales max
+  luminance by ~39× (10000 nits read as 256).
 - `sidecar/` — metadata-only inputs that bypass the video pipeline: `rpu_bin.rs` (raw DV RPU
   `.bin`/`.rpu`), `dv_xml.rs` (DV CM XML), `hdr10plus_json.rs` (hdr10plus_tool JSON); `mod.rs`
   detects by extension and renders through the ordinary `Report`. DV sidecars carry no
