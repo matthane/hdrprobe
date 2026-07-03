@@ -86,13 +86,13 @@ pub fn moov_extent(data: &[u8]) -> Option<(usize, usize)> {
     find(&top, b"moov").map(|b| (b.payload, b.end))
 }
 
-/// Per-fragment bytes warmed from a `sidx` hint: enough for the `moof`'s
+/// Per-fragment bytes warmed from a `sidx`/`mfra` hint: enough for the `moof`'s
 /// header tables (a few KiB for a seconds-long fragment), never the mdat.
 const MOOF_WARM_BYTES: usize = 16 * 1024;
-/// Cap on hinted fragments so a hostile `sidx` (u16 count, 65535 max) can't
-/// queue tens of thousands of warm reads; a partial warm still speeds the
-/// front of the moof walk.
-const SIDX_MAX_FRAGMENTS: usize = 4096;
+/// Cap on hinted fragments so a hostile index (`sidx` u16 count, `mfra` u32
+/// count) can't queue tens of thousands of warm reads; a partial warm still
+/// speeds the front of the moof walk.
+const HINT_MAX_FRAGMENTS: usize = 4096;
 
 /// Fragment head ranges `(offset, len)` hinted by a front `sidx` box, for the
 /// prefetch warmer. Indexing a fragmented MP4 walks moof → moof via top-level
@@ -152,7 +152,7 @@ pub fn sidx_fragment_heads(data: &[u8], search_limit: usize) -> Option<Vec<(u64,
     };
     let declared = read_u16(data, count_off) as usize;
     let entries = count_off + 2;
-    let n = clamp_count(declared, entries, 12, sidx.end).min(SIDX_MAX_FRAGMENTS);
+    let n = clamp_count(declared, entries, 12, sidx.end).min(HINT_MAX_FRAGMENTS);
 
     // Fragments chain from the first byte after the sidx box plus first_offset;
     // each entry's referenced_size advances the running offset.
@@ -172,6 +172,61 @@ pub fn sidx_fragment_heads(data: &[u8], search_limit: usize) -> Option<Vec<(u64,
         off = off.saturating_add(size);
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// Fragment head ranges `(offset, len)` hinted by a tail `mfra` box, for the
+/// prefetch warmer — the random-access index most recorders/muxers write when
+/// there is no `sidx` (e.g. GPAC). Located in O(1) via the trailing `mfro`
+/// box, whose last u32 is the whole `mfra`'s size; each `tfra` child lists
+/// absolute `moof` offsets. The same **hint-only** contract as
+/// `sidx_fragment_heads`: the fragment index is still built from the moof
+/// boxes, so a wrong or missing `mfra` costs nothing but a wasted warm.
+pub fn mfra_fragment_heads(data: &[u8]) -> Option<Vec<(u64, usize)>> {
+    let len = data.len();
+    if len < 16 {
+        return None;
+    }
+    // Trailing mfro: size(4) 'mfro' version/flags(4) mfra_size(4).
+    if read_u32(data, len - 16) != 16 || &data[len - 12..len - 8] != b"mfro" {
+        return None;
+    }
+    let mfra_size = read_u32(data, len - 4) as usize;
+    let mfra_start = len.checked_sub(mfra_size)?;
+    let hdr = iter_boxes(data, mfra_start, len);
+    let mfra = find(&hdr, b"mfra")?;
+
+    let mut offsets: Vec<u64> = Vec::new();
+    for tfra in iter_boxes(data, mfra.payload, mfra.end).iter().filter(|b| &b.typ == b"tfra") {
+        // tfra (FullBox): track_ID(4), reserved + 2-bit lengths of the
+        // traf/trun/sample numbers (4), number_of_entry(4), then entries of
+        // (time, moof_offset) at 32/64 bits by version plus the three numbers.
+        let p = tfra.payload;
+        let version = *data.get(p)?;
+        let lengths = read_u32(data, p + 8);
+        let num_bytes =
+            ((lengths >> 4) & 3) as usize + ((lengths >> 2) & 3) as usize + (lengths & 3) as usize + 3;
+        let stride = if version == 1 { 16 } else { 8 } + num_bytes;
+        let declared = read_u32(data, p + 12) as usize;
+        let entries = p + 16;
+        let n = clamp_count(declared, entries, stride, tfra.end).min(HINT_MAX_FRAGMENTS);
+        for i in 0..n {
+            let e = entries + i * stride;
+            let moof_off = if version == 1 { read_u64(data, e + 8) } else { read_u32(data, e + 4) as u64 };
+            if moof_off > 0 && moof_off < len as u64 {
+                offsets.push(moof_off);
+            }
+        }
+    }
+    if offsets.is_empty() {
+        return None;
+    }
+    // Several tracks' tfra entries usually name the same moofs; dedupe so the
+    // warm list stays one range per fragment (warm_ranges would merge overlaps
+    // anyway, but not distant duplicates interleaved by track).
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets.truncate(HINT_MAX_FRAGMENTS);
+    Some(offsets.into_iter().map(|o| (o, MOOF_WARM_BYTES)).collect())
 }
 
 /// QuickTime (`.mov`) and MP4 share the ISOBMFF box structure, so one backend
@@ -1269,6 +1324,51 @@ mod tests {
         // Zero-size entries stop the chain rather than loop in place.
         let buf = boxb(b"sidx", &sidx_body(0, 0, &[(false, 0), (false, 100)]));
         assert_eq!(sidx_fragment_heads(&buf, buf.len()), None);
+    }
+
+    /// tfra body (v0, single-byte traf/trun/sample numbers): track, lengths=0,
+    /// count, then (time, moof_offset, 1+1+1 bytes) per entry.
+    fn tfra_body(track: u32, moof_offsets: &[u32]) -> Vec<u8> {
+        let mut b = u32s(&[0, track, 0, moof_offsets.len() as u32]);
+        for &off in moof_offsets {
+            b.extend_from_slice(&u32s(&[0, off]));
+            b.extend_from_slice(&[1, 1, 1]);
+        }
+        b
+    }
+
+    fn mfra_file(tfras: &[Vec<u8>]) -> Vec<u8> {
+        let mut mfra_kids: Vec<u8> = tfras.iter().flat_map(|t| boxb(b"tfra", t)).collect();
+        // mfro's size field counts the whole mfra including the mfro itself.
+        let mfra_size = 8 + mfra_kids.len() + 16;
+        mfra_kids.extend_from_slice(&boxb(b"mfro", &u32s(&[0, mfra_size as u32])));
+        let mut file = boxb(b"free", &[0; 100]); // stand-in for moov/moofs/mdat
+        file.extend_from_slice(&boxb(b"mfra", &mfra_kids));
+        file
+    }
+
+    #[test]
+    fn mfra_fragment_heads_dedupe_across_tracks() {
+        // Two tracks whose tfra entries name overlapping moofs: one warm range
+        // per distinct moof, sorted.
+        let file = mfra_file(&[tfra_body(1, &[16, 60]), tfra_body(2, &[16, 90])]);
+        let heads = mfra_fragment_heads(&file).unwrap();
+        let offsets: Vec<u64> = heads.iter().map(|h| h.0).collect();
+        assert_eq!(offsets, vec![16, 60, 90]);
+        assert!(heads.iter().all(|h| h.1 == MOOF_WARM_BYTES));
+
+        // Entries pointing outside the file are dropped, not warmed.
+        let file = mfra_file(&[tfra_body(1, &[16, u32::MAX])]);
+        assert_eq!(mfra_fragment_heads(&file).unwrap().len(), 1);
+
+        // No trailing mfro (classic MP4 tail) -> no hint.
+        assert_eq!(mfra_fragment_heads(&boxb(b"free", &[0; 64])), None);
+
+        // A lying mfro size that runs past the file start -> no hint.
+        let mut file = mfra_file(&[tfra_body(1, &[16])]);
+        let n = file.len();
+        file[n - 4..].copy_from_slice(&u32s(&[1 << 30]));
+        assert_eq!(mfra_fragment_heads(&file), None);
     }
 
     #[test]

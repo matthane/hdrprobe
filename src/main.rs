@@ -252,7 +252,7 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
     // region in as many synchronous round-trips; warm it with one pipelined read
     // first. No-op on local volumes; never changes what we parse.
     let remote = prefetch::is_remote(&file);
-    prefetch::warm_metadata(remote, &file, path, &mmap);
+    let warmed_head = prefetch::warm_metadata(remote, &file, path, &mmap);
 
     let demux = container::demux(path, &mmap, cli.full).context("demux failed")?;
 
@@ -261,7 +261,7 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
     // ranges the sampler will fault. Default path only: `--full` reads every
     // chunk and `--no-rpu` reads none.
     if !cli.full && !cli.no_rpu {
-        prefetch::warm_sample_chunks(remote, &file, &demux, cli.samples);
+        prefetch::warm_sample_chunks(remote, &file, &demux, cli.samples, warmed_head);
     }
 
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };

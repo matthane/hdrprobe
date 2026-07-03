@@ -260,18 +260,23 @@ excluded by config.
   (Windows `FileRemoteProtocolInfo`), never by re-probing the path (a `canonicalize` re-opens
   the file over SMB). Two stages, both executed by `prefetch::warm_ranges` (sort, coalesce
   overlaps, then concurrent positioned reads so one range's latency hides another's):
-  `warm_metadata` before demux gathers the generic head window, the TS head/tail windows, a
-  tail `moov`, the MKV `Tags` extent plus the head *block* window from the first cluster
+  `warm_metadata` before demux gathers the head window (per container: `ts::HEAD_SCAN_BYTES`
+  for TS; the small `MP4_HEAD_WARM` for a confirmed ISOBMFF, whose real regions are all warmed
+  by exact extent so a generic multi-MiB head would only stream `mdat` bytes nothing parses,
+  ~80 ms of pure transfer at 1 GbE; the generic `HEAD_WARM` otherwise), the TS tail window, the
+  `moov` extent, the MKV `Tags` extent plus the head *block* window from the first cluster
   (SeekHead-resolved via `mkv::head_blocks_extent`, so attachments before the clusters can't
   push the block walk past the warm), the raw-HEVC window spans (`annexb::window_spans`, the
-  same constants `split_windows` scans by), and fMP4 `sidx` fragment heads
-  (`mp4::sidx_fragment_heads`); `warm_sample_chunks` after demux replays
+  same constants `split_windows` scans by), and fMP4 fragment heads from a front `sidx`
+  (`mp4::sidx_fragment_heads`) or, failing that, the tail `mfra` random-access index
+  (`mp4::mfra_fragment_heads`, found in O(1) via the trailing `mfro`);
+  `warm_sample_chunks` after demux replays
   `sample::select_indices` over the container's exact chunk ranges so the sampler's scattered
   AU faults arrive warm. The chunk warm is skipped under `--full` (every chunk is read anyway;
   pre-reading a whole movie would regress), under `--no-rpu` (no chunk is read), and for TS
-  (chunks index into `reassembled`, not the file). The `sidx` ranges are a **hint only**: the
-  fragment index is always built from the `moof` boxes themselves, so a wrong or missing `sidx`
-  wastes a warm but can never change output. Couplings that remain numeric and easy to break
+  (chunks index into `reassembled`, not the file). The `sidx`/`mfra` ranges are a **hint
+  only**: the fragment index is always built from the `moof` boxes themselves, so a wrong or
+  missing index wastes a warm but can never change output. Couplings that remain numeric and easy to break
   silently: **raw AV1** — `av1::HEAD_SCAN_BYTES` (the bounded head walk for both OBU and IVF)
   <= `prefetch::HEAD_WARM`, so the generic head warm covers the whole walked span; **TS/M2TS** —
   the warmed head (chosen by `looks_like_ts`) is exactly `ts::HEAD_SCAN_BYTES`, the demux's

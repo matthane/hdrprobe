@@ -28,18 +28,28 @@ use std::path::Path;
 
 use crate::container::Demux;
 
-/// Head window warmed for every remote file. Covers the front-loaded metadata of
-/// most backends: MKV (EBML header + Info + Tracks + the bounded head window of
-/// blocks it walks — see `mkv::HEAD_SPAN_BYTES`), raw-HEVC/AV1 front windows, and
-/// MP4 faststart `ftyp` + `moov`. Sized to hold the front metadata plus that 4 MiB
-/// block span so the whole fast-path working set arrives in one pipelined read
-/// instead of hundreds of scattered faults. TS/M2TS is warmed separately with a
-/// larger window (`ts::HEAD_SCAN_BYTES`) since its in-band SPS sits a GOP in.
+/// Head window warmed for remote files whose working set actually spans the
+/// front: MKV (EBML header + Info + Tracks + the bounded head window of blocks
+/// it walks — see `mkv::HEAD_SPAN_BYTES`) and raw-HEVC/AV1 front windows. Sized
+/// to hold the front metadata plus that 4 MiB block span so the whole fast-path
+/// working set arrives in one pipelined read instead of hundreds of scattered
+/// faults. TS/M2TS is warmed separately with a larger window
+/// (`ts::HEAD_SCAN_BYTES`) since its in-band SPS sits a GOP in; MP4 with a
+/// smaller one (`MP4_HEAD_WARM`) since its metadata is warmed by exact extent.
 ///
 /// Raw AV1's bounded head walk (`av1::HEAD_SCAN_BYTES`) is deliberately kept `<=`
 /// this so the warm covers it whole; shrink this below that and the AV1 window's
 /// tail faults in one page at a time on the NAS again.
 const HEAD_WARM: usize = 8 << 20; // 8 MiB
+
+/// Head window for ISOBMFF (a `moov` was found): everything the MP4 path reads
+/// is warmed by exact extent — the `moov` itself, a front `sidx`'s fragment
+/// heads, and the sampled AUs (`warm_sample_chunks`, whose head-run AUs sit at
+/// the start of `mdat`) — so a generic multi-MiB head would mostly stream
+/// `mdat` bytes nothing parses. That waste is pure transfer time: ~8 MiB is
+/// ~80 ms of a NAS probe at 1 GbE, which used to dominate the whole scan. This
+/// covers `ftyp` and incidental front boxes only.
+const MP4_HEAD_WARM: usize = 1 << 20; // 1 MiB
 
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
@@ -93,10 +103,11 @@ pub fn is_remote(_file: &File) -> bool {
 /// Warm the container metadata region so a network filesystem streams it in a
 /// pipelined read instead of many synchronous page faults. Best-effort and a
 /// no-op on local volumes (`remote` is the caller's `is_remote` verdict, decided
-/// once per file); never changes what is parsed.
-pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
+/// once per file); never changes what is parsed. Returns the number of head
+/// bytes warmed, so `warm_sample_chunks` can skip ranges already covered.
+pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usize {
     if !remote {
-        return;
+        return 0;
     }
     let size = data.len();
 
@@ -109,16 +120,24 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
     let mut ranges: Vec<(u64, usize)> = Vec::new();
 
     // Front-loaded metadata (and, for the bounded fast path, the sampled blocks).
-    // TS/M2TS is the exception: it has no container box, so resolution/colour come
-    // from the in-band SPS at the first IDR (~a GOP in), and the default demux
-    // reads a larger head window to reach it — warm that whole region instead.
+    // TS/M2TS has no container box, so resolution/colour come from the in-band
+    // SPS at the first IDR (~a GOP in), and the default demux reads a larger
+    // head window to reach it — warm that whole region instead. A confirmed
+    // ISOBMFF (moov found) needs almost none of the generic head: its regions
+    // are warmed by exact extent below, and a generic head would stream `mdat`
+    // bytes nothing parses.
     let is_ts = looks_like_ts(path, data);
+    let is_mp4 = looks_like_mp4(path, data);
+    let moov = if is_mp4 { crate::container::mp4::moov_extent(data) } else { None };
     let head = if is_ts {
         crate::container::ts::HEAD_SCAN_BYTES as usize
+    } else if moov.is_some() {
+        MP4_HEAD_WARM
     } else {
         HEAD_WARM
-    };
-    ranges.push((0, head.min(size)));
+    }
+    .min(size);
+    ranges.push((0, head));
 
     // TS/M2TS has no duration box, so it also reads a small tail window for the
     // last PCR (see `ts::pcr_duration`). Overlap with the head on small files is
@@ -129,19 +148,22 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
         ranges.push((start as u64, size - start));
     }
 
-    // MP4 with `moov` at the tail is the one common metadata region the head
-    // window misses; a front-placed `moov` merges into the head range.
-    let is_mp4 = looks_like_mp4(path, data);
+    // The `moov` is warmed by its exact extent, wherever it sits (front-placed
+    // merges into the head range; tail-placed is the one common metadata
+    // region a head window could never cover).
+    if let Some((start, end)) = moov {
+        ranges.push((start as u64, end - start));
+    }
     if is_mp4 {
-        if let Some((start, end)) = crate::container::mp4::moov_extent(data) {
-            ranges.push((start as u64, end - start));
-        }
-        // Fragmented MP4: a front `sidx` lists every fragment's byte size, so
-        // the moof header regions can be streamed concurrently instead of the
-        // fragment index's serial moof → moof pointer chase faulting one
-        // round-trip per fragment. Hint-only: the index is still built from
-        // the moof boxes themselves.
+        // Fragmented MP4: a front `sidx` (or, failing that, the tail `mfra`
+        // random-access index — one extra tail round-trip to probe) lists every
+        // fragment's position, so the moof header regions can be streamed
+        // concurrently instead of the fragment index's serial moof → moof
+        // pointer chase faulting one round-trip per fragment. Hint-only: the
+        // index is still built from the moof boxes themselves.
         if let Some(heads) = crate::container::mp4::sidx_fragment_heads(data, HEAD_WARM) {
+            ranges.extend(heads);
+        } else if let Some(heads) = crate::container::mp4::mfra_fragment_heads(data) {
             ranges.extend(heads);
         }
     }
@@ -178,6 +200,7 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
     }
 
     warm_ranges(file, ranges);
+    head
 }
 
 /// Merge overlapping/adjacent ranges and warm them concurrently — scattered
@@ -220,10 +243,17 @@ const CHUNK_WARM_TOTAL_CAP: usize = 128 << 20; // 128 MiB
 /// the same inputs yields exactly the chunks `sample::scan` will read, and each
 /// chunk's byte range is known from the container index, so the scattered
 /// mmap faults (one ~32 KiB round-trip each) collapse into a few pipelined
-/// reads. Callers gate this to the default path: under `--full` every chunk is
-/// read and pre-reading a whole movie would be a regression, and under
-/// `--no-rpu` no chunk is read at all.
-pub fn warm_sample_chunks(remote: bool, file: &File, demux: &Demux, samples: usize) {
+/// reads. `warmed_head` is `warm_metadata`'s return: ranges it already covered
+/// are skipped. Callers gate this to the default path: under `--full` every
+/// chunk is read and pre-reading a whole movie would be a regression, and
+/// under `--no-rpu` no chunk is read at all.
+pub fn warm_sample_chunks(
+    remote: bool,
+    file: &File,
+    demux: &Demux,
+    samples: usize,
+    warmed_head: usize,
+) {
     // TS/M2TS chunks index into the reassembled buffer, not the file — its
     // file-side working set (head + tail windows) is warmed by `warm_metadata`.
     if !remote || demux.reassembled.is_some() || demux.chunks.is_empty() {
@@ -234,9 +264,8 @@ pub fn warm_sample_chunks(remote: bool, file: &File, demux: &Demux, samples: usi
     for i in crate::sample::select_indices(demux.chunks.len(), samples, false) {
         let c = demux.chunks[i];
         let len = (c.size as usize).min(CHUNK_WARM_RANGE_CAP);
-        // Already streamed by the metadata head warm (MKV/AV1 head chunks, the
-        // head run of a front-mdat MP4).
-        if c.offset.saturating_add(len as u64) <= HEAD_WARM as u64 {
+        // Already streamed by the metadata head warm (MKV/AV1 head chunks).
+        if c.offset.saturating_add(len as u64) <= warmed_head as u64 {
             continue;
         }
         total += len;
