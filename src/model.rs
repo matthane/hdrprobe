@@ -213,8 +213,10 @@ pub struct DolbyVision {
     /// needs a decode, which hdrprobe never does, so absence is not proof.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fel_brightness_expansion: Option<FelBrightnessExpansion>,
+    /// The RPU's L6 block: MaxCLL/MaxFALL plus the mastering luminances, in
+    /// the bitstream's raw integer units.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub l6_fallback: Option<L6Fallback>,
+    pub l6: Option<L6>,
     /// L9 mastering-display color space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l9_mastering: Option<String>,
@@ -286,7 +288,7 @@ pub struct ActiveArea {
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
-pub struct L6Fallback {
+pub struct L6 {
     pub max_cll: u16,
     pub max_fall: u16,
     pub max_mastering: u16,
@@ -379,7 +381,7 @@ mod tests {
                     bl_max_nits: 1000.0,
                     rpu_max_nits: 4000.0,
                 }),
-                l6_fallback: Some(L6Fallback {
+                l6: Some(L6 {
                     max_cll: 737,
                     max_fall: 130,
                     max_mastering: 1000,
@@ -491,11 +493,11 @@ mod tests {
             "dolby_vision.mastering_display.primaries_level",
             "dolby_vision.fel_brightness_expansion.bl_max_nits",
             "dolby_vision.fel_brightness_expansion.rpu_max_nits",
-            "dolby_vision.l6_fallback.max_cll",
-            "dolby_vision.l6_fallback.max_fall",
-            "dolby_vision.l6_fallback.max_mastering",
-            "dolby_vision.l6_fallback.min_mastering",
-            "dolby_vision.l6_fallback.zeroed",
+            "dolby_vision.l6.max_cll",
+            "dolby_vision.l6.max_fall",
+            "dolby_vision.l6.max_mastering",
+            "dolby_vision.l6.min_mastering",
+            "dolby_vision.l6.zeroed",
             "dolby_vision.l9_mastering",
             "dolby_vision.l11_content",
             "dolby_vision.l11_white_point",

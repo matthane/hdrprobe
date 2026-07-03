@@ -77,7 +77,7 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
         .clone()
         .or_else(|| sei.mastering.clone())
         .or_else(|| {
-            dv.and_then(|d| d.l6_fallback.as_ref()).map(|l6| MasteringDisplay {
+            dv.and_then(|d| d.l6.as_ref()).map(|l6| MasteringDisplay {
                 max_luminance: l6.max_mastering as f64,
                 min_luminance: l6.min_mastering as f64 / 10000.0,
                 // The display's own primaries per the DV metadata (L9), not the
@@ -90,7 +90,7 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
         });
 
     let content_light = demux.content_light.or(sei.content_light).or_else(|| {
-        dv.and_then(|d| d.l6_fallback.as_ref()).map(|l6| crate::model::ContentLight {
+        dv.and_then(|d| d.l6.as_ref()).map(|l6| crate::model::ContentLight {
             max_cll: l6.max_cll,
             max_fall: l6.max_fall,
         })

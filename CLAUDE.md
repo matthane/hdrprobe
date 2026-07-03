@@ -149,7 +149,7 @@ excluded by config.
   the RPU is **FEL** *and* the grade's `source_max_pq` exceeds the **base layer's own** declared
   mastering max (container MDCV / ST.2086 SEI) by >10% (e.g. 4000-nit grade over a 1000-nit BL).
   Never flag a MEL (its residual is empty, so it can't out-bright the BL no matter what the
-  displays say), never compare against the RPU's L6 fallback (self-referential), and never flag
+  displays say), never compare against the RPU's own L6 values (self-referential), and never flag
   sidecars (no base layer to expand beyond), so `main.rs` is the only caller. This is a metadata
   verdict only: confirming the general case would mean decoding and comparing composed-vs-BL
   pixels, which hdrprobe never does, so a missing badge is not proof of no expansion.

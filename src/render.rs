@@ -203,7 +203,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     kv(&mut s, &c, "L5 active area", &areas);
                 }
             }
-            if let Some(l6) = &dv.l6_fallback {
+            if let Some(l6) = &dv.l6 {
                 let flag = if l6.zeroed { format!("  {}", c.warn("(zeroed)")) } else { String::new() };
                 kv(&mut s, &c, "L6 content light", &format!("MaxCLL {} · MaxFALL {}{}", l6.max_cll, l6.max_fall, flag));
             }

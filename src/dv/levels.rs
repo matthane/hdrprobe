@@ -12,7 +12,7 @@ use dolby_vision::rpu::rpu_data_nlq::DoviELType;
 
 use crate::container::DvConfig;
 use crate::model::{
-    ActiveArea, DolbyVision, DvCensus, FelBrightnessExpansion, L6Fallback, LevelPresence,
+    ActiveArea, DolbyVision, DvCensus, FelBrightnessExpansion, L6, LevelPresence,
     MasteringDisplay, TrimTarget,
 };
 
@@ -35,7 +35,7 @@ pub struct DvAggregate {
     /// can exceed the base layer's ST.2086 SEI (e.g. a 4000-nit DV grade over a
     /// 1000-nit HDR10 base).
     source_pq: Option<(u16, u16)>,
-    l6: Option<L6Fallback>,
+    l6: Option<L6>,
     l9_primary: Option<u8>,
     /// L9 custom chromaticities (R,G,B,WP x/y in 0.15 fixed point, ÷32767),
     /// carried only by the 17-byte form (index 255).
@@ -140,7 +140,7 @@ impl DvAggregate {
 
         if self.l6.is_none() {
             if let Some(ExtMetadataBlock::Level6(b)) = dm.get_block(6) {
-                self.l6 = Some(L6Fallback {
+                self.l6 = Some(L6 {
                     max_cll: b.max_content_light_level,
                     max_fall: b.max_frame_average_light_level,
                     max_mastering: b.max_display_mastering_luminance,
@@ -335,7 +335,7 @@ impl DvAggregate {
             // Filled by `flag_fel_brightness_expansion` after the base layer's
             // mastering display is known; the RPU alone can't decide this.
             fel_brightness_expansion: None,
-            l6_fallback: self.l6,
+            l6: self.l6,
             l9_mastering: l9_label,
             l11_content: self.l11_content.map(content_type_name),
             l11_white_point: self.l11_white_point.map(white_point_name),
@@ -371,7 +371,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         l5_assumed_canvas: None,
         mastering_display: None,
         fel_brightness_expansion: None,
-        l6_fallback: None,
+        l6: None,
         l9_mastering: None,
         l11_content: None,
         l11_white_point: None,

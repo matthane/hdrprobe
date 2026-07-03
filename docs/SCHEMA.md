@@ -229,8 +229,8 @@ Present for every video input; absent for sidecars.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `format` | string | always | Overall classification; see below |
-| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 fallback |
-| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 fallback |
+| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values |
+| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values |
 
 ### `format` values
 
@@ -287,7 +287,7 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 | `l5_assumed_canvas` | array `[width, height]` | optional | Present only for DV sidecars, which record no resolution: the canvas (3840x2160) the active-area dimensions were computed against |
 | `mastering_display` | `MasteringDisplay` | optional | The DV grade's own mastering display (see the `MasteringDisplay` section). Its `primaries` is filled only from a recognized L9 (`primaries_level` 9) or a DV XML Level-0 (`primaries_level` 0); a CM v2.9 RPU carries no display gamut, so the field is luminance-only there |
 | `fel_brightness_expansion` | `FelBrightnessExpansion` | optional | Metadata indication that the FEL likely carries brightness beyond the base layer; see below |
-| `l6_fallback` | `L6Fallback` | optional | The RPU's L6 (ST.2086-shaped) fallback block |
+| `l6` | `L6` | optional | The RPU's L6 block: MaxCLL/MaxFALL and the mastering luminances (the DV carriage of HDR10-style static metadata) |
 | `l9_mastering` | string | optional | L9 mastering-display gamut name. The `MasteringDisplay.primaries` names plus `"custom"` (an L9 with unrecognized explicit chromaticities) and `"unknown"` (an unrecognized predefined index) |
 | `l11_content` | string | optional | L11 content type, named per Dolby's L11 (Dolby Vision IQ) definitions: `"Default"`, `"Movies"`, `"Game"`, `"Sport"`, `"User Generated Content"`, or `"Unknown"` for values outside the published 0-4 range |
 | `l11_white_point` | string | optional | L11 intended white point: `"D65"` (0, the default), `"D93"` (8), or `"code N"` for the other codes, which Dolby accepts but does not publicly name. Present only when L11 was seen |
@@ -309,14 +309,20 @@ expansion.
 | `bl_max_nits` | float | always | The base layer's declared mastering max (container MDCV or ST.2086 SEI) |
 | `rpu_max_nits` | float | always | The DV grade's mastering max (`source_max_pq`) |
 
-## Object: `L6Fallback`
+## Object: `L6`
+
+Reported in the bitstream's native integer units, unchanged from how the RPU stores them.
+This is a deliberate contrast with `MasteringDisplay`, whose luminances are converted to
+cd/m² floats: keeping the raw values here is lossless and matches what other RPU tools
+(e.g. `dovi_tool info`) print. Only `min_mastering` is fixed-point; it is the one field in
+the schema that needs a unit conversion to read in nits.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `max_cll` | integer | always | L6 MaxCLL, cd/m² |
 | `max_fall` | integer | always | L6 MaxFALL, cd/m² |
 | `max_mastering` | integer | always | L6 mastering max luminance, cd/m² |
-| `min_mastering` | integer | always | L6 mastering min luminance in 0.0001 cd/m² units |
+| `min_mastering` | integer | always | L6 mastering min luminance in fixed-point units of 0.0001 cd/m²; divide by 10000 for nits (`50` means 0.005 cd/m², `1` means 0.0001 cd/m²) |
 | `zeroed` | boolean | always | `true` when MaxCLL and MaxFALL are both zero (a common real-world defect) |
 
 ## Object: `TrimTarget`
