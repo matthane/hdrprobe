@@ -114,7 +114,14 @@ excluded by config.
   some malformed input. Route *every* call into them through `dv::rpu::guard` (`catch_unwind`).
   **Never re-add `panic = "abort"` to the release profile** — it turns the guard into a no-op.
 - **Report title-stable DV levels only.** Show profile/level/compat, L254 (CM version), L6, L9,
-  L11, and the *set* of L2/L8 trim targets. Never emit L1 or per-shot trim *values*. **L5 is the
+  L11, and the *set* of L2/L8 trim targets. Never emit L1 or per-shot trim *values*.
+  **MaxCLL/MaxFALL is HDR10 (CTA-861.3) signaling with no consumer on an IPT-PQ-c2 base**, and
+  such streams still carry L6 on every frame — real mastering luminance, zeroed CLL
+  (corpus-verified, including Dolby's own P5 demo). So for an IPT base (compat id 0 —
+  P5/P20/AV1 10.0 — or a bare P5 label) the text report drops the L6 line (`render.rs`) and the
+  HDR section's CLL *and* Mastering lines never fall back to L6 (`hdr::assemble`, both gated on
+  `base` — the L6 mastering half is just the grade's display, already on the DV Mastering line);
+  a *signalled* MDCV/CLL box or SEI still shows, and the JSON keeps `dolby_vision.l6` verbatim. **L5 is the
   deliberate exception**: it varies with aspect changes, so it's sampled and shown as the set of
   distinct active areas, labelled `[sampled]` (vs `[full scan]` under `--full`). An L8 trim's
   `target_display_index` maps to nits via `levels::resolve_l8_nits`: a **custom index (255, common

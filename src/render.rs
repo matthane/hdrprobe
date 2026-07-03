@@ -204,7 +204,13 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     kv(&mut s, &c, "L5 active area", &areas);
                 }
             }
-            if let Some(l6) = &dv.l6 {
+            // L6's CLL fields exist to feed HDR10 signaling (CTA-861.3), so on an
+            // IPT-PQ-c2 base — compat id 0 (P5/P20/AV1 10.0) or a bare P5 label
+            // with no config — they're a zeroed placeholder or, if filled, inert
+            // for playback. Keep the line out of the text report; the JSON still
+            // carries `l6` verbatim (the mastering half is real either way).
+            let ipt_base = dv.bl_compatibility_id == Some(0) || dv.profile.starts_with('5');
+            if let Some(l6) = dv.l6.as_ref().filter(|_| !ipt_base) {
                 let flag = if l6.zeroed { format!("  {}", c.warn("(zeroed)")) } else { String::new() };
                 kv(&mut s, &c, "L6 content light", &format!("MaxCLL {} · MaxFALL {}{}", l6.max_cll, l6.max_fall, flag));
             }
