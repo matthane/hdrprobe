@@ -28,18 +28,19 @@ use std::path::Path;
 
 use crate::container::Demux;
 
-/// Head window warmed for remote files whose working set actually spans the
-/// front: MKV (EBML header + Info + Tracks + the bounded head window of blocks
-/// it walks — see `mkv::HEAD_SPAN_BYTES`) and raw-HEVC/AV1 front windows. Sized
-/// to hold the front metadata plus that 4 MiB block span so the whole fast-path
-/// working set arrives in one pipelined read instead of hundreds of scattered
-/// faults. TS/M2TS is warmed separately with a larger window
-/// (`ts::HEAD_SCAN_BYTES`) since its in-band SPS sits a GOP in; MP4 with a
-/// smaller one (`MP4_HEAD_WARM`) since its metadata is warmed by exact extent.
+/// Generic head window for remote files whose front working set can't be
+/// resolved by exact extent: raw AV1 (the bounded head walk), an MKV whose
+/// SeekHead has no Cluster entry (fallback below), and unrecognized formats.
+/// TS/M2TS is warmed with a larger window (`ts::HEAD_SCAN_BYTES`) since its
+/// in-band SPS sits a GOP in; MP4 and extent-resolved MKV with smaller ones
+/// (`MP4_HEAD_WARM` / `MKV_HEAD_WARM`) since their real regions are warmed by
+/// exact extent; raw HEVC by its own scan shape (window spans, or the whole
+/// file when the whole-file scan applies).
 ///
 /// Raw AV1's bounded head walk (`av1::HEAD_SCAN_BYTES`) is deliberately kept `<=`
 /// this so the warm covers it whole; shrink this below that and the AV1 window's
-/// tail faults in one page at a time on the NAS again.
+/// tail faults in one page at a time on the NAS again. The MKV fallback relies
+/// on this covering the first block offset + `mkv::HEAD_SPAN_BYTES`.
 const HEAD_WARM: usize = 8 << 20; // 8 MiB
 
 /// Head window for ISOBMFF (a `moov` was found): everything the MP4 path reads
@@ -50,6 +51,17 @@ const HEAD_WARM: usize = 8 << 20; // 8 MiB
 /// ~80 ms of a NAS probe at 1 GbE, which used to dominate the whole scan. This
 /// covers `ftyp` and incidental front boxes only.
 const MP4_HEAD_WARM: usize = 1 << 20; // 1 MiB
+
+/// Head window for an MKV whose first-Cluster offset resolved
+/// (`mkv::head_blocks_extent`): the block walk's span is then warmed by exact
+/// extent, so the generic head would only re-stream bytes that extent already
+/// covers (or skipped attachment payloads the walk never reads). This holds
+/// the front metadata the demux walks element-by-element — EBML header,
+/// SeekHead, Info, Tracks — which sits well inside 1 MiB in practice; a
+/// front element pushed past it by attachments faults in a handful of
+/// id/size headers, not payloads. Without a resolved Cluster offset the
+/// generic `HEAD_WARM` fallback applies (see its coupling note).
+const MKV_HEAD_WARM: usize = 1 << 20; // 1 MiB
 
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
@@ -103,8 +115,10 @@ pub fn is_remote(_file: &File) -> bool {
 /// Warm the container metadata region so a network filesystem streams it in a
 /// pipelined read instead of many synchronous page faults. Best-effort and a
 /// no-op on local volumes (`remote` is the caller's `is_remote` verdict, decided
-/// once per file); never changes what is parsed. Returns the number of head
-/// bytes warmed, so `warm_sample_chunks` can skip ranges already covered.
+/// once per file); never changes what is parsed. Returns the length of the
+/// contiguous warmed prefix from byte 0 (after coalescing — an MKV head that
+/// merges into its block span counts whole), so `warm_sample_chunks` can skip
+/// ranges already covered.
 pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usize {
     if !remote {
         return 0;
@@ -112,27 +126,46 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     let size = data.len();
 
     // Gather every range first, then stream them concurrently in one pass. The
-    // extent discoveries below (`moov_extent`, `tags_extent`, `detect_layout`)
-    // each fault only a handful of pages, so running them before any warm costs
-    // a few cold round-trips but lets all ranges — head and tail — overlap
-    // instead of the head warm serially delaying the extent the demux is
-    // actually blocked on.
+    // extent discoveries below (`moov_extent`, `tags_extent`, `detect_layout`,
+    // `head_blocks_extent`) each fault only a handful of pages, so running them
+    // before any warm costs a few cold round-trips but lets all ranges — head
+    // and tail — overlap instead of the head warm serially delaying the extent
+    // the demux is actually blocked on.
     let mut ranges: Vec<(u64, usize)> = Vec::new();
 
-    // Front-loaded metadata (and, for the bounded fast path, the sampled blocks).
-    // TS/M2TS has no container box, so resolution/colour come from the in-band
-    // SPS at the first IDR (~a GOP in), and the default demux reads a larger
-    // head window to reach it — warm that whole region instead. A confirmed
-    // ISOBMFF (moov found) needs almost none of the generic head: its regions
-    // are warmed by exact extent below, and a generic head would stream `mdat`
-    // bytes nothing parses.
     let is_ts = looks_like_ts(path, data);
     let is_mp4 = looks_like_mp4(path, data);
+    let is_mkv = looks_like_mkv(path, data);
     let moov = if is_mp4 { crate::container::mp4::moov_extent(data) } else { None };
+    let mkv_blocks = if is_mkv { crate::container::mkv::head_blocks_extent(data) } else { None };
+    // Container sniffs win ties: a box size or cluster byte can look like a
+    // start code, but a raw stream can't look like a container.
+    let is_raw_hevc = !is_ts && !is_mp4 && !is_mkv && looks_like_raw_hevc(path, data);
+    // `Some` = the demux will NAL-scan these bounded windows; `None` = it will
+    // scan every byte of the (<= 48 MiB) file (`annexb::split_windows`).
+    let hevc_spans = if is_raw_hevc { crate::container::annexb::window_spans(size) } else { None };
+
+    // Front-loaded metadata (and, for the bounded fast path, the sampled blocks).
+    // The head is sized to what the front parse actually consumes: TS/M2TS has
+    // no container box, so resolution/colour come from the in-band SPS at the
+    // first IDR (~a GOP in) and the default demux reads a large head window to
+    // reach it. A confirmed ISOBMFF (moov found) or extent-resolved MKV needs
+    // almost none of the generic head — their regions are warmed by exact
+    // extent below, and a generic head would stream bytes nothing parses. Raw
+    // HEVC follows its own scan shape: window 0's span when windowed, else the
+    // whole file (every byte is NAL-scanned; unwarmed it faults in ~32 KiB
+    // round-trips).
     let head = if is_ts {
         crate::container::ts::HEAD_SCAN_BYTES as usize
     } else if moov.is_some() {
         MP4_HEAD_WARM
+    } else if mkv_blocks.is_some() {
+        MKV_HEAD_WARM
+    } else if is_raw_hevc {
+        match &hevc_spans {
+            Some(spans) => spans.first().map(|s| s.1).unwrap_or(HEAD_WARM),
+            None => size,
+        }
     } else {
         HEAD_WARM
     }
@@ -172,35 +205,35 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     // the demux reads it for the per-stream bitrate via the front SeekHead. Warm
     // that small tail element so the read isn't a lone RTT; a front-placed `Tags`
     // (inside the head) merges away.
-    let is_mkv = looks_like_mkv(path, data);
     if is_mkv {
         if let Some((start, end)) = crate::container::mkv::tags_extent(data) {
             ranges.push((start as u64, end - start));
         }
-        // Attachments (cover art, fonts) can push the first cluster past the
-        // generic head warm; warm the bounded head block window from wherever
-        // the clusters actually start. Front-cluster layouts merge into the
-        // head range.
-        if let Some((start, end)) = crate::container::mkv::head_blocks_extent(data) {
+        // The bounded head block window, from wherever the clusters actually
+        // start — the block-header walk plus the sampled AUs consume most of
+        // it, and attachments (cover art, fonts) can push it past any generic
+        // head. Front-cluster layouts merge into the head range.
+        if let Some((start, end)) = mkv_blocks {
             ranges.push((start as u64, end - start));
         }
     }
 
-    // Raw HEVC (Annex-B) NAL-splits bounded windows spread across the file at
-    // demux time (`annexb::split_windows`); only the first sits inside the head
-    // warm. Warm each nominal span so the walk doesn't fault 2 MiB windows in
-    // page-cluster round-trips. `None` when the whole-file scan applies; the
-    // head-covered span merges away. Container sniffs above win ties: a box
-    // size or cluster byte can look like a start code, but a raw stream can't
-    // look like a container.
-    if !is_ts && !is_mp4 && !is_mkv && looks_like_raw_hevc(path, data) {
-        if let Some(spans) = crate::container::annexb::window_spans(size) {
-            ranges.extend(spans);
-        }
+    // Raw HEVC (Annex-B) windowed scan: warm each nominal span so the walk
+    // doesn't fault 2 MiB windows in page-cluster round-trips. Window 0
+    // duplicates the head range and merges away. (The whole-file-scan case is
+    // already the head range itself.)
+    if let Some(spans) = hevc_spans {
+        ranges.extend(spans);
     }
 
-    warm_ranges(file, ranges);
-    head
+    // Warm once, then report the contiguous prefix from byte 0 so the chunk
+    // warm can skip AUs the coalesced head region already streamed.
+    let merged = merge_ranges(ranges);
+    warm_merged(file, &merged);
+    match merged.first() {
+        Some(&(0, end)) => end as usize,
+        _ => 0,
+    }
 }
 
 /// Merge overlapping/adjacent ranges and warm them concurrently — scattered
@@ -209,11 +242,14 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
 /// shared `&File` are safe: each carries its own offset, and nothing in the
 /// program relies on the file cursor.
 fn warm_ranges(file: &File, ranges: Vec<(u64, usize)>) {
+    warm_merged(file, &merge_ranges(ranges));
+}
+
+/// Warm already-merged `(start, end)` extents concurrently.
+fn warm_merged(file: &File, merged: &[(u64, u64)]) {
     use rayon::prelude::*;
 
-    merge_ranges(ranges)
-        .par_iter()
-        .for_each(|&(start, end)| warm(file, start, (end - start) as usize));
+    merged.par_iter().for_each(|&(start, end)| warm(file, start, (end - start) as usize));
 }
 
 /// Sort `(offset, len)` ranges and coalesce overlapping/adjacent ones into

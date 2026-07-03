@@ -260,10 +260,14 @@ excluded by config.
   (Windows `FileRemoteProtocolInfo`), never by re-probing the path (a `canonicalize` re-opens
   the file over SMB). Two stages, both executed by `prefetch::warm_ranges` (sort, coalesce
   overlaps, then concurrent positioned reads so one range's latency hides another's):
-  `warm_metadata` before demux gathers the head window (per container: `ts::HEAD_SCAN_BYTES`
-  for TS; the small `MP4_HEAD_WARM` for a confirmed ISOBMFF, whose real regions are all warmed
-  by exact extent so a generic multi-MiB head would only stream `mdat` bytes nothing parses,
-  ~80 ms of pure transfer at 1 GbE; the generic `HEAD_WARM` otherwise), the TS tail window, the
+  `warm_metadata` before demux gathers the head window sized to what the front parse actually
+  consumes (`ts::HEAD_SCAN_BYTES` for TS; the small `MP4_HEAD_WARM` for a confirmed ISOBMFF and
+  `MKV_HEAD_WARM` for an MKV whose first-cluster offset resolved — both have their real regions
+  warmed by exact extent, so a generic multi-MiB head would only stream bytes nothing parses,
+  ~80 ms of pure transfer per 8 MiB at 1 GbE; for raw HEVC, window 0's span when windowed, else
+  the **whole file** — the whole-file NAL scan under `annexb`'s 48 MiB windowing threshold
+  reads every byte, and unwarmed it faults in ~32 KiB round-trips; the generic `HEAD_WARM`
+  otherwise), the TS tail window, the
   `moov` extent, the MKV `Tags` extent plus the head *block* window from the first cluster
   (SeekHead-resolved via `mkv::head_blocks_extent`, so attachments before the clusters can't
   push the block walk past the warm), the raw-HEVC window spans (`annexb::window_spans`, the
@@ -272,7 +276,9 @@ excluded by config.
   (`mp4::mfra_fragment_heads`, found in O(1) via the trailing `mfro`);
   `warm_sample_chunks` after demux replays
   `sample::select_indices` over the container's exact chunk ranges so the sampler's scattered
-  AU faults arrive warm. The chunk warm is skipped under `--full` (every chunk is read anyway;
+  AU faults arrive warm — it skips ranges inside `warm_metadata`'s return, the *coalesced*
+  contiguous warmed prefix from byte 0 (an MKV head that merges into its block span counts
+  whole). The chunk warm is skipped under `--full` (every chunk is read anyway;
   pre-reading a whole movie would regress), under `--no-rpu` (no chunk is read), and for TS
   (chunks index into `reassembled`, not the file). The `sidx`/`mfra` ranges are a **hint
   only**: the fragment index is always built from the `moof` boxes themselves, so a wrong or
@@ -283,7 +289,9 @@ excluded by config.
   packet budget is sized to stay within it (`HEAD_SCAN_BYTES / 192`, the larger stride), and the
   warmed tail is exactly `ts::TAIL_SCAN_BYTES` for the last-PCR duration read; **MKV without a
   Cluster SeekHead entry** falls back to the old handshake, `prefetch::HEAD_WARM` >= the first
-  block's offset + `mkv::HEAD_SPAN_BYTES`. Warm via a positioned `ReadFile`/`read_at`, **not**
+  block's offset + `mkv::HEAD_SPAN_BYTES` (with a resolved cluster the coupling is structural:
+  `MKV_HEAD_WARM` holds only the front metadata, and the block span is warmed by exact extent).
+  Warm via a positioned `ReadFile`/`read_at`, **not**
   `Mmap::advise` (memmap2's advise is `#[cfg(unix)]`, a no-op on the Windows/SMB target).
 - **Malformed-input safety in `mp4.rs`.** `read_u32/u16/u64` are bounds-safe (return 0 on OOB);
   any box-declared count fed to a loop/alloc must go through `clamp_count`. Apply the same
