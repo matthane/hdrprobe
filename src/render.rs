@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::model::{BitrateScope, Report};
+use crate::model::{BitrateScope, ColorInfo, Report};
 
 pub struct RenderOpts {
     pub color: bool,
@@ -331,7 +331,17 @@ fn video_line(r: &Report) -> String {
 }
 
 fn color_line(r: &Report) -> String {
-    let cc = &r.general.color;
+    // The profile-defined colour inferences inside apply only to video inputs: a
+    // metadata-only sidecar (no codec — the same signal that suppresses the Video
+    // line) has no base layer whose colour they could describe.
+    build_color_line(
+        &r.general.color,
+        r.dolby_vision.as_ref().map(|dv| dv.profile.as_str()),
+        !r.general.codec.is_empty(),
+    )
+}
+
+fn build_color_line(cc: &ColorInfo, dv_profile: Option<&str>, has_video: bool) -> String {
     let mut parts = Vec::new();
 
     // Dolby Vision Profile 5 is spec-locked to Dolby's IPT-PQ-c2 colour space over
@@ -339,13 +349,15 @@ fn color_line(r: &Report) -> String {
     // colour space can't be expressed in CICP, so the SPS carries "unspecified"
     // (2/2/2) and only the range survives, leaving a bare "full". Any CICP a P5
     // stream did happen to carry would be noise, so state the fixed profile colour.
-    let is_p5 = r.dolby_vision.as_ref().is_some_and(|dv| dv.profile == "5");
+    // Match by prefix: the label carries the compat minor when a dvcC supplied one
+    // ("5.0"), but a raw elementary stream has no dvcC and labels bare ("5").
+    let is_p5 = has_video && dv_profile.is_some_and(|p| p.starts_with('5'));
     // Profile 4's base layer is defined as Rec.709 SDR (VUI 0,1,1,1,0). Older P4
     // muxes omit the colour description entirely (colour_description_present_flag=0),
     // so the SPS yields no primaries/transfer at all — like the P5 case, state the
     // profile-defined base colour rather than leave it blank. A P4 stream that *does*
     // signal a colour description keeps its own values (this only fills the gap).
-    let is_p4 = r.dolby_vision.as_ref().is_some_and(|dv| dv.profile.starts_with('4'));
+    let is_p4 = has_video && dv_profile.is_some_and(|p| p.starts_with('4'));
     let p4_colour_absent = is_p4 && cc.primaries.is_none() && cc.transfer.is_none();
     if is_p5 {
         // P5 is the case that must *not* collapse: its encoding (PQ) genuinely
@@ -477,5 +489,62 @@ impl Colorizer {
     }
     fn accent(&self, t: &str) -> String {
         self.wrap("33", t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range_only() -> ColorInfo {
+        ColorInfo { range: Some("full".to_string()), ..Default::default() }
+    }
+
+    /// P5's colour is definitional (never signalled), so the line must state it
+    /// whether the profile labels with a compat minor ("5.0", from a container
+    /// dvcC) or bare ("5", a raw elementary stream with no dvcC).
+    #[test]
+    fn p5_states_definitional_colour_for_both_label_shapes() {
+        for label in ["5.0", "5"] {
+            assert_eq!(
+                build_color_line(&range_only(), Some(label), true),
+                "IPT-PQ-c2 · BT.2020 · PQ (SMPTE ST 2084) · full",
+                "profile label {label}"
+            );
+        }
+    }
+
+    /// A metadata-only sidecar has no base layer, so the profile-defined colour
+    /// inferences (P5 IPT-PQ-c2, P4 Rec.709 SDR) must never fire for one.
+    #[test]
+    fn sidecar_gets_no_profile_defined_colour() {
+        assert_eq!(build_color_line(&ColorInfo::default(), Some("5"), false), "");
+        assert_eq!(build_color_line(&ColorInfo::default(), Some("4.2"), false), "");
+    }
+
+    /// Profile 20 signals real CICP in its colr box; the matrix name is prepended
+    /// to the signalled values rather than substituted for them.
+    #[test]
+    fn p20_keeps_signalled_cicp() {
+        let cc = ColorInfo {
+            primaries: Some("BT.2020".to_string()),
+            transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+            matrix: Some("IPT-PQ-c2".to_string()),
+            range: Some("full".to_string()),
+        };
+        assert_eq!(
+            build_color_line(&cc, Some("20.0"), true),
+            "IPT-PQ-c2 · BT.2020 · PQ (SMPTE ST 2084) · full"
+        );
+    }
+
+    /// A P4 mux with no signalled colour description states the profile-defined
+    /// Rec.709 SDR base, collapsed to one label plus the default limited range.
+    #[test]
+    fn p4_fills_absent_colour_description() {
+        assert_eq!(
+            build_color_line(&ColorInfo::default(), Some("4.2 (FEL)"), true),
+            "BT.709 · limited"
+        );
     }
 }
