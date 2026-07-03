@@ -41,21 +41,23 @@ HDR10+
 
 ## What it reports
 
-- **General and video:** container, codec and profile, resolution, frame rate, bit depth, chroma
-  subsampling, colour signalling (primaries, transfer, matrix, and range), and stereoscopic /
-  multiview structure (MV-HEVC, such as Dolby Vision Profile 20).
-- **HDR (static):** classification across SDR, HDR10, HLG, HDR10+, and Dolby Vision, including
-  their combinations, plus the mastering display (ST.2086) and MaxCLL / MaxFALL content light
-  levels.
-- **HDR10+:** presence, profile, application version, window count, and target display max
-  luminance.
+### General video
+
+Container, codec and profile, resolution, frame rate, bit depth, chroma subsampling, colour
+signalling (primaries, transfer, matrix, and range), and stereoscopic / multiview structure
+(MV-HEVC, such as Dolby Vision Profile 20).
+
+### HDR
+
+The static mastering display characteristics (ST.2086 primaries and min/max luminance) and the
+MaxCLL / MaxFALL content light levels.
 
 ### Dolby Vision
 
-hdrprobe reports both the fixed identity of the stream and its title-stable dynamic metadata.
+Both the fixed identity of the stream and its title-stable dynamic metadata.
 
-**Identity.** The profile is reported in `profile.compatibility` form, where the second digit is
-the base layer's cross-compatibility id:
+**Identity.** The profile, in `profile.compatibility` form, where the second digit is the base
+layer's cross-compatibility id:
 
 | Profile | Codec | Reported format(s) |
 |---|---|---|
@@ -67,21 +69,28 @@ the base layer's cross-compatibility id:
 | 10 | AV1 | `10.0`, `10.1`, `10.4` |
 | 20 | MV-HEVC | `20.0`, `20.4` |
 
-Alongside the profile, hdrprobe reports the level, the presence of the base layer / enhancement
-layer / RPU, the base-layer compatibility, and the CM version (`v2.9`, or `v4.0` via L254).
+Alongside it, the level, the presence of the base layer / enhancement layer / RPU, the
+base-layer compatibility, and the CM version (`v2.9`, or `v4.0` via L254).
 
 **Dynamic levels.** The distinct values seen across the title: `L5` active areas, `L6` fallback,
-`L9` mastering, `L11` content type, and the set of `L2` / `L8` trim targets. An `L8` trim's
-target display may be defined by an `L10` block (as in Profile `20`), whose peak luminance is
-then resolved from that definition.
+`L9` mastering, `L11` content type, and the set of `L2` / `L8` trim targets.
 
-**Deliberately omitted.** Per-frame values such as `L1` and per-shot trim values. These are
-decode-time noise rather than title-level facts.
+**Deliberately omitted.** The per-frame and per-shot analysis levels (`L1` brightness, `L3` L1
+offsets, `L4` temporal) and the per-shot trim values. These vary shot to shot rather than
+describing the title, so they collapse to nothing meaningful once sampled or aggregated.
 
 RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoid/dovi_tool)
 (the `dolby_vision` crate); HDR10+ parsing uses the sibling `hdr10plus` crate.
 
+### HDR10+
+
+Presence, profile, application version, window count, and target display max luminance.
+
 ## Supported inputs
+
+hdrprobe reads both video containers and standalone metadata sidecar files.
+
+**Video containers.**
 
 | Container | Codecs | Notes |
 |---|---|---|
@@ -91,30 +100,12 @@ RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoi
 | Raw HEVC | Annex-B | profile inferred from the RPU |
 | Raw AV1 | IVF, low-overhead OBU | Dolby Vision Profile 10 |
 
-hdrprobe recognises HEVC Dolby Vision profiles 4 (FEL and MEL), 5, 7 (FEL and MEL), 8.x, and 20
-(10-bit MV-HEVC for 3D / dual-view, BL+RPU); AVC Profile 9; and AV1 Profile 10.x. Profile 4 is a
-legacy dual-layer format with an SDR (Rec.709) base layer whose HDR is reconstructed by the RPU
-composer rather than carried in the base pixels. hdrprobe reports its SDR base, dual-layer
-structure, and FEL/MEL kind even for older muxes whose compact container descriptor omits the
-compatibility id.
-
-Profile 9 (`dvav.09`) is the AVC (H.264) profile: an 8-bit, single-layer, SDR-compatible
-Rec.709 base with the Dolby Vision RPU carried in-band as an unspecified NAL unit, the same
-role the RPU plays in the single-layer HEVC profiles (8.x), just wrapped for H.264. Because it
-has no enhancement layer and a directly viewable base, a non-Dolby-Vision player shows plain SDR
-while a capable display applies the per-scene metadata. hdrprobe parses the H.264 elementary
-stream directly (dimensions, colour, and frame rate from the SPS; the RPU from its NAL), so it
-reports the same title-stable Dolby Vision levels for Profile 9 as for any other profile.
-
 Containers are matched by extension first, then by content: a file whose extension does not match
 its bytes (for example a Transport Stream saved as `.mkv`) is still recognised and parsed
 correctly, at no cost to correctly-named files.
 
-### Metadata sidecar files
-
-hdrprobe also reads standalone metadata files that carry no picture data. These bypass the
-video pipeline entirely and are rendered through the same report, so text, JSON, and quiet
-output all work unchanged.
+**Metadata sidecar files.** These carry no picture data, bypass the video pipeline entirely, and
+are rendered through the same report, so text, JSON, and quiet output all work unchanged.
 
 | Input | Extension | Notes |
 |---|---|---|
@@ -122,7 +113,7 @@ output all work unchanged.
 | Dolby Vision CM XML | `.xml` | Dolby CM metadata (DolbyLabsMDF), aggregated per shot |
 | HDR10+ JSON | `.json` | hdr10plus_tool metadata; reports the file-level profile and the first scene from a bounded head read |
 
-Each file is identified by content rather than extension alone, so an unrelated `.bin`,
+Each sidecar is identified by content rather than extension alone, so an unrelated `.bin`,
 `.xml`, or `.json` in a scanned directory is skipped. Because none of these formats records a
 resolution, the L5 active-area dimensions for the Dolby Vision sidecars are computed against an
 assumed UHD (3840x2160) master and labelled as assumed in the report.
@@ -180,13 +171,11 @@ Exit codes: `0` parsed successfully, `1` usage error, `2` unreadable or corrupt 
 
 ## Performance
 
-hdrprobe reads only the bytes it needs. The default path memory-maps the file, parses the
-container index, and samples roughly 16 spread seek points in parallel using `rayon`. For
-large raw elementary streams it NAL-splits only bounded byte windows rather than the whole
-file, so cost stays flat regardless of file size. On remote volumes (SMB and NFS), it warms
-the metadata region with a single pipelined read before parsing, so a scan does not fault
-those bytes in over hundreds of round-trips. The `--full` flag lifts the sampling bounds for
-an honest whole-stream census, trading speed for completeness.
+hdrprobe reads only the bytes it needs. It memory-maps the file and samples a spread of seek
+points in parallel rather than scanning the whole stream, so cost stays flat regardless of file
+size. On remote volumes (SMB and NFS) it warms the regions it is about to parse ahead of time,
+so a scan does not stall on hundreds of round-trips. The `--full` flag trades this speed for
+completeness, lifting the sampling bounds for an honest whole-stream census.
 
 Malformed input is handled gracefully. The third-party RPU and HDR10+ parsers can panic on
 some inputs, so they are isolated with `catch_unwind`. One corrupt file never aborts a
