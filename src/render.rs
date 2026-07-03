@@ -175,7 +175,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 // More than one distinct active area means the aspect ratio
                 // changes across the title — worth flagging as special.
                 let variable = if dv.l5_active_areas.len() > 1 {
-                    format!("  {}", c.good("(variable!)"))
+                    format!("  {}", c.good("(variable)"))
                 } else {
                     String::new()
                 };
@@ -192,7 +192,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 }
             }
             if let Some(l6) = &dv.l6_fallback {
-                let flag = if l6.zeroed { format!("  {}", c.warn("(zeroed!)")) } else { String::new() };
+                let flag = if l6.zeroed { format!("  {}", c.warn("(zeroed)")) } else { String::new() };
                 kv(&mut s, &c, "L6 content light", &format!("MaxCLL {} · MaxFALL {}{}", l6.max_cll, l6.max_fall, flag));
             }
             // L9 folds into the Mastering line above when recognized; a
