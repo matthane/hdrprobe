@@ -1,10 +1,9 @@
 # hdrprobe
 
-Fast HDR and Dolby Vision metadata inspector.
+Fast HDR, HDR10+, and Dolby Vision metadata inspector.
 
-hdrprobe is a single native binary that answers one question quickly: what HDR and Dolby
-Vision metadata does this file actually carry? It does the work that normally requires
-`mediainfo`, `ffprobe`, and `dovi_tool` together, without launching subprocesses in the hot
+hdrprobe is a single native binary that answers one question quickly: what HDR and dynamic metadata does this file actually carry? It does the work that normally requires
+`mediainfo`, `ffprobe`, `dovi_tool`, and `hdr10plus_tool` together, without launching subprocesses in the hot
 path, writing temp files, or extracting a full RPU stream to disk first. It memory-maps the
 file and reads only the bytes it needs, so it stays fast regardless of file size.
 
