@@ -8,15 +8,20 @@
 //! hundreds of RTTs — the multi-hundred-ms "same file is 25 ms local / 800 ms on
 //! the NAS" gap.
 //!
-//! This module warms the byte ranges we're about to parse with one sequential,
-//! pipelined positioned read per range. On Windows the memory-mapped section and
+//! This module warms the byte ranges we're about to parse with pipelined
+//! positioned reads, in two stages: `warm_metadata` before demux (container
+//! metadata regions, per backend) and `warm_sample_chunks` after demux (the
+//! exact access units the sampler will fault). Both feed `warm_ranges`, which
+//! coalesces overlapping ranges and streams them concurrently so one range's
+//! network latency hides another's. On Windows the memory-mapped section and
 //! cached `ReadFile` share the Cache Manager's pages for the same file, so the
 //! warm read populates exactly the pages the subsequent mmap faults will hit; the
 //! same holds for the shared page cache on Linux CIFS/NFS. Parsing still runs
 //! against the mmap — nothing is copied into the report path, so the zero-copy
 //! `Chunk` model is untouched. Warming only affects *timing*, never what we parse.
 //!
-//! It is gated to remote volumes on Windows so the tight local path is unchanged.
+//! It is gated to remote volumes on Windows (`is_remote`, decided from the open
+//! handle at zero network cost) so the tight local path is unchanged.
 
 use std::fs::File;
 use std::path::Path;

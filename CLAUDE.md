@@ -89,9 +89,13 @@ excluded by config.
   (new field, new enumerated value), major for breaking (rename/removal, type/unit/presence/
   meaning change). The golden shape test in `model.rs` pins the serialized field paths, so a
   model change fails `cargo test` until the expected list, version, and document move together.
-- `prefetch.rs` — warms the metadata region with one pipelined positioned read before the
-  mmap parse, so SMB/NFS scans don't fault it in over hundreds of round-trips. Timing only —
-  parsing still runs against the mmap; gated to remote volumes on Windows (`GetDriveTypeW`).
+- `prefetch.rs` — warms the byte ranges the parse is about to fault, in two stages: container
+  metadata before demux (`warm_metadata`) and the selected sample AUs after demux
+  (`warm_sample_chunks`), both executed by `warm_ranges` (sort, coalesce, then concurrent
+  pipelined positioned reads), so SMB/NFS scans don't fault them in over hundreds of
+  round-trips. Timing only: parsing still runs against the mmap. Gated to remote volumes by
+  `is_remote`, decided from the open handle (Windows `FileRemoteProtocolInfo`), which costs no
+  extra network round-trip and is correct through mapped drives, UNC, symlinks, and subst.
 
 ## Invariants that are easy to violate
 
@@ -250,23 +254,32 @@ excluded by config.
   head window; the last comes from a *bounded* trailing window (`ts::TAIL_SCAN_BYTES`, 4 MiB). Head
   + tail only, never the middle. A discontinuity flag in the sampled tail, a missing PCR, or an
   implausible span yields `None` rather than a wrong number (`ts::pcr_duration`).
-- **NAS speed rides on warm-window couplings the corpus can't check.** `prefetch::warm_metadata`
-  streams the metadata region in one pipelined read so SMB/NFS scans don't fault it in over
-  hundreds of round-trips. Three per-backend couplings, each of which must hold or the demux walks
-  past the warmed bytes and faults them one-by-one again: **MKV** — `prefetch::HEAD_WARM` >= the
-  first block's offset + `mkv::HEAD_SPAN_BYTES`; **raw AV1** — `av1::HEAD_SCAN_BYTES` (the bounded
-  head walk for both OBU and IVF) <= `prefetch::HEAD_WARM`, so the generic head warm covers the whole
-  walked span; **TS/M2TS** — the warmed head (chosen by
-  `looks_like_ts`) is exactly `ts::HEAD_SCAN_BYTES`, and the demux's packet budget is sized to stay
-  within it (`HEAD_SCAN_BYTES / 192`, the larger stride, so the byte span read never exceeds the
-  warm for either stride). TS also warms a **trailing** `ts::TAIL_SCAN_BYTES` window for the
-  last-PCR duration read (skipped when it overlaps the head on small files) — grow the tail scan
-  without growing the warmed tail and the last-PCR read faults in one-by-one again. Shrinking
-  `HEAD_WARM`/`HEAD_SCAN_BYTES`, growing `HEAD_SPAN_BYTES` or the
-  TS packet budget, or unbounding either index breaks this **silently** — it's timing-only, so tests
-  pass and `-q` is unchanged; the regression only shows on a real network path. Warm via a
-  positioned `ReadFile`/`read_at`, **not** `Mmap::advise` (memmap2's advise is `#[cfg(unix)]`, a
-  no-op on the Windows/SMB target).
+- **NAS speed rides on the prefetch warms, and warm regressions are silent.** Everything here is
+  timing-only: tests pass and `-q` is unchanged when it breaks; the regression only shows on a
+  real network path. Warming is gated by `prefetch::is_remote`, decided from the open handle
+  (Windows `FileRemoteProtocolInfo`), never by re-probing the path (a `canonicalize` re-opens
+  the file over SMB). Two stages, both executed by `prefetch::warm_ranges` (sort, coalesce
+  overlaps, then concurrent positioned reads so one range's latency hides another's):
+  `warm_metadata` before demux gathers the generic head window, the TS head/tail windows, a
+  tail `moov`, the MKV `Tags` extent plus the head *block* window from the first cluster
+  (SeekHead-resolved via `mkv::head_blocks_extent`, so attachments before the clusters can't
+  push the block walk past the warm), the raw-HEVC window spans (`annexb::window_spans`, the
+  same constants `split_windows` scans by), and fMP4 `sidx` fragment heads
+  (`mp4::sidx_fragment_heads`); `warm_sample_chunks` after demux replays
+  `sample::select_indices` over the container's exact chunk ranges so the sampler's scattered
+  AU faults arrive warm. The chunk warm is skipped under `--full` (every chunk is read anyway;
+  pre-reading a whole movie would regress), under `--no-rpu` (no chunk is read), and for TS
+  (chunks index into `reassembled`, not the file). The `sidx` ranges are a **hint only**: the
+  fragment index is always built from the `moof` boxes themselves, so a wrong or missing `sidx`
+  wastes a warm but can never change output. Couplings that remain numeric and easy to break
+  silently: **raw AV1** — `av1::HEAD_SCAN_BYTES` (the bounded head walk for both OBU and IVF)
+  <= `prefetch::HEAD_WARM`, so the generic head warm covers the whole walked span; **TS/M2TS** —
+  the warmed head (chosen by `looks_like_ts`) is exactly `ts::HEAD_SCAN_BYTES`, the demux's
+  packet budget is sized to stay within it (`HEAD_SCAN_BYTES / 192`, the larger stride), and the
+  warmed tail is exactly `ts::TAIL_SCAN_BYTES` for the last-PCR duration read; **MKV without a
+  Cluster SeekHead entry** falls back to the old handshake, `prefetch::HEAD_WARM` >= the first
+  block's offset + `mkv::HEAD_SPAN_BYTES`. Warm via a positioned `ReadFile`/`read_at`, **not**
+  `Mmap::advise` (memmap2's advise is `#[cfg(unix)]`, a no-op on the Windows/SMB target).
 - **Malformed-input safety in `mp4.rs`.** `read_u32/u16/u64` are bounds-safe (return 0 on OOB);
   any box-declared count fed to a loop/alloc must go through `clamp_count`. Apply the same
   discipline to new table parsing.
