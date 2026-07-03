@@ -74,7 +74,7 @@ pub fn try_process(path: &Path) -> Result<Option<Report>> {
         }
         let size = std::fs::metadata(path)?.len();
         let payload = hdr10plus_json::parse(&head)?;
-        return Ok(Some(build_report(path, size, "HDR10+ JSON", payload, started)));
+        return Ok(Some(build_report(path, size, "HDR10+ JSON", payload, None, started)));
     }
 
     let data = std::fs::read(path)?;
@@ -84,15 +84,19 @@ pub fn try_process(path: &Path) -> Result<Option<Report>> {
         return Ok(None);
     };
 
-    let (container, payload) = match kind {
-        Kind::RpuBin => ("Dolby Vision RPU", rpu_bin::parse(&data)?),
-        Kind::DvXml => ("Dolby Vision XML", dv_xml::parse(&data)?),
+    // Frame rate is a DV-XML-only global (Level 0) fact; the RPU bin carries none.
+    let (container, payload, fps) = match kind {
+        Kind::RpuBin => ("Dolby Vision RPU", rpu_bin::parse(&data)?, None),
+        Kind::DvXml => {
+            let (payload, meta) = dv_xml::parse(&data)?;
+            ("Dolby Vision XML", payload, meta.fps)
+        }
         // `.json` is handled above via a bounded head read, so it never reaches
         // the whole-file path.
         Kind::Hdr10PlusJson => unreachable!("json is dispatched before the full read"),
     };
 
-    Ok(Some(build_report(path, size, container, payload, started)))
+    Ok(Some(build_report(path, size, container, payload, fps, started)))
 }
 
 #[derive(Clone, Copy)]
@@ -189,8 +193,11 @@ fn dv_from_rpus(rpus: &[DoviRpu], canvas: Option<(u32, u32)>) -> Result<Payload>
 /// Finalize a populated aggregator into a DV payload. Shared by the raw RPU-bin
 /// path (which folds one RPU per frame) and the DV XML path (which folds one
 /// representative RPU per shot). `canvas` is the assumed L5 canvas, if any.
-fn finalize_dv(agg: DvAggregate, canvas: Option<(u32, u32)>) -> Result<Payload> {
+fn finalize_dv(mut agg: DvAggregate, canvas: Option<(u32, u32)>) -> Result<Payload> {
     let (cw, ch) = canvas.unwrap_or((0, 0));
+    // Metadata-only input: no base layer, so a convention-default compat minor
+    // (P8 -> .1) can't be backed by a base-layer VUI and is flagged as assumed.
+    agg.mark_metadata_only();
     // Every RPU in the sidecar was accounted for, so this is an exhaustive census,
     // not a sample: pass full=true for the per-level presence / scene-cut counts.
     // There is no container dvcC, it isn't AV1, and it isn't dual-track.
@@ -205,7 +212,14 @@ fn finalize_dv(agg: DvAggregate, canvas: Option<(u32, u32)>) -> Result<Payload> 
     }
 }
 
-fn build_report(path: &Path, size: u64, container: &str, payload: Payload, started: Instant) -> Report {
+fn build_report(
+    path: &Path,
+    size: u64,
+    container: &str,
+    payload: Payload,
+    fps: Option<f64>,
+    started: Instant,
+) -> Report {
     let (dolby_vision, hdr10plus) = match payload {
         Payload::DolbyVision(dv) => (Some(*dv), Hdr10Plus::absent()),
         Payload::Hdr10Plus(hp) => (None, hp),
@@ -219,7 +233,7 @@ fn build_report(path: &Path, size: u64, container: &str, payload: Payload, start
             codec_profile: None,
             width: None,
             height: None,
-            fps: None,
+            fps,
             duration_secs: None,
             bitrate: None,
             bit_depth: None,

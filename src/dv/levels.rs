@@ -41,9 +41,28 @@ pub struct DvAggregate {
     scene_cuts: usize,
     /// Per-level RPU presence counts (level -> #RPUs carrying it).
     level_counts: BTreeMap<u8, usize>,
+    /// BL compatibility id known without a container dvcC — a DV XML declares its
+    /// profile (so the minor digit is real, not a convention default). `None` for
+    /// a raw RPU bin, which carries no compatibility id at all.
+    compat_override: Option<u8>,
+    /// Metadata-only sidecar (RPU bin / DV XML): no base layer to back a
+    /// convention-default compat minor, so such a default is flagged as assumed.
+    metadata_only: bool,
 }
 
 impl DvAggregate {
+    /// Record a compatibility id known from outside a container dvcC (a DV XML's
+    /// declared profile), so the label's minor digit is real rather than assumed.
+    pub fn set_compat_id(&mut self, id: u8) {
+        self.compat_override = Some(id);
+    }
+
+    /// Mark this as a metadata-only sidecar (no base layer), enabling the
+    /// `[compat assumed]` flag when the compat minor is a convention default.
+    pub fn mark_metadata_only(&mut self) {
+        self.metadata_only = true;
+    }
+
     /// Fold in one real RPU (one frame). Scene-cut count comes from the RPU's own
     /// `scene_refresh_flag`. Used by the raw RPU-bin path, which is genuinely
     /// per-frame.
@@ -178,7 +197,13 @@ impl DvAggregate {
             DoviELType::MEL => "MEL".to_string(),
         });
 
-        let compat_id = cfg.and_then(|c| c.bl_compatibility_id);
+        // Compat id from the container dvcC/dvvC, else a DV XML's declared profile.
+        // When neither carries it, the label's minor digit is a convention default
+        // (P8 -> .1, P4 -> .2). That's only flagged as assumed for a metadata-only
+        // sidecar: a video input's base-layer VUI backs the inference officially.
+        let compat_id = cfg.and_then(|c| c.bl_compatibility_id).or(self.compat_override);
+        let profile_compat_assumed =
+            self.metadata_only && compat_id.is_none() && matches!(profile, 4 | 8);
         let profile_str = dv_profile_label(profile, compat_id, self.el_type.as_ref());
 
         // Presence: prefer explicit container flags, else derive from profile.
@@ -242,6 +267,7 @@ impl DvAggregate {
 
         Some(DolbyVision {
             profile: profile_str,
+            profile_compat_assumed,
             structure,
             level: cfg.and_then(|c| c.level),
             bl_present: bl,
@@ -253,6 +279,7 @@ impl DvAggregate {
             cm_version,
             l5_active_areas,
             l5_assumed_canvas: None,
+            mastering_display: None,
             l6_fallback: self.l6,
             l9_mastering: self.l9_primary.map(primary_name),
             l11_content: self.l11_content.map(content_type_name),
@@ -272,6 +299,9 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
     let profile_str = dv_profile_label(cfg.profile, cfg.bl_compatibility_id, None);
     DolbyVision {
         profile: profile_str,
+        // Container path: the convention-default compat minor is backed by the
+        // base layer, not a metadata-only guess, so it is never flagged assumed.
+        profile_compat_assumed: false,
         structure: structure_str(cfg.el_present, dual_track),
         level: cfg.level,
         bl_present: cfg.bl_present,
@@ -283,6 +313,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         cm_version: None,
         l5_active_areas: Vec::new(),
         l5_assumed_canvas: None,
+        mastering_display: None,
         l6_fallback: None,
         l9_mastering: None,
         l11_content: None,

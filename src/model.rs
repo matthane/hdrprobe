@@ -3,6 +3,11 @@
 
 use serde::Serialize;
 
+/// serde `skip_serializing_if` predicate for `bool` fields that default false.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub file: String,
@@ -124,6 +129,13 @@ pub struct ContentLight {
 pub struct DolbyVision {
     /// `profile.compatibility`, e.g. "8.1", "7.6 (FEL)", "5.0", "10.4".
     pub profile: String,
+    /// True when the compatibility minor digit was supplied by convention rather
+    /// than read from data — i.e. no container dvcC/dvvC and no XML-declared
+    /// profile carried the `dv_bl_signal_compatibility_id` (a raw RPU bin, or a
+    /// legacy Profile-4 mux whose compact descriptor omits the nibble). The
+    /// major number is still RPU-derived; only the `.1`/`.2` is a default.
+    #[serde(skip_serializing_if = "is_false")]
+    pub profile_compat_assumed: bool,
     /// Layer/track layout, present only for dual-layer (Profile 7) content:
     /// "Single track, dual layer" (BL+EL interleaved in one track/stream) or
     /// "Dual track, dual layer" (BL and EL on separate tracks/PIDs).
@@ -153,6 +165,10 @@ pub struct DolbyVision {
     /// baked into the RPU in actual pixels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l5_assumed_canvas: Option<[u32; 2]>,
+    /// Mastering-display luminance from a DV CM XML's global (Level 0) metadata.
+    /// Sidecars only — video files carry this in the HDR section instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mastering_display: Option<MasteringDisplay>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l6_fallback: Option<L6Fallback>,
     /// L9 mastering-display color space.

@@ -26,11 +26,55 @@ use dolby_vision::xml::{CmXmlParser, XmlParserOpts};
 
 use crate::dv::levels::DvAggregate;
 use crate::dv::rpu::guard;
+use crate::model::MasteringDisplay;
 
 use super::{finalize_dv, Payload, ASSUMED_CANVAS};
 
-pub fn parse(data: &[u8]) -> Result<Payload> {
+/// The Level 0 (global) frame rate and mastering display that libdovi's parser
+/// drops — it never reads `<EditRate>`, and folds the mastering display into a
+/// lossy PQ code. Both are read straight from the raw XML (exact, and cheap: the
+/// elements sit in the file head), independent of the libdovi aggregation.
+pub struct GlobalMeta {
+    pub fps: Option<f64>,
+    pub mastering: Option<MasteringDisplay>,
+}
+
+/// Text of the first `<tag>…</tag>` at or after `from`, trimmed.
+fn tag_text<'a>(xml: &'a str, tag: &str, from: usize) -> Option<&'a str> {
+    let s = xml[from..].find(&format!("<{tag}>"))? + from + tag.len() + 2;
+    let e = xml[s..].find(&format!("</{tag}>"))? + s;
+    Some(xml[s..e].trim())
+}
+
+/// Frame rate from `<EditRate>`: "num den" (or "num,den") is a rational, a lone
+/// value is the rate itself. `None` if absent or unparseable.
+fn parse_frame_rate(xml: &str) -> Option<f64> {
+    let inner = tag_text(xml, "EditRate", 0)?;
+    let nums: Vec<f64> = inner
+        .split([' ', ',', '\t', '\n'])
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+    match nums.as_slice() {
+        [num, den] if *den != 0.0 => Some(num / den),
+        [rate] if *rate > 0.0 => Some(*rate),
+        _ => None,
+    }
+}
+
+/// Mastering-display luminance (nits) from the global `<MasteringDisplay>` block.
+/// Scoped past that opening tag so the `PeakBrightness`/`MinimumBrightness` read
+/// are the mastering display's, not a `ColorEncoding` or `TargetDisplay` one.
+fn parse_mastering(xml: &str) -> Option<MasteringDisplay> {
+    let md = xml.find("<MasteringDisplay>")?;
+    let max = tag_text(xml, "PeakBrightness", md)?.parse::<f64>().ok()?;
+    let min = tag_text(xml, "MinimumBrightness", md)?.parse::<f64>().ok()?;
+    Some(MasteringDisplay { max_luminance: max, min_luminance: min, primaries: None })
+}
+
+pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
     let xml = String::from_utf8_lossy(data).into_owned();
+    let meta = GlobalMeta { fps: parse_frame_rate(&xml), mastering: parse_mastering(&xml) };
 
     let agg: Option<DvAggregate> = guard(|| {
         let opts = XmlParserOpts {
@@ -49,6 +93,13 @@ pub fn parse(data: &[u8]) -> Result<Payload> {
         .ok()?;
 
         let mut agg = DvAggregate::default();
+        // The XML declares its profile, which fixes the BL compatibility id — so
+        // the label's minor digit is real, not the P8/P4 convention default.
+        agg.set_compat_id(match cfg.profile {
+            GenerateProfile::Profile5 => 0,
+            GenerateProfile::Profile81 => 1,
+            GenerateProfile::Profile84 => 4,
+        });
 
         for shot in &cfg.shots {
             if shot.duration == 0 {
@@ -103,7 +154,13 @@ pub fn parse(data: &[u8]) -> Result<Payload> {
     });
 
     match agg {
-        Some(agg) => finalize_dv(agg, Some(ASSUMED_CANVAS)),
+        Some(agg) => {
+            let mut payload = finalize_dv(agg, Some(ASSUMED_CANVAS))?;
+            if let Payload::DolbyVision(dv) = &mut payload {
+                dv.mastering_display = meta.mastering.clone();
+            }
+            Ok((payload, meta))
+        }
         None => bail!("failed to parse Dolby Vision XML"),
     }
 }
