@@ -31,7 +31,7 @@ Dolby Vision
   L5 offsets        L0 R0 T276 B276   [sampled]
   L5 active area    3840×1608  (2.39:1)
   L6 content light  MaxCLL 737 · MaxFALL 130
-  L11 APO           Cinema · reference mode
+  L11 APO           Movies · white point D65 · reference mode
 
 HDR10+
   Profile           B

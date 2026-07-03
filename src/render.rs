@@ -218,11 +218,15 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 }
             }
             if let Some(l11) = &dv.l11_content {
+                let wp = match &dv.l11_white_point {
+                    Some(wp) => format!(" · white point {wp}"),
+                    None => String::new(),
+                };
                 let rm = match dv.l11_reference_mode {
                     Some(true) => " · reference mode",
                     _ => "",
                 };
-                kv(&mut s, &c, "L11 APO", &format!("{}{}", l11, rm));
+                kv(&mut s, &c, "L11 APO", &format!("{}{}{}", l11, wp, rm));
             }
             if let Some(census) = &dv.census {
                 let levels = census

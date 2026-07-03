@@ -41,6 +41,7 @@ pub struct DvAggregate {
     /// carried only by the 17-byte form (index 255).
     l9_custom: Option<[u16; 8]>,
     l11_content: Option<u8>,
+    l11_white_point: Option<u8>,
     l11_ref_mode: Option<bool>,
     /// L2 trim targets in nits (self-contained: L2 carries its own target_max_pq).
     trim_targets: BTreeSet<u32>,
@@ -170,6 +171,7 @@ impl DvAggregate {
         if self.l11_content.is_none() {
             if let Some(ExtMetadataBlock::Level11(b)) = dm.get_block(11) {
                 self.l11_content = Some(b.content_type);
+                self.l11_white_point = Some(b.whitepoint);
                 self.l11_ref_mode = Some(b.reference_mode_flag);
             }
         }
@@ -336,6 +338,7 @@ impl DvAggregate {
             l6_fallback: self.l6,
             l9_mastering: l9_label,
             l11_content: self.l11_content.map(content_type_name),
+            l11_white_point: self.l11_white_point.map(white_point_name),
             l11_reference_mode: self.l11_ref_mode,
             trim_targets,
             rpu_count: self.rpu_count,
@@ -371,6 +374,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         l6_fallback: None,
         l9_mastering: None,
         l11_content: None,
+        l11_white_point: None,
         l11_reference_mode: None,
         trim_targets: Vec::new(),
         rpu_count: 0,
@@ -494,16 +498,31 @@ fn primary_name(idx: u8) -> String {
     .to_string()
 }
 
+/// L11 content-type names per Dolby's "Dolby Vision IQ - Content Type Metadata
+/// (L11)" knowledge-base article. 0 is a defined value ("Default": the legacy
+/// consumer experience, auto-added when tools upconvert a 4.0.2 XML to 5.1.0),
+/// not reserved.
 fn content_type_name(t: u8) -> String {
     match t {
-        0 => "Reserved",
-        1 => "Cinema",
-        2 => "Games",
-        3 => "Sports",
-        4 => "User-generated",
+        0 => "Default",
+        1 => "Movies",
+        2 => "Game",
+        3 => "Sport",
+        4 => "User Generated Content",
         _ => "Unknown",
     }
     .to_string()
+}
+
+/// L11 intended white point. Dolby publishes names only for 0 (D65, the
+/// default) and 8 (D93); the rest of the 0..=15 range is accepted by metafier
+/// but unnamed, so it renders as the raw code rather than a guess.
+fn white_point_name(wp: u8) -> String {
+    match wp {
+        0 => "D65".to_string(),
+        8 => "D93".to_string(),
+        n => format!("code {n}"),
+    }
 }
 
 /// The RPU DM header's (`source_min_pq`, `source_max_pq`) pair -> luminance in

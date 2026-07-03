@@ -289,7 +289,8 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 | `fel_brightness_expansion` | `FelBrightnessExpansion` | optional | Metadata indication that the FEL likely carries brightness beyond the base layer; see below |
 | `l6_fallback` | `L6Fallback` | optional | The RPU's L6 (ST.2086-shaped) fallback block |
 | `l9_mastering` | string | optional | L9 mastering-display gamut name. The `MasteringDisplay.primaries` names plus `"custom"` (an L9 with unrecognized explicit chromaticities) and `"unknown"` (an unrecognized predefined index) |
-| `l11_content` | string | optional | L11 content type: `"Cinema"`, `"Games"`, `"Sports"`, `"User-generated"`, `"Reserved"`, `"Unknown"` |
+| `l11_content` | string | optional | L11 content type, named per Dolby's L11 (Dolby Vision IQ) definitions: `"Default"`, `"Movies"`, `"Game"`, `"Sport"`, `"User Generated Content"`, or `"Unknown"` for values outside the published 0-4 range |
+| `l11_white_point` | string | optional | L11 intended white point: `"D65"` (0, the default), `"D93"` (8), or `"code N"` for the other codes, which Dolby accepts but does not publicly name. Present only when L11 was seen |
 | `l11_reference_mode` | boolean | optional | L11 reference-mode flag; present only when L11 was seen |
 | `trim_targets` | array of `TrimTarget` | omitted when empty | Distinct L2/L8 trim target displays, in nits, sorted ascending |
 | `rpu_count` | integer | always | Number of RPUs successfully parsed (0 under `--no-rpu`) |

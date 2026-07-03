@@ -221,6 +221,9 @@ pub struct DolbyVision {
     /// L11 content type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l11_content: Option<String>,
+    /// L11 intended white point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub l11_white_point: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l11_reference_mode: Option<bool>,
     /// Distinct L2/L8 trim targets (union across samples), each tagged with the
@@ -384,7 +387,8 @@ mod tests {
                     zeroed: false,
                 }),
                 l9_mastering: Some("BT.2020".to_string()),
-                l11_content: Some("Cinema".to_string()),
+                l11_content: Some("Movies".to_string()),
+                l11_white_point: Some("D65".to_string()),
                 l11_reference_mode: Some(true),
                 trim_targets: vec![TrimTarget { nits: 100, levels: vec![2, 8] }],
                 rpu_count: 722,
@@ -494,6 +498,7 @@ mod tests {
             "dolby_vision.l6_fallback.zeroed",
             "dolby_vision.l9_mastering",
             "dolby_vision.l11_content",
+            "dolby_vision.l11_white_point",
             "dolby_vision.l11_reference_mode",
             "dolby_vision.trim_targets[].nits",
             "dolby_vision.trim_targets[].levels[]",
