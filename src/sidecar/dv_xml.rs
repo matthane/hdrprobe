@@ -47,29 +47,77 @@ fn tag_text<'a>(xml: &'a str, tag: &str, from: usize) -> Option<&'a str> {
 }
 
 /// Frame rate from `<EditRate>`: "num den" (or "num,den") is a rational, a lone
-/// value is the rate itself. `None` if absent or unparseable.
+/// value is the rate itself. The 2.0.5 (CM v2.9) schema instead nests a
+/// `<Rate><n>num</n><d>den</d></Rate>` element. `None` if absent or unparseable.
 fn parse_frame_rate(xml: &str) -> Option<f64> {
-    let inner = tag_text(xml, "EditRate", 0)?;
-    let nums: Vec<f64> = inner
-        .split([' ', ',', '\t', '\n'])
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<f64>().ok())
-        .collect();
-    match nums.as_slice() {
-        [num, den] if *den != 0.0 => Some(num / den),
-        [rate] if *rate > 0.0 => Some(*rate),
-        _ => None,
+    if let Some(inner) = tag_text(xml, "EditRate", 0) {
+        let nums: Vec<f64> = inner
+            .split([' ', ',', '\t', '\n'])
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<f64>().ok())
+            .collect();
+        match nums.as_slice() {
+            [num, den] if *den != 0.0 => return Some(num / den),
+            [rate] if *rate > 0.0 => return Some(*rate),
+            _ => {}
+        }
+    }
+    let r = xml.find("<Rate>")?;
+    let n = tag_text(xml, "n", r)?.parse::<f64>().ok()?;
+    let d = tag_text(xml, "d", r)?.parse::<f64>().ok()?;
+    (n > 0.0 && d > 0.0).then_some(n / d)
+}
+
+/// Mastering-display luminance (nits) and gamut from the global
+/// `<MasteringDisplay>` block. Reads are scoped to that element's own text so
+/// the values can't come from a `ColorEncoding` (before it) or `TargetDisplay`
+/// (after it). The gamut comes from the explicit `<Red>x y</Red>`-style
+/// chromaticities, named through the shared gamut matcher — this is the only
+/// mastering-primaries carrier a CM v2.9 title has (no L9), and it's exact for
+/// v4.0 too. Unmatched coordinates yield no name, never a guess.
+fn parse_mastering(xml: &str) -> Option<MasteringDisplay> {
+    let md = mastering_element(xml)?;
+    let max = tag_text(md, "PeakBrightness", 0)?.parse::<f64>().ok()?;
+    let min = tag_text(md, "MinimumBrightness", 0)?.parse::<f64>().ok()?;
+    let primaries = parse_primaries(md).map(str::to_string);
+    // The DV XML's mastering display is Level-0 global data, so a recognized
+    // gamut is tagged L0 (vs an RPU-carried L9).
+    let primaries_level = primaries.is_some().then_some(0);
+    Some(MasteringDisplay { max_luminance: max, min_luminance: min, primaries, primaries_level })
+}
+
+/// Body of the first `<MasteringDisplay>` element. The opening tag is bare in
+/// the 4.0.2+ schemas but carries a `level="0"` attribute in the 2.0.5 (CM
+/// v2.9) schema, so match the tag name and skip to the end of the opening tag.
+fn mastering_element(xml: &str) -> Option<&str> {
+    let mut from = 0;
+    loop {
+        let i = xml[from..].find("<MasteringDisplay")? + from;
+        let rest = &xml[i + "<MasteringDisplay".len()..];
+        // Reject a longer tag name that merely shares the prefix.
+        if !matches!(rest.as_bytes().first(), Some(b'>' | b' ' | b'\t' | b'\r' | b'\n')) {
+            from = i + 1;
+            continue;
+        }
+        let body = &rest[rest.find('>')? + 1..];
+        let end = body.find("</MasteringDisplay>").unwrap_or(body.len());
+        return Some(&body[..end]);
     }
 }
 
-/// Mastering-display luminance (nits) from the global `<MasteringDisplay>` block.
-/// Scoped past that opening tag so the `PeakBrightness`/`MinimumBrightness` read
-/// are the mastering display's, not a `ColorEncoding` or `TargetDisplay` one.
-fn parse_mastering(xml: &str) -> Option<MasteringDisplay> {
-    let md = xml.find("<MasteringDisplay>")?;
-    let max = tag_text(xml, "PeakBrightness", md)?.parse::<f64>().ok()?;
-    let min = tag_text(xml, "MinimumBrightness", md)?.parse::<f64>().ok()?;
-    Some(MasteringDisplay { max_luminance: max, min_luminance: min, primaries: None })
+/// The R/G/B/white-point chromaticity pairs of a `<MasteringDisplay>` element's
+/// `<Primaries>`, matched to a gamut name. Coordinates are separated by a space
+/// (4.0.2 schema) or a comma (2.0.5). `None` when any coordinate is absent or
+/// the set matches no known mastering gamut.
+fn parse_primaries(md: &str) -> Option<&'static str> {
+    let xy = |tag: &str| -> Option<(f64, f64)> {
+        let mut it = tag_text(md, tag, 0)?
+            .split([' ', ',', '\t', '\n'])
+            .filter(|s| !s.is_empty())
+            .filter_map(|v| v.parse::<f64>().ok());
+        Some((it.next()?, it.next()?))
+    };
+    crate::hdr::primaries_label(xy("Red")?, xy("Green")?, xy("Blue")?, xy("WhitePoint")?)
 }
 
 pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
@@ -158,19 +206,120 @@ pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
             let mut payload = finalize_dv(agg, Some(ASSUMED_CANVAS))?;
             // Prefer the exact XML luminance over the aggregate's PQ-derived one
             // (CmXmlParser folds this display into lossy 12-bit codes), but keep
-            // the derived value when the XML block is absent — and carry over the
-            // aggregate's L9-derived gamut either way (this XML read is
-            // luminance-only).
+            // the derived value when the XML block is absent. For the gamut,
+            // prefer the aggregate's L9 name (what an RPU generated from this
+            // XML would carry; it derives from these same chromaticities), and
+            // fall back to the XML's own Level-0 primaries — the only carrier a
+            // CM v2.9 XML has.
             if let Payload::DolbyVision(dv) = &mut payload {
                 if let Some(xml_md) = &meta.mastering {
                     let mut md = xml_md.clone();
-                    md.primaries =
-                        dv.mastering_display.take().and_then(|m| m.primaries);
+                    if let Some(agg_md) = dv.mastering_display.take() {
+                        if agg_md.primaries.is_some() {
+                            md.primaries = agg_md.primaries;
+                            md.primaries_level = agg_md.primaries_level;
+                        }
+                    }
                     dv.mastering_display = Some(md);
                 }
             }
             Ok((payload, meta))
         }
         None => bail!("failed to parse Dolby Vision XML"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mastering_display_reads_luminance_and_named_primaries() {
+        // The mastering display's own values must win over the ColorEncoding
+        // block before it (a 10000-nit PQ signal with the same P3 primaries)
+        // and the TargetDisplay after it (100-nit BT.709). Layout mirrors a
+        // real Resolve 4.0.2 export.
+        let xml = r#"<Track><ColorEncoding>
+            <Primaries><Red>0.68 0.32</Red><Green>0.265 0.69</Green><Blue>0.15 0.06</Blue></Primaries>
+            <WhitePoint>0.3127 0.329</WhitePoint>
+            <PeakBrightness>10000</PeakBrightness><MinimumBrightness>0</MinimumBrightness>
+          </ColorEncoding>
+          <DVGlobalData level="0"><MasteringDisplay>
+            <ID>20</ID>
+            <Primaries><Red>0.68 0.32</Red><Green>0.265 0.69</Green><Blue>0.15 0.06</Blue></Primaries>
+            <WhitePoint>0.3127 0.329</WhitePoint>
+            <PeakBrightness>1000</PeakBrightness><MinimumBrightness>0.0001</MinimumBrightness>
+          </MasteringDisplay>
+          <TargetDisplay>
+            <Primaries><Red>0.64 0.33</Red><Green>0.3 0.6</Green><Blue>0.15 0.06</Blue></Primaries>
+            <WhitePoint>0.3127 0.329</WhitePoint>
+            <PeakBrightness>100</PeakBrightness><MinimumBrightness>0.005</MinimumBrightness>
+          </TargetDisplay></DVGlobalData></Track>"#;
+        let md = parse_mastering(xml).expect("mastering display parses");
+        assert_eq!(md.max_luminance, 1000.0);
+        assert_eq!(md.min_luminance, 0.0001);
+        // The Level-0 gamut carrier — the only one a CM v2.9 XML has.
+        assert_eq!(md.primaries.as_deref(), Some("DCI-P3 D65"));
+        assert_eq!(md.primaries_level, Some(0));
+    }
+
+    #[test]
+    fn mastering_display_parses_the_205_schema_form() {
+        // The 2.0.5 (CM v2.9) schema writes an attributed opening tag and
+        // comma-separated coordinates (dovi_meta output verbatim).
+        let xml = r#"<MasteringDisplay level="0">
+            <ID>20</ID>
+            <Name>1000-nits, P3, D65, ST.2084, Full</Name>
+            <Primaries><Red>0.68,0.32</Red><Green>0.265,0.69</Green><Blue>0.15,0.06</Blue></Primaries>
+            <WhitePoint>0.3127,0.329</WhitePoint>
+            <PeakBrightness>1000</PeakBrightness>
+            <MinimumBrightness>0.0001</MinimumBrightness>
+          </MasteringDisplay>"#;
+        let md = parse_mastering(xml).expect("2.0.5 mastering display parses");
+        assert_eq!(md.max_luminance, 1000.0);
+        assert_eq!(md.primaries.as_deref(), Some("DCI-P3 D65"));
+        assert_eq!(md.primaries_level, Some(0));
+    }
+
+    #[test]
+    fn mastering_display_without_primaries_stays_luminance_only() {
+        // No <Primaries> inside the element: the TargetDisplay's BT.709 set
+        // further down must not leak in — luminance parses, gamut stays absent.
+        let xml = r#"<MasteringDisplay>
+            <PeakBrightness>4000</PeakBrightness><MinimumBrightness>0.005</MinimumBrightness>
+          </MasteringDisplay>
+          <TargetDisplay>
+            <Primaries><Red>0.64 0.33</Red><Green>0.3 0.6</Green><Blue>0.15 0.06</Blue></Primaries>
+            <WhitePoint>0.3127 0.329</WhitePoint>
+            <PeakBrightness>100</PeakBrightness><MinimumBrightness>0.005</MinimumBrightness>
+          </TargetDisplay>"#;
+        let md = parse_mastering(xml).expect("mastering display parses");
+        assert_eq!(md.max_luminance, 4000.0);
+        assert_eq!(md.primaries, None);
+        assert_eq!(md.primaries_level, None);
+    }
+
+    #[test]
+    fn frame_rate_reads_both_schema_forms() {
+        // 4.0.2+: a rational (or lone value) inside <EditRate>.
+        assert_eq!(parse_frame_rate("<EditRate>24000 1001</EditRate>"), Some(24000.0 / 1001.0));
+        assert_eq!(parse_frame_rate("<EditRate>25</EditRate>"), Some(25.0));
+        // 2.0.5: <Rate> with nested numerator/denominator (dovi_meta output).
+        assert_eq!(
+            parse_frame_rate("<Rate>\n<n>24000</n>\n<d>1001</d>\n</Rate>"),
+            Some(24000.0 / 1001.0)
+        );
+        assert_eq!(parse_frame_rate("<Rate><n>24</n><d>0</d></Rate>"), None);
+    }
+
+    #[test]
+    fn off_gamut_mastering_primaries_are_never_guessed() {
+        let xml = r#"<MasteringDisplay>
+            <Primaries><Red>0.7 0.3</Red><Green>0.2 0.7</Green><Blue>0.14 0.05</Blue></Primaries>
+            <WhitePoint>0.30 0.32</WhitePoint>
+            <PeakBrightness>1000</PeakBrightness><MinimumBrightness>0.0001</MinimumBrightness>
+          </MasteringDisplay>"#;
+        let md = parse_mastering(xml).expect("mastering display parses");
+        assert_eq!(md.primaries, None);
     }
 }
