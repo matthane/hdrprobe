@@ -142,6 +142,13 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
         if let Some((start, end)) = crate::container::mkv::tags_extent(data) {
             ranges.push((start as u64, end - start));
         }
+        // Attachments (cover art, fonts) can push the first cluster past the
+        // generic head warm; warm the bounded head block window from wherever
+        // the clusters actually start. Front-cluster layouts merge into the
+        // head range.
+        if let Some((start, end)) = crate::container::mkv::head_blocks_extent(data) {
+            ranges.push((start as u64, end - start));
+        }
     }
 
     // Raw HEVC (Annex-B) NAL-splits bounded windows spread across the file at

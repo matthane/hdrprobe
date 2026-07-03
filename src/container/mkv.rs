@@ -205,29 +205,7 @@ fn segment_extent(data: &[u8]) -> Option<(usize, usize)> {
 /// layout) in one pipelined read on network filesystems. `None` if there is no
 /// Segment, no SeekHead entry for `Tags`, or the pointer doesn't land on one.
 pub fn tags_extent(data: &[u8]) -> Option<(usize, usize)> {
-    let (seg_start, seg_end) = segment_extent(data)?;
-    let mut p = seg_start;
-    let mut tags_off = None;
-    while p < seg_end {
-        let (id, p1) = read_id(data, p)?;
-        let (size, p2) = read_size(data, p1)?;
-        let end = match size {
-            Some(s) => (p2 + s as usize).min(seg_end),
-            None => break,
-        };
-        if id == ID_SEEKHEAD {
-            if let Some(off) = seekhead_tags_offset(data, p2, end, seg_start) {
-                tags_off = Some(off);
-                break;
-            }
-        }
-        // The Tags pointer lives in the front SeekHead; don't walk into clusters.
-        if id == ID_CLUSTER || end <= p {
-            break;
-        }
-        p = end;
-    }
-    let off = tags_off?;
+    let off = front_seekhead_offset_of(data, ID_TAGS)?;
     let (id, p1) = read_id(data, off)?;
     if id != ID_TAGS {
         return None;
@@ -238,6 +216,52 @@ pub fn tags_extent(data: &[u8]) -> Option<(usize, usize)> {
         None => data.len(),
     };
     Some((off, end))
+}
+
+/// Byte extent `[start, end)` of the default head *block* window — the first
+/// `Cluster`'s offset (resolved via the front SeekHead) plus the bounded span
+/// the fast-path demux walks from the first block (`HEAD_SPAN_BYTES`), with
+/// slack for cluster headers and the final block running past the span bound.
+/// For the prefetch warmer: when attachments (cover art, fonts) push the
+/// clusters past the generic head warm, the block walk would otherwise fault
+/// in header by header on a network volume. `None` when no SeekHead names a
+/// `Cluster` or the pointer doesn't land on one (the generic head warm then
+/// covers the common front-cluster layout).
+pub fn head_blocks_extent(data: &[u8]) -> Option<(usize, usize)> {
+    const SLACK: usize = 1 << 20; // 1 MiB
+    let off = front_seekhead_offset_of(data, ID_CLUSTER)?;
+    let (id, _) = read_id(data, off)?;
+    if id != ID_CLUSTER {
+        return None;
+    }
+    let end = (off + HEAD_SPAN_BYTES as usize + SLACK).min(data.len());
+    Some((off, end))
+}
+
+/// Absolute offset of a level-1 element resolved via the Segment's front
+/// SeekHead(s). Walks only front-of-segment elements — the pointer lives in
+/// the front SeekHead, so never into clusters.
+fn front_seekhead_offset_of(data: &[u8], target: u32) -> Option<usize> {
+    let (seg_start, seg_end) = segment_extent(data)?;
+    let mut p = seg_start;
+    while p < seg_end {
+        let (id, p1) = read_id(data, p)?;
+        let (size, p2) = read_size(data, p1)?;
+        let end = match size {
+            Some(s) => (p2 + s as usize).min(seg_end),
+            None => return None,
+        };
+        if id == ID_SEEKHEAD {
+            if let Some(off) = seekhead_offset_of(data, p2, end, seg_start, target) {
+                return Some(off);
+            }
+        }
+        if id == ID_CLUSTER || end <= p {
+            return None;
+        }
+        p = end;
+    }
+    None
 }
 
 pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
@@ -441,13 +465,25 @@ struct TrackStats {
 /// (`seg_start`). Lets us read a tail-placed `Tags` (mkvmerge's default layout)
 /// with one bounded read instead of walking the whole file to reach it.
 fn seekhead_tags_offset(data: &[u8], start: usize, end: usize, seg_start: usize) -> Option<usize> {
+    seekhead_offset_of(data, start, end, seg_start, ID_TAGS)
+}
+
+/// Absolute offset of the first Seek entry targeting the level-1 element
+/// `target` (a 4-byte class ID, e.g. `Tags` or `Cluster`).
+fn seekhead_offset_of(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    seg_start: usize,
+    target: u32,
+) -> Option<usize> {
     let mut p = start;
     while p < end {
         let (id, p1) = read_id(data, p)?;
         let (size, p2) = read_size(data, p1)?;
         let cend = (p2 + size.unwrap_or(0) as usize).min(end);
         if id == ID_SEEK {
-            if let Some(pos) = seek_entry_tags_pos(data, p2, cend) {
+            if let Some(pos) = seek_entry_pos(data, p2, cend, target) {
                 return Some(seg_start + pos);
             }
         }
@@ -459,9 +495,9 @@ fn seekhead_tags_offset(data: &[u8], start: usize, end: usize, seg_start: usize)
     None
 }
 
-/// A `Seek` entry's `SeekPosition`, but only when its `SeekID` targets `Tags`.
-fn seek_entry_tags_pos(data: &[u8], start: usize, end: usize) -> Option<usize> {
-    let mut is_tags = false;
+/// A `Seek` entry's `SeekPosition`, but only when its `SeekID` targets `target`.
+fn seek_entry_pos(data: &[u8], start: usize, end: usize, target: u32) -> Option<usize> {
+    let mut id_matches = false;
     let mut pos = None;
     let mut p = start;
     while p < end {
@@ -470,7 +506,7 @@ fn seek_entry_tags_pos(data: &[u8], start: usize, end: usize) -> Option<usize> {
         let s = size.unwrap_or(0) as usize;
         let cend = (p2 + s).min(end);
         match id {
-            ID_SEEK_ID => is_tags = data.get(p2..cend) == Some(&ID_TAGS.to_be_bytes()[..]),
+            ID_SEEK_ID => id_matches = data.get(p2..cend) == Some(&target.to_be_bytes()[..]),
             ID_SEEK_POSITION => pos = Some(read_uint(data, p2, s) as usize),
             _ => {}
         }
@@ -479,7 +515,7 @@ fn seek_entry_tags_pos(data: &[u8], start: usize, end: usize) -> Option<usize> {
         }
         p = cend;
     }
-    if is_tags {
+    if id_matches {
         pos
     } else {
         None
@@ -1130,5 +1166,40 @@ mod tests {
         let seg_start = data.len() - seg_payload.len();
         let start = seg_start + seekhead.len();
         assert_eq!(tags_extent(&data), Some((start, start + tags.len())));
+    }
+
+    #[test]
+    fn head_blocks_extent_resolves_the_first_cluster_via_seekhead() {
+        // Segment { SeekHead(→Cluster), filler ("attachments"), Cluster }: the
+        // warmer must recover the head block window from wherever the clusters
+        // actually start, not assume they sit inside the generic head warm.
+        let filler = el(&ID_ATTACHMENTS.to_be_bytes(), &[0u8; 64]);
+        let cluster = el(&ID_CLUSTER.to_be_bytes(), &[0u8; 32]);
+        let seek = {
+            let mut b = el(&[0x53, 0xAB], &ID_CLUSTER.to_be_bytes()); // SeekID = Cluster
+            b.extend(el(&[0x53, 0xAC], &[0])); // SeekPosition patched below
+            el(&[0x4D, 0xBB], &b)
+        };
+        let seekhead = el(&ID_SEEKHEAD.to_be_bytes(), &seek);
+        let pos = (seekhead.len() + filler.len()) as u8;
+
+        let mut seg_payload = seekhead;
+        // Patch the 1-byte SeekPosition (last payload byte of the SeekHead).
+        *seg_payload.last_mut().unwrap() = pos;
+        seg_payload.extend(&filler);
+        seg_payload.extend(&cluster);
+        let data = el(&ID_SEGMENT.to_be_bytes(), &seg_payload);
+
+        let start = (data.len() - seg_payload.len()) + pos as usize;
+        // Extent begins at the cluster and is clamped to the (tiny) file end.
+        assert_eq!(head_blocks_extent(&data), Some((start, data.len())));
+
+        // A pointer that doesn't land on a Cluster yields nothing.
+        let bogus = el(&ID_SEGMENT.to_be_bytes(), &el(&ID_SEEKHEAD.to_be_bytes(), &{
+            let mut b = el(&[0x53, 0xAB], &ID_CLUSTER.to_be_bytes());
+            b.extend(el(&[0x53, 0xAC], &[1])); // points into the SeekHead itself
+            el(&[0x4D, 0xBB], &b)
+        }));
+        assert_eq!(head_blocks_extent(&bogus), None);
     }
 }
