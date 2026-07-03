@@ -547,19 +547,24 @@ fn snap_nits(nits: f64) -> u32 {
     best
 }
 
-/// Dolby L8 `target_display_index` -> nits, for the common predefined targets.
+/// Dolby L8 `target_display_index` -> nits, for the predefined targets.
+///
+/// Values verified against metafier 5.5.0's canonical target-display table
+/// (redefining a referenced target in a CM XML makes `--validate` warn with
+/// the canonical `pq(0,N)`/`gamma_dci(0,N)` definition; probed per index).
+/// 16/18/21 are 48-nit theatrical projector targets and 42 is the 108-nit
+/// Dolby Cinema target — the index never encodes nits directly. Indices
+/// metafier doesn't define (e.g. 20/22/23, which belong to the *mastering*
+/// display ID namespace) are absent on purpose: dropped, never guessed.
 fn l8_index_to_nits(idx: u8) -> Option<u32> {
     Some(match idx {
         1 => 100,
-        16 => 100,
-        18 => 600,
-        20 => 1000,
-        21 => 2000,
-        22 => 4000,
-        23 => 10000,
-        27 => 600,
-        28 => 1000,
-        48 => 48,
+        16 | 18 | 21 => 48,
+        24 | 25 => 300,
+        27 | 28 => 600,
+        37 | 38 => 2000,
+        42 => 108,
+        48 | 49 => 1000,
         _ => return None,
     })
 }
@@ -624,6 +629,25 @@ mod tests {
         // yields nothing rather than a made-up number.
         assert_eq!(resolve_l8_nits(27, &BTreeMap::new()), Some(600));
         assert_eq!(resolve_l8_nits(200, &BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn l8_predefined_table_matches_dolby_canon() {
+        // Metafier-verified canonical targets. Index 48 is the 1000-nit P3 D65
+        // home target (a real disc: Speed Racer UHD carries L8 TIDs {1, 48});
+        // the actual 48-nit displays are the theatrical 16/18/21. Mastering-
+        // display-namespace IDs (20/22/23) must stay unmapped, not guessed.
+        let none = BTreeMap::new();
+        assert_eq!(resolve_l8_nits(48, &none), Some(1000));
+        assert_eq!(resolve_l8_nits(49, &none), Some(1000));
+        for cinema in [16, 18, 21] {
+            assert_eq!(resolve_l8_nits(cinema, &none), Some(48));
+        }
+        assert_eq!(resolve_l8_nits(42, &none), Some(108), "Dolby Cinema");
+        assert_eq!(resolve_l8_nits(28, &none), Some(600), "600-nit BT.2020");
+        for unmapped in [20, 22, 23] {
+            assert_eq!(resolve_l8_nits(unmapped, &none), None);
+        }
     }
 
     #[test]
