@@ -25,11 +25,13 @@ HDR
 Dolby Vision
   Structure         Single track, dual layer
   Profile           7.6 (MEL)
-  Content mapping   v2.9
-  Trim targets      100 nits [L2]
+  Content mapping   v4.0
+  Trim targets      100 nits [L2/L8], 600 nits [L2], 1000 nits [L2]
   L5 offsets        L0 R0 T276 B276   [sampled]
   L5 active area    3840×1608  (2.39:1)
   L6 content light  MaxCLL 737 · MaxFALL 130
+  L9 mastering      DCI-P3 D65
+  L11 APO           Cinema · reference
 
 HDR10+
   Profile           B
