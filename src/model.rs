@@ -152,6 +152,14 @@ pub struct MasteringDisplay {
 pub struct ContentLight {
     pub max_cll: u16,
     pub max_fall: u16,
+    /// True when MaxCLL/MaxFALL are both zero (common real defect).
+    pub zeroed: bool,
+}
+
+impl ContentLight {
+    pub fn new(max_cll: u16, max_fall: u16) -> Self {
+        ContentLight { max_cll, max_fall, zeroed: max_cll == 0 && max_fall == 0 }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -348,7 +356,7 @@ mod tests {
                     primaries: Some("DCI-P3 D65".to_string()),
                     primaries_level: Some(9),
                 }),
-                content_light: Some(ContentLight { max_cll: 737, max_fall: 130 }),
+                content_light: Some(ContentLight::new(737, 130)),
             }),
             dolby_vision: Some(DolbyVision {
                 profile: "7.6 (FEL)".to_string(),
@@ -469,6 +477,7 @@ mod tests {
             "hdr.mastering.primaries_level",
             "hdr.content_light.max_cll",
             "hdr.content_light.max_fall",
+            "hdr.content_light.zeroed",
             "dolby_vision.profile",
             "dolby_vision.profile_compat_assumed",
             "dolby_vision.structure",

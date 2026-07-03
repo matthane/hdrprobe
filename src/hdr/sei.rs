@@ -183,10 +183,7 @@ pub(crate) fn parse_content_light(p: &[u8]) -> Option<ContentLight> {
     if p.len() < 4 {
         return None;
     }
-    Some(ContentLight {
-        max_cll: u16::from_be_bytes([p[0], p[1]]),
-        max_fall: u16::from_be_bytes([p[2], p[3]]),
-    })
+    Some(ContentLight::new(u16::from_be_bytes([p[0], p[1]]), u16::from_be_bytes([p[2], p[3]])))
 }
 
 /// HDR10+ (ST.2094-40) rides in a registered ITU-T T.35 message: country code

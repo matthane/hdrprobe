@@ -90,10 +90,7 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
         });
 
     let content_light = demux.content_light.or(sei.content_light).or_else(|| {
-        dv.and_then(|d| d.l6.as_ref()).map(|l6| crate::model::ContentLight {
-            max_cll: l6.max_cll,
-            max_fall: l6.max_fall,
-        })
+        dv.and_then(|d| d.l6.as_ref()).map(|l6| crate::model::ContentLight::new(l6.max_cll, l6.max_fall))
     });
 
     Hdr { format, mastering, content_light }

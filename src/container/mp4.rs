@@ -533,10 +533,7 @@ fn parse_clli(data: &[u8], b: &BoxHdr) -> Option<ContentLight> {
     if b.end < p + 4 {
         return None;
     }
-    Some(ContentLight {
-        max_cll: read_u16(data, p),
-        max_fall: read_u16(data, p + 2),
-    })
+    Some(ContentLight::new(read_u16(data, p), read_u16(data, p + 2)))
 }
 
 /// Build a per-sample byte-range index from stsc/stco/co64/stsz tables.

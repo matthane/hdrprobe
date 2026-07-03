@@ -836,10 +836,7 @@ fn parse_colour(
     }
 
     if max_cll.is_some() || max_fall.is_some() {
-        *content_light = Some(ContentLight {
-            max_cll: max_cll.unwrap_or(0) as u16,
-            max_fall: max_fall.unwrap_or(0) as u16,
-        });
+        *content_light = Some(ContentLight::new(max_cll.unwrap_or(0) as u16, max_fall.unwrap_or(0) as u16));
     }
 }
 

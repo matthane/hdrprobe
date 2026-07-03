@@ -269,6 +269,7 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 |---|---|---|---|
 | `max_cll` | integer | always | Maximum content light level, cd/m² |
 | `max_fall` | integer | always | Maximum frame-average light level, cd/m² |
+| `zeroed` | boolean | always | `true` when MaxCLL and MaxFALL are both zero (a common real-world defect), mirroring `L6.zeroed` |
 
 ## Object: `DolbyVision`
 

@@ -74,7 +74,8 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 );
             }
             if let Some(cl) = &hdr.content_light {
-                kv(&mut s, &c, "Content light", &format!("MaxCLL {} · MaxFALL {}", cl.max_cll, cl.max_fall));
+                let flag = if cl.zeroed { format!("  {}", c.warn("(zeroed)")) } else { String::new() };
+                kv(&mut s, &c, "Content light", &format!("MaxCLL {} · MaxFALL {}{}", cl.max_cll, cl.max_fall, flag));
             }
             s.push('\n');
         }
