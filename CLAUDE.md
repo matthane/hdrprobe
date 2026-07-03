@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 82 unit tests
+cargo test                     # 87 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -101,7 +101,15 @@ excluded by config.
   breaks this model. The **one exception is TS/M2TS**, which scatters the elementary stream
   across packets: it fills `Demux::reassembled: Option<Vec<u8>>` and `chunks` index into *that*.
   `sample.rs` picks the source via `reassembled.as_deref().unwrap_or(mmap)`. All other backends
-  leave it `None`.
+  leave it `None`. **Fragmented MP4 (fMP4/CMAF) stays zero-copy too**: its moov `stbl` tables are
+  present but *empty* (a silently empty report, not an error), so when they yield no samples and
+  `moof` boxes exist, `mp4.rs` builds the index from each fragment's `tfhd`/`trun` tables instead
+  (`build_fragment_index`) — sizes/durations fall back tfhd → `mvex` trex defaults, every traf is
+  walked (not just the video track's) because a traf without an explicit base offset chains off
+  the end of the previous traf's data, and an unsizable run is dropped, never guessed. The summed
+  trun sample durations are the track's own exact duration: they feed fps and the bitrate
+  denominator (`stream_duration_secs`, matching MediaInfo's video-track rate), while the Duration
+  line keeps the mvhd presentation value, falling back to the sum and then `mehd`.
 - **Third-party parsers can panic, not just `Err`.** libdovi and the `hdr10plus` crate abort on
   some malformed input. Route *every* call into them through `dv::rpu::guard` (`catch_unwind`).
   **Never re-add `panic = "abort"` to the release profile** — it turns the guard into a no-op.
@@ -254,7 +262,9 @@ excluded by config.
 - **Average bitrate is per-backend and correct-or-labelled, never a wrong number.** Each backend
   fills `Demux::bitrate: Option<Bitrate>` (`model::Bitrate::{video_stream_bps,video_stream,overall}`)
   so container quirks stay local. A *video-stream* rate is emitted only from an exact source: MP4
-  sums the `stsz` sizes (exact, free — sample tables, never sample data); MKV prefers the mkvmerge
+  sums the `stsz` sizes (exact, free — sample tables, never sample data; an fMP4 sums the `trun`
+  sizes over the summed `trun` durations instead, and an *empty* index yields `None`, never 0 b/s);
+  MKV prefers the mkvmerge
   `BPS` statistics tag (what MediaInfo reports — used verbatim since it already spans the video
   track's own duration, which the Segment duration only approximates), else `NUMBER_OF_BYTES`, else
   the summed block index *only when complete* (`!stopped_early`); TS sums the reassembled stream

@@ -1,6 +1,8 @@
 //! Minimal ISOBMFF (MP4/MOV) demuxer. Walks the box tree to recover the video
 //! track's codec config (hvcC/av1C), DV config (dvcC/dvvC/dvwC), colour info, and a
-//! per-sample byte-range index from the `stbl` tables. Never reads sample
+//! per-sample byte-range index — from the `stbl` tables for a classic mux, or
+//! from the `moof` fragments' `traf`/`tfhd`/`trun` boxes for a fragmented MP4
+//! (fMP4/CMAF), whose moov tables are present but empty. Never reads sample
 //! payloads here — only their offsets/sizes.
 
 use anyhow::{bail, Context, Result};
@@ -10,6 +12,7 @@ use crate::model::{ColorInfo, ContentLight, MasteringDisplay};
 
 struct BoxHdr {
     typ: [u8; 4],
+    start: usize,   // abs offset of the box header (first byte of the size field)
     payload: usize, // abs offset of payload start
     end: usize,     // abs offset of box end
 }
@@ -64,7 +67,7 @@ fn iter_boxes(d: &[u8], start: usize, end: usize) -> Vec<BoxHdr> {
         if box_end > end || box_end <= p {
             break;
         }
-        out.push(BoxHdr { typ, payload, end: box_end });
+        out.push(BoxHdr { typ, start: p, payload, end: box_end });
         p = box_end;
     }
     out
@@ -134,7 +137,18 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             continue;
         }
 
-        if let Some(t) = parse_video_track(data, &mdia_boxes, movie_timescale, movie_duration)? {
+        // Track id from tkhd — a fragment's tfhd names its track by this id.
+        let track_id = find(&trak_boxes, b"tkhd")
+            .map(|t| {
+                let v = *data.get(t.payload).unwrap_or(&0);
+                let o = if v == 1 { t.payload + 20 } else { t.payload + 12 };
+                read_u32(data, o)
+            })
+            .unwrap_or(0);
+
+        if let Some(t) =
+            parse_video_track(data, &mdia_boxes, movie_timescale, movie_duration, track_id)?
+        {
             tracks.push(t);
         }
     }
@@ -142,6 +156,48 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
     if tracks.is_empty() {
         bail!("no video track found in MP4");
     }
+
+    // Fragmented MP4 (fMP4/CMAF): the moov's stbl tables are present but empty —
+    // the sample layout lives in the moof fragments' trun boxes. Fill each empty
+    // track's index from the fragments; the chunks still point into the mmap, so
+    // the zero-copy model holds (data offsets resolve against the enclosing moof
+    // or an explicit base offset, never a reassembled buffer).
+    if tracks.iter().any(|t| t.chunks.is_empty()) && top.iter().any(|b| &b.typ == b"moof") {
+        let (trex, mehd_duration) = parse_mvex(data, &moov_boxes);
+        for t in &mut tracks {
+            if !t.chunks.is_empty() {
+                continue;
+            }
+            let (chunks, duration_ticks) = build_fragment_index(data, &top, t.track_id, &trex);
+            t.chunks = chunks;
+            // The summed trun sample durations are the track's exact own duration
+            // (the bitrate denominator); the Duration line keeps the mvhd value,
+            // falling back to this sum and then the mvex mehd when mvhd is empty.
+            if duration_ticks > 0 && t.media_timescale > 0 {
+                t.stream_duration_secs =
+                    Some(duration_ticks as f64 / t.media_timescale as f64);
+            }
+            if t.duration_secs.is_none() {
+                t.duration_secs = t.stream_duration_secs.or(
+                    if mehd_duration > 0 && movie_timescale > 0 {
+                        Some(mehd_duration as f64 / movie_timescale as f64)
+                    } else {
+                        None
+                    },
+                );
+            }
+            // fps: prefer the summed sample durations (exact, media timescale);
+            // fall back to sample count over the container duration.
+            if t.fps.is_none() && !t.chunks.is_empty() {
+                t.fps = if duration_ticks > 0 && t.media_timescale > 0 {
+                    Some(t.chunks.len() as f64 * t.media_timescale as f64 / duration_ticks as f64)
+                } else {
+                    t.duration_secs.filter(|d| *d > 0.0).map(|d| t.chunks.len() as f64 / d)
+                };
+            }
+        }
+    }
+
     Ok(assemble_tracks(data, tracks, container_label(&top, data)))
 }
 
@@ -151,6 +207,14 @@ struct VideoTrack {
     chunks: Vec<Chunk>,
     fps: Option<f64>,
     duration_secs: Option<f64>,
+    /// The track's *own* playback duration, when it is known exactly — the mdhd
+    /// media duration, or for a fragmented mux the summed trun sample durations.
+    /// Used as the bitrate denominator (matching MediaInfo, and the same
+    /// track-own-duration preference as the MKV `BPS` tag); `duration_secs` may
+    /// instead be the whole-presentation mvhd value shown on the Duration line.
+    stream_duration_secs: Option<f64>,
+    track_id: u32,
+    media_timescale: u32,
 }
 
 /// Fold one or more video tracks into a single `Demux`. For the common
@@ -199,10 +263,14 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         color
     };
 
-    // The stsz table gives every sample's encoded size, so the concatenated
-    // chunks are the exact video-stream byte count — no sample data was read.
+    // The stsz table (or the fragment trun index) gives every sample's encoded
+    // size, so the concatenated chunks are the exact video-stream byte count —
+    // no sample data was read. Divide by the track's own duration when known.
     let stream_bytes = chunks.iter().map(|c| c.size).sum::<u64>();
-    let bitrate = crate::model::Bitrate::video_stream(stream_bytes, p.duration_secs);
+    let bitrate = crate::model::Bitrate::video_stream(
+        stream_bytes,
+        p.stream_duration_secs.or(p.duration_secs),
+    );
 
     // More than one video track means a Profile-7 base/enhancement pair muxed as
     // separate `trak`s (dual track); a single track holds an interleaved or
@@ -237,6 +305,7 @@ fn parse_video_track(
     mdia_boxes: &[BoxHdr],
     movie_timescale: u32,
     movie_duration: u64,
+    track_id: u32,
 ) -> Result<Option<VideoTrack>> {
     // media timescale / duration
     let (media_timescale, media_duration) = match find(mdia_boxes, b"mdhd") {
@@ -270,19 +339,30 @@ fn parse_video_track(
     let sample_count = chunks.len() as u64;
 
     // Duration / fps.
-    let duration_secs = if media_timescale > 0 && media_duration > 0 {
+    let stream_duration_secs = if media_timescale > 0 && media_duration > 0 {
         Some(media_duration as f64 / media_timescale as f64)
-    } else if movie_timescale > 0 && movie_duration > 0 {
-        Some(movie_duration as f64 / movie_timescale as f64)
     } else {
         None
     };
+    let duration_secs = stream_duration_secs.or(if movie_timescale > 0 && movie_duration > 0 {
+        Some(movie_duration as f64 / movie_timescale as f64)
+    } else {
+        None
+    });
     let fps = match (duration_secs, sample_count) {
         (Some(d), n) if d > 0.0 && n > 0 => Some(n as f64 / d),
         _ => None,
     };
 
-    Ok(Some(VideoTrack { sd, chunks, fps, duration_secs }))
+    Ok(Some(VideoTrack {
+        sd,
+        chunks,
+        fps,
+        duration_secs,
+        stream_duration_secs,
+        track_id,
+        media_timescale,
+    }))
 }
 
 struct SampleDesc {
@@ -315,7 +395,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     };
 
     // VisualSampleEntry: width/height at box offset 32/34; child boxes at 86.
-    let entry_box_start = entry.payload - 8; // back up to the box header start
+    let entry_box_start = entry.start;
     let width = read_u16(data, entry_box_start + 32) as u32;
     let height = read_u16(data, entry_box_start + 34) as u32;
     let children = iter_boxes(data, entry_box_start + 86, entry.end);
@@ -606,6 +686,182 @@ fn build_sample_index(data: &[u8], stbl: &[BoxHdr], _codec: Codec) -> Result<Vec
     Ok(chunks)
 }
 
+/// Per-track sample defaults from a `trex` box, applied to fragment samples that
+/// carry neither a per-sample value in their `trun` nor a `tfhd` default.
+struct TrexDefault {
+    track_id: u32,
+    sample_duration: u32,
+    sample_size: u32,
+}
+
+/// Movie-fragment defaults from the moov's `mvex`: the per-track `trex` entries
+/// plus the `mehd` whole-presentation duration (movie-timescale ticks, 0 when
+/// absent). An fMP4 without an `mvex` yields empty defaults, not an error.
+fn parse_mvex(data: &[u8], moov_boxes: &[BoxHdr]) -> (Vec<TrexDefault>, u64) {
+    let mut trex = Vec::new();
+    let mut mehd_duration = 0u64;
+    let Some(mvex) = find(moov_boxes, b"mvex") else {
+        return (trex, mehd_duration);
+    };
+    for c in &iter_boxes(data, mvex.payload, mvex.end) {
+        match &c.typ {
+            b"mehd" => {
+                let v = *data.get(c.payload).unwrap_or(&0);
+                mehd_duration = if v == 1 {
+                    read_u64(data, c.payload + 4)
+                } else {
+                    read_u32(data, c.payload + 4) as u64
+                };
+            }
+            // trex: version/flags, track_ID, default_sample_description_index,
+            // default_sample_duration, default_sample_size, default_sample_flags.
+            b"trex" => trex.push(TrexDefault {
+                track_id: read_u32(data, c.payload + 4),
+                sample_duration: read_u32(data, c.payload + 12),
+                sample_size: read_u32(data, c.payload + 16),
+            }),
+            _ => {}
+        }
+    }
+    (trex, mehd_duration)
+}
+
+/// Track-fragment header: which track this `traf` extends, plus the sample
+/// defaults and data-offset base that its `trun` runs resolve against.
+struct Tfhd {
+    track_id: u32,
+    base_data_offset: Option<u64>,
+    default_base_is_moof: bool,
+    default_sample_duration: Option<u32>,
+    default_sample_size: Option<u32>,
+}
+
+fn parse_tfhd(data: &[u8], b: &BoxHdr) -> Tfhd {
+    let p = b.payload;
+    let flags = read_u32(data, p) & 0x00FF_FFFF;
+    let track_id = read_u32(data, p + 4);
+    let mut off = p + 8;
+    let mut base_data_offset = None;
+    if flags & 0x1 != 0 {
+        base_data_offset = Some(read_u64(data, off));
+        off += 8;
+    }
+    if flags & 0x2 != 0 {
+        off += 4; // sample_description_index
+    }
+    let mut default_sample_duration = None;
+    if flags & 0x8 != 0 {
+        default_sample_duration = Some(read_u32(data, off));
+        off += 4;
+    }
+    let mut default_sample_size = None;
+    if flags & 0x10 != 0 {
+        default_sample_size = Some(read_u32(data, off));
+    }
+    Tfhd {
+        track_id,
+        base_data_offset,
+        default_base_is_moof: flags & 0x0002_0000 != 0,
+        default_sample_duration,
+        default_sample_size,
+    }
+}
+
+/// Build the per-sample byte index for one track of a fragmented MP4 by walking
+/// every top-level `moof`'s `traf`/`tfhd`/`trun` boxes. Every traf is walked (not
+/// just the target track's) because a traf without an explicit base offset chains
+/// implicitly off the end of the previous traf's data. Returns the chunks plus
+/// the summed per-sample durations in media-timescale ticks (0 when no duration
+/// signal exists), so the caller can derive duration/fps when the moov carries
+/// neither. Metadata-only: reads box headers and tables, never sample payloads.
+fn build_fragment_index(
+    data: &[u8],
+    top: &[BoxHdr],
+    track_id: u32,
+    trex: &[TrexDefault],
+) -> (Vec<Chunk>, u64) {
+    let mut chunks = Vec::new();
+    let mut duration_ticks = 0u64;
+
+    for moof in top.iter().filter(|b| &b.typ == b"moof") {
+        let moof_boxes = iter_boxes(data, moof.payload, moof.end);
+        // Data-offset base for a traf that declares none: the moof start for the
+        // first, then the running end of the previous traf's data.
+        let mut implicit_base = moof.start as u64;
+        for traf in moof_boxes.iter().filter(|b| &b.typ == b"traf") {
+            let traf_boxes = iter_boxes(data, traf.payload, traf.end);
+            let Some(tfhd_box) = find(&traf_boxes, b"tfhd") else { continue };
+            let tfhd = parse_tfhd(data, tfhd_box);
+            let tdef = trex.iter().find(|t| t.track_id == tfhd.track_id);
+            let default_size =
+                tfhd.default_sample_size.or(tdef.map(|t| t.sample_size));
+            let default_duration =
+                tfhd.default_sample_duration.or(tdef.map(|t| t.sample_duration));
+            let is_target = tfhd.track_id == track_id;
+
+            let base = tfhd.base_data_offset.unwrap_or(if tfhd.default_base_is_moof {
+                moof.start as u64
+            } else {
+                implicit_base
+            });
+            let mut off = base;
+            for trun in traf_boxes.iter().filter(|b| &b.typ == b"trun") {
+                let p = trun.payload;
+                let flags = read_u32(data, p) & 0x00FF_FFFF;
+                let declared = read_u32(data, p + 4) as usize;
+                let mut ep = p + 8;
+                if flags & 0x1 != 0 {
+                    // data_offset is signed, relative to the traf's base.
+                    let doff = read_u32(data, ep) as i32;
+                    off = (base as i64 + doff as i64).max(0) as u64;
+                    ep += 4;
+                }
+                if flags & 0x4 != 0 {
+                    ep += 4; // first_sample_flags
+                }
+                let has_duration = flags & 0x100 != 0;
+                let has_size = flags & 0x200 != 0;
+                if !has_size && default_size.is_none() {
+                    continue; // no way to size these samples
+                }
+                // Per-sample entry stride: duration, size, flags, cto — each 4
+                // bytes when its flag is set, in that order.
+                let stride = 4 * ((has_duration as usize)
+                    + (has_size as usize)
+                    + ((flags & 0x400 != 0) as usize)
+                    + ((flags & 0x800 != 0) as usize));
+                let count = if stride > 0 {
+                    clamp_count(declared, ep, stride, trun.end)
+                } else {
+                    // All-default samples carry no entry bytes to clamp against;
+                    // cap the count so a corrupt value can't drive a huge alloc.
+                    declared.min(1 << 20)
+                };
+                for i in 0..count {
+                    let e = ep + i * stride;
+                    let duration = if has_duration {
+                        read_u32(data, e)
+                    } else {
+                        default_duration.unwrap_or(0)
+                    };
+                    let size = if has_size {
+                        read_u32(data, e + if has_duration { 4 } else { 0 })
+                    } else {
+                        default_size.unwrap_or(0)
+                    } as u64;
+                    if is_target {
+                        chunks.push(Chunk { offset: off, size });
+                        duration_ticks += duration as u64;
+                    }
+                    off += size;
+                }
+            }
+            implicit_base = off;
+        }
+    }
+    (chunks, duration_ticks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +896,9 @@ mod tests {
             chunks: (0..chunks).map(|i| Chunk { offset: i as u64, size: 1 }).collect(),
             fps: Some(24.0),
             duration_secs: Some(1.0),
+            stream_duration_secs: None,
+            track_id: 1,
+            media_timescale: 0,
         }
     }
 
@@ -728,7 +987,7 @@ mod tests {
             buf.extend_from_slice(&size.to_be_bytes());
             buf.extend_from_slice(&typ);
             buf.extend_from_slice(body);
-            boxes.push(BoxHdr { typ, payload: start + 8, end: buf.len() });
+            boxes.push(BoxHdr { typ, start, payload: start + 8, end: buf.len() });
         };
         // stsz: 4 (ver/flags) + 4 (sample_size=0) + 4 (count=1e9) + 2 sizes
         let mut stsz = vec![0, 0, 0, 0, 0, 0, 0, 0];
@@ -761,16 +1020,115 @@ mod tests {
         // the stri eye-view byte 0x03 = left + right present → a stereo pair.
         let vexu = hex_bytes("0000001d766578750000001565796573000000\
                               0d737472690000000003");
-        let hdr = BoxHdr { typ: *b"vexu", payload: 8, end: vexu.len() };
+        let hdr = BoxHdr { typ: *b"vexu", start: 0, payload: 8, end: vexu.len() };
         assert_eq!(parse_stereo(&vexu, &hdr).as_deref(), Some("Stereoscopic 3D (2 views)"));
 
         // A monoscopic file has no vexu; an empty/childless one yields no label.
-        let empty = BoxHdr { typ: *b"vexu", payload: 8, end: 8 };
+        let empty = BoxHdr { typ: *b"vexu", start: 0, payload: 8, end: 8 };
         assert_eq!(parse_stereo(&[0; 8], &empty), None);
     }
 
     fn hex_bytes(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// Serialize one size-prefixed box (header + body) for synthetic fragments.
+    fn boxb(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = ((8 + body.len()) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(body);
+        v
+    }
+
+    fn u32s(vals: &[u32]) -> Vec<u8> {
+        vals.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn fragment_index_walks_trun_runs() {
+        // moof { traf { tfhd (track 1, default-base-is-moof), trun (data_offset,
+        // per-sample sizes 10 and 20) } }, offset from the moof box start.
+        let tfhd = boxb(b"tfhd", &u32s(&[0x0002_0000, 1]));
+        let trun = boxb(b"trun", &u32s(&[0x201, 2, 100, 10, 20]));
+        let traf = boxb(b"traf", &[tfhd, trun].concat());
+        let mut buf = boxb(b"free", &[0; 8]); // shift the moof off offset 0
+        buf.extend_from_slice(&boxb(b"moof", &traf));
+        let moof_start = 16u64;
+
+        let top = iter_boxes(&buf, 0, buf.len());
+        let (chunks, ticks) = build_fragment_index(&buf, &top, 1, &[]);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!((chunks[0].offset, chunks[0].size), (moof_start + 100, 10));
+        assert_eq!((chunks[1].offset, chunks[1].size), (moof_start + 110, 20));
+        assert_eq!(ticks, 0, "no duration signal anywhere");
+    }
+
+    #[test]
+    fn fragment_index_chains_trafs_and_applies_trex_defaults() {
+        // An audio traf (track 2) precedes the video traf (track 1). The video
+        // traf declares no base offset, so it chains implicitly off the end of
+        // the audio data; its trun has no per-sample fields, so size/duration
+        // come from the trex defaults.
+        let audio_tfhd = boxb(b"tfhd", &u32s(&[0x0002_0000, 2]));
+        let audio_trun = boxb(b"trun", &u32s(&[0x201, 1, 200, 50]));
+        let audio_traf = boxb(b"traf", &[audio_tfhd, audio_trun].concat());
+        let video_tfhd = boxb(b"tfhd", &u32s(&[0, 1]));
+        let video_trun = boxb(b"trun", &u32s(&[0, 3]));
+        let video_traf = boxb(b"traf", &[video_tfhd, video_trun].concat());
+        let buf = boxb(b"moof", &[audio_traf, video_traf].concat());
+
+        let trex = [TrexDefault { track_id: 1, sample_duration: 100, sample_size: 5 }];
+        let top = iter_boxes(&buf, 0, buf.len());
+        let (chunks, ticks) = build_fragment_index(&buf, &top, 1, &trex);
+        assert_eq!(chunks.len(), 3, "only the target track's samples are indexed");
+        // Audio data ran [moof+200, moof+250); video continues from there.
+        assert_eq!((chunks[0].offset, chunks[0].size), (250, 5));
+        assert_eq!(chunks[2].offset, 260);
+        assert_eq!(ticks, 300, "trex default duration summed per sample");
+    }
+
+    #[test]
+    fn fragment_index_survives_a_lying_trun_count() {
+        // trun declares 1e9 samples but holds two size entries → clamped to what
+        // the box bytes can hold, no giant alloc, no panic.
+        let tfhd = boxb(b"tfhd", &u32s(&[0x0002_0000, 1]));
+        let trun = boxb(b"trun", &u32s(&[0x200, 1_000_000_000, 10, 20]));
+        let traf = boxb(b"traf", &[tfhd, trun].concat());
+        let buf = boxb(b"moof", &traf);
+
+        let top = iter_boxes(&buf, 0, buf.len());
+        let (chunks, _) = build_fragment_index(&buf, &top, 1, &[]);
+        assert_eq!(chunks.len(), 2, "only the two real entries are indexed");
+        assert_eq!(chunks[1].size, 20);
+    }
+
+    #[test]
+    fn fragment_index_drops_unsizable_runs() {
+        // No per-sample sizes, no tfhd default, no trex entry: the samples can't
+        // be sized, so the run yields nothing rather than fabricated chunks.
+        let tfhd = boxb(b"tfhd", &u32s(&[0x0002_0000, 1]));
+        let trun = boxb(b"trun", &u32s(&[0, 4]));
+        let traf = boxb(b"traf", &[tfhd, trun].concat());
+        let buf = boxb(b"moof", &traf);
+
+        let top = iter_boxes(&buf, 0, buf.len());
+        let (chunks, _) = build_fragment_index(&buf, &top, 1, &[]);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn parse_mvex_reads_trex_and_mehd() {
+        let mehd = boxb(b"mehd", &u32s(&[0, 178_000]));
+        let trex = boxb(b"trex", &u32s(&[0, 1, 1, 1001, 4096, 0]));
+        let moov = boxb(b"moov", &boxb(b"mvex", &[mehd, trex].concat()));
+        let moov_boxes = iter_boxes(&moov, 8, moov.len());
+
+        let (trex, mehd_duration) = parse_mvex(&moov, &moov_boxes);
+        assert_eq!(mehd_duration, 178_000);
+        assert_eq!(trex.len(), 1);
+        assert_eq!(trex[0].track_id, 1);
+        assert_eq!(trex[0].sample_duration, 1001);
+        assert_eq!(trex[0].sample_size, 4096);
     }
 }
