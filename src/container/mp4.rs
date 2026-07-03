@@ -86,6 +86,94 @@ pub fn moov_extent(data: &[u8]) -> Option<(usize, usize)> {
     find(&top, b"moov").map(|b| (b.payload, b.end))
 }
 
+/// Per-fragment bytes warmed from a `sidx` hint: enough for the `moof`'s
+/// header tables (a few KiB for a seconds-long fragment), never the mdat.
+const MOOF_WARM_BYTES: usize = 16 * 1024;
+/// Cap on hinted fragments so a hostile `sidx` (u16 count, 65535 max) can't
+/// queue tens of thousands of warm reads; a partial warm still speeds the
+/// front of the moof walk.
+const SIDX_MAX_FRAGMENTS: usize = 4096;
+
+/// Fragment head ranges `(offset, len)` hinted by a front `sidx` box, for the
+/// prefetch warmer. Indexing a fragmented MP4 walks moof → moof via top-level
+/// box headers — a serial pointer chase costing one network round-trip per
+/// fragment — but a CMAF-style front `sidx` lists every fragment's byte size up
+/// front, so the warmer can stream all the moof header regions concurrently
+/// before `build_fragment_index` walks them. **Hint-only by design**: the
+/// fragment index is still built from the moof boxes themselves, so a missing
+/// or lying `sidx` costs nothing but a wasted warm. The search never chases
+/// past the first `moof`/`mdat` or `search_limit` (a tail `sidx` couldn't be
+/// found without the very pointer chase this avoids).
+pub fn sidx_fragment_heads(data: &[u8], search_limit: usize) -> Option<Vec<(u64, usize)>> {
+    // Bounded front walk for a top-level sidx; deliberately not `iter_boxes`
+    // over the whole file, which would itself fault every box header in.
+    let end = data.len();
+    let mut p = 0usize;
+    let sidx = loop {
+        if p + 8 > end || p > search_limit {
+            return None;
+        }
+        let size32 = read_u32(data, p) as usize;
+        let typ = [data[p + 4], data[p + 5], data[p + 6], data[p + 7]];
+        let (payload, box_end) = if size32 == 1 {
+            if p + 16 > end {
+                return None;
+            }
+            (p + 16, p + read_u64(data, p + 8) as usize)
+        } else if size32 == 0 {
+            (p + 8, end)
+        } else {
+            (p + 8, p + size32)
+        };
+        if box_end > end || box_end <= p {
+            return None;
+        }
+        match &typ {
+            b"sidx" => break BoxHdr { typ, start: p, payload, end: box_end },
+            // Fragments started: a usable global sidx sits in front of them, and
+            // walking on would *be* the per-moof pointer chase. An `mdat` is
+            // different — one bounded hop — and real muxes put one before the
+            // sidx (ffmpeg's global_sidx writes the first fragment as a
+            // moov-indexed mdat), so it falls through to the skip.
+            b"moof" => return None,
+            _ => {}
+        }
+        p = box_end;
+    };
+
+    // sidx (FullBox): reference_ID(4) timescale(4), then EPT + first_offset at
+    // 32/64 bits by version, reserved(2), reference_count(2), 12-byte entries.
+    let p = sidx.payload;
+    let version = *data.get(p)?;
+    let (first_offset, count_off) = if version == 0 {
+        (read_u32(data, p + 16) as u64, p + 22)
+    } else {
+        (read_u64(data, p + 20), p + 30)
+    };
+    let declared = read_u16(data, count_off) as usize;
+    let entries = count_off + 2;
+    let n = clamp_count(declared, entries, 12, sidx.end).min(SIDX_MAX_FRAGMENTS);
+
+    // Fragments chain from the first byte after the sidx box plus first_offset;
+    // each entry's referenced_size advances the running offset.
+    let mut off = (sidx.end as u64).saturating_add(first_offset);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let word = read_u32(data, entries + i * 12);
+        let size = (word & 0x7FFF_FFFF) as u64;
+        if size == 0 {
+            break; // degenerate entry; stop rather than warm one spot repeatedly
+        }
+        // reference_type 1 points at a nested sidx, not media; skip its head
+        // but keep advancing the chain.
+        if word & 0x8000_0000 == 0 {
+            out.push((off, (size as usize).min(MOOF_WARM_BYTES)));
+        }
+        off = off.saturating_add(size);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// QuickTime (`.mov`) and MP4 share the ISOBMFF box structure, so one backend
 /// reads both. They differ only in the `ftyp` major brand: a QuickTime-native
 /// mux stamps `qt  `, and MediaInfo labels such files "QuickTime". Report that
@@ -1115,6 +1203,72 @@ mod tests {
         let top = iter_boxes(&buf, 0, buf.len());
         let (chunks, _) = build_fragment_index(&buf, &top, 1, &[]);
         assert!(chunks.is_empty());
+    }
+
+    /// sidx body: version/flags, reference_ID, timescale, EPT + first_offset
+    /// (32-bit v0 / 64-bit v1), reserved, count, then 12-byte entries.
+    fn sidx_body(version: u8, first_offset: u64, entries: &[(bool, u32)]) -> Vec<u8> {
+        let mut b = vec![version, 0, 0, 0];
+        b.extend_from_slice(&u32s(&[1, 90_000])); // reference_ID, timescale
+        if version == 0 {
+            b.extend_from_slice(&u32s(&[0, first_offset as u32])); // EPT, first_offset
+        } else {
+            b.extend_from_slice(&0u64.to_be_bytes());
+            b.extend_from_slice(&first_offset.to_be_bytes());
+        }
+        b.extend_from_slice(&(0u16).to_be_bytes()); // reserved
+        b.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for &(is_sidx, size) in entries {
+            let word = size & 0x7FFF_FFFF | if is_sidx { 0x8000_0000 } else { 0 };
+            b.extend_from_slice(&u32s(&[word, 90_000, 0])); // word, duration, SAP
+        }
+        b
+    }
+
+    #[test]
+    fn sidx_fragment_heads_chain_from_the_box_end() {
+        // ftyp, then a v0 sidx with two media references and a nested-sidx
+        // reference between them (skipped, but its size advances the chain).
+        let mut buf = boxb(b"ftyp", &[0; 8]);
+        let sidx = boxb(b"sidx", &sidx_body(0, 40, &[(false, 100), (true, 60), (false, 200)]));
+        let anchor = (buf.len() + sidx.len()) as u64 + 40;
+        buf.extend_from_slice(&sidx);
+
+        let heads = sidx_fragment_heads(&buf, buf.len()).unwrap();
+        assert_eq!(heads, vec![(anchor, 100), (anchor + 160, 200)]);
+
+        // v1 (64-bit EPT/first_offset) resolves the same chain.
+        let mut buf = boxb(b"ftyp", &[0; 8]);
+        let sidx = boxb(b"sidx", &sidx_body(1, 0, &[(false, 1 << 24)]));
+        let anchor = (buf.len() + sidx.len()) as u64;
+        buf.extend_from_slice(&sidx);
+        let heads = sidx_fragment_heads(&buf, buf.len()).unwrap();
+        assert_eq!(heads, vec![(anchor, MOOF_WARM_BYTES)], "warm len capped to the moof head");
+    }
+
+    #[test]
+    fn sidx_fragment_heads_survive_a_lying_count_and_stop_at_moof() {
+        // Count claims 1000 entries but the box holds one: clamped, no panic.
+        let mut body = sidx_body(0, 0, &[(false, 100)]);
+        let count_off = body.len() - 12 - 2;
+        body[count_off..count_off + 2].copy_from_slice(&1000u16.to_be_bytes());
+        let buf = boxb(b"sidx", &body);
+        assert_eq!(sidx_fragment_heads(&buf, buf.len()).unwrap().len(), 1);
+
+        // A sidx *after* the first moof is never chased...
+        let mut buf = boxb(b"moof", &[0; 8]);
+        buf.extend_from_slice(&boxb(b"sidx", &sidx_body(0, 0, &[(false, 100)])));
+        assert_eq!(sidx_fragment_heads(&buf, buf.len()), None);
+
+        // ...but an mdat before it is hopped over in one bounded jump
+        // (ffmpeg's global_sidx layout: ftyp, moov, mdat, sidx, moof...).
+        let mut buf = boxb(b"mdat", &[0; 32]);
+        buf.extend_from_slice(&boxb(b"sidx", &sidx_body(0, 0, &[(false, 100)])));
+        assert_eq!(sidx_fragment_heads(&buf, buf.len()).unwrap().len(), 1);
+
+        // Zero-size entries stop the chain rather than loop in place.
+        let buf = boxb(b"sidx", &sidx_body(0, 0, &[(false, 0), (false, 100)]));
+        assert_eq!(sidx_fragment_heads(&buf, buf.len()), None);
     }
 
     #[test]

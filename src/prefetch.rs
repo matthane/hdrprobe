@@ -131,6 +131,14 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
         if let Some((start, end)) = crate::container::mp4::moov_extent(data) {
             ranges.push((start as u64, end - start));
         }
+        // Fragmented MP4: a front `sidx` lists every fragment's byte size, so
+        // the moof header regions can be streamed concurrently instead of the
+        // fragment index's serial moof → moof pointer chase faulting one
+        // round-trip per fragment. Hint-only: the index is still built from
+        // the moof boxes themselves.
+        if let Some(heads) = crate::container::mp4::sidx_fragment_heads(data, HEAD_WARM) {
+            ranges.extend(heads);
+        }
     }
 
     // MKV writes the statistics `Tags` after the clusters (past the head window);
@@ -243,7 +251,7 @@ fn warm(file: &File, offset: u64, len: usize) {
     if len == 0 {
         return;
     }
-    let mut buf = vec![0u8; 1 << 20]; // 1 MiB scratch
+    let mut buf = vec![0u8; len.min(1 << 20)]; // scratch, 1 MiB cap
     let mut pos = offset;
     let mut remaining = len;
     while remaining > 0 {
