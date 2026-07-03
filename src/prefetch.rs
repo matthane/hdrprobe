@@ -126,7 +126,8 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
 
     // MP4 with `moov` at the tail is the one common metadata region the head
     // window misses; a front-placed `moov` merges into the head range.
-    if looks_like_mp4(path, data) {
+    let is_mp4 = looks_like_mp4(path, data);
+    if is_mp4 {
         if let Some((start, end)) = crate::container::mp4::moov_extent(data) {
             ranges.push((start as u64, end - start));
         }
@@ -136,9 +137,23 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
     // the demux reads it for the per-stream bitrate via the front SeekHead. Warm
     // that small tail element so the read isn't a lone RTT; a front-placed `Tags`
     // (inside the head) merges away.
-    if looks_like_mkv(path, data) {
+    let is_mkv = looks_like_mkv(path, data);
+    if is_mkv {
         if let Some((start, end)) = crate::container::mkv::tags_extent(data) {
             ranges.push((start as u64, end - start));
+        }
+    }
+
+    // Raw HEVC (Annex-B) NAL-splits bounded windows spread across the file at
+    // demux time (`annexb::split_windows`); only the first sits inside the head
+    // warm. Warm each nominal span so the walk doesn't fault 2 MiB windows in
+    // page-cluster round-trips. `None` when the whole-file scan applies; the
+    // head-covered span merges away. Container sniffs above win ties: a box
+    // size or cluster byte can look like a start code, but a raw stream can't
+    // look like a container.
+    if !is_ts && !is_mp4 && !is_mkv && looks_like_raw_hevc(path, data) {
+        if let Some(spans) = crate::container::annexb::window_spans(size) {
+            ranges.extend(spans);
         }
     }
 
@@ -261,6 +276,13 @@ fn looks_like_mkv(path: &Path, data: &[u8]) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     matches!(ext.as_str(), "mkv" | "webm" | "mka")
         || (data.len() >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3)
+}
+
+fn looks_like_raw_hevc(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "hevc" | "h265" | "265")
+        || data.starts_with(&[0, 0, 1])
+        || data.starts_with(&[0, 0, 0, 1])
 }
 
 #[cfg(test)]

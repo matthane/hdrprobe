@@ -14,6 +14,32 @@ use crate::model::ColorInfo;
 const WINDOW_BYTES: usize = 2 * 1024 * 1024;
 const NUM_WINDOWS: usize = 24;
 
+/// Warm overshoot past a window's nominal end: `split_windows` starts at the
+/// first start code at/after `k * stride` and extends past `WINDOW_BYTES` to the
+/// next start code, both typically well inside this slack.
+const WINDOW_WARM_SLACK: usize = 64 * 1024;
+
+/// Nominal byte spans `(offset, len)` the default windowed scan will read, for
+/// the network prefetch warmer: `None` when the whole-file scan applies (the
+/// file fits under the windowing threshold — `--full` scans everything at any
+/// size and needs no span list). Spans start at the same `k * stride` positions
+/// `split_windows` resyncs from; sharing this file's constants keeps the
+/// warm/scan coupling structural rather than a doc handshake.
+pub fn window_spans(len: usize) -> Option<Vec<(u64, usize)>> {
+    if len <= WINDOW_BYTES * NUM_WINDOWS {
+        return None;
+    }
+    let stride = len / NUM_WINDOWS;
+    Some(
+        (0..NUM_WINDOWS)
+            .map(|k| {
+                let ws = k * stride;
+                (ws as u64, (WINDOW_BYTES + WINDOW_WARM_SLACK).min(len - ws))
+            })
+            .collect(),
+    )
+}
+
 pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     let mut nals: Vec<NalRef> = Vec::new();
     if full || data.len() <= WINDOW_BYTES * NUM_WINDOWS {
@@ -195,6 +221,25 @@ mod tests {
 
     fn nal_type_of(b: u8) -> u8 {
         (b >> 1) & 0x3F
+    }
+
+    #[test]
+    fn window_spans_mirror_the_windowed_scan() {
+        // Under the windowing threshold the demux scans the whole file: no spans.
+        assert_eq!(window_spans(WINDOW_BYTES * NUM_WINDOWS), None);
+
+        // Above it, one in-bounds span per window, anchored at the same
+        // `k * stride` resync positions `split_windows` uses and covering at
+        // least the nominal window bytes available from there.
+        let len = 300 * 1024 * 1024;
+        let spans = window_spans(len).unwrap();
+        assert_eq!(spans.len(), NUM_WINDOWS);
+        let stride = len / NUM_WINDOWS;
+        for (k, &(off, sz)) in spans.iter().enumerate() {
+            assert_eq!(off as usize, k * stride);
+            assert!(sz >= WINDOW_BYTES.min(len - off as usize));
+            assert!(off as usize + sz <= len, "span must stay in bounds");
+        }
     }
 
     #[test]
