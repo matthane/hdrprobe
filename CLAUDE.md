@@ -69,11 +69,14 @@ excluded by config.
   `.bin`/`.rpu`), `dv_xml.rs` (DV CM XML), `hdr10plus_json.rs` (hdr10plus_tool JSON); `mod.rs`
   detects by extension and renders through the ordinary `Report`. DV sidecars carry no
   resolution, so L5 is sized against an assumed UHD canvas (`ASSUMED_CANVAS`) and labelled.
-  A DV XML's Level-0 globals **frame rate** and **mastering display** are read straight from the
-  raw XML in `dv_xml.rs` (`<EditRate>`, `<MasteringDisplay>` peak/min/primaries), *not* from
-  libdovi: `CmXmlParser` never parses `<EditRate>` and folds the mastering display into a lossy PQ
-  code, so reading the XML gives exact values. Both elements sit in the file head, so it's cheap;
-  keep them off the libdovi path. The XML's Level-0 primaries (tagged `[L0]`) are the
+  A DV XML's Level-0 globals **frame rate** and **mastering display**, and its **schema version**,
+  are read straight from the raw XML in `dv_xml.rs` (`<EditRate>`, `<MasteringDisplay>`
+  peak/min/primaries, and the root `version` attribute / `<Version>` child — the same pair libdovi
+  accepts), *not* from libdovi: `CmXmlParser` never parses `<EditRate>`, folds the mastering
+  display into a lossy PQ code, and reduces the version to a coarse enum, so reading the XML gives
+  exact values. All sit in the file head, so it's cheap; keep them off the libdovi path. The
+  version renders as the General section's `Schema version` line (`model::General::format_version`),
+  present only when an input declares one — today only DV XML sidecars. The XML's Level-0 primaries (tagged `[L0]`) are the
   mastering-gamut fallback for a CM v2.9 XML, which has no L9; a recognized L9 wins when present,
   so CM v4.0 output is unchanged.
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
