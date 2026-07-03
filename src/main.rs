@@ -11,6 +11,7 @@ mod model;
 mod prefetch;
 mod render;
 mod sample;
+mod shell;
 mod sidecar;
 
 use std::fs::File;
@@ -30,7 +31,7 @@ use crate::render::RenderOpts;
 #[command(name = "hdrprobe", version, about = "Fast HDR / Dolby Vision metadata inspector")]
 struct Cli {
     /// Input file(s) or directory(ies).
-    #[arg(required = true)]
+    #[arg(required_unless_present_any = ["install_shell", "uninstall_shell"])]
     files: Vec<PathBuf>,
 
     /// Output JSON instead of text (array for multiple files).
@@ -76,6 +77,14 @@ struct Cli {
     /// Write output to a file instead of stdout.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Register a right-click "Inspect HDR metadata" context-menu entry (Windows).
+    #[arg(long)]
+    install_shell: bool,
+
+    /// Remove the right-click context-menu entry (Windows).
+    #[arg(long)]
+    uninstall_shell: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -94,6 +103,19 @@ enum ColorWhen {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Shell integration is an action-and-exit path: register/remove the Explorer
+    // context-menu verb, then return without touching the file pipeline.
+    if cli.install_shell || cli.uninstall_shell {
+        let res = if cli.install_shell { shell::install() } else { shell::uninstall() };
+        return match res {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::from(1)
+            }
+        };
+    }
 
     // Third-party parsers (libdovi / hdr10plus) can panic on malformed input.
     // We isolate those with `catch_unwind` (see `dv::rpu::guard`) and handle
