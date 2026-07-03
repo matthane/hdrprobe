@@ -26,12 +26,12 @@ Dolby Vision
   Structure         Single track, dual layer
   Profile           7.6 (MEL)
   Content mapping   v4.0
+  Mastering         DCI-P3 D65 [L9] · max 1000  min 0.0001 cd/m²
   Trim targets      100 nits [L2/L8], 600 nits [L2], 1000 nits [L2]
   L5 offsets        L0 R0 T276 B276   [sampled]
   L5 active area    3840×1608  (2.39:1)
   L6 content light  MaxCLL 737 · MaxFALL 130
-  L9 mastering      DCI-P3 D65
-  L11 APO           Cinema · reference
+  L11 APO           Cinema · reference mode
 
 HDR10+
   Profile           B
@@ -50,8 +50,9 @@ signalling (primaries, transfer, matrix, and range), and stereoscopic / multivie
 
 ### HDR
 
-The static mastering display characteristics (ST.2086 primaries and min/max luminance) and the
-MaxCLL / MaxFALL content light levels.
+The static mastering display characteristics (ST.2086 min/max luminance and the mastering
+gamut, named when recognized: BT.2020, DCI-P3 D65, DCI-P3, or BT.709) and the MaxCLL / MaxFALL
+content light levels.
 
 ### Dolby Vision
 
@@ -70,12 +71,14 @@ layer's cross-compatibility id:
 | 10 | AV1 | `10.0`, `10.1`, `10.4` |
 | 20 | MV-HEVC | `20.0`, `20.4` |
 
-Alongside it, the track and layer structure (for dual-layer content) and the content-mapping
-version (`v2.9`, or `v4.0` via L254).
+Alongside it, the track and layer structure (for dual-layer content), the content-mapping
+version (`v2.9`, or `v4.0` via L254), and the DV grade's own mastering display, which can
+differ from the base layer's: on a Profile 7 title a 4000-nit grade can sit over a 1000-nit
+HDR10 base.
 
 **Dynamic levels.** The distinct values seen across the title: `L5` offsets and active areas,
-`L6` content light, `L9` mastering, `L11` APO (content type), and the set of `L2` / `L8` trim
-targets.
+`L6` content light, `L9` mastering gamut, `L11` APO (content type), and the set of `L2` / `L8`
+trim targets.
 
 **Deliberately omitted.** The per-frame and per-shot analysis levels (`L1` brightness, `L3` L1
 offsets) and the per-shot trim values. These vary shot to shot rather than describing the title,
