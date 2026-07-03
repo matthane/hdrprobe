@@ -124,11 +124,24 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     .as_ref()
                     .map(|p| format!("{p} {} · ", c.dim("[L9]")))
                     .unwrap_or_default();
+                // The grade out-brights the base layer's declared mastering: a
+                // FEL whose residual likely carries highlights the BL lacks, so
+                // stripping the EL (e.g. a P7 -> P8 conversion) would lose them.
+                let expansion = dv
+                    .fel_brightness_expansion
+                    .map(|_| format!("  {}", c.warn("(FEL brightness expansion)")))
+                    .unwrap_or_default();
                 kv(
                     &mut s,
                     &c,
                     "Mastering",
-                    &format!("{}max {}  min {} cd/m²", prim, fmt_num(md.max_luminance), fmt_num(md.min_luminance)),
+                    &format!(
+                        "{}max {}  min {} cd/m²{}",
+                        prim,
+                        fmt_num(md.max_luminance),
+                        fmt_num(md.min_luminance),
+                        expansion
+                    ),
                 );
             }
             if !dv.trim_targets.is_empty() {

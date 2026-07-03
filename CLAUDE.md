@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 61 unit tests
+cargo test                     # 69 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -122,6 +122,15 @@ excluded by config.
   the config + RPU the same way, and its **SDR base is inferred from the profile** in
   `hdr::assemble` (P4 is SDR-compatible by definition) since old P4 muxes carry neither a compat
   id nor a base-layer transfer VUI.
+- **FEL brightness expansion is a metadata verdict with hard gates.** The DV Mastering line's
+  `(FEL brightness expansion)` badge (`levels::flag_fel_brightness_expansion`) fires only when
+  the RPU is **FEL** *and* the grade's `source_max_pq` exceeds the **base layer's own** declared
+  mastering max (container MDCV / ST.2086 SEI) by >10% (e.g. 4000-nit grade over a 1000-nit BL).
+  Never flag a MEL (its residual is empty, so it can't out-bright the BL no matter what the
+  displays say), never compare against the RPU's L6 fallback (self-referential), and never flag
+  sidecars (no base layer to expand beyond), so `main.rs` is the only caller. This is a metadata
+  verdict only: confirming the general case would mean decoding and comparing composed-vs-BL
+  pixels, which hdrprobe never does, so a missing badge is not proof of no expansion.
 - **Extension dispatch falls back to content sniffing only on error.** `container::demux` picks a
   backend by extension and returns immediately on success — sniffing never runs on the happy path
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),

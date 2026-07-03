@@ -259,10 +259,22 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
     let scan = sample::scan(&demux, &mmap, &opts);
 
     let is_av1 = matches!(demux.codec, container::Codec::Av1);
-    let dv = scan
+    let mut dv = scan
         .dv
         .finalize(demux.width, demux.height, demux.dv_config.as_ref(), cli.full, is_av1, demux.dv_dual_track)
         .or_else(|| demux.dv_config.as_ref().map(|c| dv::levels::container_only(c, demux.dv_dual_track)));
+
+    // FEL brightness expansion is only decidable here on the video path: it
+    // needs the base layer's own declared mastering display (container MDCV or
+    // ST.2086 SEI), which a metadata sidecar doesn't have.
+    if let Some(dv) = dv.as_mut() {
+        let bl_max = demux
+            .mastering
+            .as_ref()
+            .or(scan.sei.mastering.as_ref())
+            .map(|m| m.max_luminance);
+        dv::levels::flag_fel_brightness_expansion(dv, bl_max);
+    }
 
     let hdr10plus = match scan.sei.hdr10plus {
         Some(info) => Hdr10Plus {

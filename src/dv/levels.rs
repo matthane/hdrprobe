@@ -12,7 +12,8 @@ use dolby_vision::rpu::rpu_data_nlq::DoviELType;
 
 use crate::container::DvConfig;
 use crate::model::{
-    ActiveArea, DolbyVision, DvCensus, L6Fallback, LevelPresence, MasteringDisplay, TrimTarget,
+    ActiveArea, DolbyVision, DvCensus, FelBrightnessExpansion, L6Fallback, LevelPresence,
+    MasteringDisplay, TrimTarget,
 };
 
 /// Metadata levels we census, in report order.
@@ -320,6 +321,9 @@ impl DvAggregate {
             l5_active_areas,
             l5_assumed_canvas: None,
             mastering_display,
+            // Filled by `flag_fel_brightness_expansion` after the base layer's
+            // mastering display is known; the RPU alone can't decide this.
+            fel_brightness_expansion: None,
             l6_fallback: self.l6,
             l9_mastering: l9_label,
             l11_content: self.l11_content.map(content_type_name),
@@ -354,6 +358,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         l5_active_areas: Vec::new(),
         l5_assumed_canvas: None,
         mastering_display: None,
+        fel_brightness_expansion: None,
         l6_fallback: None,
         l9_mastering: None,
         l11_content: None,
@@ -362,6 +367,32 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         rpu_count: 0,
         sampled: false,
         census: None,
+    }
+}
+
+/// Flag likely FEL brightness expansion: the grade's own mastering display
+/// (`source_max_pq`, already on `dv.mastering_display`) is meaningfully
+/// brighter than the base layer's declared mastering max in nits
+/// (`bl_max_nits`, from the container MDCV or the ST.2086 SEI, never the
+/// RPU's own L6 fallback, which would be self-referential). Gated to FEL: a
+/// MEL's residual is empty, so it can never carry brightness the BL lacks,
+/// however the mastering displays differ. This is a metadata verdict only;
+/// confirming the general case would mean decoding and comparing composed vs
+/// BL pixels, which hdrprobe never does, so a missing flag is not proof of no
+/// expansion.
+pub fn flag_fel_brightness_expansion(dv: &mut DolbyVision, bl_max_nits: Option<f64>) {
+    if dv.el_type.as_deref() != Some("FEL") {
+        return;
+    }
+    let Some(rpu_max) = dv.mastering_display.as_ref().map(|m| m.max_luminance) else { return };
+    let Some(bl_max) = bl_max_nits.filter(|&b| b > 0.0) else { return };
+    // A 10% margin separates real mastering-target steps (1000 -> 2000/4000,
+    // always 2x or more) from quantisation noise between the two encodings
+    // (bounded by the 4% snap tolerance), without hardcoding the canonical
+    // 1000/4000 pair.
+    if rpu_max > bl_max * 1.1 {
+        dv.fel_brightness_expansion =
+            Some(FelBrightnessExpansion { bl_max_nits: bl_max, rpu_max_nits: rpu_max });
     }
 }
 
@@ -593,6 +624,51 @@ mod tests {
         // yields nothing rather than a made-up number.
         assert_eq!(resolve_l8_nits(27, &BTreeMap::new()), Some(600));
         assert_eq!(resolve_l8_nits(200, &BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn fel_brightness_expansion_needs_fel_and_a_brighter_grade() {
+        let dv = |el: Option<&str>, rpu_max: f64| {
+            let cfg = DvConfig {
+                profile: 7,
+                level: None,
+                bl_present: true,
+                el_present: true,
+                rpu_present: true,
+                bl_compatibility_id: Some(6),
+            };
+            let mut d = container_only(&cfg, false);
+            d.el_type = el.map(str::to_string);
+            d.mastering_display = Some(MasteringDisplay {
+                max_luminance: rpu_max,
+                min_luminance: 0.0001,
+                primaries: None,
+            });
+            d
+        };
+        // The canonical case: a 4000-nit FEL grade over a 1000-nit HDR10 base.
+        let mut d = dv(Some("FEL"), 4000.0);
+        flag_fel_brightness_expansion(&mut d, Some(1000.0));
+        let x = d.fel_brightness_expansion.expect("expansion flagged");
+        assert_eq!((x.bl_max_nits, x.rpu_max_nits), (1000.0, 4000.0));
+        // A MEL's residual is empty; it can never out-bright the BL.
+        let mut d = dv(Some("MEL"), 4000.0);
+        flag_fel_brightness_expansion(&mut d, Some(1000.0));
+        assert!(d.fel_brightness_expansion.is_none());
+        // Matching targets (and sub-margin noise) stay unflagged.
+        let mut d = dv(Some("FEL"), 4000.0);
+        flag_fel_brightness_expansion(&mut d, Some(4000.0));
+        assert!(d.fel_brightness_expansion.is_none());
+        let mut d = dv(Some("FEL"), 1000.0);
+        flag_fel_brightness_expansion(&mut d, Some(994.0));
+        assert!(d.fel_brightness_expansion.is_none());
+        // No (or zeroed) BL mastering: no comparison, never a guess.
+        let mut d = dv(Some("FEL"), 4000.0);
+        flag_fel_brightness_expansion(&mut d, None);
+        assert!(d.fel_brightness_expansion.is_none());
+        let mut d = dv(Some("FEL"), 4000.0);
+        flag_fel_brightness_expansion(&mut d, Some(0.0));
+        assert!(d.fel_brightness_expansion.is_none());
     }
 
     #[test]

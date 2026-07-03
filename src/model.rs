@@ -173,6 +173,17 @@ pub struct DolbyVision {
     /// HDR10 base).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mastering_display: Option<MasteringDisplay>,
+    /// Metadata indication that the FEL likely expands brightness beyond the
+    /// base layer: the DV grade's own mastering display (`source_max_pq`) is
+    /// meaningfully brighter than the base layer's declared one (container
+    /// MDCV / ST.2086 SEI), the classic case being a 4000-nit grade over a
+    /// 1000-nit HDR10 base. Only set
+    /// for FEL video inputs: a MEL's residual is empty (it can never carry
+    /// brightness the BL lacks), and a metadata sidecar has no base layer to
+    /// expand beyond. Metadata tier only; confirming actual pixel expansion
+    /// needs a decode, which hdrprobe never does, so absence is not proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fel_brightness_expansion: Option<FelBrightnessExpansion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l6_fallback: Option<L6Fallback>,
     /// L9 mastering-display color space.
@@ -212,6 +223,14 @@ pub struct DvCensus {
 pub struct LevelPresence {
     pub level: u8,
     pub rpus_with: usize,
+}
+
+/// The evidence pair behind the FEL brightness-expansion flag, both in nits:
+/// the base layer's declared mastering max and the RPU grade's mastering max.
+#[derive(Debug, Serialize, Clone, Copy)]
+pub struct FelBrightnessExpansion {
+    pub bl_max_nits: f64,
+    pub rpu_max_nits: f64,
 }
 
 /// One distinct trim target, in nits, plus the level(s) that produced it — 2
