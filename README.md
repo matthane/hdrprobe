@@ -76,8 +76,8 @@ base-layer compatibility, and the CM version (`v2.9`, or `v4.0` via L254).
 `L9` mastering, `L11` content type, and the set of `L2` / `L8` trim targets.
 
 **Deliberately omitted.** The per-frame and per-shot analysis levels (`L1` brightness, `L3` L1
-offsets, `L4` temporal) and the per-shot trim values. These vary shot to shot rather than
-describing the title, so they collapse to nothing meaningful once sampled or aggregated.
+offsets) and the per-shot trim values. These vary shot to shot rather than describing the title,
+so they collapse to nothing meaningful once sampled or aggregated.
 
 RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoid/dovi_tool)
 (the `dolby_vision` crate); HDR10+ parsing uses the sibling `hdr10plus` crate.
