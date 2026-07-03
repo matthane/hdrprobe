@@ -8,8 +8,23 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Version of hdrprobe's own JSON output schema, `"<major>.<minor>"`, carried on
+/// every `Report` and documented in `docs/SCHEMA.md`. Versioned independently of
+/// the crate version so an unchanged value tells consumers their scripts need no
+/// update. Bump the minor for additive changes (a new optional field, a new value
+/// in an enumerated string set); bump the major for anything that can break a
+/// correct consumer (renaming/removing a field, changing a type, unit, presence
+/// condition, or the meaning of an existing value). Any bump must update
+/// `docs/SCHEMA.md` and the golden shape test below in the same change.
+pub const SCHEMA_VERSION: &str = "1.0";
+
 #[derive(Debug, Serialize)]
 pub struct Report {
+    /// hdrprobe's own output-schema version (`SCHEMA_VERSION`). The name spells
+    /// out whose schema it is: `general.format_version` is the *input's* declared
+    /// version (e.g. a DV CM XML's), and `dolby_vision.cm_version` is Dolby's
+    /// content-mapping version — this field is neither.
+    pub hdrprobe_schema_version: &'static str,
     pub file: String,
     pub size_bytes: u64,
     pub general: General,
@@ -299,5 +314,226 @@ impl Hdr10Plus {
             profile: None,
             target_max_luminance: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Report` with every optional field populated and every array non-empty,
+    /// so serialization exercises the complete schema surface.
+    fn maximal_report() -> Report {
+        Report {
+            hdrprobe_schema_version: SCHEMA_VERSION,
+            file: "movie.mkv".to_string(),
+            size_bytes: 1,
+            general: General {
+                container: "Matroska".to_string(),
+                codec: "HEVC".to_string(),
+                codec_profile: Some("Main 10, High tier @ L5.1".to_string()),
+                format_version: Some("4.0.2".to_string()),
+                width: Some(3840),
+                height: Some(2160),
+                fps: Some(23.976),
+                duration_secs: Some(30.0),
+                bitrate: Some(Bitrate::video_stream_bps(1.0)),
+                bit_depth: Some(10),
+                chroma: Some("4:2:0".to_string()),
+                stereo: Some("Stereoscopic 3D (2 views)".to_string()),
+                color: ColorInfo {
+                    primaries: Some("BT.2020".to_string()),
+                    transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+                    matrix: Some("BT.2020 NCL".to_string()),
+                    range: Some("limited".to_string()),
+                },
+            },
+            hdr: Some(Hdr {
+                format: "Dolby Vision + HDR10 (fallback)".to_string(),
+                mastering: Some(MasteringDisplay {
+                    max_luminance: 1000.0,
+                    min_luminance: 0.0001,
+                    primaries: Some("DCI-P3 D65".to_string()),
+                    primaries_level: Some(9),
+                }),
+                content_light: Some(ContentLight { max_cll: 737, max_fall: 130 }),
+            }),
+            dolby_vision: Some(DolbyVision {
+                profile: "7.6 (FEL)".to_string(),
+                profile_compat_assumed: true,
+                structure: Some("Single track, dual layer".to_string()),
+                level: Some(6),
+                bl_present: true,
+                el_present: true,
+                rpu_present: true,
+                el_type: Some("FEL".to_string()),
+                bl_compatibility_id: Some(6),
+                compatibility: Some("HDR10-compatible".to_string()),
+                cm_version: Some("CM v4.0".to_string()),
+                l5_active_areas: vec![ActiveArea {
+                    width: 3840,
+                    height: 1608,
+                    left: 0,
+                    right: 0,
+                    top: 276,
+                    bottom: 276,
+                }],
+                l5_assumed_canvas: Some([3840, 2160]),
+                mastering_display: Some(MasteringDisplay {
+                    max_luminance: 4000.0,
+                    min_luminance: 0.0001,
+                    primaries: Some("BT.2020".to_string()),
+                    primaries_level: Some(0),
+                }),
+                fel_brightness_expansion: Some(FelBrightnessExpansion {
+                    bl_max_nits: 1000.0,
+                    rpu_max_nits: 4000.0,
+                }),
+                l6_fallback: Some(L6Fallback {
+                    max_cll: 737,
+                    max_fall: 130,
+                    max_mastering: 1000,
+                    min_mastering: 1,
+                    zeroed: false,
+                }),
+                l9_mastering: Some("BT.2020".to_string()),
+                l11_content: Some("Cinema".to_string()),
+                l11_reference_mode: Some(true),
+                trim_targets: vec![TrimTarget { nits: 100, levels: vec![2, 8] }],
+                rpu_count: 722,
+                sampled: false,
+                census: Some(DvCensus {
+                    scene_cuts: 5,
+                    dm_version_index: Some(2),
+                    level_presence: vec![LevelPresence { level: 1, rpus_with: 722 }],
+                }),
+            }),
+            hdr10plus: Hdr10Plus {
+                present: true,
+                application_version: Some(1),
+                num_windows: Some(1),
+                profile: Some('B'),
+                target_max_luminance: Some(400),
+            },
+            elapsed_ms: 5.0,
+        }
+    }
+
+    /// Flatten a serialized value into `a.b.c` / `a[].b` leaf paths.
+    fn collect_paths(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    let p =
+                        if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                    collect_paths(val, &p, out);
+                }
+            }
+            serde_json::Value::Array(items) => match items.first() {
+                Some(first) => collect_paths(first, &format!("{prefix}[]"), out),
+                None => out.push(format!("{prefix}[]")),
+            },
+            _ => out.push(prefix.to_string()),
+        }
+    }
+
+    /// Golden test pinning the serialized schema surface. If this fails, the JSON
+    /// output shape changed: update `docs/SCHEMA.md`, decide whether the change is
+    /// additive (bump `SCHEMA_VERSION`'s minor) or breaking (bump its major), and
+    /// only then update the expected list here.
+    #[test]
+    fn schema_shape_is_pinned() {
+        let v = serde_json::to_value(maximal_report()).expect("report serializes");
+        let mut paths = Vec::new();
+        collect_paths(&v, "", &mut paths);
+        paths.sort();
+
+        let mut expected = vec![
+            "hdrprobe_schema_version",
+            "file",
+            "size_bytes",
+            "elapsed_ms",
+            "general.container",
+            "general.codec",
+            "general.codec_profile",
+            "general.format_version",
+            "general.width",
+            "general.height",
+            "general.fps",
+            "general.duration_secs",
+            "general.bitrate.bits_per_sec",
+            "general.bitrate.scope",
+            "general.bit_depth",
+            "general.chroma",
+            "general.stereo",
+            "general.color.primaries",
+            "general.color.transfer",
+            "general.color.matrix",
+            "general.color.range",
+            "hdr.format",
+            "hdr.mastering.max_luminance",
+            "hdr.mastering.min_luminance",
+            "hdr.mastering.primaries",
+            "hdr.mastering.primaries_level",
+            "hdr.content_light.max_cll",
+            "hdr.content_light.max_fall",
+            "dolby_vision.profile",
+            "dolby_vision.profile_compat_assumed",
+            "dolby_vision.structure",
+            "dolby_vision.level",
+            "dolby_vision.bl_present",
+            "dolby_vision.el_present",
+            "dolby_vision.rpu_present",
+            "dolby_vision.el_type",
+            "dolby_vision.bl_compatibility_id",
+            "dolby_vision.compatibility",
+            "dolby_vision.cm_version",
+            "dolby_vision.l5_active_areas[].width",
+            "dolby_vision.l5_active_areas[].height",
+            "dolby_vision.l5_active_areas[].left",
+            "dolby_vision.l5_active_areas[].right",
+            "dolby_vision.l5_active_areas[].top",
+            "dolby_vision.l5_active_areas[].bottom",
+            "dolby_vision.l5_assumed_canvas[]",
+            "dolby_vision.mastering_display.max_luminance",
+            "dolby_vision.mastering_display.min_luminance",
+            "dolby_vision.mastering_display.primaries",
+            "dolby_vision.mastering_display.primaries_level",
+            "dolby_vision.fel_brightness_expansion.bl_max_nits",
+            "dolby_vision.fel_brightness_expansion.rpu_max_nits",
+            "dolby_vision.l6_fallback.max_cll",
+            "dolby_vision.l6_fallback.max_fall",
+            "dolby_vision.l6_fallback.max_mastering",
+            "dolby_vision.l6_fallback.min_mastering",
+            "dolby_vision.l6_fallback.zeroed",
+            "dolby_vision.l9_mastering",
+            "dolby_vision.l11_content",
+            "dolby_vision.l11_reference_mode",
+            "dolby_vision.trim_targets[].nits",
+            "dolby_vision.trim_targets[].levels[]",
+            "dolby_vision.rpu_count",
+            "dolby_vision.sampled",
+            "dolby_vision.census.scene_cuts",
+            "dolby_vision.census.dm_version_index",
+            "dolby_vision.census.level_presence[].level",
+            "dolby_vision.census.level_presence[].rpus_with",
+            "hdr10plus.present",
+            "hdr10plus.application_version",
+            "hdr10plus.num_windows",
+            "hdr10plus.profile",
+            "hdr10plus.target_max_luminance",
+        ];
+        expected.sort_unstable();
+        assert_eq!(paths, expected, "JSON schema surface changed; see docs/SCHEMA.md");
+    }
+
+    #[test]
+    fn schema_version_matches_the_documented_one() {
+        assert_eq!(SCHEMA_VERSION, "1.0");
+        let v = serde_json::to_value(maximal_report()).unwrap();
+        assert_eq!(v["hdrprobe_schema_version"], "1.0");
+        // The HDR10+ profile char must serialize as a one-character string, as
+        // documented, not as a number.
+        assert_eq!(v["hdr10plus"]["profile"], "B");
     }
 }

@@ -216,6 +216,7 @@ fn build_report(
         Payload::Hdr10Plus(hp) => (None, hp),
     };
     Report {
+        hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
         file: path.display().to_string(),
         size_bytes: size,
         general: General {

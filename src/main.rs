@@ -314,6 +314,7 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
     };
 
     Ok(Report {
+        hdrprobe_schema_version: model::SCHEMA_VERSION,
         file: path.display().to_string(),
         size_bytes: size,
         general,
