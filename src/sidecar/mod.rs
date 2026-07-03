@@ -7,7 +7,9 @@
 //! windows). Each sidecar parses into the metadata hdrprobe already models and is
 //! rendered through the ordinary `Report`, so text / JSON / `-q` output all work
 //! unchanged. The heavy lifting reuses the existing aggregators: RPU-bin and DV
-//! XML both reduce to `Vec<DoviRpu>` fed through `dv::levels::DvAggregate`.
+//! XML both reduce to representative `DoviRpu`s (one per run of identical
+//! frames / one per shot) folded frame-weighted through
+//! `dv::levels::DvAggregate`.
 
 mod dv_xml;
 mod hdr10plus_json;
@@ -17,7 +19,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{bail, Result};
-use dolby_vision::rpu::dovi_rpu::DoviRpu;
 
 use crate::dv::levels::DvAggregate;
 use crate::dv::rpu::parse_hevc_rpu;
@@ -64,8 +65,7 @@ pub fn try_process(path: &Path) -> Result<Option<Report>> {
     // file — and it's also by far the largest (one metadata object per frame,
     // often hundreds of MB). So we read a bounded head window rather than pull the
     // whole per-frame array into memory only to discard it. Every other sidecar
-    // reduces to `Vec<DoviRpu>` aggregated over the whole title, so it needs the
-    // full file.
+    // aggregates over the whole title, so it needs the full file.
     if ext == "json" {
         let mut head = Vec::new();
         read_head(path, hdr10plus_json::HEAD_BYTES, &mut head)?;
@@ -175,24 +175,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Aggregate a full list of RPUs (from an RPU bin or generated from a DV XML)
-/// into the title-stable Dolby Vision section. Shared by both DV sidecars.
-///
-/// `canvas` is the picture size the L5 active-area dimensions are computed
-/// against — the assumed UHD master (`ASSUMED_CANVAS`) for both DV sidecars,
-/// since neither records a resolution. Passing `None` (used only by tests /
-/// callers with no canvas) shows bare offsets with dimensions omitted.
-fn dv_from_rpus(rpus: &[DoviRpu], canvas: Option<(u32, u32)>) -> Result<Payload> {
-    let mut agg = DvAggregate::default();
-    for rpu in rpus {
-        agg.add(rpu);
-    }
-    finalize_dv(agg, canvas)
-}
-
 /// Finalize a populated aggregator into a DV payload. Shared by the raw RPU-bin
-/// path (which folds one RPU per frame) and the DV XML path (which folds one
-/// representative RPU per shot). `canvas` is the assumed L5 canvas, if any.
+/// path (which folds one representative RPU per run of identical frames) and
+/// the DV XML path (which folds one representative RPU per shot). `canvas` is
+/// the picture size the L5 active-area dimensions are computed against — the
+/// assumed UHD master (`ASSUMED_CANVAS`) for both DV sidecars, since neither
+/// records a resolution. Passing `None` (used only by tests / callers with no
+/// canvas) shows bare offsets with dimensions omitted.
 fn finalize_dv(mut agg: DvAggregate, canvas: Option<(u32, u32)>) -> Result<Payload> {
     let (cw, ch) = canvas.unwrap_or((0, 0));
     // Metadata-only input: no base layer, so a convention-default compat minor
