@@ -13,7 +13,7 @@ pub struct RenderOpts {
     pub show_timing: bool,
 }
 
-const LABEL_W: usize = 15;
+const LABEL_W: usize = 16;
 
 pub fn render(r: &Report, o: &RenderOpts) -> String {
     let mut s = String::new();
@@ -28,16 +28,23 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         if let Some(d) = r.general.duration_secs {
             kv(&mut s, &c, "Duration", &human_duration(d));
         }
+        // Video files show fps in the Video line; a metadata-only sidecar (no
+        // codec) has no Video line, so it surfaces its frame rate on its own.
+        if r.general.codec.is_empty() {
+            if let Some(fps) = r.general.fps {
+                kv(&mut s, &c, "Frame rate", &format!("{:.3} fps", fps));
+            }
+        }
         if let Some(br) = &r.general.bitrate {
             let scope = match br.scope {
                 BitrateScope::VideoStream => "video stream",
                 BitrateScope::Overall => "overall",
             };
-            let tag = c.dim(&format!("({})", scope));
+            let tag = c.dim(&format!("[{}]", scope));
             kv(&mut s, &c, "Bitrate", &format!("{}   {}", human_bitrate(br.bits_per_sec), tag));
         }
         let video = video_line(r);
-        if !video.is_empty() {
+        if !video.is_empty() && !r.general.codec.is_empty() {
             kv(&mut s, &c, "Video", &video);
         }
         let color = color_line(r);
@@ -75,67 +82,98 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         if let Some(dv) = &r.dolby_vision {
             let _ = writeln!(s, "{}", c.header("Dolby Vision"));
 
+            if let Some(census) = &dv.census {
+                // Census stats lead the section (consistent across all input
+                // types). This line is census-gated, and the census only exists
+                // on a full scan (sidecars are always full; video needs --full),
+                // so an RPU count here is never a sample — no "[full scan]" tag.
+                kv(&mut s, &c, "RPU count", &dv.rpu_count.to_string());
+                kv(&mut s, &c, "Scene cuts", &census.scene_cuts.to_string());
+            }
             if let Some(structure) = &dv.structure {
                 kv(&mut s, &c, "Structure", structure);
             }
 
-            let mut carriage = Vec::new();
-            if dv.bl_present {
-                carriage.push("BL");
-            }
-            if dv.el_present {
-                carriage.push("EL");
-            }
-            if dv.rpu_present {
-                carriage.push("RPU");
-            }
-            // Carriage only; BL cross-compatibility (HDR10/SDR/HLG) is already
-            // shown as a "(fallback)" tag on the HDR format line, so it's not
-            // repeated here.
-            let mut prof = c.value(&dv.profile).to_string();
-            let _ = write!(prof, "   ({})", carriage.join("+"));
-            kv(&mut s, &c, "Profile", &prof);
+            // The BL/EL/RPU carriage booleans are still collected on the model
+            // (for a future backend schema) but omitted from this report: the
+            // profile and MEL/FEL tag already convey the layer structure, and
+            // the per-track BL flag reads as misleading on dual-track P7.
+            let profile = if dv.profile_compat_assumed {
+                format!("{}   {}", c.value(&dv.profile), c.dim("[compat assumed]"))
+            } else {
+                c.value(&dv.profile)
+            };
+            kv(&mut s, &c, "Profile", &profile);
 
-            if let Some(l) = dv.level {
-                let envelope = match dv_level_tier_mbps(l) {
-                    Some((main, high)) => format!(
-                        "{}   {}",
-                        l,
-                        c.dim(&format!("(max bit rate: {main} Mbps Main tier / {high} Mbps High tier)"))
-                    ),
-                    None => l.to_string(),
-                };
-                kv(&mut s, &c, "Level", &envelope);
-            }
+            // The DV level only defines the codec bit-rate envelope; it says
+            // nothing useful at a glance, so it's kept on the model but not
+            // rendered here.
             if let Some(cm) = &dv.cm_version {
-                let elt = dv.el_type.as_ref().map(|e| format!(" · {}", e)).unwrap_or_default();
-                // The L254 block is only present in CM v4.0; don't tag v2.9 with it.
-                let tag = if cm == "CM v4.0" { format!("   {}", c.dim("[L254]")) } else { String::new() };
-                kv(&mut s, &c, "RPU / DM", &format!("present · {}{}{}", cm, elt, tag));
+                // Only the content-mapping version: "present" is implied by the
+                // section header, and the EL type (MEL/FEL) is already on the
+                // Profile line. `cm_version` is stored as "CM v2.9"/"CM v4.0";
+                // drop the redundant "CM " since the label spells it out.
+                let ver = cm.strip_prefix("CM ").unwrap_or(cm);
+                kv(&mut s, &c, "Content mapping", ver);
             }
-            for area in &dv.l5_active_areas {
-                let offsets = format!("L{} R{} T{} B{}", area.left, area.right, area.top, area.bottom);
-                let dims = if area.width > 0 && area.height > 0 {
-                    format!(
-                        "{}×{}  ({})  ·  {}",
-                        area.width,
-                        area.height,
-                        aspect(area.width, area.height),
-                        c.dim(&offsets)
-                    )
-                } else {
-                    format!("offsets {}", offsets)
-                };
+            if !dv.trim_targets.is_empty() {
+                let list = dv
+                    .trim_targets
+                    .iter()
+                    .map(|t| {
+                        let tag = t.levels.iter().map(|l| format!("L{l}")).collect::<Vec<_>>().join("/");
+                        format!("{} nits {}", t.nits, c.dim(&format!("[{tag}]")))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                kv(&mut s, &c, "Trim targets", &list);
+            }
+            if !dv.l5_active_areas.is_empty() {
+                // The set of distinct active areas is shown inline (joined by
+                // " + ") rather than one line per area: offsets are the raw L5
+                // signal, the active area is derived. The [sampled]/[full scan]/
+                // [assumes canvas] tag describes the whole set, so it renders once.
                 let tag = match dv.l5_assumed_canvas {
                     Some([w, h]) => format!("[assumes {}×{} canvas]", w, h),
                     None if dv.sampled => "[sampled]".to_string(),
                     None => "[full scan]".to_string(),
                 };
-                kv(&mut s, &c, "L5 active area", &format!("{}   {}", dims, c.dim(&tag)));
+                let offsets = dv
+                    .l5_active_areas
+                    .iter()
+                    .map(|a| format!("L{} R{} T{} B{}", a.left, a.right, a.top, a.bottom))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                // More than one distinct active area means the aspect ratio
+                // changes across the title — worth flagging as special.
+                let variable = if dv.l5_active_areas.len() > 1 {
+                    format!("  {}", c.good("(variable!)"))
+                } else {
+                    String::new()
+                };
+                kv(&mut s, &c, "L5 offsets", &format!("{}{}   {}", offsets, variable, c.dim(&tag)));
+                let areas = dv
+                    .l5_active_areas
+                    .iter()
+                    .filter(|a| a.width > 0 && a.height > 0)
+                    .map(|a| format!("{}×{}  ({})", a.width, a.height, aspect(a.width, a.height)))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                if !areas.is_empty() {
+                    kv(&mut s, &c, "L5 active area", &areas);
+                }
+            }
+            if let Some(md) = &dv.mastering_display {
+                kv(
+                    &mut s,
+                    &c,
+                    "Mastering",
+                    &format!("max {}  min {} cd/m²", fmt_num(md.max_luminance), fmt_num(md.min_luminance)),
+                );
             }
             if let Some(l6) = &dv.l6_fallback {
                 let flag = if l6.zeroed { format!("  {}", c.warn("(zeroed!)")) } else { String::new() };
-                kv(&mut s, &c, "L6 fallback", &format!("MaxCLL {} · MaxFALL {}{}", l6.max_cll, l6.max_fall, flag));
+                kv(&mut s, &c, "L6 content light", &format!("MaxCLL {} · MaxFALL {}{}", l6.max_cll, l6.max_fall, flag));
             }
             if let Some(l9) = &dv.l9_mastering {
                 kv(&mut s, &c, "L9 mastering", l9);
@@ -145,23 +183,9 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     Some(true) => " · reference mode",
                     _ => "",
                 };
-                kv(&mut s, &c, "L11 content", &format!("{}{}", l11, rm));
-            }
-            if !dv.trim_targets.is_empty() {
-                let list = dv
-                    .trim_targets
-                    .iter()
-                    .map(|t| {
-                        let tag = t.levels.iter().map(|l| format!("L{l}")).collect::<Vec<_>>().join("/");
-                        format!("{} {}", t.nits, c.dim(&format!("[{tag}]")))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                kv(&mut s, &c, "Trim targets", &format!("{} nit", list));
+                kv(&mut s, &c, "L11 APO", &format!("{}{}", l11, rm));
             }
             if let Some(census) = &dv.census {
-                kv(&mut s, &c, "RPU count", &format!("{}   {}", dv.rpu_count, c.dim("[full scan]")));
-                kv(&mut s, &c, "Scene cuts", &census.scene_cuts.to_string());
                 let levels = census
                     .level_presence
                     .iter()
@@ -333,22 +357,6 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
-/// Max Main / High tier bit rates (Mbps) per Dolby Vision level, from DV spec Table 4.
-/// The envelope makes the bare level number meaningful; resolution/fps already appear
-/// in the video section, so only the tier bit-rate caps are surfaced here.
-fn dv_level_tier_mbps(level: u8) -> Option<(u16, u16)> {
-    Some(match level {
-        1..=2 => (20, 50),
-        3..=5 => (20, 70),
-        6..=7 => (25, 130),
-        8..=9 => (40, 130),
-        10..=11 => (60, 240),
-        12 => (120, 480),
-        13 => (240, 800),
-        _ => return None,
-    })
-}
-
 fn aspect(w: u32, h: u32) -> String {
     if h == 0 {
         return "?".to_string();
@@ -424,6 +432,9 @@ impl Colorizer {
     }
     fn warn(&self, t: &str) -> String {
         self.wrap("33", t)
+    }
+    fn good(&self, t: &str) -> String {
+        self.wrap("32", t)
     }
     fn accent(&self, t: &str) -> String {
         self.wrap("33", t)

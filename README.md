@@ -11,31 +11,31 @@ file and reads only the bytes it needs, so it stays fast regardless of file size
 movie.mkv  (225.14 MiB)
 
 General
-  Container        Matroska
-  Duration         30s
-  Bitrate          46.08 Mb/s   (video stream)
-  Video            HEVC (Main 10, High tier @ L5.1) · 3840×2160 · 23.976 fps · 10-bit 4:2:0
-  Color            BT.2020 · PQ (SMPTE ST 2084) · limited
+  Container         Matroska
+  Duration          30s
+  Bitrate           46.08 Mb/s   [video stream]
+  Video             HEVC (Main 10, High tier @ L5.1) · 3840×2160 · 23.976 fps · 10-bit 4:2:0
+  Color             BT.2020 · PQ (SMPTE ST 2084) · limited
 
 HDR
-  Format           Dolby Vision + HDR10+ + HDR10 (fallback)
-  Mastering        max 1000  min 0.0001 cd/m²
-  Content light    MaxCLL 737 · MaxFALL 130
+  Format            Dolby Vision + HDR10+ + HDR10 (fallback)
+  Mastering         max 1000  min 0.0001 cd/m²
+  Content light     MaxCLL 737 · MaxFALL 130
 
 Dolby Vision
-  Structure        Single track, dual layer
-  Profile          7.6 (MEL)   (BL+EL+RPU)
-  Level            6   (max bit rate: 25 Mbps Main tier / 130 Mbps High tier)
-  RPU / DM         present · CM v2.9 · MEL
-  L5 active area   3840×1608  (2.39:1)  ·  L0 R0 T276 B276   [sampled]
-  L6 fallback      MaxCLL 737 · MaxFALL 130
-  Trim targets     100 [L2] nit
+  Structure         Single track, dual layer
+  Profile           7.6 (MEL)
+  Content mapping   v2.9
+  Trim targets      100 nits [L2]
+  L5 offsets        L0 R0 T276 B276   [sampled]
+  L5 active area    3840×1608  (2.39:1)
+  L6 content light  MaxCLL 737 · MaxFALL 130
 
 HDR10+
-  Profile          B
-  Application      v1
-  Windows          1
-  Target           400 nits
+  Profile           B
+  Application       v1
+  Windows           1
+  Target            400 nits
 ```
 
 ## What it reports
@@ -68,11 +68,12 @@ layer's cross-compatibility id:
 | 10 | AV1 | `10.0`, `10.1`, `10.4` |
 | 20 | MV-HEVC | `20.0`, `20.4` |
 
-Alongside it, the level, the presence of the base layer / enhancement layer / RPU, the
-base-layer compatibility, and the CM version (`v2.9`, or `v4.0` via L254).
+Alongside it, the track and layer structure (for dual-layer content) and the content-mapping
+version (`v2.9`, or `v4.0` via L254).
 
-**Dynamic levels.** The distinct values seen across the title: `L5` active areas, `L6` fallback,
-`L9` mastering, `L11` content type, and the set of `L2` / `L8` trim targets.
+**Dynamic levels.** The distinct values seen across the title: `L5` offsets and active areas,
+`L6` content light, `L9` mastering, `L11` APO (content type), and the set of `L2` / `L8` trim
+targets.
 
 **Deliberately omitted.** The per-frame and per-shot analysis levels (`L1` brightness, `L3` L1
 offsets) and the per-shot trim values. These vary shot to shot rather than describing the title,
