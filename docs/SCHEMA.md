@@ -1,10 +1,11 @@
 # hdrprobe JSON output schema
 
+**Schema version: 1.0** (as of hdrprobe 0.1.0)
+
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
-contract external scripts can rely on. It describes **schema version 1.0** (as of hdrprobe
-0.1.0) and is maintained against the report model in `src/model.rs`; every object and field
-that can appear in the output is listed here, together with the conditions under which it
-appears.
+contract external scripts can rely on. It is maintained against the report model in
+`src/model.rs`; every object and field that can appear in the output is listed here,
+together with the conditions under which it appears.
 
 ## Output modes
 
@@ -86,7 +87,8 @@ either use `--format ndjson` or normalize after parsing, e.g. in Python:
 ## Schema versioning
 
 Every `Report` carries `hdrprobe_schema_version`, the version of **this document's schema**,
-as a `"<major>.<minor>"` string. The current version is `"1.0"`.
+as a `"<major>.<minor>"` string. The current version is the one stated at the top of this
+document.
 
 The name is deliberately explicit about whose version it is, because the output contains two
 other, unrelated version fields: `general.format_version` is the version an *input* sidecar
