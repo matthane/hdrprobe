@@ -507,17 +507,23 @@ fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<ColorInfo> {
 }
 
 fn parse_mdcv(data: &[u8], b: &BoxHdr) -> Option<MasteringDisplay> {
-    // mdcv: 3x(primary x,y u16), white x,y u16, max(4) min(4) luminance.
+    // mdcv: 3x(primary x,y u16), white x,y u16, max(4) min(4) luminance —
+    // ST.2086 layout: G/B/R primary order, chromaticities in 0.00002 units.
     let p = b.payload;
     if b.end < p + 24 {
         return None;
     }
+    let xy = |o: usize| {
+        (read_u16(data, p + o) as f64 / 50000.0, read_u16(data, p + o + 2) as f64 / 50000.0)
+    };
+    // primaries_label takes R, G, B, white; the box stores G, B, R, white.
+    let primaries = crate::hdr::primaries_label(xy(8), xy(0), xy(4), xy(12));
     let max_lum = read_u32(data, p + 16); // units 0.0001 cd/m²
     let min_lum = read_u32(data, p + 20);
     Some(MasteringDisplay {
         max_luminance: max_lum as f64 / 10000.0,
         min_luminance: min_lum as f64 / 10000.0,
-        primaries: None,
+        primaries: primaries.map(str::to_string),
     })
 }
 

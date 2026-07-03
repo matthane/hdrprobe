@@ -19,7 +19,7 @@ General
 
 HDR
   Format            Dolby Vision + HDR10+ + HDR10 (fallback)
-  Mastering         max 1000  min 0.0001 cd/m²
+  Mastering         DCI-P3 D65 · max 1000  min 0.0001 cd/m²
   Content light     MaxCLL 737 · MaxFALL 130
 
 Dolby Vision

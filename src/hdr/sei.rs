@@ -122,22 +122,30 @@ fn handle_payload(payload_type: u32, payload: &[u8], out: &mut SeiFindings) {
     }
 }
 
-/// mastering_display_colour_volume: G/B/R primaries + white point (16b each),
-/// then max (32b) and min (32b) luminance in units of 0.0001 cd/m². The AV1
-/// `HDR_MDCV` metadata OBU shares this exact 24-byte layout, so the AV1 path
-/// reuses this parser.
+/// mastering_display_colour_volume: G/B/R primaries + white point (x,y u16
+/// each, 0.00002 units), then max (32b) and min (32b) luminance in units of
+/// 0.0001 cd/m². The ISOBMFF `mdcv` box shares this layout and scaling.
 pub(crate) fn parse_mastering(p: &[u8]) -> Option<MasteringDisplay> {
     if p.len() < 24 {
         return None;
     }
+    let xy = |i: usize| {
+        (
+            u16::from_be_bytes([p[i], p[i + 1]]) as f64 / 50000.0,
+            u16::from_be_bytes([p[i + 2], p[i + 3]]) as f64 / 50000.0,
+        )
+    };
+    // ST.2086 orders the primaries green, blue, red.
+    let (g, b, r, wp) = (xy(0), xy(4), xy(8), xy(12));
     let max_lum = u32::from_be_bytes([p[16], p[17], p[18], p[19]]);
     let min_lum = u32::from_be_bytes([p[20], p[21], p[22], p[23]]);
     Some(MasteringDisplay {
         max_luminance: max_lum as f64 / 10000.0,
         min_luminance: min_lum as f64 / 10000.0,
-        primaries: None,
+        primaries: crate::hdr::primaries_label(r, g, b, wp).map(str::to_string),
     })
 }
+
 
 /// content_light_level_info (MaxCLL/MaxFALL). Shared with the AV1 `HDR_CLL`
 /// metadata OBU, which has the same two big-endian u16 layout.
@@ -196,9 +204,12 @@ mod tests {
 
     #[test]
     fn mastering_and_content_light_in_one_nal() {
-        // 137 (mastering, 24B): primaries filler + max=10_000_000 + min=50.
+        // 137 (mastering, 24B): BT.2020 primaries in ST.2086's G,B,R order +
+        // D65 white (0.00002 units) + max=10_000_000 + min=50.
         let mut mdcv = vec![0x89, 0x18];
-        mdcv.extend_from_slice(&[0x11; 16]);
+        for v in [8500u16, 39850, 6550, 2300, 35400, 14600, 15635, 16450] {
+            mdcv.extend_from_slice(&v.to_be_bytes());
+        }
         mdcv.extend_from_slice(&10_000_000u32.to_be_bytes()); // 1000 cd/m²
         mdcv.extend_from_slice(&50u32.to_be_bytes()); // 0.005 cd/m²
         // 144 (content light, 4B): MaxCLL 3597, MaxFALL 505.
@@ -213,6 +224,7 @@ mod tests {
         let m = f.mastering.expect("mastering");
         assert_eq!(m.max_luminance, 1000.0);
         assert_eq!(m.min_luminance, 0.005);
+        assert_eq!(m.primaries.as_deref(), Some("BT.2020"));
         let cl = f.content_light.expect("content light");
         assert_eq!(cl.max_cll, 3597);
         assert_eq!(cl.max_fall, 505);

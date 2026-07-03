@@ -49,6 +49,10 @@ const ID_PRIMARIES: u32 = 0x55BB;
 const ID_MAX_CLL: u32 = 0x55BC;
 const ID_MAX_FALL: u32 = 0x55BD;
 const ID_MASTERING: u32 = 0x55D0;
+// PrimaryRChromaticityX (0x55D1) .. WhitePointChromaticityY (0x55D8): the
+// R/G/B primary + white point x,y floats, contiguous and in that order.
+const ID_CHROMA_FIRST: u32 = 0x55D1;
+const ID_CHROMA_LAST: u32 = 0x55D8;
 const ID_LUMINANCE_MAX: u32 = 0x55D9;
 const ID_LUMINANCE_MIN: u32 = 0x55DA;
 
@@ -842,6 +846,8 @@ fn parse_colour(
 fn parse_mastering(data: &[u8], start: usize, end: usize) -> Option<MasteringDisplay> {
     let mut max_lum = None;
     let mut min_lum = None;
+    // Rx, Ry, Gx, Gy, Bx, By, Wx, Wy — CIE 1931 floats, no scaling needed.
+    let mut chroma = [None::<f64>; 8];
     let mut p = start;
     while p < end {
         let Some((id, p1)) = read_id(data, p) else { break };
@@ -851,6 +857,9 @@ fn parse_mastering(data: &[u8], start: usize, end: usize) -> Option<MasteringDis
         match id {
             ID_LUMINANCE_MAX => max_lum = read_float(data, p2, s),
             ID_LUMINANCE_MIN => min_lum = read_float(data, p2, s),
+            ID_CHROMA_FIRST..=ID_CHROMA_LAST => {
+                chroma[(id - ID_CHROMA_FIRST) as usize] = read_float(data, p2, s)
+            }
             _ => {}
         }
         p = cend;
@@ -858,10 +867,16 @@ fn parse_mastering(data: &[u8], start: usize, end: usize) -> Option<MasteringDis
     if max_lum.is_none() && min_lum.is_none() {
         return None;
     }
+    let primaries = if chroma.iter().all(Option::is_some) {
+        let c = chroma.map(|v| v.unwrap_or(0.0));
+        crate::hdr::primaries_label((c[0], c[1]), (c[2], c[3]), (c[4], c[5]), (c[6], c[7]))
+    } else {
+        None
+    };
     Some(MasteringDisplay {
         max_luminance: max_lum.unwrap_or(0.0),
         min_luminance: min_lum.unwrap_or(0.0),
-        primaries: None,
+        primaries: primaries.map(str::to_string),
     })
 }
 

@@ -59,7 +59,8 @@ excluded by config.
   unchanged.
 - `av1/` — `obu.rs` (OBU walker, T.35 routing), `seq.rs` (sequence header).
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
-- `hdr/` — `mod.rs` (format classification), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer).
+- `hdr/` — `mod.rs` (format classification + `primaries_label`, the chromaticity→gamut matcher
+  behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer).
 - `sidecar/` — metadata-only inputs that bypass the video pipeline: `rpu_bin.rs` (raw DV RPU
   `.bin`/`.rpu`), `dv_xml.rs` (DV CM XML), `hdr10plus_json.rs` (hdr10plus_tool JSON); `mod.rs`
   detects by extension and renders through the ordinary `Report`. DV sidecars carry no

@@ -59,16 +59,13 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             let _ = writeln!(s, "{}", c.header("HDR"));
             kv(&mut s, &c, "Format", &hdr.format);
             if let Some(m) = &hdr.mastering {
-                let prim = m
-                    .primaries
-                    .as_ref()
-                    .map(|p| format!("   {}", c.dim(&format!("[{}]", p))))
-                    .unwrap_or_default();
+                // Gamut first, luminance after: "DCI-P3 D65 · max 1000  min 0.0001 cd/m²".
+                let prim = m.primaries.as_ref().map(|p| format!("{p} · ")).unwrap_or_default();
                 kv(
                     &mut s,
                     &c,
                     "Mastering",
-                    &format!("max {}  min {} cd/m²{}", fmt_num(m.max_luminance), fmt_num(m.min_luminance), prim),
+                    &format!("{}max {}  min {} cd/m²", prim, fmt_num(m.max_luminance), fmt_num(m.min_luminance)),
                 );
             }
             if let Some(cl) = &hdr.content_light {
