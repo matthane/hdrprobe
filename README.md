@@ -155,6 +155,9 @@ hdrprobe --format ndjson -r ./library > report.ndjson
 
 A directory argument is scanned for video files. Add `-r` to descend into subdirectories.
 
+For scripting against the JSON output, every object and field is documented in
+[docs/SCHEMA.md](docs/SCHEMA.md).
+
 ### Options
 
 | Flag | Effect |

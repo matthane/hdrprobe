@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 70 unit tests
+cargo test                     # 82 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -80,6 +80,15 @@ excluded by config.
   mastering-gamut fallback for a CM v2.9 XML, which has no L9; a recognized L9 wins when present,
   so CM v4.0 output is unchanged.
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
+  The JSON output is an external contract documented field-by-field in `docs/SCHEMA.md` and
+  versioned by `model::SCHEMA_VERSION` (the `hdrprobe_schema_version` field on every report,
+  independent of the crate version — named to distinguish it from the input's own
+  `format_version` and Dolby's `cm_version`): any change to `model.rs` (fields, presence
+  conditions) or to a rendered label value space (container/codec/profile/format strings,
+  enumerated names) must update the document and bump the version — minor for additive
+  (new field, new enumerated value), major for breaking (rename/removal, type/unit/presence/
+  meaning change). The golden shape test in `model.rs` pins the serialized field paths, so a
+  model change fails `cargo test` until the expected list, version, and document move together.
 - `prefetch.rs` — warms the metadata region with one pipelined positioned read before the
   mmap parse, so SMB/NFS scans don't fault it in over hundreds of round-trips. Timing only —
   parsing still runs against the mmap; gated to remote volumes on Windows (`GetDriveTypeW`).
