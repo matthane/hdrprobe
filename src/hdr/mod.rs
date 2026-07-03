@@ -85,6 +85,7 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
                 // CICP, so tagging with CICP would misstate the display. No L9
                 // (CM v2.9) → no tag, never a guess.
                 primaries: dv.and_then(|d| d.l9_mastering.clone()),
+                primaries_level: dv.and_then(|d| d.l9_mastering.as_ref()).map(|_| 9),
             })
         });
 

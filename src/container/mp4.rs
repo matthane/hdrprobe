@@ -524,6 +524,7 @@ fn parse_mdcv(data: &[u8], b: &BoxHdr) -> Option<MasteringDisplay> {
         max_luminance: max_lum as f64 / 10000.0,
         min_luminance: min_lum as f64 / 10000.0,
         primaries: primaries.map(str::to_string),
+        primaries_level: None,
     })
 }
 

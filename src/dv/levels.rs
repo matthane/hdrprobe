@@ -294,14 +294,23 @@ impl DvAggregate {
                 .collect(),
         });
 
-        // The mastering display's gamut: L9 is the RPU's only carrier of it (the
-        // DM data header describes the *signal* space, not the display), so the
-        // recognized L9 name rides the Mastering line; "custom"/"unknown" stay
-        // on the standalone L9 line instead, never guessed.
+        // The mastering display's gamut: L9 is the RPU's only carrier of it, so
+        // the recognized L9 name rides the Mastering line; "custom"/"unknown"
+        // stay on the standalone L9 line instead, never guessed. A CM v2.9 RPU
+        // (no L9) genuinely carries no display gamut, so its Mastering line is
+        // luminance-only. The DM data header's ycc_to_rgb/rgb_to_lms matrices
+        // are NOT a substitute fingerprint: they describe the *signal* space,
+        // not the display — verified empirically (July 2026) across the corpus,
+        // where every BT.2020-container title carries the identical BT.2020
+        // rgb_to_lms set [7222, 8771, 390, ...] regardless of mastering display
+        // (including P3-D65-mastered titles, both CM v2.9 ones per their BL
+        // MDCV and CM v4.0 ones per their own L9), and P5/P20 carry the
+        // IPTPQc2 crosstalk matrix. Don't reintroduce matrix matching.
         let l9_label = l9_label(self.l9_primary, self.l9_custom);
         let l9_recognized =
             l9_label.clone().filter(|l| l != "custom" && l != "unknown");
         let mastering_display = self.source_pq.map(source_pq_to_mastering).map(|mut m| {
+            m.primaries_level = l9_recognized.is_some().then_some(9);
             m.primaries = l9_recognized;
             m
         });
@@ -506,6 +515,7 @@ fn source_pq_to_mastering((min, max): (u16, u16)) -> MasteringDisplay {
         max_luminance: snap_nits(pq12_to_nits(max)) as f64,
         min_luminance: (pq12_to_nits(min) * 10000.0).round() / 10000.0,
         primaries: None,
+        primaries_level: None,
     }
 }
 
@@ -667,6 +677,7 @@ mod tests {
                 max_luminance: rpu_max,
                 min_luminance: 0.0001,
                 primaries: None,
+                primaries_level: None,
             });
             d
         };

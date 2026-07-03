@@ -117,6 +117,12 @@ pub struct MasteringDisplay {
     pub min_luminance: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primaries: Option<String>,
+    /// The Dolby metadata level the `primaries` name came from, when it has
+    /// one: 9 for an RPU L9 block, 0 for a DV XML's Level-0 global
+    /// `<MasteringDisplay>` chromaticities. `None` for container/SEI-derived
+    /// primaries (MDCV, ST.2086), which need no provenance tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primaries_level: Option<u8>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]

@@ -145,6 +145,7 @@ pub(crate) fn parse_mastering(p: &[u8]) -> Option<MasteringDisplay> {
         max_luminance: max_lum as f64 / 10000.0,
         min_luminance: min_lum as f64 / 10000.0,
         primaries: crate::hdr::primaries_label(r, g, b, wp).map(str::to_string),
+        primaries_level: None,
     })
 }
 
@@ -172,6 +173,7 @@ pub(crate) fn parse_mastering_av1(p: &[u8]) -> Option<MasteringDisplay> {
         max_luminance: quant(max_lum),
         min_luminance: quant(min_lum),
         primaries: crate::hdr::primaries_label(r, g, b, wp).map(str::to_string),
+        primaries_level: None,
     })
 }
 

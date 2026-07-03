@@ -877,6 +877,7 @@ fn parse_mastering(data: &[u8], start: usize, end: usize) -> Option<MasteringDis
         max_luminance: max_lum.unwrap_or(0.0),
         min_luminance: min_lum.unwrap_or(0.0),
         primaries: primaries.map(str::to_string),
+        primaries_level: None,
     })
 }
 

@@ -116,13 +116,20 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             // The DV grade's mastering display comes from the DM data header
             // (source_min/max_pq), not a metadata level — so it renders with the
             // header-derived lines above, ahead of the L2..L11 level lines. The
-            // gamut is the one L9 fact (the header carries no primaries), so it
+            // gamut is level-carried (the header has no primaries): L9 in an
+            // RPU, the Level-0 global `<MasteringDisplay>` in a DV XML — so it
             // rides along with its provenance tagged, like the trim targets'.
             if let Some(md) = &dv.mastering_display {
                 let prim = md
                     .primaries
                     .as_ref()
-                    .map(|p| format!("{p} {} · ", c.dim("[L9]")))
+                    .map(|p| {
+                        let tag = md
+                            .primaries_level
+                            .map(|l| format!("{} ", c.dim(&format!("[L{l}]"))))
+                            .unwrap_or_default();
+                        format!("{p} {tag}· ")
+                    })
                     .unwrap_or_default();
                 // The grade out-brights the base layer's declared mastering: a
                 // FEL whose residual likely carries highlights the BL lacks, so
