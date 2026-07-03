@@ -256,6 +256,14 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
 
     let demux = container::demux(path, &mmap, cli.full).context("demux failed")?;
 
+    // The sampled access units are scattered across the whole file (worst for
+    // MP4, whose sample index spans a multi-GB mdat), so warm exactly the
+    // ranges the sampler will fault. Default path only: `--full` reads every
+    // chunk and `--no-rpu` reads none.
+    if !cli.full && !cli.no_rpu {
+        prefetch::warm_sample_chunks(remote, &file, &demux, cli.samples);
+    }
+
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
     let scan = sample::scan(&demux, &mmap, &opts);
 

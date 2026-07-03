@@ -128,7 +128,11 @@ fn extract_chunk(data: &[u8], chunk: Chunk, fmt: NalFormat, codec: &Codec) -> Ch
 }
 
 /// Choose access-unit indices to sample: a head run plus an even spread.
-fn select_indices(n: usize, samples: usize, full: bool) -> Vec<usize> {
+///
+/// `pub(crate)` because `prefetch::warm_sample_chunks` calls it with the same
+/// inputs to warm exactly the chunks `scan` will fault on a network volume —
+/// selection must stay deterministic so the two never diverge.
+pub(crate) fn select_indices(n: usize, samples: usize, full: bool) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }

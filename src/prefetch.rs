@@ -21,6 +21,8 @@
 use std::fs::File;
 use std::path::Path;
 
+use crate::container::Demux;
+
 /// Head window warmed for every remote file. Covers the front-loaded metadata of
 /// most backends: MKV (EBML header + Info + Tracks + the bounded head window of
 /// blocks it walks — see `mkv::HEAD_SPAN_BYTES`), raw-HEVC/AV1 front windows, and
@@ -170,6 +172,45 @@ fn merge_ranges(mut ranges: Vec<(u64, usize)>) -> Vec<(u64, u64)> {
         }
     }
     merged
+}
+
+/// Per-range / total caps on the sampled-chunk warm, so a corrupt sample index
+/// (box-declared sizes are attacker-controlled) can't drive the warmer into
+/// streaming gigabytes. Generous against real content: a 4K IDR access unit is
+/// single-digit MiB, and the default 16 samples total well under the budget.
+const CHUNK_WARM_RANGE_CAP: usize = 32 << 20; // 32 MiB
+const CHUNK_WARM_TOTAL_CAP: usize = 128 << 20; // 128 MiB
+
+/// Warm the access units the sampler is about to fault. `select_indices` with
+/// the same inputs yields exactly the chunks `sample::scan` will read, and each
+/// chunk's byte range is known from the container index, so the scattered
+/// mmap faults (one ~32 KiB round-trip each) collapse into a few pipelined
+/// reads. Callers gate this to the default path: under `--full` every chunk is
+/// read and pre-reading a whole movie would be a regression, and under
+/// `--no-rpu` no chunk is read at all.
+pub fn warm_sample_chunks(remote: bool, file: &File, demux: &Demux, samples: usize) {
+    // TS/M2TS chunks index into the reassembled buffer, not the file — its
+    // file-side working set (head + tail windows) is warmed by `warm_metadata`.
+    if !remote || demux.reassembled.is_some() || demux.chunks.is_empty() {
+        return;
+    }
+    let mut ranges: Vec<(u64, usize)> = Vec::new();
+    let mut total = 0usize;
+    for i in crate::sample::select_indices(demux.chunks.len(), samples, false) {
+        let c = demux.chunks[i];
+        let len = (c.size as usize).min(CHUNK_WARM_RANGE_CAP);
+        // Already streamed by the metadata head warm (MKV/AV1 head chunks, the
+        // head run of a front-mdat MP4).
+        if c.offset.saturating_add(len as u64) <= HEAD_WARM as u64 {
+            continue;
+        }
+        total += len;
+        if total > CHUNK_WARM_TOTAL_CAP {
+            break;
+        }
+        ranges.push((c.offset, len));
+    }
+    warm_ranges(file, ranges);
 }
 
 /// Sequentially read `len` bytes from `offset` into a scratch buffer and discard
