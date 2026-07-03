@@ -70,10 +70,12 @@ excluded by config.
   detects by extension and renders through the ordinary `Report`. DV sidecars carry no
   resolution, so L5 is sized against an assumed UHD canvas (`ASSUMED_CANVAS`) and labelled.
   A DV XML's Level-0 globals **frame rate** and **mastering display** are read straight from the
-  raw XML in `dv_xml.rs` (`<EditRate>`, `<MasteringDisplay>` peak/min), *not* from libdovi:
-  `CmXmlParser` never parses `<EditRate>` and folds the mastering display into a lossy PQ code, so
-  reading the XML gives exact values. Both elements sit in the file head, so it's cheap; keep them
-  off the libdovi path.
+  raw XML in `dv_xml.rs` (`<EditRate>`, `<MasteringDisplay>` peak/min/primaries), *not* from
+  libdovi: `CmXmlParser` never parses `<EditRate>` and folds the mastering display into a lossy PQ
+  code, so reading the XML gives exact values. Both elements sit in the file head, so it's cheap;
+  keep them off the libdovi path. The XML's Level-0 primaries (tagged `[L0]`) are the
+  mastering-gamut fallback for a CM v2.9 XML, which has no L9; a recognized L9 wins when present,
+  so CM v4.0 output is unchanged.
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
 - `prefetch.rs` — warms the metadata region with one pipelined positioned read before the
   mmap parse, so SMB/NFS scans don't fault it in over hundreds of round-trips. Timing only —
@@ -105,7 +107,15 @@ excluded by config.
   **L10 is never in the tag**: it only *defines* the display an L8 trim points at; the trim itself
   is L8.
 - **DV facts and their sources.** BL **compatibility id** and DV **level** come from the
-  `dvcC`/`dvvC` box, *not* the RPU. Everything dynamic (FEL/MEL, L5/L6/L9/L11/L254, trim
+  `dvcC`/`dvvC` box, *not* the RPU. The DV Mastering line's **luminance** is the DM header's
+  `source_min_pq`/`source_max_pq` (present in every CM version); its **gamut** comes only from a
+  level that actually carries one — RPU L9 (CM v4.0) or a DV XML's Level-0 `<MasteringDisplay>` —
+  tagged `[L9]`/`[L0]` per `model::MasteringDisplay::primaries_level`. A CM v2.9 RPU carries **no
+  mastering primaries at all**: the DM header's `ycc_to_rgb`/`rgb_to_lms` matrices are the
+  *signal* space, not the display — corpus-verified: P3-D65-mastered titles (v2.9 per their BL
+  MDCV, v4.0 per their own L9) all carry the identical BT.2020 `rgb_to_lms` (see the comment in
+  `levels::finalize`) — so never fingerprint them into a gamut name; the v2.9 line stays
+  luminance-only. Everything dynamic (FEL/MEL, L5/L6/L9/L11/L254, trim
   targets) comes from the **RPU**, which rides the base layer / a DV-flagged track — the
   enhancement-layer *residual* is decode-only and never needed. This is why P7 dual-track
   "just works" once the BL/DV track's RPU is parsed. The **compatibility id is `Option<u8>`**:
