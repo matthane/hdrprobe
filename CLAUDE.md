@@ -191,8 +191,11 @@ excluded by config.
   (the base-layer type: 8.1 HDR10 vs 8.4 HLG), which lives only in the dvcC/dvvC — the RPU can't
   distinguish them. A metadata-only sidecar has no dvcC: a **DV XML declares its profile**
   (`dv_xml.rs` maps `GenerateProfile` -> compat via `DvAggregate::set_compat_id`, so the minor is
-  real), but a **raw RPU bin has nothing**, so its minor is a convention default (P8 -> .1, P4 -> .2)
-  flagged `[compat assumed]` (`model::profile_compat_assumed`). That flag is gated to metadata-only
+  real), but a **raw RPU bin has nothing**, so its minor is a convention default (P8 -> .1,
+  P7 -> .6, P4 -> .2) flagged `[compat assumed]` (`model::profile_compat_assumed`). The P7 default
+  also covers the common *video* case of an untouched BDMV M2TS, which has **no `0xB0` DV
+  descriptor at all** — Blu-ray signals DV via the HDMV registration descriptor and the playlist
+  STN table; only remuxes (tsMuxeR etc.) add the descriptor. That flag is gated to metadata-only
   sidecars via `DvAggregate::mark_metadata_only`: a video input — **even a raw HEVC/AV1 elementary
   stream with no dvcC** — has a base-layer VUI that officially backs the inference, so it's never
   flagged. Don't widen the flag to `cfg.is_none()`; raw bitstreams share that state but aren't

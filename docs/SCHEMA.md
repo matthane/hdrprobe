@@ -275,7 +275,7 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `profile` | string | always | `<major>.<minor>` from the container config, e.g. `"8.1"`, `"5.0"`, `"10.4"`, `"20.0"`. Dual-layer profiles (4, 7) append the enhancement-layer kind: `"7.6 (FEL)"`, `"4.2 (MEL)"`. When no compatibility id is available the minor is a convention default for profiles 8 (`8.1`) and 4 (`4.2`); any other profile then prints its bare major, e.g. `"5"` |
+| `profile` | string | always | `<major>.<minor>` from the container config, e.g. `"8.1"`, `"5.0"`, `"10.4"`, `"20.0"`. Dual-layer profiles (4, 7) append the enhancement-layer kind: `"7.6 (FEL)"`, `"4.2 (MEL)"`. When no compatibility id is available the minor is a convention default for profiles 8 (`8.1`), 7 (`7.6`, the only combination Dolby defines; an untouched BDMV M2TS carries no DV descriptor, so this is the common Blu-ray-original case) and 4 (`4.2`); any other profile then prints its bare major, e.g. `"5"` |
 | `profile_compat_assumed` | boolean | only when `true` | The minor digit above was supplied by convention rather than read from data. Set only for metadata-only sidecars (a raw RPU bin); a video input's base-layer signalling backs the inference, so it is never flagged there |
 | `structure` | string | optional | Layer/track layout, present only for dual-layer content: `"Single track, dual layer"` or `"Dual track, dual layer"` |
 | `level` | integer | optional | DV level from the container `dvcC`/`dvvC`; absent when there is no container config (raw streams, sidecars) |

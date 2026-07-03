@@ -230,11 +230,12 @@ impl DvAggregate {
 
         // Compat id from the container dvcC/dvvC, else a DV XML's declared profile.
         // When neither carries it, the label's minor digit is a convention default
-        // (P8 -> .1, P4 -> .2). That's only flagged as assumed for a metadata-only
-        // sidecar: a video input's base-layer VUI backs the inference officially.
+        // (P8 -> .1, P7 -> .6, P4 -> .2). That's only flagged as assumed for a
+        // metadata-only sidecar: a video input's base-layer VUI backs the
+        // inference officially.
         let compat_id = cfg.and_then(|c| c.bl_compatibility_id).or(self.compat_override);
         let profile_compat_assumed =
-            self.metadata_only && compat_id.is_none() && matches!(profile, 4 | 8);
+            self.metadata_only && compat_id.is_none() && matches!(profile, 4 | 7 | 8);
         let profile_str = dv_profile_label(profile, compat_id, self.el_type.as_ref());
 
         // Presence: prefer explicit container flags, else derive from profile.
@@ -419,7 +420,11 @@ pub fn flag_fel_brightness_expansion(dv: &mut DolbyVision, bl_max_nits: Option<f
 /// the profile's definition rather than guessed. Profile 8 mandates
 /// cross-compatibility signalling, so a raw P8 RPU (a `.bin`/`.xml` sidecar, or
 /// an AV1 P10 RPU libdovi reports as 8) is labelled `8.1` by convention, matching
-/// dovi_tool. Profile 4 is SDR-compatible by definition (CCID 2), so a legacy P4
+/// dovi_tool. Profile 7 is defined with CCID 6 only (the UHD Blu-ray HDR10 base) —
+/// and its most common carrier, an untouched BDMV M2TS, has *no* DV descriptor to
+/// read (Blu-ray signals DV via the playlist STN table, not the PMT `0xB0`
+/// descriptor a remux would add) — so a descriptor-less P7 is labelled `7.6`.
+/// Profile 4 is SDR-compatible by definition (CCID 2), so a legacy P4
 /// mux whose compact descriptor omits the nibble is labelled `4.2` — consistent
 /// with `hdr::assemble` inferring P4's SDR base from the profile. Any other
 /// profile without a compat id prints its bare number.
@@ -427,6 +432,7 @@ fn dv_profile_label(profile: u8, compat: Option<u8>, el_type: Option<&DoviELType
     let base = match compat {
         Some(id) => format!("{profile}.{id}"),
         None if profile == 8 => "8.1".to_string(),
+        None if profile == 7 => "7.6".to_string(),
         None if profile == 4 => "4.2".to_string(),
         None => profile.to_string(),
     };
