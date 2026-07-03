@@ -98,7 +98,11 @@ impl Bitrate {
     }
 
     /// Per-stream rate from an exact encoded byte count over the stream duration.
+    /// Zero bytes means "no sample index", not a real rate — `None`, never 0 b/s.
     pub fn video_stream(bytes: u64, duration_secs: Option<f64>) -> Option<Self> {
+        if bytes == 0 {
+            return None;
+        }
         let d = duration_secs.filter(|d| *d > 0.0)?;
         Some(Bitrate { bits_per_sec: bytes as f64 * 8.0 / d, scope: BitrateScope::VideoStream })
     }
