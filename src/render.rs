@@ -113,6 +113,24 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 let ver = cm.strip_prefix("CM ").unwrap_or(cm);
                 kv(&mut s, &c, "Content mapping", ver);
             }
+            // The DV grade's mastering display comes from the DM data header
+            // (source_min/max_pq), not a metadata level — so it renders with the
+            // header-derived lines above, ahead of the L2..L11 level lines. The
+            // gamut is the one L9 fact (the header carries no primaries), so it
+            // rides along with its provenance tagged, like the trim targets'.
+            if let Some(md) = &dv.mastering_display {
+                let prim = md
+                    .primaries
+                    .as_ref()
+                    .map(|p| format!("{p} {} · ", c.dim("[L9]")))
+                    .unwrap_or_default();
+                kv(
+                    &mut s,
+                    &c,
+                    "Mastering",
+                    &format!("{}max {}  min {} cd/m²", prim, fmt_num(md.max_luminance), fmt_num(md.min_luminance)),
+                );
+            }
             if !dv.trim_targets.is_empty() {
                 let list = dv
                     .trim_targets
@@ -160,20 +178,19 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     kv(&mut s, &c, "L5 active area", &areas);
                 }
             }
-            if let Some(md) = &dv.mastering_display {
-                kv(
-                    &mut s,
-                    &c,
-                    "Mastering",
-                    &format!("max {}  min {} cd/m²", fmt_num(md.max_luminance), fmt_num(md.min_luminance)),
-                );
-            }
             if let Some(l6) = &dv.l6_fallback {
                 let flag = if l6.zeroed { format!("  {}", c.warn("(zeroed!)")) } else { String::new() };
                 kv(&mut s, &c, "L6 content light", &format!("MaxCLL {} · MaxFALL {}{}", l6.max_cll, l6.max_fall, flag));
             }
-            if let Some(l9) = &dv.l9_mastering {
-                kv(&mut s, &c, "L9 mastering", l9);
+            // L9 folds into the Mastering line above when recognized; a
+            // standalone line remains only when it couldn't ride there (no
+            // mastering display in the DM header, or an unmatched custom gamut).
+            let l9_on_mastering =
+                dv.mastering_display.as_ref().is_some_and(|m| m.primaries.is_some());
+            if !l9_on_mastering {
+                if let Some(l9) = &dv.l9_mastering {
+                    kv(&mut s, &c, "L9 mastering", l9);
+                }
             }
             if let Some(l11) = &dv.l11_content {
                 let rm = match dv.l11_reference_mode {

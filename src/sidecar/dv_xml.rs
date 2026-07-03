@@ -156,8 +156,18 @@ pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
     match agg {
         Some(agg) => {
             let mut payload = finalize_dv(agg, Some(ASSUMED_CANVAS))?;
+            // Prefer the exact XML luminance over the aggregate's PQ-derived one
+            // (CmXmlParser folds this display into lossy 12-bit codes), but keep
+            // the derived value when the XML block is absent — and carry over the
+            // aggregate's L9-derived gamut either way (this XML read is
+            // luminance-only).
             if let Payload::DolbyVision(dv) = &mut payload {
-                dv.mastering_display = meta.mastering.clone();
+                if let Some(xml_md) = &meta.mastering {
+                    let mut md = xml_md.clone();
+                    md.primaries =
+                        dv.mastering_display.take().and_then(|m| m.primaries);
+                    dv.mastering_display = Some(md);
+                }
             }
             Ok((payload, meta))
         }

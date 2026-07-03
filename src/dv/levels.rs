@@ -11,7 +11,9 @@ use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlock;
 use dolby_vision::rpu::rpu_data_nlq::DoviELType;
 
 use crate::container::DvConfig;
-use crate::model::{ActiveArea, DolbyVision, DvCensus, L6Fallback, LevelPresence, TrimTarget};
+use crate::model::{
+    ActiveArea, DolbyVision, DvCensus, L6Fallback, LevelPresence, MasteringDisplay, TrimTarget,
+};
 
 /// Metadata levels we census, in report order.
 const CENSUS_LEVELS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 254];
@@ -26,8 +28,17 @@ pub struct DvAggregate {
     dm_version_index: Option<u8>,
     /// Distinct L5 offset rectangles (left, right, top, bottom).
     l5_offsets: Vec<(u16, u16, u16, u16)>,
+    /// DV mastering-display luminance range from the vdr_dm_data header
+    /// (`source_min_pq`, `source_max_pq`, 12-bit PQ codes), first RPU carrying
+    /// it. This is the grade's own mastering display — on a Profile 7 title it
+    /// can exceed the base layer's ST.2086 SEI (e.g. a 4000-nit DV grade over a
+    /// 1000-nit HDR10 base).
+    source_pq: Option<(u16, u16)>,
     l6: Option<L6Fallback>,
     l9_primary: Option<u8>,
+    /// L9 custom chromaticities (R,G,B,WP x/y in 0.15 fixed point, ÷32767),
+    /// carried only by the 17-byte form (index 255).
+    l9_custom: Option<[u16; 8]>,
     l11_content: Option<u8>,
     l11_ref_mode: Option<bool>,
     /// L2 trim targets in nits (self-contained: L2 carries its own target_max_pq).
@@ -93,6 +104,11 @@ impl DvAggregate {
         let Some(dm) = &rpu.vdr_dm_data else { return };
 
         self.scene_cuts += scene_cuts;
+        // Mastering-display range of the DV grade, from the DM data header.
+        // Title-stable in practice; a zero max is an absent/defaulted value.
+        if self.source_pq.is_none() && dm.source_max_pq > 0 {
+            self.source_pq = Some((dm.source_min_pq, dm.source_max_pq));
+        }
         // Per-level presence census over the levels we care about.
         for &lvl in CENSUS_LEVELS {
             if dm.level_blocks_iter(lvl).next().is_some() {
@@ -135,6 +151,18 @@ impl DvAggregate {
         if self.l9_primary.is_none() {
             if let Some(ExtMetadataBlock::Level9(b)) = dm.get_block(9) {
                 self.l9_primary = Some(b.source_primary_index);
+                if b.length > 1 {
+                    self.l9_custom = Some([
+                        b.source_primary_red_x,
+                        b.source_primary_red_y,
+                        b.source_primary_green_x,
+                        b.source_primary_green_y,
+                        b.source_primary_blue_x,
+                        b.source_primary_blue_y,
+                        b.source_primary_white_x,
+                        b.source_primary_white_y,
+                    ]);
+                }
             }
         }
 
@@ -265,6 +293,18 @@ impl DvAggregate {
                 .collect(),
         });
 
+        // The mastering display's gamut: L9 is the RPU's only carrier of it (the
+        // DM data header describes the *signal* space, not the display), so the
+        // recognized L9 name rides the Mastering line; "custom"/"unknown" stay
+        // on the standalone L9 line instead, never guessed.
+        let l9_label = l9_label(self.l9_primary, self.l9_custom);
+        let l9_recognized =
+            l9_label.clone().filter(|l| l != "custom" && l != "unknown");
+        let mastering_display = self.source_pq.map(source_pq_to_mastering).map(|mut m| {
+            m.primaries = l9_recognized;
+            m
+        });
+
         Some(DolbyVision {
             profile: profile_str,
             profile_compat_assumed,
@@ -279,9 +319,9 @@ impl DvAggregate {
             cm_version,
             l5_active_areas,
             l5_assumed_canvas: None,
-            mastering_display: None,
+            mastering_display,
             l6_fallback: self.l6,
-            l9_mastering: self.l9_primary.map(primary_name),
+            l9_mastering: l9_label,
             l11_content: self.l11_content.map(content_type_name),
             l11_reference_mode: self.l11_ref_mode,
             trim_targets,
@@ -381,6 +421,23 @@ fn compat_str(id: u8) -> Option<String> {
     )
 }
 
+/// Resolve an L9 block to a gamut name: a predefined index through the Dolby
+/// index table, a custom index (255) by matching its raw chromaticities (0.15
+/// fixed point, ÷32767) against the shared gamut matcher — falling back to
+/// "custom" when the coordinates match no known mastering gamut.
+fn l9_label(primary: Option<u8>, custom: Option<[u16; 8]>) -> Option<String> {
+    match (primary, custom) {
+        (Some(255), Some(c)) => {
+            let f = |x: u16, y: u16| (x as f64 / 32767.0, y as f64 / 32767.0);
+            crate::hdr::primaries_label(f(c[0], c[1]), f(c[2], c[3]), f(c[4], c[5]), f(c[6], c[7]))
+                .map(str::to_string)
+                .or(Some("custom".to_string()))
+        }
+        (Some(idx), _) => Some(primary_name(idx)),
+        (None, _) => None,
+    }
+}
+
 fn primary_name(idx: u8) -> String {
     match idx {
         0 => "DCI-P3 D65",
@@ -407,6 +464,18 @@ fn content_type_name(t: u8) -> String {
         _ => "Unknown",
     }
     .to_string()
+}
+
+/// The RPU DM header's (`source_min_pq`, `source_max_pq`) pair -> luminance in
+/// nits. The max snaps to the standard mastering targets (the codes are 12-bit
+/// quantisations of exactly those values: 3079 ≈ 1000, 3696 ≈ 4000); the min is
+/// sub-nit (e.g. code 7 ≈ 0.0001), so it's rounded to 4 decimals instead.
+fn source_pq_to_mastering((min, max): (u16, u16)) -> MasteringDisplay {
+    MasteringDisplay {
+        max_luminance: snap_nits(pq12_to_nits(max)) as f64,
+        min_luminance: (pq12_to_nits(min) * 10000.0).round() / 10000.0,
+        primaries: None,
+    }
 }
 
 /// SMPTE ST 2084 (PQ) EOTF for a 12-bit code value -> cd/m².
@@ -475,6 +544,39 @@ fn resolve_l8_nits(idx: u8, l10_targets: &BTreeMap<u8, u32>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_pq_decodes_the_common_mastering_ranges() {
+        // The 12-bit PQ codes real titles carry: 3079/3696 are the quantised
+        // 1000/4000-nit peaks (the P7 "1000-nit BL, 4000-nit grade" case), and
+        // min code 7 is the ubiquitous 0.0001 cd/m² floor.
+        let m = source_pq_to_mastering((7, 3079));
+        assert_eq!(m.max_luminance, 1000.0);
+        assert_eq!(m.min_luminance, 0.0001);
+        let m = source_pq_to_mastering((7, 3696));
+        assert_eq!(m.max_luminance, 4000.0);
+        // Profile 8.4 (HLG) convention: 62/3079 -> 0.005 / 1000 nits.
+        let m = source_pq_to_mastering((62, 3079));
+        assert_eq!(m.min_luminance, 0.005);
+    }
+
+    #[test]
+    fn l9_custom_chromaticities_match_known_gamuts() {
+        // Index 255 carries raw 0.15 fixed-point chromaticities: P3 D65 encodes
+        // as round(coord × 32767). Matched through the shared gamut matcher so
+        // a custom-coded standard gamut still gets its name.
+        let q = |v: f64| (v * 32767.0).round() as u16;
+        let p3d65 = [
+            q(0.680), q(0.320), q(0.265), q(0.690), q(0.150), q(0.060), q(0.3127), q(0.3290),
+        ];
+        assert_eq!(l9_label(Some(255), Some(p3d65)).as_deref(), Some("DCI-P3 D65"));
+        // Off-gamut coordinates fall back to "custom", never a guessed name.
+        let odd = [q(0.7), q(0.3), q(0.2), q(0.7), q(0.14), q(0.05), q(0.30), q(0.32)];
+        assert_eq!(l9_label(Some(255), Some(odd)).as_deref(), Some("custom"));
+        // Predefined indices keep the table name; no L9 at all stays None.
+        assert_eq!(l9_label(Some(0), None).as_deref(), Some("DCI-P3 D65"));
+        assert_eq!(l9_label(None, None), None);
+    }
 
     #[test]
     fn l8_index_255_resolves_via_l10_definition() {

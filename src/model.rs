@@ -165,8 +165,12 @@ pub struct DolbyVision {
     /// baked into the RPU in actual pixels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l5_assumed_canvas: Option<[u32; 2]>,
-    /// Mastering-display luminance from a DV CM XML's global (Level 0) metadata.
-    /// Sidecars only — video files carry this in the HDR section instead.
+    /// The DV grade's own mastering-display luminance: the RPU DM header's
+    /// `source_min_pq`/`source_max_pq` (or, for a DV CM XML, the exact global
+    /// Level-0 values). Distinct from the HDR section's mastering line, which
+    /// describes the *base layer* (container/ST.2086 SEI) — on a Profile 7
+    /// title the DV grade can exceed it (4000-nit grade over a 1000-nit
+    /// HDR10 base).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mastering_display: Option<MasteringDisplay>,
     #[serde(skip_serializing_if = "Option::is_none")]
