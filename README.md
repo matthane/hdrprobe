@@ -164,9 +164,29 @@ A directory argument is scanned for video files. Add `-r` to descend into subdir
 | `-r, --recursive` | Descend into directory arguments |
 | `--threads <N>` | Number of parallel workers (default: logical core count) |
 | `-o, --output <path>` | Write to a file instead of stdout |
+| `--install-shell` | Windows: add a right-click "Inspect HDR metadata" context-menu entry |
+| `--uninstall-shell` | Windows: remove that context-menu entry |
 | `-h, --help`, `-V, --version` | Standard |
 
 Exit codes: `0` parsed successfully, `1` usage error, `2` unreadable or corrupt input.
+
+### Windows shell integration
+
+```sh
+hdrprobe --install-shell     # register the right-click menu entry
+hdrprobe --uninstall-shell   # remove it
+```
+
+`--install-shell` adds an "Inspect HDR metadata" entry to the right-click menu of
+every supported file type, so any video or metadata sidecar can be inspected from
+Explorer. Selecting it opens a console running the report, kept open until you press
+a key. The entry launches whichever `hdrprobe.exe` you ran the install from, so run
+it from the binary's final location.
+
+Registration is per-user, so it needs no administrator rights: it writes verbs under
+`HKCU\Software\Classes\SystemFileAssociations` and touches no default file
+associations. On Windows 11 the entry lives under "Show more options" in the
+right-click menu.
 
 ## Performance
 
