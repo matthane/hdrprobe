@@ -251,7 +251,8 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
     // On a network filesystem (SMB/NFS) the mmap parse would fault the metadata
     // region in as many synchronous round-trips; warm it with one pipelined read
     // first. No-op on local volumes; never changes what we parse.
-    prefetch::warm_metadata(&file, path, &mmap);
+    let remote = prefetch::is_remote(&file);
+    prefetch::warm_metadata(remote, &file, path, &mmap);
 
     let demux = container::demux(path, &mmap, cli.full).context("demux failed")?;
 

@@ -42,16 +42,53 @@ use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
-    fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+    fn GetFileInformationByHandleEx(
+        h_file: *mut std::ffi::c_void,
+        file_information_class: u32,
+        file_information: *mut std::ffi::c_void,
+        buffer_size: u32,
+    ) -> i32;
 }
+/// `FILE_INFO_BY_HANDLE_CLASS::FileRemoteProtocolInfo`.
 #[cfg(windows)]
-const DRIVE_REMOTE: u32 = 4;
+const FILE_REMOTE_PROTOCOL_INFO_CLASS: u32 = 13;
+
+/// Whether the open file lives on a network filesystem — the gate for every
+/// warm. Decided from the already-open handle, so it costs no extra network
+/// round-trip (unlike a path canonicalization, which re-opens the file over
+/// SMB) and is correct through mapped drives, UNC paths, symlinks, and subst.
+/// On Windows, `FileRemoteProtocolInfo` succeeds only for remote files; the
+/// verdict is just that success. Elsewhere a page-cache warm is cheap and
+/// helps CIFS/NFS, so it is always on.
+#[cfg(windows)]
+pub fn is_remote(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    // FILE_REMOTE_PROTOCOL_INFO is 116 bytes, 4-byte aligned; only the call's
+    // success matters, never the contents.
+    let mut info = [0u32; 29];
+    // SAFETY: the handle is valid for the lifetime of `file`, and the buffer is
+    // a live, writable allocation of the documented size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FILE_REMOTE_PROTOCOL_INFO_CLASS,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of_val(&info) as u32,
+        ) != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_remote(_file: &File) -> bool {
+    true
+}
 
 /// Warm the container metadata region so a network filesystem streams it in a
 /// pipelined read instead of many synchronous page faults. Best-effort and a
-/// no-op on local volumes; never changes what is parsed.
-pub fn warm_metadata(file: &File, path: &Path, data: &[u8]) {
-    if !should_warm(path) {
+/// no-op on local volumes (`remote` is the caller's `is_remote` verdict, decided
+/// once per file); never changes what is parsed.
+pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
+    if !remote {
         return;
     }
     let size = data.len();
@@ -155,27 +192,16 @@ fn looks_like_mkv(path: &Path, data: &[u8]) -> bool {
         || (data.len() >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3)
 }
 
-/// Whether warming is worth it. On Windows we restrict it to network volumes so
-/// the fast local path is untouched; elsewhere a page-cache warm is cheap and
-/// helps CIFS/NFS, so it is always on.
-#[cfg(windows)]
-fn should_warm(path: &Path) -> bool {
-    use std::path::{Component, Prefix};
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let Some(Component::Prefix(pref)) = abs.components().next() else {
-        return false;
-    };
-    let disk = match pref.kind() {
-        Prefix::UNC(..) | Prefix::VerbatimUNC(..) => return true,
-        Prefix::Disk(d) | Prefix::VerbatimDisk(d) => d,
-        _ => return false,
-    };
-    let root: [u16; 4] = [disk.to_ascii_uppercase() as u16, b':' as u16, b'\\' as u16, 0];
-    // SAFETY: `root` is a valid NUL-terminated wide string that outlives the call.
-    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
-}
-
-#[cfg(not(windows))]
-fn should_warm(_path: &Path) -> bool {
-    true
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn is_remote_is_false_for_a_local_temp_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("hdrprobe_is_remote_smoke");
+        let file = std::fs::File::create(&path).unwrap();
+        assert!(!super::is_remote(&file), "local temp file must not warm");
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
 }
