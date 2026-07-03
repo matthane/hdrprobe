@@ -25,6 +25,11 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     if o.show_general {
         let _ = writeln!(s, "{}", c.header("General"));
         kv(&mut s, &c, "Container", &r.general.container);
+        // Sidecar schema version (a DV XML's root `version` attribute); video
+        // inputs never carry one, so the line only appears for sidecars.
+        if let Some(v) = &r.general.format_version {
+            kv(&mut s, &c, "Schema version", v);
+        }
         if let Some(d) = r.general.duration_secs {
             kv(&mut s, &c, "Duration", &human_duration(d));
         }

@@ -74,7 +74,7 @@ pub fn try_process(path: &Path) -> Result<Option<Report>> {
         }
         let size = std::fs::metadata(path)?.len();
         let payload = hdr10plus_json::parse(&head)?;
-        return Ok(Some(build_report(path, size, "HDR10+ JSON", payload, None, started)));
+        return Ok(Some(build_report(path, size, "HDR10+ JSON", payload, None, None, started)));
     }
 
     let data = std::fs::read(path)?;
@@ -84,19 +84,20 @@ pub fn try_process(path: &Path) -> Result<Option<Report>> {
         return Ok(None);
     };
 
-    // Frame rate is a DV-XML-only global (Level 0) fact; the RPU bin carries none.
-    let (container, payload, fps) = match kind {
-        Kind::RpuBin => ("Dolby Vision RPU", rpu_bin::parse(&data)?, None),
+    // Frame rate and schema version are DV-XML-only global facts; the RPU bin
+    // carries neither.
+    let (container, payload, fps, version) = match kind {
+        Kind::RpuBin => ("Dolby Vision RPU", rpu_bin::parse(&data)?, None, None),
         Kind::DvXml => {
             let (payload, meta) = dv_xml::parse(&data)?;
-            ("Dolby Vision XML", payload, meta.fps)
+            ("Dolby Vision XML", payload, meta.fps, meta.version)
         }
         // `.json` is handled above via a bounded head read, so it never reaches
         // the whole-file path.
         Kind::Hdr10PlusJson => unreachable!("json is dispatched before the full read"),
     };
 
-    Ok(Some(build_report(path, size, container, payload, fps, started)))
+    Ok(Some(build_report(path, size, container, payload, fps, version, started)))
 }
 
 #[derive(Clone, Copy)]
@@ -207,6 +208,7 @@ fn build_report(
     container: &str,
     payload: Payload,
     fps: Option<f64>,
+    format_version: Option<String>,
     started: Instant,
 ) -> Report {
     let (dolby_vision, hdr10plus) = match payload {
@@ -220,6 +222,7 @@ fn build_report(
             container: container.to_string(),
             codec: String::new(),
             codec_profile: None,
+            format_version,
             width: None,
             height: None,
             fps,

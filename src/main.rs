@@ -301,6 +301,7 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
         container: demux.container.to_string(),
         codec: demux.codec.label(),
         codec_profile: demux.codec_profile.clone(),
+        format_version: None,
         width: if demux.width > 0 { Some(demux.width) } else { None },
         height: if demux.height > 0 { Some(demux.height) } else { None },
         fps: demux.fps,

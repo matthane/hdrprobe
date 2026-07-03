@@ -28,6 +28,11 @@ pub struct General {
     pub codec: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec_profile: Option<String>,
+    /// Sidecar schema version, e.g. "4.0.2" from a DV CM XML's root
+    /// `<DolbyLabsMDF version=…>` attribute. `None` for video inputs and
+    /// sidecars that don't declare one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

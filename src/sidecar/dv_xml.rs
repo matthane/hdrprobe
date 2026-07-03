@@ -30,13 +30,17 @@ use crate::model::MasteringDisplay;
 
 use super::{finalize_dv, Payload, ASSUMED_CANVAS};
 
-/// The Level 0 (global) frame rate and mastering display that libdovi's parser
-/// drops — it never reads `<EditRate>`, and folds the mastering display into a
-/// lossy PQ code. Both are read straight from the raw XML (exact, and cheap: the
-/// elements sit in the file head), independent of the libdovi aggregation.
+/// The XML facts libdovi's parser drops or degrades — it never reads
+/// `<EditRate>`, folds the mastering display into a lossy PQ code, and reduces
+/// the schema version to a coarse enum. All are read straight from the raw XML
+/// (exact, and cheap: the elements sit in the file head), independent of the
+/// libdovi aggregation.
 pub struct GlobalMeta {
     pub fps: Option<f64>,
     pub mastering: Option<MasteringDisplay>,
+    /// Schema version from the root `<DolbyLabsMDF version=…>` attribute,
+    /// e.g. "2.0.5" (CM v2.9) or "4.0.2"/"5.1.0" (CM v4.0).
+    pub version: Option<String>,
 }
 
 /// Text of the first `<tag>…</tag>` at or after `from`, trimmed.
@@ -44,6 +48,35 @@ fn tag_text<'a>(xml: &'a str, tag: &str, from: usize) -> Option<&'a str> {
     let s = xml[from..].find(&format!("<{tag}>"))? + from + tag.len() + 2;
     let e = xml[s..].find(&format!("</{tag}>"))? + s;
     Some(xml[s..e].trim())
+}
+
+/// Schema version, declared in one of two places (the same pair libdovi
+/// accepts): a `version` attribute on the root (`<DolbyLabsMDF … version="2.0.5">`,
+/// the legacy schemas) or a `<Version>4.0.2</Version>` child element (4.0.x/5.x).
+/// The attribute is matched inside the root's opening tag only, requiring the
+/// name at a token boundary so a namespace URI that merely contains "version="
+/// can't satisfy it.
+fn parse_version(xml: &str) -> Option<String> {
+    let start = xml.find("<DolbyLabsMDF")?;
+    let tag_end = start + xml[start..].find('>')?;
+    let tag = &xml[start..tag_end];
+    let mut from = 0;
+    while let Some(i) = tag[from..].find("version=").map(|i| i + from) {
+        if !tag.as_bytes()[..i].last().is_some_and(|b| b.is_ascii_whitespace()) {
+            from = i + 1;
+            continue;
+        }
+        let rest = &tag[i + "version=".len()..];
+        let quote = *rest.as_bytes().first()? as char;
+        if quote != '"' && quote != '\'' {
+            from = i + 1;
+            continue;
+        }
+        let val = rest[1..1 + rest[1..].find(quote)?].trim();
+        return (!val.is_empty()).then(|| val.to_string());
+    }
+    let val = tag_text(xml, "Version", tag_end)?;
+    (!val.is_empty()).then(|| val.to_string())
 }
 
 /// Frame rate from `<EditRate>`: "num den" (or "num,den") is a rational, a lone
@@ -122,7 +155,11 @@ fn parse_primaries(md: &str) -> Option<&'static str> {
 
 pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
     let xml = String::from_utf8_lossy(data).into_owned();
-    let meta = GlobalMeta { fps: parse_frame_rate(&xml), mastering: parse_mastering(&xml) };
+    let meta = GlobalMeta {
+        fps: parse_frame_rate(&xml),
+        mastering: parse_mastering(&xml),
+        version: parse_version(&xml),
+    };
 
     let agg: Option<DvAggregate> = guard(|| {
         let opts = XmlParserOpts {
@@ -310,6 +347,33 @@ mod tests {
             Some(24000.0 / 1001.0)
         );
         assert_eq!(parse_frame_rate("<Rate><n>24</n><d>0</d></Rate>"), None);
+    }
+
+    #[test]
+    fn schema_version_reads_both_declaration_forms() {
+        // 4.0.x/5.x: a <Version> child element under a namespaced root.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+          <DolbyLabsMDF xmlns="http://www.dolby.com/schemas/dvmd/4_0_2">
+            <Version>4.0.2</Version>
+          </DolbyLabsMDF>"#;
+        assert_eq!(parse_version(xml).as_deref(), Some("4.0.2"));
+        // Legacy schemas: a root `version` attribute, single-quoted here to
+        // cover both quote styles.
+        assert_eq!(
+            parse_version("<DolbyLabsMDF version='2.0.5' xmlns=\"urn:dolby\">").as_deref(),
+            Some("2.0.5")
+        );
+        // The attribute wins when both are present (it is the root's own).
+        assert_eq!(
+            parse_version("<DolbyLabsMDF version=\"5.1.0\"><Version>9.9</Version>").as_deref(),
+            Some("5.1.0")
+        );
+        // The XML declaration's own version="1.0" must not leak in when the root
+        // declares nothing, nor may a "version=" inside a namespace URI.
+        assert_eq!(
+            parse_version("<?xml version=\"1.0\"?><DolbyLabsMDF xmlns=\"urn:x?version=9.9\"/>"),
+            None
+        );
     }
 
     #[test]
