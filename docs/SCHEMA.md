@@ -231,8 +231,8 @@ Present for every video input; absent for sidecars.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `format` | string | always | Overall classification; see below |
-| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values |
-| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values |
+| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values. Like `content_light`, the L6 fallback applies only when the stream has an independently viewable base signal: on an IPT-PQ-c2 base (Profile 5 and Profile 20) the L6 values merely restate the DV grade's own display, which `dolby_vision.mastering_display` already reports, so the field is omitted. A container or SEI value, when actually signalled, is always reported |
+| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values. The L6 fallback applies only when the stream has an independently viewable base signal (a base tag in `format`): MaxCLL/MaxFALL is HDR10 (CTA-861.3) convention, so a DV stream with no viewable base (Profile 5 and Profile 20, whose base is IPT-PQ-c2) omits the field rather than echo L6's zeroed placeholder. A container or SEI value, when actually signalled, is always reported |
 
 ### `format` values
 

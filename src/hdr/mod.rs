@@ -72,11 +72,20 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
     let format = formats.join(" + ");
 
     // Prefer container mastering, then the SEI ST.2086 message, then DV L6.
+    // This line means the *base layer's own* declared display, so the L6
+    // fallback — like the CLL one below — applies only when there is a
+    // standards-viewable base to describe. On an IPT-PQ-c2 base (`base ==
+    // None`) the stream declares nothing itself (corpus P5 files carry no
+    // MDCV box/SEI), and L6's mastering half is just the grade's display
+    // re-encoded, already shown authoritatively on the DV Mastering line
+    // (DM header source_min/max_pq) — falling back would duplicate it as a
+    // base-layer fact. A signalled MDCV on an IPT stream still shows.
     let mastering = demux
         .mastering
         .clone()
         .or_else(|| sei.mastering.clone())
         .or_else(|| {
+            base?;
             dv.and_then(|d| d.l6.as_ref()).map(|l6| MasteringDisplay {
                 max_luminance: l6.max_mastering as f64,
                 min_luminance: l6.min_mastering as f64 / 10000.0,
@@ -89,7 +98,17 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
             })
         });
 
+    // MaxCLL/MaxFALL is HDR10 static-metadata convention (CTA-861.3; Dolby's
+    // profiles/levels spec names it only in the compat-id-1 base-signal
+    // definition), so the L6 fallback applies only when the title has a
+    // standards-viewable base at all. An IPT-PQ-c2 base (Profile 5/20, AV1
+    // 10.0 — exactly the `base == None` cases) has no consumer for CLL, and
+    // its L6, when carried, is a zeroed placeholder (corpus P5 files and
+    // Dolby's own demo alike), so falling back would render noise. A CLL the
+    // container/SEI actually signals still shows — observed bytes are always
+    // reported.
     let content_light = demux.content_light.or(sei.content_light).or_else(|| {
+        base?;
         dv.and_then(|d| d.l6.as_ref()).map(|l6| crate::model::ContentLight::new(l6.max_cll, l6.max_fall))
     });
 
