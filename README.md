@@ -94,11 +94,11 @@ hdrprobe reads both video containers and standalone metadata sidecar files.
 
 | Container | Codecs | Notes |
 |---|---|---|
-| MP4 / MOV | HEVC, AVC, AV1 | includes Profile 7 dual-track (separate BL and EL `trak` boxes), Profile 20 (MV-HEVC, `dvwC` config), and Profile 9 (8-bit AVC, `avcC` + `dvcC`) |
-| MKV / WebM | HEVC, AV1 | single-track, and Profile 7 single-track dual-layer |
-| MPEG-TS / M2TS | HEVC, AVC | includes Profile 7 dual-PID (BL and EL on separate PIDs), legacy Profile 4 (single-PID dual layer), and Profile 9 (8-bit AVC BL, `stream_type` 0x1B) |
-| Raw HEVC | Annex-B | profile inferred from the RPU |
-| Raw AV1 | IVF, low-overhead OBU | Dolby Vision Profile 10 |
+| MP4 / MOV | HEVC, AVC, AV1 | Single or dual track; an enhancement layer may ride its own track |
+| MKV / WebM | HEVC, AV1 | Single track; an enhancement layer may be interleaved into it |
+| MPEG-TS / M2TS | HEVC, AVC | Single or dual track; an enhancement layer may ride its own track |
+| Raw HEVC | Annex-B | Elementary stream; profile inferred from the RPU |
+| Raw AV1 | IVF, low-overhead OBU | Elementary stream; the RPU rides an in-band metadata OBU |
 
 Containers are matched by extension first, then by content: a file whose extension does not match
 its bytes (for example a Transport Stream saved as `.mkv`) is still recognised and parsed

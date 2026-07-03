@@ -119,12 +119,14 @@ excluded by config.
   succeeds; otherwise the original, more specific error is surfaced.
 - **Layer/track structure is observed, not assumed per-container.** The report's `Structure` line
   (`Single track, dual layer` vs `Dual track, dual layer`) is rendered only for dual-layer content
-  (an EL is present, i.e. Profile 7) and is driven by `Demux::dv_dual_track`, which each backend
+  (an EL is present, i.e. Profile 4 or 7) and is driven by `Demux::dv_dual_track`, which each backend
   sets from what it actually saw: MP4 from its video-`trak` count (`tracks.len() > 1`), TS/M2TS from
-  its video-PID count (a P7 EL rides its own PID), MKV/raw-HEVC/AV1 always `false` (BL+EL interleaved
-  in one track, or single-layer). So in practice MKV is always single-track, TS/M2TS always dual, and
-  MP4 either — but the label follows the bytes, so an atypical mux is reported correctly rather than
-  by rule. `levels::{finalize,container_only}` gate it behind `el_present` via `structure_str`.
+  its video-PID count (a P7 EL rides its own PID, so >1 video PID), MKV/raw-HEVC/AV1 always `false`
+  (BL+EL interleaved in one track, or single-layer). So in practice MKV is always single-track; TS/M2TS
+  is dual for Profile 7 (BL and EL on separate PIDs) but single-track for legacy Profile 4, whose EL is
+  interleaved into one PID (the corpus `dv4_hevc.ts` reads `Single track, dual layer`); MP4 is either —
+  but the label follows the bytes, so an atypical mux is reported correctly rather than by rule.
+  `levels::{finalize,container_only}` gate it behind `el_present` via `structure_str`.
 - **Profile number authority.** libdovi's `dovi_profile` can't express AV1 P10 (returns 5/8),
   so `levels::finalize` takes the profile number from the container dvcC when present, else 10
   for AV1. Don't trust the RPU's profile field for the number.
