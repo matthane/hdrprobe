@@ -245,22 +245,20 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         }
     }
 
-    // Only surface HDR10+ when it's present, like the Dolby Vision section.
-    if o.show_hdr10plus && r.hdr10plus.present {
-        let _ = writeln!(s, "{}", c.header("HDR10+"));
-        if let Some(p) = r.hdr10plus.profile {
-            kv(&mut s, &c, "Profile", &p.to_string());
+    // The section exists only when HDR10+ metadata was found, like Dolby Vision.
+    if o.show_hdr10plus {
+        if let Some(hp) = &r.hdr10plus {
+            let _ = writeln!(s, "{}", c.header("HDR10+"));
+            if let Some(p) = hp.profile {
+                kv(&mut s, &c, "Profile", &p.to_string());
+            }
+            kv(&mut s, &c, "Application", &format!("v{}", hp.application_version));
+            kv(&mut s, &c, "Windows", &hp.num_windows.to_string());
+            if let Some(n) = hp.target_max_luminance {
+                kv(&mut s, &c, "Target", &format!("{} nits", n));
+            }
+            s.push('\n');
         }
-        if let Some(v) = r.hdr10plus.application_version {
-            kv(&mut s, &c, "Application", &format!("v{}", v));
-        }
-        if let Some(w) = r.hdr10plus.num_windows {
-            kv(&mut s, &c, "Windows", &w.to_string());
-        }
-        if let Some(n) = r.hdr10plus.target_max_luminance {
-            kv(&mut s, &c, "Target", &format!("{} nits", n));
-        }
-        s.push('\n');
     }
 
     if o.show_timing {
@@ -278,7 +276,7 @@ pub fn render_quiet(r: &Report) -> String {
     }
     if let Some(hdr) = &r.hdr {
         parts.push(hdr.format.clone());
-    } else if r.hdr10plus.present {
+    } else if r.hdr10plus.is_some() {
         parts.push("HDR10+".to_string());
     } else if r.dolby_vision.is_none() {
         parts.push("SDR".to_string());

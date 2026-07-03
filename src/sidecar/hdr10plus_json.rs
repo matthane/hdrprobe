@@ -55,9 +55,8 @@ pub fn parse(head: &[u8]) -> Result<Payload> {
         .map(|b| b as char);
 
     Ok(Payload::Hdr10Plus(Hdr10Plus {
-        present: true,
-        application_version: Some(meta.application_version),
-        num_windows: Some(meta.num_windows),
+        application_version: meta.application_version,
+        num_windows: meta.num_windows,
         profile,
         target_max_luminance: (meta.targeted_system_display_maximum_luminance > 0)
             .then_some(meta.targeted_system_display_maximum_luminance),

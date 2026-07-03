@@ -212,8 +212,8 @@ fn build_report(
     started: Instant,
 ) -> Report {
     let (dolby_vision, hdr10plus) = match payload {
-        Payload::DolbyVision(dv) => (Some(*dv), Hdr10Plus::absent()),
-        Payload::Hdr10Plus(hp) => (None, hp),
+        Payload::DolbyVision(dv) => (Some(*dv), None),
+        Payload::Hdr10Plus(hp) => (None, Some(hp)),
     };
     Report {
         hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
@@ -287,9 +287,8 @@ mod tests {
         let json = br#"{"JSONInfo":{"HDR10plusProfile":"A","Version":"1.0"},"SceneInfo":[{"LuminanceParameters":{"AverageRGB":5,"LuminanceDistributions":{"DistributionIndex":[1,5,10,25,50,75,90,95,99],"DistributionValues":[0,1,2,3,4,5,6,7,8]},"MaxScl":[100,200,300]},"NumberOfWindows":1,"TargetedSystemDisplayMaximumLuminance":400,"SceneFrameIndex":0,"SceneId":0,"SequenceFrameIndex":0},{"LuminanceParameters":{"AverageRGB":9,"LuminanceDistributions":{"DistributionIndex":[1],"DistributionValues":[9]},"MaxScl":[1,2,3]},"NumberOfWindows":1,"TargetedSystemDisplayMaximumLuminance":1000,"SceneFrameIndex":0,"SceneId":1,"SequenceFrameIndex":1}],"SceneInfoSummary":{"SceneFirstFrameIndex":[0],"SceneFrameNumbers":[2]}}"#;
         match hdr10plus_json::parse(json).expect("valid HDR10+ head parses") {
             Payload::Hdr10Plus(hp) => {
-                assert!(hp.present);
                 assert_eq!(hp.profile, Some('A'));
-                assert_eq!(hp.num_windows, Some(1));
+                assert_eq!(hp.num_windows, 1);
                 assert_eq!(hp.target_max_luminance, Some(400));
             }
             _ => panic!("expected an HDR10+ payload"),

@@ -124,7 +124,7 @@ build until the schema version, that test, and this document are updated togethe
 - **Empty arrays are omitted.** `l5_active_areas` and `trim_targets` are absent rather than `[]`
   when nothing was found.
 - **Default-false booleans may be omitted.** `profile_compat_assumed` appears only when `true`.
-  All other booleans (`bl_present`, `el_present`, `rpu_present`, `present`, `sampled`, `zeroed`,
+  All other booleans (`bl_present`, `el_present`, `rpu_present`, `sampled`, `zeroed`,
   `l11_reference_mode`) are serialized whenever their containing object is.
 - **Numbers.** JSON has a single number type; the tables below note the underlying type.
   Integer-typed fields are always whole numbers. Float-typed fields (`fps`, `duration_secs`,
@@ -147,7 +147,7 @@ build until the schema version, that test, and this document are updated togethe
 | `general` | `General` | always | Container, codec, picture, and colour signalling |
 | `hdr` | `Hdr` | video inputs only | Static HDR classification and mastering info; absent for metadata sidecars, which have no base layer |
 | `dolby_vision` | `DolbyVision` | when DV metadata was found | Present when at least one RPU parsed, when the container carries a DV configuration (including under `--no-rpu`), or for a DV sidecar |
-| `hdr10plus` | `Hdr10Plus` | always | HDR10+ presence and parameters; `{"present": false}` when none |
+| `hdr10plus` | `Hdr10Plus` | when HDR10+ metadata was found | Present when ST.2094-40 metadata was parsed from the stream, or for an HDR10+ JSON sidecar. Like `dolby_vision`, the object's existence is the presence signal |
 | `elapsed_ms` | float | always | Wall-clock parse time in milliseconds |
 
 ## Object: `General`
@@ -161,7 +161,7 @@ build until the schema version, that test, and this document are updated togethe
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
 | `fps` | float | optional | Frame rate. From container timing (MP4/MKV), the SPS VUI (TS, raw HEVC), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>`. Absent when the input carries no rate signal; never guessed |
-| `duration_secs` | float | optional | Duration in seconds. Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; sidecars other than none) |
+| `duration_secs` | float | optional | Duration in seconds. Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; all sidecars) |
 | `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists |
 | `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
 | `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"` (a reserved signalling value renders `"?"`) |
@@ -359,13 +359,13 @@ Exhaustive per-RPU statistics, only produced when every RPU in the title was sca
 
 ## Object: `Hdr10Plus`
 
-Always present at the top level.
+Present only when HDR10+ (ST.2094-40) metadata was found; its existence is the presence
+signal, mirroring `dolby_vision`.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `present` | boolean | always | Whether HDR10+ (ST.2094-40) metadata was found |
-| `application_version` | integer | optional | Application version; only when `present` is `true` |
-| `num_windows` | integer | optional | Number of processing windows; only when `present` is `true` |
+| `application_version` | integer | always | Application version |
+| `num_windows` | integer | always | Number of processing windows |
 | `profile` | string | optional | Single-character ST.2094-40 profile: `"A"` (histogram only) or `"B"` (Bezier tone-mapping curve). Omitted when the profile could not be determined |
 | `target_max_luminance` | integer | optional | Target display max luminance the grade was made for, cd/m². Omitted when zero or absent |
 
@@ -376,8 +376,7 @@ section, and codec identification. A metadata sidecar (raw RPU, DV XML, HDR10+ J
 picture data: `codec` is `""`, `hdr` is absent, and `width`/`height`/`duration_secs`/`bitrate`/
 `bit_depth`/`chroma`/`stereo` are absent. A DV XML additionally provides `fps` (from
 `<EditRate>`) and `format_version`; a raw RPU bin provides neither. An HDR10+ JSON sidecar has
-no `dolby_vision` section; DV sidecars have no meaningful `hdr10plus` (it reads
-`{"present": false}`).
+no `dolby_vision` section; DV sidecars have no `hdr10plus` section.
 
 **Default (sampled) run.** `dolby_vision.sampled` is `true`; `l5_active_areas` and
 `trim_targets` are unions over the sampled RPUs and may be incomplete; `census` is absent.

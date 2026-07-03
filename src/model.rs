@@ -32,7 +32,10 @@ pub struct Report {
     pub hdr: Option<Hdr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dolby_vision: Option<DolbyVision>,
-    pub hdr10plus: Hdr10Plus,
+    /// Present only when HDR10+ metadata was found, mirroring `dolby_vision`:
+    /// the object's existence *is* the presence signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdr10plus: Option<Hdr10Plus>,
     /// Wall-clock parse time in milliseconds.
     pub elapsed_ms: f64,
 }
@@ -291,30 +294,14 @@ pub struct L6Fallback {
 
 #[derive(Debug, Serialize)]
 pub struct Hdr10Plus {
-    pub present: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub application_version: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_windows: Option<u8>,
+    pub application_version: u8,
+    pub num_windows: u8,
     /// ST.2094-40 profile: 'A' (histogram only) or 'B' (Bézier tone-mapping curve).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<char>,
     /// Target display max luminance the grade was made for (nits).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_max_luminance: Option<u32>,
-}
-
-impl Hdr10Plus {
-    /// The "not present" value, used when a report carries no HDR10+ metadata.
-    pub fn absent() -> Self {
-        Hdr10Plus {
-            present: false,
-            application_version: None,
-            num_windows: None,
-            profile: None,
-            target_max_luminance: None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -408,13 +395,12 @@ mod tests {
                     level_presence: vec![LevelPresence { level: 1, rpus_with: 722 }],
                 }),
             }),
-            hdr10plus: Hdr10Plus {
-                present: true,
-                application_version: Some(1),
-                num_windows: Some(1),
+            hdr10plus: Some(Hdr10Plus {
+                application_version: 1,
+                num_windows: 1,
                 profile: Some('B'),
                 target_max_luminance: Some(400),
-            },
+            }),
             elapsed_ms: 5.0,
         }
     }
@@ -517,7 +503,6 @@ mod tests {
             "dolby_vision.census.dm_version_index",
             "dolby_vision.census.level_presence[].level",
             "dolby_vision.census.level_presence[].rpus_with",
-            "hdr10plus.present",
             "hdr10plus.application_version",
             "hdr10plus.num_windows",
             "hdr10plus.profile",

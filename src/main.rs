@@ -276,16 +276,12 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
         dv::levels::flag_fel_brightness_expansion(dv, bl_max);
     }
 
-    let hdr10plus = match scan.sei.hdr10plus {
-        Some(info) => Hdr10Plus {
-            present: true,
-            application_version: Some(info.application_version),
-            num_windows: Some(info.num_windows),
-            profile: (info.profile != 0).then_some(info.profile as char),
-            target_max_luminance: (info.target_max_luminance > 0).then_some(info.target_max_luminance),
-        },
-        None => Hdr10Plus::absent(),
-    };
+    let hdr10plus = scan.sei.hdr10plus.map(|info| Hdr10Plus {
+        application_version: info.application_version,
+        num_windows: info.num_windows,
+        profile: (info.profile != 0).then_some(info.profile as char),
+        target_max_luminance: (info.target_max_luminance > 0).then_some(info.target_max_luminance),
+    });
 
     let hdr = Some(hdr::assemble(&demux, dv.as_ref(), &scan.sei));
 
