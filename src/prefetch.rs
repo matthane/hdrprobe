@@ -93,6 +93,14 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
     }
     let size = data.len();
 
+    // Gather every range first, then stream them concurrently in one pass. The
+    // extent discoveries below (`moov_extent`, `tags_extent`, `detect_layout`)
+    // each fault only a handful of pages, so running them before any warm costs
+    // a few cold round-trips but lets all ranges — head and tail — overlap
+    // instead of the head warm serially delaying the extent the demux is
+    // actually blocked on.
+    let mut ranges: Vec<(u64, usize)> = Vec::new();
+
     // Front-loaded metadata (and, for the bounded fast path, the sampled blocks).
     // TS/M2TS is the exception: it has no container box, so resolution/colour come
     // from the in-band SPS at the first IDR (~a GOP in), and the default demux
@@ -103,43 +111,65 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) {
     } else {
         HEAD_WARM
     };
-    warm(file, 0, head.min(size));
+    ranges.push((0, head.min(size)));
 
     // TS/M2TS has no duration box, so it also reads a small tail window for the
-    // last PCR (see `ts::pcr_duration`). Warm that trailing window in one read;
-    // skip it when the tail overlaps the already-warmed head (small files).
+    // last PCR (see `ts::pcr_duration`). Overlap with the head on small files is
+    // coalesced away by `warm_ranges`.
     if is_ts {
         let tail = crate::container::ts::TAIL_SCAN_BYTES as usize;
         let start = size.saturating_sub(tail);
-        if start >= head {
-            warm(file, start as u64, size - start);
-        }
+        ranges.push((start as u64, size - start));
     }
 
     // MP4 with `moov` at the tail is the one common metadata region the head
-    // window misses; warm the part of its extent not already covered.
+    // window misses; a front-placed `moov` merges into the head range.
     if looks_like_mp4(path, data) {
         if let Some((start, end)) = crate::container::mp4::moov_extent(data) {
-            let warm_start = start.max(HEAD_WARM);
-            if warm_start < end {
-                warm(file, warm_start as u64, end - warm_start);
-            }
+            ranges.push((start as u64, end - start));
         }
     }
 
     // MKV writes the statistics `Tags` after the clusters (past the head window);
     // the demux reads it for the per-stream bitrate via the front SeekHead. Warm
-    // that small tail element in one read so the read isn't a lone RTT; the front
-    // SeekHead it's resolved from is already in the warmed head. Skip when it
-    // falls inside the head (front-placed or small file).
+    // that small tail element so the read isn't a lone RTT; a front-placed `Tags`
+    // (inside the head) merges away.
     if looks_like_mkv(path, data) {
         if let Some((start, end)) = crate::container::mkv::tags_extent(data) {
-            let warm_start = start.max(HEAD_WARM);
-            if warm_start < end {
-                warm(file, warm_start as u64, end - warm_start);
-            }
+            ranges.push((start as u64, end - start));
         }
     }
+
+    warm_ranges(file, ranges);
+}
+
+/// Merge overlapping/adjacent ranges and warm them concurrently — scattered
+/// ranges become ~pool-width parallel positioned reads instead of a serial
+/// chain, so one range's network latency hides another's. Positioned reads on a
+/// shared `&File` are safe: each carries its own offset, and nothing in the
+/// program relies on the file cursor.
+fn warm_ranges(file: &File, ranges: Vec<(u64, usize)>) {
+    use rayon::prelude::*;
+
+    merge_ranges(ranges)
+        .par_iter()
+        .for_each(|&(start, end)| warm(file, start, (end - start) as usize));
+}
+
+/// Sort `(offset, len)` ranges and coalesce overlapping/adjacent ones into
+/// disjoint `(start, end)` extents, dropping empties.
+fn merge_ranges(mut ranges: Vec<(u64, usize)>) -> Vec<(u64, u64)> {
+    ranges.retain(|r| r.1 > 0);
+    ranges.sort_unstable_by_key(|r| r.0);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (off, len) in ranges {
+        let end = off.saturating_add(len as u64);
+        match merged.last_mut() {
+            Some(last) if off <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((off, end)),
+        }
+    }
+    merged
 }
 
 /// Sequentially read `len` bytes from `offset` into a scratch buffer and discard
@@ -194,6 +224,20 @@ fn looks_like_mkv(path: &Path, data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merge_ranges_coalesces_overlaps_and_drops_empties() {
+        // Out-of-order input; the 2nd range overlaps the 1st, the adjacent 3rd
+        // extends it, the empty one vanishes, and the far one stays separate.
+        let merged = super::merge_ranges(vec![
+            (100, 50),  // 100..150
+            (0, 0),     // empty
+            (900, 10),  // 900..910
+            (120, 80),  // overlaps -> ..200
+            (200, 25),  // adjacent -> ..225
+        ]);
+        assert_eq!(merged, vec![(100, 225), (900, 910)]);
+    }
+
     #[cfg(windows)]
     #[test]
     fn is_remote_is_false_for_a_local_temp_file() {
