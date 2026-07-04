@@ -58,53 +58,8 @@ const PCR_MODULUS: u64 = (1u64 << 33) * 300;
 /// The PMT's "no PCR" sentinel PID.
 const PID_NONE: u16 = 0x1FFF;
 
-/// Reassembly limits. TS titles are large (multi-GB 4K discs), so by default we
-/// peek at a bounded window **at the head only** (`HEAD_SCAN_BYTES`) — enough to
-/// reassemble the SPS and confirm the RPU/DV levels, then bail — never spreading
-/// across the file. This keeps the fast path to a single front-of-file region
-/// (which the network prefetch warms in one read; see `prefetch::warm_metadata`)
-/// and mirrors the head-bounded MKV/raw-HEVC default. `--full` lifts every cap for
-/// a true exhaustive scan (reassembling the whole video stream, no 2s guarantee,
-/// and picking up dynamic per-shot variation the default deliberately skips).
-struct Limits {
-    windows: usize,
-    aus_per_window: usize,
-    window_packet_budget: usize,
-    pid_au_cap: usize,
-    pid_byte_cap: usize,
-}
-
-impl Limits {
-    fn sampled() -> Self {
-        Limits {
-            // A single head window bounded only by a byte budget: the default just
-            // grabs title-stable static metadata, so there is no reason to fault in
-            // packets spread across a multi-GB file. The AU/byte caps are lifted so
-            // the read isn't cut short before the first IDR/SPS; the packet budget
-            // (sized to `HEAD_SCAN_BYTES`, the prefetch-warmed region) is the sole
-            // bound. Divide by the larger stride (192) so the byte span read stays
-            // within `HEAD_SCAN_BYTES` for both TS (188) and M2TS (192).
-            windows: 1,
-            aus_per_window: usize::MAX,
-            window_packet_budget: (HEAD_SCAN_BYTES / 192) as usize,
-            pid_au_cap: usize::MAX,
-            pid_byte_cap: usize::MAX,
-        }
-    }
-    /// A single window spanning the whole file with every cap removed.
-    fn full() -> Self {
-        Limits {
-            windows: 1,
-            aus_per_window: usize::MAX,
-            window_packet_budget: usize::MAX,
-            pid_au_cap: usize::MAX,
-            pid_byte_cap: usize::MAX,
-        }
-    }
-}
-
 /// Packet layout: offset of the first sync byte and the packet stride.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Layout {
     first: usize,
     stride: usize,
@@ -155,8 +110,15 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         Codec::Hevc
     };
 
-    let limits = if full { Limits::full() } else { Limits::sampled() };
-    let (buf, chunks) = reassemble(data, layout, &video_pids, &limits);
+    let (buf, chunks) = if full {
+        // Exhaustive one-shot walk of the whole stream (no packet budget).
+        let mut buf = Vec::new();
+        let mut chunks = Vec::new();
+        EsStreamer::new(layout, &video_pids, usize::MAX).next_window(data, &mut buf, &mut chunks, usize::MAX);
+        (buf, chunks)
+    } else {
+        head_reassemble(data, layout, &video_pids)
+    };
     let (width, height, bit_depth, chroma, codec_profile, color, fps, sps_chunk) =
         sps_metadata(&buf, &chunks, &codec);
 
@@ -361,98 +323,110 @@ struct PidState {
     pid: u16,
     acc: Vec<u8>,
     started: bool,
-    au_total: usize,
-    bytes_total: usize,
-    win_emitted: usize,
 }
 
-impl PidState {
-    fn quota_reached(&self, lim: &Limits) -> bool {
-        self.au_total >= lim.pid_au_cap || self.bytes_total >= lim.pid_byte_cap
-    }
-    fn done_for_window(&self, lim: &Limits) -> bool {
-        self.win_emitted >= lim.aus_per_window || self.quota_reached(lim)
-    }
+/// Resumable walker over the target PIDs' scattered PES payloads: reassembles
+/// completed access units into a caller-provided Annex-B buffer, window by
+/// window. One engine serves both paths — the default's bounded head pass
+/// (`head_reassemble`) and `--full`'s exhaustive walk, which streams the whole
+/// elementary stream through a fixed-size scratch window (`sample::scan`)
+/// instead of materializing multi-GB of ES in one owned buffer.
+///
+/// Partial per-PID accumulators carry across `next_window` calls, so an AU
+/// whose packets straddle a window pause is emitted intact in a later window.
+/// The trailing AU still accumulating at end of stream is never flushed (no
+/// terminating PES start bounds it) — matching the historical one-shot pass,
+/// and likewise excluded from the `--full` bitrate byte count. A PID whose PES
+/// never restarts accumulates unbounded in `acc`, as it always has; a cap
+/// could silently change output if a late PES start eventually flushed it.
+pub struct EsStreamer {
+    layout: Layout,
+    states: Vec<PidState>,
+    cursor: usize,
+    packets_left: usize,
+    finished: bool,
 }
 
-/// Reassemble access units for the target PIDs into one owned Annex-B buffer,
-/// returning it with per-AU chunk ranges into it. Sampling breadth is bounded by
-/// `lim` (a single bounded head window by default, the whole stream under `--full`).
-fn reassemble(data: &[u8], layout: Layout, pids: &[u16], lim: &Limits) -> (Vec<u8>, Vec<Chunk>) {
-    let mut states: Vec<PidState> = pids
-        .iter()
-        .map(|&pid| PidState {
-            pid,
-            acc: Vec::new(),
-            started: false,
-            au_total: 0,
-            bytes_total: 0,
-            win_emitted: 0,
-        })
-        .collect();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunks: Vec<Chunk> = Vec::new();
-
-    // Disjoint windows: each is bounded by the next window's start so a small
-    // file is covered exactly once (no duplicate AUs), while a large file only
-    // reads a bounded budget of each window.
-    let starts = window_starts(data, layout, lim.windows);
-    for (wi, &ws) in starts.iter().enumerate() {
-        let win_end = starts.get(wi + 1).copied().unwrap_or(data.len()).min(data.len());
-        let Some(mut p) = align(data, layout, ws) else { continue };
-        for s in states.iter_mut() {
-            s.acc.clear();
-            s.started = false;
-            s.win_emitted = 0;
+impl EsStreamer {
+    fn new(layout: Layout, pids: &[u16], packet_budget: usize) -> Self {
+        EsStreamer {
+            layout,
+            states: pids
+                .iter()
+                .map(|&pid| PidState { pid, acc: Vec::new(), started: false })
+                .collect(),
+            cursor: layout.first,
+            packets_left: packet_budget,
+            finished: false,
         }
-        let mut packets = 0;
-        while p + TS_UNIT <= win_end && packets < lim.window_packet_budget {
-            if data[p] != SYNC {
-                match resync(data, layout, p) {
+    }
+
+    /// Append completed access units to `buf`/`chunks` (chunk offsets are
+    /// relative to `buf`) until at least `target_bytes` accumulate or the walk
+    /// ends (end of data, packet budget exhausted, or unrecoverable sync loss).
+    /// A window may overshoot `target_bytes` by one AU — the whole accumulator
+    /// is appended when a new PES start completes it. Returns `true` while more
+    /// input remains.
+    pub fn next_window(
+        &mut self,
+        data: &[u8],
+        buf: &mut Vec<u8>,
+        chunks: &mut Vec<Chunk>,
+        target_bytes: usize,
+    ) -> bool {
+        if self.finished {
+            return false;
+        }
+        while self.cursor + TS_UNIT <= data.len() && self.packets_left > 0 {
+            if data[self.cursor] != SYNC {
+                // Re-locking the phase reads no packet, so it costs no budget.
+                match resync(data, self.layout, self.cursor) {
                     Some(np) => {
-                        p = np;
+                        self.cursor = np;
                         continue;
                     }
                     None => break,
                 }
             }
-            if let Some((pid, pusi, payload)) = packet_payload(data, p) {
-                if let Some(si) = states.iter().position(|s| s.pid == pid) {
-                    process(&mut states[si], pusi, payload, &mut buf, &mut chunks, lim);
+            if let Some((pid, pusi, payload)) = packet_payload(data, self.cursor) {
+                if let Some(si) = self.states.iter().position(|s| s.pid == pid) {
+                    process(&mut self.states[si], pusi, payload, buf, chunks);
                 }
             }
-            if states.iter().all(|s| s.done_for_window(lim)) {
-                break;
+            self.cursor += self.layout.stride;
+            self.packets_left -= 1;
+            if buf.len() >= target_bytes {
+                return true;
             }
-            p += layout.stride;
-            packets += 1;
         }
+        self.finished = true;
+        false
     }
+}
+
+/// One-shot head reassembly for the default (non-`--full`) metadata pass: a
+/// single window bounded only by a packet budget sized to `HEAD_SCAN_BYTES`
+/// (the prefetch-warmed region — divide by the larger stride, 192, so the byte
+/// span stays within it for both TS and M2TS). The budget is the sole bound:
+/// the default just grabs title-stable static metadata, and the read must not
+/// be cut short before the first IDR/SPS, typically ~one 4K GOP in.
+fn head_reassemble(data: &[u8], layout: Layout, pids: &[u16]) -> (Vec<u8>, Vec<Chunk>) {
+    let mut buf = Vec::new();
+    let mut chunks = Vec::new();
+    let mut st = EsStreamer::new(layout, pids, (HEAD_SCAN_BYTES / 192) as usize);
+    st.next_window(data, &mut buf, &mut chunks, usize::MAX);
     (buf, chunks)
 }
 
 /// Feed one packet's payload into a PID's reassembler, emitting a completed
 /// access unit (into `buf`/`chunks`) when a new PES starts.
-fn process(
-    st: &mut PidState,
-    pusi: bool,
-    payload: &[u8],
-    buf: &mut Vec<u8>,
-    chunks: &mut Vec<Chunk>,
-    lim: &Limits,
-) {
-    if st.done_for_window(lim) {
-        return;
-    }
+fn process(st: &mut PidState, pusi: bool, payload: &[u8], buf: &mut Vec<u8>, chunks: &mut Vec<Chunk>) {
     if pusi {
         // A new PES begins: finalize the previous access unit.
         if st.started && !st.acc.is_empty() {
             let offset = buf.len() as u64;
             buf.extend_from_slice(&st.acc);
             chunks.push(Chunk { offset, size: st.acc.len() as u64 });
-            st.au_total += 1;
-            st.bytes_total += st.acc.len();
-            st.win_emitted += 1;
         }
         st.acc.clear();
         match pes_es_offset(payload) {
@@ -478,21 +452,6 @@ fn pes_es_offset(payload: &[u8]) -> Option<usize> {
     // [8] = PES_header_data_length.
     let header_data_len = payload[8] as usize;
     Some(9 + header_data_len)
-}
-
-/// Byte offsets to begin each reassembly window: the true stream head plus an
-/// even spread across the file.
-fn window_starts(data: &[u8], layout: Layout, windows: usize) -> Vec<usize> {
-    let windows = windows.max(1);
-    let mut v = Vec::with_capacity(windows);
-    v.push(layout.first);
-    let len = data.len();
-    for w in 1..windows {
-        v.push(len * w / windows);
-    }
-    v.sort_unstable();
-    v.dedup();
-    v
 }
 
 /// Snap a desired byte offset up to the next packet boundary on the stream's
@@ -861,23 +820,15 @@ mod tests {
     #[test]
     fn reassembly_emits_au_on_next_pes() {
         // A PES spanning two packets is emitted only when the next PES starts.
-        let mut st = PidState {
-            pid: 0x100,
-            acc: Vec::new(),
-            started: false,
-            au_total: 0,
-            bytes_total: 0,
-            win_emitted: 0,
-        };
+        let mut st = PidState { pid: 0x100, acc: Vec::new(), started: false };
         let mut buf = Vec::new();
         let mut chunks = Vec::new();
-        let lim = Limits::sampled();
         let pes1 = [0x00, 0x00, 0x01, 0xE0, 0, 0, 0x80, 0, 0, 0xAA, 0xBB, 0xCC];
-        process(&mut st, true, &pes1, &mut buf, &mut chunks, &lim);
-        process(&mut st, false, &[0xDD], &mut buf, &mut chunks, &lim);
+        process(&mut st, true, &pes1, &mut buf, &mut chunks);
+        process(&mut st, false, &[0xDD], &mut buf, &mut chunks);
         assert!(chunks.is_empty()); // AU not yet complete
         let pes2 = [0x00, 0x00, 0x01, 0xE0, 0, 0, 0x80, 0, 0, 0x11];
-        process(&mut st, true, &pes2, &mut buf, &mut chunks, &lim);
+        process(&mut st, true, &pes2, &mut buf, &mut chunks);
         assert_eq!(chunks.len(), 1);
         let c = chunks[0];
         assert_eq!(&buf[c.offset as usize..(c.offset + c.size) as usize], &[0xAA, 0xBB, 0xCC, 0xDD]);
