@@ -223,15 +223,20 @@ excluded by config.
   because primaries == transfer (unlike P5, whose encoding differs from its colour space).
 - **`--full` changes demux behaviour, not just sampling.** It threads into `container::demux(..,
   full)`: TS reassembles the whole stream (vs a single head window of `ts::HEAD_SCAN_BYTES`), raw
-  HEVC scans every byte (vs windowed), MKV indexes every cluster (vs a head byte-window of
+  HEVC scans every byte (vs a single head window of `annexb::HEAD_SCAN_BYTES`, 8 MiB, dropping the
+  boundary-cut trailing NAL), MKV indexes every cluster (vs a head byte-window of
   `HEAD_SPAN_BYTES` — without this, walking every block header page-faults the whole multi-GB movie
   off disk), and **raw AV1** walks the whole stream (vs a single head window of `av1::HEAD_SCAN_BYTES`,
   8 MiB). Keep new backends consistent — bounded by default, exhaustive under `--full`. A backend
   that bounds its `chunks` index must not derive fps/frame-count from `chunks.len()` in the bounded
-  path. **Raw AV1 is head-window-only, never spread** (unlike raw HEVC's windows): low-overhead OBU
-  has no byte-scannable sync marker — AV1 has no emulation prevention, so a temporal-delimiter byte
-  pattern can occur inside frame payload — so the demux can only resync from the byte-0 boundary. It
-  walks one head window from there, the same head-only shape TS uses; L5 is sampled from it. **Frame
+  path. **The bounded default is always head-only, never a spread of mid-file windows**: every
+  format reads a minimal head region to fill the fields, `[sampled]` tags flag what could vary
+  per-title, and mid-file variation (e.g. L5 aspect changes) is `--full`'s job by design. For raw
+  AV1 head-only is also forced (low-overhead OBU has no byte-scannable sync marker — AV1 has no
+  emulation prevention, so a temporal-delimiter byte pattern can occur inside frame payload — so
+  the demux can only resync from the byte-0 boundary); raw HEVC *could* resync on start codes, but
+  a window spread costs ~50 MiB of reads on a NAS (measured ~600 ms at 1 GbE) for coverage that
+  was never the default's contract — don't reintroduce it. **Frame
   rate for boxless containers comes from an in-band constant-rate signal, independent of the bounded
   sample, so it's correct by default**: TS/M2TS and raw HEVC from the SPS VUI timing info
   (`vui_time_scale / vui_num_units_in_tick`, halved when `field_seq_flag` marks fields, parsed in
@@ -264,14 +269,11 @@ excluded by config.
   consumes (`ts::HEAD_SCAN_BYTES` for TS; the small `MP4_HEAD_WARM` for a confirmed ISOBMFF and
   `MKV_HEAD_WARM` for an MKV whose first-cluster offset resolved — both have their real regions
   warmed by exact extent, so a generic multi-MiB head would only stream bytes nothing parses,
-  ~80 ms of pure transfer per 8 MiB at 1 GbE; for raw HEVC, window 0's span when windowed, else
-  the **whole file** — the whole-file NAL scan under `annexb`'s 48 MiB windowing threshold
-  reads every byte, and unwarmed it faults in ~32 KiB round-trips; the generic `HEAD_WARM`
-  otherwise), the TS tail window, the
+  ~80 ms of pure transfer per 8 MiB at 1 GbE; the generic `HEAD_WARM` otherwise, which also
+  covers the raw HEVC/AV1 bounded head walks whole), the TS tail window, the
   `moov` extent, the MKV `Tags` extent plus the head *block* window from the first cluster
   (SeekHead-resolved via `mkv::head_blocks_extent`, so attachments before the clusters can't
-  push the block walk past the warm), the raw-HEVC window spans (`annexb::window_spans`, the
-  same constants `split_windows` scans by), and fMP4 fragment heads from a front `sidx`
+  push the block walk past the warm), and fMP4 fragment heads from a front `sidx`
   (`mp4::sidx_fragment_heads`) or, failing that, the tail `mfra` random-access index
   (`mp4::mfra_fragment_heads`, found in O(1) via the trailing `mfro`);
   `warm_sample_chunks` after demux replays
@@ -283,7 +285,8 @@ excluded by config.
   (chunks index into `reassembled`, not the file). The `sidx`/`mfra` ranges are a **hint
   only**: the fragment index is always built from the `moof` boxes themselves, so a wrong or
   missing index wastes a warm but can never change output. Couplings that remain numeric and easy to break
-  silently: **raw AV1** — `av1::HEAD_SCAN_BYTES` (the bounded head walk for both OBU and IVF)
+  silently: **raw AV1 and raw HEVC** — `av1::HEAD_SCAN_BYTES` (the bounded head walk for both
+  OBU and IVF) and `annexb::HEAD_SCAN_BYTES` (the bounded head NAL scan) both
   <= `prefetch::HEAD_WARM`, so the generic head warm covers the whole walked span; **TS/M2TS** —
   the warmed head (chosen by `looks_like_ts`) is exactly `ts::HEAD_SCAN_BYTES`, the demux's
   packet budget is sized to stay within it (`HEAD_SCAN_BYTES / 192`, the larger stride), and the
@@ -297,7 +300,7 @@ excluded by config.
   any box-declared count fed to a loop/alloc must go through `clamp_count`. Apply the same
   discipline to new table parsing.
 - `split_annexb` treats the buffer start as an implicit NAL boundary (chunks begin at a NAL
-  header, not a start code) — relied upon by the length-prefixed and windowed paths.
+  header, not a start code) — relied upon by the length-prefixed and head-window paths.
 - **Average bitrate is per-backend and correct-or-labelled, never a wrong number.** Each backend
   fills `Demux::bitrate: Option<Bitrate>` (`model::Bitrate::{video_stream_bps,video_stream,overall}`)
   so container quirks stay local. A *video-stream* rate is emitted only from an exact source: MP4

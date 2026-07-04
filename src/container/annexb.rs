@@ -8,44 +8,21 @@ use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::parse_sps;
 use crate::model::ColorInfo;
 
-/// Bytes NAL-split per sampling window, and the number of windows spread across
-/// the file. Below `WINDOW_BYTES * NUM_WINDOWS` a whole-file scan is cheaper than
-/// windowing, so it's used unconditionally there and for `--full` at any size.
-const WINDOW_BYTES: usize = 2 * 1024 * 1024;
-const NUM_WINDOWS: usize = 24;
-
-/// Warm overshoot past a window's nominal end: `split_windows` starts at the
-/// first start code at/after `k * stride` and extends past `WINDOW_BYTES` to the
-/// next start code, both typically well inside this slack.
-const WINDOW_WARM_SLACK: usize = 64 * 1024;
-
-/// Nominal byte spans `(offset, len)` the default windowed scan will read, for
-/// the network prefetch warmer: `None` when the whole-file scan applies (the
-/// file fits under the windowing threshold — `--full` scans everything at any
-/// size and needs no span list). Spans start at the same `k * stride` positions
-/// `split_windows` resyncs from; sharing this file's constants keeps the
-/// warm/scan coupling structural rather than a doc handshake.
-pub fn window_spans(len: usize) -> Option<Vec<(u64, usize)>> {
-    if len <= WINDOW_BYTES * NUM_WINDOWS {
-        return None;
-    }
-    let stride = len / NUM_WINDOWS;
-    Some(
-        (0..NUM_WINDOWS)
-            .map(|k| {
-                let ws = k * stride;
-                (ws as u64, (WINDOW_BYTES + WINDOW_WARM_SLACK).min(len - ws))
-            })
-            .collect(),
-    )
-}
+/// Bytes NAL-split by the default (non-`--full`) scan: a single head window,
+/// the same bounded-default shape TS and raw AV1 use. Everything the report
+/// needs from a raw stream lives at the head (SPS at byte 0, an RPU/SEI per
+/// frame); per-title variation (mid-file L5 aspect changes) is `--full`'s job,
+/// and the report's `[sampled]` tags already say so. Must stay `<=`
+/// `prefetch::HEAD_WARM` so the generic head warm covers the whole walked span
+/// on a network volume (the same coupling `av1::HEAD_SCAN_BYTES` keeps).
+pub const HEAD_SCAN_BYTES: usize = 8 << 20; // 8 MiB
 
 pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     let mut nals: Vec<NalRef> = Vec::new();
-    if full || data.len() <= WINDOW_BYTES * NUM_WINDOWS {
+    if full || data.len() <= HEAD_SCAN_BYTES {
         nal::split_annexb(data, &mut nals);
     } else {
-        split_windows(data, &mut nals);
+        split_head(data, &mut nals);
     }
 
     // Resolution / bit depth / colour from the first SPS.
@@ -102,48 +79,16 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     })
 }
 
-/// Default-mode scan for large raw streams: NAL-split only a bounded set of byte
-/// windows spread across the file (head first) instead of every byte, so cost is
-/// O(windows) regardless of file size. Each window starts on a real start code
-/// (so no partial leading NAL) and extends to the next start code past its end
-/// (so the tail NAL is whole). Windows never overlap. `--full` skips this and
-/// scans the whole stream. Static levels live in the head; the spread captures
-/// L5 variation — the same head-plus-spread philosophy the TS backend uses.
-fn split_windows(data: &[u8], out: &mut Vec<NalRef>) {
-    let len = data.len();
-    let stride = len / NUM_WINDOWS;
-    let mut scanned_to = 0usize;
-    let mut tmp: Vec<NalRef> = Vec::new();
-    for k in 0..NUM_WINDOWS {
-        let ws = match find_start_code(data, (k * stride).max(scanned_to)) {
-            Some(s) => s,
-            None => break,
-        };
-        let we = find_start_code(data, (ws + WINDOW_BYTES).min(len)).unwrap_or(len);
-        tmp.clear();
-        nal::split_annexb(&data[ws..we], &mut tmp);
-        for mut nr in tmp.drain(..) {
-            nr.start += ws;
-            nr.end += ws;
-            out.push(nr);
-        }
-        scanned_to = we;
-        if we >= len {
-            break;
-        }
+/// Default-mode scan for large raw streams: NAL-split the head window only, so
+/// cost is O(window) regardless of file size. The last NAL is cut by the window
+/// edge, so it's dropped rather than surfaced as a truncated payload (its AU
+/// just ends a NAL early, the same edge TS's head window has). `--full` skips
+/// this and scans the whole stream.
+fn split_head(data: &[u8], out: &mut Vec<NalRef>) {
+    nal::split_annexb(&data[..HEAD_SCAN_BYTES.min(data.len())], out);
+    if data.len() > HEAD_SCAN_BYTES {
+        out.pop();
     }
-}
-
-/// First index at/after `from` of a 3-byte (`00 00 01`) Annex-B start-code prefix.
-fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 const VCL_MAX: u8 = 31;
@@ -201,55 +146,33 @@ mod tests {
     }
 
     #[test]
-    fn windowed_split_rebases_offsets_and_matches_whole_file_when_it_fits() {
-        // With a single covering window, windowed output must equal whole-file
-        // split: same types and same *absolute* byte ranges (rebasing correct).
-        let d = stream();
+    fn head_split_matches_whole_file_prefix_and_drops_the_cut_nal() {
+        // A stream one NAL past the head window: the bounded split must yield
+        // exactly the whole-file split's NALs that end inside the window, and
+        // drop the one the edge cuts (never surface a truncated payload).
+        let mut d = Vec::new();
+        let nal_size = 1 << 20; // 1 MiB per NAL, 4-byte start code + header
+        while d.len() <= HEAD_SCAN_BYTES {
+            d.extend_from_slice(&[0, 0, 0, 1, 0x42, 0x01]);
+            d.resize(d.len() + nal_size, 0xAA);
+        }
         let mut whole = Vec::new();
         nal::split_annexb(&d, &mut whole);
-        let mut win = Vec::new();
-        split_windows(&d, &mut win);
-        assert_eq!(win.len(), whole.len(), "same NAL count");
-        for (a, b) in win.iter().zip(&whole) {
+        let mut head = Vec::new();
+        split_head(&d, &mut head);
+        assert!(head.len() < whole.len(), "the boundary-cut NAL must be dropped");
+        for (a, b) in head.iter().zip(&whole) {
             assert_eq!((a.nal_type, a.start, a.end), (b.nal_type, b.start, b.end));
         }
-        // Ranges must actually point at the right header bytes in the file.
-        for nr in &win {
-            assert_eq!(nal_type_of(d[nr.start]), nr.nal_type);
-        }
-    }
+        assert!(head.last().unwrap().end <= HEAD_SCAN_BYTES);
 
-    fn nal_type_of(b: u8) -> u8 {
-        (b >> 1) & 0x3F
-    }
-
-    #[test]
-    fn window_spans_mirror_the_windowed_scan() {
-        // Under the windowing threshold the demux scans the whole file: no spans.
-        assert_eq!(window_spans(WINDOW_BYTES * NUM_WINDOWS), None);
-
-        // Above it, one in-bounds span per window, anchored at the same
-        // `k * stride` resync positions `split_windows` uses and covering at
-        // least the nominal window bytes available from there.
-        let len = 300 * 1024 * 1024;
-        let spans = window_spans(len).unwrap();
-        assert_eq!(spans.len(), NUM_WINDOWS);
-        let stride = len / NUM_WINDOWS;
-        for (k, &(off, sz)) in spans.iter().enumerate() {
-            assert_eq!(off as usize, k * stride);
-            assert!(sz >= WINDOW_BYTES.min(len - off as usize));
-            assert!(off as usize + sz <= len, "span must stay in bounds");
-        }
-    }
-
-    #[test]
-    fn find_start_code_finds_next_prefix() {
-        // Each NAL here is prefixed with a 4-byte code `00 00 00 01`, so the
-        // 3-byte `00 00 01` prefix sits one byte in (the leading 00 is padding).
-        let d = stream(); // 14-byte NALs
-        assert_eq!(find_start_code(&d, 0), Some(1));
-        // Next start code after the first NAL's payload: block 1 begins at 14.
-        assert_eq!(find_start_code(&d, 4), Some(15));
-        assert_eq!(find_start_code(&[1, 2, 3], 0), None);
+        // At or under the window the demux path takes the whole-file split, and
+        // `split_head` itself is a no-op passthrough there too.
+        let small = stream();
+        let mut whole_small = Vec::new();
+        nal::split_annexb(&small, &mut whole_small);
+        let mut head_small = Vec::new();
+        split_head(&small, &mut head_small);
+        assert_eq!(head_small.len(), whole_small.len());
     }
 }

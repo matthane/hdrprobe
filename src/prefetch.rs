@@ -29,18 +29,18 @@ use std::path::Path;
 use crate::container::Demux;
 
 /// Generic head window for remote files whose front working set can't be
-/// resolved by exact extent: raw AV1 (the bounded head walk), an MKV whose
-/// SeekHead has no Cluster entry (fallback below), and unrecognized formats.
-/// TS/M2TS is warmed with a larger window (`ts::HEAD_SCAN_BYTES`) since its
-/// in-band SPS sits a GOP in; MP4 and extent-resolved MKV with smaller ones
-/// (`MP4_HEAD_WARM` / `MKV_HEAD_WARM`) since their real regions are warmed by
-/// exact extent; raw HEVC by its own scan shape (window spans, or the whole
-/// file when the whole-file scan applies).
+/// resolved by exact extent: raw AV1 and raw HEVC (their bounded head walks),
+/// an MKV whose SeekHead has no Cluster entry (fallback below), and
+/// unrecognized formats. TS/M2TS is warmed with a larger window
+/// (`ts::HEAD_SCAN_BYTES`) since its in-band SPS sits a GOP in; MP4 and
+/// extent-resolved MKV with smaller ones (`MP4_HEAD_WARM` / `MKV_HEAD_WARM`)
+/// since their real regions are warmed by exact extent.
 ///
-/// Raw AV1's bounded head walk (`av1::HEAD_SCAN_BYTES`) is deliberately kept `<=`
-/// this so the warm covers it whole; shrink this below that and the AV1 window's
-/// tail faults in one page at a time on the NAS again. The MKV fallback relies
-/// on this covering the first block offset + `mkv::HEAD_SPAN_BYTES`.
+/// The raw bounded head walks (`av1::HEAD_SCAN_BYTES`, `annexb::HEAD_SCAN_BYTES`)
+/// are deliberately kept `<=` this so the warm covers them whole; shrink this
+/// below them and those windows' tails fault in one page at a time on the NAS
+/// again. The MKV fallback relies on this covering the first block offset +
+/// `mkv::HEAD_SPAN_BYTES`.
 const HEAD_WARM: usize = 8 << 20; // 8 MiB
 
 /// Head window for ISOBMFF (a `moov` was found): everything the MP4 path reads
@@ -138,12 +138,6 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     let is_mkv = looks_like_mkv(path, data);
     let moov = if is_mp4 { crate::container::mp4::moov_extent(data) } else { None };
     let mkv_blocks = if is_mkv { crate::container::mkv::head_blocks_extent(data) } else { None };
-    // Container sniffs win ties: a box size or cluster byte can look like a
-    // start code, but a raw stream can't look like a container.
-    let is_raw_hevc = !is_ts && !is_mp4 && !is_mkv && looks_like_raw_hevc(path, data);
-    // `Some` = the demux will NAL-scan these bounded windows; `None` = it will
-    // scan every byte of the (<= 48 MiB) file (`annexb::split_windows`).
-    let hevc_spans = if is_raw_hevc { crate::container::annexb::window_spans(size) } else { None };
 
     // Front-loaded metadata (and, for the bounded fast path, the sampled blocks).
     // The head is sized to what the front parse actually consumes: TS/M2TS has
@@ -152,20 +146,14 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     // reach it. A confirmed ISOBMFF (moov found) or extent-resolved MKV needs
     // almost none of the generic head — their regions are warmed by exact
     // extent below, and a generic head would stream bytes nothing parses. Raw
-    // HEVC follows its own scan shape: window 0's span when windowed, else the
-    // whole file (every byte is NAL-scanned; unwarmed it faults in ~32 KiB
-    // round-trips).
+    // HEVC/AV1 head walks are covered by the generic head (the `<=` couplings
+    // on `HEAD_WARM`).
     let head = if is_ts {
         crate::container::ts::HEAD_SCAN_BYTES as usize
     } else if moov.is_some() {
         MP4_HEAD_WARM
     } else if mkv_blocks.is_some() {
         MKV_HEAD_WARM
-    } else if is_raw_hevc {
-        match &hevc_spans {
-            Some(spans) => spans.first().map(|s| s.1).unwrap_or(HEAD_WARM),
-            None => size,
-        }
     } else {
         HEAD_WARM
     }
@@ -216,14 +204,6 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
         if let Some((start, end)) = mkv_blocks {
             ranges.push((start as u64, end - start));
         }
-    }
-
-    // Raw HEVC (Annex-B) windowed scan: warm each nominal span so the walk
-    // doesn't fault 2 MiB windows in page-cluster round-trips. Window 0
-    // duplicates the head range and merges away. (The whole-file-scan case is
-    // already the head range itself.)
-    if let Some(spans) = hevc_spans {
-        ranges.extend(spans);
     }
 
     // Warm once, then report the contiguous prefix from byte 0 so the chunk
@@ -361,13 +341,6 @@ fn looks_like_mkv(path: &Path, data: &[u8]) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     matches!(ext.as_str(), "mkv" | "webm" | "mka")
         || (data.len() >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3)
-}
-
-fn looks_like_raw_hevc(path: &Path, data: &[u8]) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    matches!(ext.as_str(), "hevc" | "h265" | "265")
-        || data.starts_with(&[0, 0, 1])
-        || data.starts_with(&[0, 0, 0, 1])
 }
 
 #[cfg(test)]
