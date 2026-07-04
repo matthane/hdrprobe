@@ -1,4 +1,4 @@
-# Release builds: five per-platform binaries attached to a draft GitHub release.
+# Release builds: six per-platform binaries attached to a draft GitHub release.
 #
 # Triggered by pushing a version tag (v0.1.0, ...). The workflow_dispatch trigger
 # exists so the whole pipeline can be exercised without cutting a release: a
@@ -14,6 +14,11 @@
 # - Linux builds run on ubuntu-22.04 / ubuntu-22.04-arm so the binaries link
 #   against glibc 2.35 and run on older distros; 24.04 runners would silently
 #   raise the floor to 2.39.
+# - aarch64-unknown-linux-musl is fully static (no libc/loader dependency), for
+#   minimal userspaces like CoreELEC/LibreELEC boxes whose glibc version we
+#   can't rely on — one binary covers old vendor kernels (4.9) through current.
+#   Its tests run natively on the arm64 runner (static binaries execute fine on
+#   a glibc host).
 # - GitHub retired the free Intel macOS runners, so x86_64-apple-darwin is
 #   cross-compiled on the arm64 runner (Xcode ships both toolchains). Its tests
 #   still execute there via Rosetta 2.
@@ -74,6 +79,8 @@ jobs:
             os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
@@ -86,6 +93,13 @@ jobs:
 
       - name: Add target
         run: rustup target add ${{ matrix.target }}
+
+      # The dependency tree is pure Rust, so rustc's self-contained musl mode
+      # links the static binary without a musl sysroot; musl-gcc is installed
+      # only as the link driver.
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
