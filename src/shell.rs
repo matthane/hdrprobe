@@ -1,10 +1,14 @@
-//! Windows shell integration: a right-click "Inspect HDR metadata" context-menu
-//! verb for every supported input.
+//! Windows shell integration: a right-click "hdrprobe" context-menu flyout with
+//! "Fast" and "Full" entries for every supported input.
 //!
-//! `--install-shell` registers a verb under
+//! `--install-shell` registers a cascading verb under
 //! `HKCU\Software\Classes\SystemFileAssociations\.<ext>\shell\hdrprobe` for each
 //! extension hdrprobe understands (video + metadata sidecars), so any such file
-//! can be inspected from Explorer. `--uninstall-shell` removes them.
+//! can be inspected from Explorer. The parent key carries `MUIVerb` +
+//! `SubCommands=""` (the static-cascade marker); the two leaf verbs live under
+//! its own `shell` subkey as `fast` and `full` — Explorer lists static subverbs
+//! in key-name order, so the names double as the menu order. "Full" runs the
+//! same command with `--full`. `--uninstall-shell` removes the whole tree.
 //!
 //! Design choices that matter:
 //! - **HKCU, not HKLM** — per-user, so it needs no elevation and touches no
@@ -44,8 +48,9 @@ fn all_exts() -> impl Iterator<Item = &'static str> {
 #[cfg(windows)]
 const WINDOW_SIZE: (u32, u32) = (110, 45); // (cols, lines)
 
-/// Build the verb's command string for the classic-conhost host (no Windows
-/// Terminal installed).
+/// Build a verb's command string for the classic-conhost host (no Windows
+/// Terminal installed). `full` inserts `--full` before the selected file for
+/// the exhaustive-scan menu entry.
 ///
 /// The stored value is `cmd /c "mode con: cols=C lines=L & cls & "<exe>" "%1"
 /// & pause"`. `cmd /c` strips the first and last quote of its argument
@@ -58,12 +63,14 @@ const WINDOW_SIZE: (u32, u32) = (110, 45); // (cols, lines)
 /// open for reading. Only the verb's fresh window is resized/cleared; an
 /// existing terminal session never sees any of this.
 #[cfg(windows)]
-fn command_for(exe: &str) -> String {
+fn command_for(exe: &str, full: bool) -> String {
     let (cols, lines) = WINDOW_SIZE;
-    format!("cmd /c \"mode con: cols={cols} lines={lines} & cls & \"{exe}\" \"%1\" & pause\"")
+    let flag = if full { "--full " } else { "" };
+    format!("cmd /c \"mode con: cols={cols} lines={lines} & cls & \"{exe}\" {flag}\"%1\" & pause\"")
 }
 
-/// Build the verb's command string for the Windows Terminal host.
+/// Build a verb's command string for the Windows Terminal host. `full`
+/// inserts `--full` before the selected file, as in [`command_for`].
 ///
 /// The stored value is `"<wt>" -w new --size C,L cmd /c "cls & \"<exe>\"
 /// \"%1\" & pause"`. WT ignores client resize APIs, so the size rides its own
@@ -78,10 +85,11 @@ fn command_for(exe: &str) -> String {
 /// containing a semicolon misparses under this verb (the conhost fallback
 /// doesn't split). That's accepted — `%1` can't be escaped statically.
 #[cfg(windows)]
-fn command_for_wt(wt: &str, exe: &str) -> String {
+fn command_for_wt(wt: &str, exe: &str, full: bool) -> String {
     let (cols, lines) = WINDOW_SIZE;
+    let flag = if full { "--full " } else { "" };
     format!(
-        "\"{wt}\" -w new --size {cols},{lines} cmd /c \"cls & \\\"{exe}\\\" \\\"%1\\\" & pause\""
+        "\"{wt}\" -w new --size {cols},{lines} cmd /c \"cls & \\\"{exe}\\\" {flag}\\\"%1\\\" & pause\""
     )
 }
 
@@ -178,29 +186,64 @@ mod imp {
         Ok(())
     }
 
+    /// The verb key for one extension, root of the whole cascading entry.
+    fn verb_key(ext: &str) -> String {
+        format!("Software\\Classes\\SystemFileAssociations\\.{ext}\\shell\\hdrprobe")
+    }
+
+    /// Delete one extension's verb tree. Returns whether it existed.
+    fn delete_verb(ext: &str) -> Result<bool> {
+        let sub = wide(&verb_key(ext));
+        // SAFETY: `sub` is a valid NUL-terminated wide string; the hive is a
+        // predefined handle. Deletes the verb key and all its subkeys.
+        let rc = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr()) };
+        match rc {
+            ERROR_SUCCESS => Ok(true),
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            _ => bail!("removing registry key for .{ext} failed (code {rc})"),
+        }
+    }
+
     pub fn install() -> Result<()> {
         let exe = std::env::current_exe().context("locating the hdrprobe executable")?;
         let exe = exe.to_string_lossy().into_owned();
         // Prefer the Windows Terminal host when it's installed: it's the
         // Windows 11 default console, and only its own launch option can size
         // the window (see `command_for_wt`).
-        let command = match super::wt_path() {
-            Some(wt) => super::command_for_wt(&wt, &exe),
-            None => super::command_for(&exe),
+        let wt = super::wt_path();
+        let command = |full| match &wt {
+            Some(wt) => super::command_for_wt(wt, &exe, full),
+            None => super::command_for(&exe, full),
         };
+        let fast = command(false);
+        let full = command(true);
         let icon = format!("{exe},0");
 
         let mut n = 0;
         for ext in super::all_exts() {
-            let base = format!("Software\\Classes\\SystemFileAssociations\\.{ext}\\shell\\hdrprobe");
-            set_value(&base, None, "Inspect HDR metadata")?;
+            // Wipe any previous layout first (e.g. the pre-submenu single verb
+            // kept its `command` directly under the parent key), so an upgrade
+            // never leaves stale keys next to the cascade marker.
+            delete_verb(ext)?;
+            let base = verb_key(ext);
+            // `MUIVerb` + empty `SubCommands` marks a static cascading menu;
+            // the leaf verbs live under this key's own `shell` subkey and
+            // Explorer shows them in key-name order (`fast` before `full`).
+            set_value(&base, Some("MUIVerb"), "hdrprobe")?;
+            set_value(&base, Some("SubCommands"), "")?;
             set_value(&base, Some("Icon"), &icon)?;
-            set_value(&format!("{base}\\command"), None, &command)?;
+            for (verb, label, cmd) in [("fast", "Fast", &fast), ("full", "Full", &full)] {
+                let leaf = format!("{base}\\shell\\{verb}");
+                set_value(&leaf, None, label)?;
+                set_value(&leaf, Some("Icon"), &icon)?;
+                set_value(&format!("{leaf}\\command"), None, cmd)?;
+            }
             n += 1;
         }
 
-        println!("Registered the hdrprobe context-menu entry for {n} file types.");
-        println!("Verb runs: {command}");
+        println!("Registered the hdrprobe context-menu submenu for {n} file types.");
+        println!("Fast runs: {fast}");
+        println!("Full runs: {full}");
         println!("On Windows 11 it's under \"Show more options\" in the right-click menu.");
         Ok(())
     }
@@ -208,14 +251,8 @@ mod imp {
     pub fn uninstall() -> Result<()> {
         let mut n = 0;
         for ext in super::all_exts() {
-            let sub = wide(&format!("Software\\Classes\\SystemFileAssociations\\.{ext}\\shell\\hdrprobe"));
-            // SAFETY: `sub` is a valid NUL-terminated wide string; the hive is a
-            // predefined handle. Deletes the verb key and its `command` subkey.
-            let rc = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr()) };
-            if rc == ERROR_SUCCESS {
+            if delete_verb(ext)? {
                 n += 1;
-            } else if rc != ERROR_FILE_NOT_FOUND {
-                bail!("removing registry key for .{ext} failed (code {rc})");
             }
         }
         println!("Removed the hdrprobe context-menu entry ({n} file types).");
@@ -246,8 +283,21 @@ mod tests {
         // the conhost window resize, cls (wiping cmd's UNC-cwd warning on
         // network files), the quoted exe, the quoted selected file, then pause.
         assert_eq!(
-            command_for(r"C:\Program Files\hdrprobe.exe"),
+            command_for(r"C:\Program Files\hdrprobe.exe", false),
             r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" "%1" & pause""#
+        );
+    }
+
+    #[test]
+    fn full_command_inserts_the_flag_before_the_file() {
+        // The submenu's "Full" verb is the same chain with --full ahead of %1.
+        assert_eq!(
+            command_for(r"C:\Program Files\hdrprobe.exe", true),
+            r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" --full "%1" & pause""#
+        );
+        assert_eq!(
+            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", true),
+            r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" --full \"%1\" & pause""#
         );
     }
 
@@ -257,7 +307,7 @@ mod tests {
         // them literal; the window size rides wt's own --size option since WT
         // ignores mode con.
         assert_eq!(
-            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe"),
+            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", false),
             r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" \"%1\" & pause""#
         );
     }

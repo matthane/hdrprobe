@@ -178,8 +178,8 @@ For scripting against the JSON output, every object and field is documented in
 | `-r, --recursive` | Descend into directory arguments |
 | `--threads <N>` | Number of parallel workers (default: logical core count) |
 | `-o, --output <path>` | Write to a file instead of stdout |
-| `--install-shell` | Windows: add a right-click "Inspect HDR metadata" context-menu entry |
-| `--uninstall-shell` | Windows: remove that context-menu entry |
+| `--install-shell` | Windows: add a right-click "hdrprobe" context menu with Fast and Full entries |
+| `--uninstall-shell` | Windows: remove that context menu |
 | `-h, --help`, `-V, --version` | Standard |
 
 Exit codes: `0` parsed successfully, `1` usage error, `2` unreadable or corrupt input.
@@ -191,11 +191,13 @@ hdrprobe --install-shell     # register the right-click menu entry
 hdrprobe --uninstall-shell   # remove it
 ```
 
-`--install-shell` adds an "Inspect HDR metadata" entry to the right-click menu of
-every supported file type, so any video or metadata sidecar can be inspected from
-Explorer. Selecting it opens a console running the report, kept open until you press
-a key. The entry launches whichever `hdrprobe.exe` you ran the install from, so run
-it from the binary's final location.
+`--install-shell` adds an "hdrprobe" submenu to the right-click menu of every
+supported file type, so any video or metadata sidecar can be inspected from
+Explorer. It has two entries: **Fast** runs the normal quick scan, and **Full**
+runs the exhaustive `--full` scan of the whole file. Either opens a console
+running the report, kept open until you press a key. The menu launches whichever
+`hdrprobe.exe` you ran the install from, so run it from the binary's final
+location.
 
 Registration is per-user, so it needs no administrator rights: it writes verbs under
 `HKCU\Software\Classes\SystemFileAssociations` and touches no default file

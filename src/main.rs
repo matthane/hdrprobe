@@ -78,11 +78,11 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Register a right-click "Inspect HDR metadata" context-menu entry (Windows).
+    /// Register a right-click "hdrprobe" context-menu submenu with Fast and Full entries (Windows).
     #[arg(long)]
     install_shell: bool,
 
-    /// Remove the right-click context-menu entry (Windows).
+    /// Remove the right-click context-menu submenu (Windows).
     #[arg(long)]
     uninstall_shell: bool,
 }
