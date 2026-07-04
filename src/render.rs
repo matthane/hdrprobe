@@ -142,13 +142,17 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             // (for a future backend schema) but omitted from this report: the
             // profile and MEL/FEL tag already convey the layer structure, and
             // the per-track BL flag reads as misleading on dual-track P7.
-            let profile_value = if sidecar { c.value(&dv.profile) } else { c.bright(&dv.profile) };
-            let profile = if dv.profile_compat_assumed {
-                format!("{}{}", profile_value, c.tag("compat assumed"))
-            } else {
-                profile_value
-            };
-            kv_styled(&mut s, &c, "Profile", &profile);
+            //
+            // The profile describes a *stream* (its codec and base layer), not
+            // bare metadata: an RPU is profile-agnostic (dovi_tool's blanket
+            // "8" for extracted RPUs is remux convention, not a definition)
+            // and a DV XML's GenerateProfile is an authoring target. So the
+            // line is skipped for sidecars; the JSON keeps `profile` and
+            // `profile_compat_assumed` (that flag fires only on these inputs,
+            // so its old "[compat assumed]" tag no longer renders anywhere).
+            if !sidecar {
+                kv_styled(&mut s, &c, "Profile", &c.bright(&dv.profile));
+            }
 
             // The DV level only defines the codec bit-rate envelope; it says
             // nothing useful at a glance, so it's kept on the model but not
@@ -605,7 +609,8 @@ impl Colorizer {
     fn faint(&self, t: &str) -> String {
         self.wrap("38;2;38;95;60", t)
     }
-    /// A whole-line qualifier tag ([video stream], [compat assumed]) — the
+    /// A whole-line qualifier tag (the bitrate scope: [video stream],
+    /// [overall]) — the
     /// sampling caveats use `Footnotes` instead. Carries its own leading
     /// spacing: coloured it hangs off the value as a faint " tag" (a dim
     /// qualifier, not a separate element, so no `·` — matching `prov`),

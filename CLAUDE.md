@@ -217,7 +217,11 @@ never parse bytes native-endian.
   distinguish them. A metadata-only sidecar has no dvcC: a **DV XML declares its profile**
   (`dv_xml.rs` maps `GenerateProfile` -> compat via `DvAggregate::set_compat_id`, so the minor is
   real), but a **raw RPU bin has nothing**, so its minor is a convention default (P8 -> .1,
-  P7 -> .6, P4 -> .2) flagged `[compat assumed]` (`model::profile_compat_assumed`). The P7 default
+  P7 -> .6, P4 -> .2) recorded as `model::profile_compat_assumed`. That JSON pair is the whole
+  story for a sidecar: the **text report drops the Profile line for metadata-only sidecars
+  entirely** (`render.rs`) — an RPU is profile-agnostic (dovi_tool's blanket "8" for extracted
+  RPUs is remux convention, not a definition) and a DV XML's `GenerateProfile` is an authoring
+  target, so a rendered profile reads as a fact the metadata doesn't carry. The P7 default
   also covers the common *video* case of an untouched BDMV M2TS, which has **no `0xB0` DV
   descriptor at all** — Blu-ray signals DV via the HDMV registration descriptor and the playlist
   STN table; only remuxes (tsMuxeR etc.) add the descriptor. That flag is gated to metadata-only
