@@ -174,6 +174,7 @@ For scripting against the JSON output, every object and field is documented in
 | `-s, --samples <N>` | Number of seek points to sample (default 16). Higher values capture more distinct L5 areas. |
 | `--sections <list>` | Comma-separated list drawn from `general,hdr,dv,hdr10plus` |
 | `--color <when>` | `auto` (default, plain when piped), `always`, or `never` |
+| `--theme <name>` | Color theme: `paper` (default), `green`, `amber`, `red`, `ice`, `purple`, or `mono` (adapts to your terminal's own colors). Set `HDRPROBE_THEME` to make it stick. |
 | `-q, --quiet` | One-line summary per file |
 | `-r, --recursive` | Descend into directory arguments |
 | `--threads <N>` | Number of parallel workers (default: logical core count) |
@@ -183,6 +184,22 @@ For scripting against the JSON output, every object and field is documented in
 | `-h, --help`, `-V, --version` | Standard |
 
 Exit codes: `0` parsed successfully, `1` usage error, `2` unreadable or corrupt input.
+
+### Color themes
+
+`--theme` picks the palette for one run. To make a theme your default everywhere, set the
+`HDRPROBE_THEME` environment variable. On Windows:
+
+```sh
+setx HDRPROBE_THEME amber
+```
+
+This applies to every new terminal window and to the right-click menu entries (already-open
+terminals keep their old environment until reopened). On Linux and macOS, add
+`export HDRPROBE_THEME=amber` to your shell profile.
+
+An explicit `--theme` still overrides the variable for that run. Themes only affect colored
+output: piped, `--quiet`, and JSON output stay plain regardless.
 
 ### Windows shell integration
 
