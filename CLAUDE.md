@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 99 unit tests
+cargo test                     # 111 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -108,6 +108,14 @@ never parse bytes native-endian.
   round-trips. Timing only: parsing still runs against the mmap. Gated to remote volumes by
   `is_remote`, decided from the open handle (Windows `FileRemoteProtocolInfo`), which costs no
   extra network round-trip and is correct through mapped drives, UNC, symlinks, and subst.
+- `progress.rs` — `--full` progress reporting (`--progress auto|bar|json|off`): a `\r`-rewritten
+  stderr bar in the active theme's palette, or NDJSON events on stderr (contract documented in
+  `docs/SCHEMA.md`, "Progress events"; the event structs live here, *not* in `model.rs`, so the
+  report schema and its golden shape test are untouched). One `Progress` per file, created in
+  `main` and threaded through `container::demux` and `sample::scan`; two byte-denominated
+  phases, `Index` (a demux-time whole-file walk: MKV cluster indexing, raw HEVC/AV1 full
+  splits, TS `sps_rescue`) and `Scan` (the sampler: per-batch in `scan_chunks`, per-window +
+  `EsStreamer::position` on the TS streaming path).
 
 ## Invariants that are easy to violate
 
@@ -373,6 +381,21 @@ never parse bytes native-endian.
   mirroring the TS tail-PCR warm; keep the two in sync). Under `--full` the walk reaches `Tags`
   naturally. A track may carry several `Tag`s for one UID (e.g. SOURCE_ID before the statistics), so
   select the first entry with a usable value, not the first UID match.
+- **Progress is `--full`-only, stderr-only, and single-threaded by design.** `main` resolves
+  every `--progress` mode to `Off` unless `--full` is set (the fast path never reports), and
+  nothing progress-related may ever write to stdout — SCHEMA.md promises stdout is the pure
+  report stream, and the corpus byte-identity gate implicitly checks it. The sink
+  (`progress::Progress`) holds `Cell` state on purpose: every tick site is single-threaded —
+  demux walk loops, the TS window loop, and `sample::scan_chunks`' batch boundary *between*
+  rayon collects — so never hand it into a `par_iter` closure. `update` is byte-gated before it
+  is clock-gated (one `u64` compare in the common case, `Instant::now()` at most once per gate
+  step); keep new tick sites on that pattern, and keep `Off` free — every default-path call
+  runs through it. The JSON contract (SCHEMA.md "Progress events"): a `progress` event's
+  percentages are monotonic per phase, the `Scan` phase always closes at 100% (an `Index` walk
+  may legitimately end short — never fake its 100%), and `done` is emitted only for a file that
+  produced a report. The hot `nal::split_annexb` stays tick-free: the no-op-closure
+  monomorphization of `split_annexb_impl` compiles the gate out; only
+  `split_annexb_ticked` (the raw-HEVC `--full` walk) pays for it.
 
 ## Verifying changes
 
