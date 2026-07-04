@@ -108,11 +108,19 @@ pub struct Demux {
     /// payloads). When `Some`, `chunks` index into this buffer instead of the
     /// mmap; when `None`, chunks index into the file directly.
     pub reassembled: Option<Vec<u8>>,
+    /// TS/M2TS under `--full` only: the plan `sample::scan` uses to stream the
+    /// whole video elementary stream in bounded windows (`ts::EsStreamer`)
+    /// instead of demux materializing it — the old whole-stream `reassembled`
+    /// buffer was the video track's full size (tens of GB for a UHD BD M2TS).
+    /// When `Some`, the sampler ignores `chunks`/`reassembled` (they hold only
+    /// the head metadata window). Every other backend, and the TS default
+    /// path, leaves it `None`.
+    pub ts_stream: Option<ts::TsFullStream>,
 }
 
 /// Detect the container type and demux it. `full` requests an exhaustive scan
-/// where it changes demux behaviour (TS/M2TS reassembles the whole stream rather
-/// than a bounded sample).
+/// where it changes demux behaviour (TS/M2TS walks the whole stream rather
+/// than a bounded head sample).
 pub fn demux(path: &Path, data: &[u8], full: bool) -> Result<Demux> {
     let ext = path
         .extension()

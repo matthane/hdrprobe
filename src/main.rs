@@ -321,7 +321,14 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
         height: if demux.height > 0 { Some(demux.height) } else { None },
         fps: demux.fps,
         duration_secs: demux.duration_secs,
-        bitrate: demux.bitrate,
+        // TS/M2TS `--full`: the exact video ES byte count exists only after the
+        // streaming scan, so the demux left the rate unset and it is computed
+        // here — the same value the old whole-stream reassembly produced
+        // (`Some(0)` es_bytes ⇒ `None`, as before).
+        bitrate: match scan.es_bytes {
+            Some(bytes) => model::Bitrate::video_stream(bytes, demux.duration_secs),
+            None => demux.bitrate,
+        },
         bit_depth: demux.bit_depth,
         chroma: demux.chroma.clone(),
         stereo: demux.stereo.clone(),

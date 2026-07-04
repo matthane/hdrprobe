@@ -247,6 +247,7 @@ fn build_demux(
         chunks,
         sps_chunk: None,
         reassembled: None,
+        ts_stream: None,
     }
 }
 

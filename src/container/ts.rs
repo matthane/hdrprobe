@@ -10,7 +10,12 @@
 //! We never decode. We parse PAT → PMT to find the video PID(s) (including a
 //! Profile-7 enhancement-layer PID flagged by a Dolby Vision descriptor),
 //! reassemble a bounded head sample of access units, and hand the resulting
-//! Annex-B buffer to the normal NAL walker for RPU/SEI extraction.
+//! Annex-B buffer to the normal NAL walker for RPU/SEI extraction. Under
+//! `--full` the whole video elementary stream is *streamed*, not materialized:
+//! demux exposes `TsFullStream` on `Demux::ts_stream` and `sample::scan` drives
+//! the resumable `EsStreamer` through the file in `STREAM_WINDOW_BYTES` windows
+//! against one reused scratch buffer, so peak heap stays bounded no matter the
+//! file size (a UHD BD M2TS video track runs tens of GB).
 //!
 //! **Duration** has no container box in TS, so — like MediaInfo — we derive it
 //! from the transport clock: `last_PCR - first_PCR` on the PCR PID (a 27 MHz
@@ -110,17 +115,24 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         Codec::Hevc
     };
 
-    let (buf, chunks) = if full {
-        // Exhaustive one-shot walk of the whole stream (no packet budget).
-        let mut buf = Vec::new();
-        let mut chunks = Vec::new();
-        EsStreamer::new(layout, &video_pids, usize::MAX).next_window(data, &mut buf, &mut chunks, usize::MAX);
-        (buf, chunks)
-    } else {
-        head_reassemble(data, layout, &video_pids)
-    };
-    let (width, height, bit_depth, chroma, codec_profile, color, fps, sps_chunk) =
-        sps_metadata(&buf, &chunks, &codec);
+    // Metadata always comes from the bounded head pass — even under `--full`,
+    // which streams the whole elementary stream through `sample::scan` in
+    // bounded windows (`TsFullStream`) instead of materializing it here.
+    let (buf, chunks) = head_reassemble(data, layout, &video_pids);
+
+    let mut best = best_sps(&buf, &chunks, &codec);
+    let mut sps_chunk = best.as_ref().map(|c| c.chunk);
+    if full && best.is_none() {
+        // The head window held no SPS at all (first IDR beyond
+        // `HEAD_SCAN_BYTES` — atypical captures): under `--full` keep looking
+        // through the whole stream rather than losing the resolution the old
+        // whole-stream pass would have found. A rescue hit's chunk index is
+        // window-relative, meaningless against the head chunks — and unneeded:
+        // the `--full` scan covers every AU, so nothing must be pinned.
+        best = sps_rescue(data, layout, &video_pids, &codec);
+        sps_chunk = None;
+    }
+    let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_fields(best);
 
     // Duration from the transport clock (head+tail PCR delta). Prefer the PMT's
     // declared PCR PID, falling back to the video PID(s) — most streams carry the
@@ -136,14 +148,14 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         "MPEG-2 TS"
     };
 
-    // Only `--full` reassembles the entire elementary stream; then `buf` is the
-    // exact video-stream byte count. The default reassembles just a head window,
-    // so report the container's overall rate from the file length instead.
-    let bitrate = if full {
-        Bitrate::video_stream(buf.len() as u64, duration_secs)
-    } else {
-        Bitrate::overall(data.len() as u64, duration_secs)
-    };
+    // `--full`: the exact video-stream byte total is only known after the
+    // sampler's streaming walk, so leave the rate unset here — main.rs fills it
+    // from `sample::Scan::es_bytes` (the same value the old whole-stream
+    // reassembly produced, including `None` when no video bytes complete). The
+    // default bounded path reports the file-length overall rate as before.
+    let bitrate = if full { None } else { Bitrate::overall(data.len() as u64, duration_secs) };
+
+    let ts_stream = full.then(|| TsFullStream { layout, video_pids: video_pids.clone() });
 
     Ok(Demux {
         container,
@@ -168,6 +180,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         chunks,
         sps_chunk,
         reassembled: Some(buf),
+        ts_stream,
     })
 }
 
@@ -418,6 +431,38 @@ fn head_reassemble(data: &[u8], layout: Layout, pids: &[u16]) -> (Vec<u8>, Vec<C
     (buf, chunks)
 }
 
+/// Completed-AU bytes per streamed window of the `--full` elementary-stream
+/// walk: `sample::scan` drives an `EsStreamer` through the whole file in
+/// windows of this size, reusing one scratch buffer. This — plus the head
+/// metadata buffer (bounded by `HEAD_SCAN_BYTES`) and the per-PID partial-AU
+/// carryover (single-digit MiB) — bounds the owned heap of a `--full` TS scan,
+/// replacing the old whole-stream reassembly (the video track's full size,
+/// tens of GB for a UHD BD M2TS).
+pub const STREAM_WINDOW_BYTES: usize = 64 << 20; // 64 MiB
+
+/// Everything `sample::scan` needs to drive the exhaustive `--full` windowed
+/// walk of the video elementary stream without demux having materialized it.
+/// Carried on `Demux::ts_stream`, `Some` only for TS/M2TS under `--full`.
+#[derive(Debug, Clone)]
+pub struct TsFullStream {
+    layout: Layout,
+    video_pids: Vec<u16>,
+}
+
+impl TsFullStream {
+    #[cfg(test)]
+    pub(crate) fn new(layout: Layout, video_pids: Vec<u16>) -> Self {
+        TsFullStream { layout, video_pids }
+    }
+
+    /// A fresh unbounded streamer over the whole stream. It starts at the head,
+    /// re-reading the window the metadata pass already parsed (<= 24 MiB, cheap)
+    /// so every AU is scanned exactly once — by the streamer.
+    pub fn streamer(&self) -> EsStreamer {
+        EsStreamer::new(self.layout, &self.video_pids, usize::MAX)
+    }
+}
+
 /// Feed one packet's payload into a PID's reassembler, emitting a completed
 /// access unit (into `buf`/`chunks`) when a new PES starts.
 fn process(st: &mut PidState, pusi: bool, payload: &[u8], buf: &mut Vec<u8>, chunks: &mut Vec<Chunk>) {
@@ -591,20 +636,22 @@ struct SpsCommon {
     chunk: usize,
 }
 
-/// Recover resolution / bit depth / chroma / colour / frame rate from the widest
-/// SPS in the reassembled buffer (the base layer outranks a smaller enhancement
-/// layer). TS carries no container box, so both colour and frame rate come only
-/// from the in-band SPS VUI — parsed with the codec's own SPS reader.
-#[allow(clippy::type_complexity)]
-fn sps_metadata(
-    buf: &[u8],
-    chunks: &[Chunk],
-    codec: &Codec,
-) -> (u32, u32, Option<u8>, Option<String>, Option<String>, ColorInfo, Option<f64>, Option<usize>) {
-    let best = match codec {
+/// Recover the widest SPS in the reassembled buffer (the base layer outranks a
+/// smaller enhancement layer). TS carries no container box, so both colour and
+/// frame rate come only from the in-band SPS VUI — parsed with the codec's own
+/// SPS reader.
+fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<SpsCommon> {
+    match codec {
         Codec::Avc => best_avc_sps(buf, chunks),
         _ => best_hevc_sps(buf, chunks),
-    };
+    }
+}
+
+/// Unpack the winning SPS into the demux metadata fields.
+#[allow(clippy::type_complexity)]
+fn sps_fields(
+    best: Option<SpsCommon>,
+) -> (u32, u32, Option<u8>, Option<String>, Option<String>, ColorInfo, Option<f64>) {
     match best {
         Some(c) => (
             c.width,
@@ -614,9 +661,34 @@ fn sps_metadata(
             Some(c.profile),
             c.color,
             c.frame_rate,
-            Some(c.chunk),
         ),
-        None => (0, 0, None, None, None, ColorInfo::default(), None, None),
+        None => (0, 0, None, None, None, ColorInfo::default(), None),
+    }
+}
+
+/// `--full` fallback when the head window held no SPS: stream the whole
+/// elementary stream, window by window, through the same widest-SPS search,
+/// keeping only the running best (each window's buffer is discarded). Stops at
+/// the same UHD-width early exit the per-window search uses, else at end of
+/// stream. The result's `chunk` index is window-relative — callers must not
+/// use it against the head chunks.
+fn sps_rescue(data: &[u8], layout: Layout, pids: &[u16], codec: &Codec) -> Option<SpsCommon> {
+    let mut st = EsStreamer::new(layout, pids, usize::MAX);
+    let mut buf = Vec::new();
+    let mut chunks = Vec::new();
+    let mut best: Option<SpsCommon> = None;
+    loop {
+        buf.clear();
+        chunks.clear();
+        let more = st.next_window(data, &mut buf, &mut chunks, STREAM_WINDOW_BYTES);
+        if let Some(w) = best_sps(&buf, &chunks, codec) {
+            if best.as_ref().is_none_or(|b| w.width > b.width) {
+                best = Some(w);
+            }
+        }
+        if !more || best.as_ref().is_some_and(|b| b.width >= 3840) {
+            return best;
+        }
     }
 }
 
@@ -815,6 +887,132 @@ mod tests {
         pkt[4] = 7;
         pkt[5] = 0x00; // PCR_flag clear
         assert!(packet_pcr(&pkt, 0).is_none());
+    }
+
+    /// One 188-byte packet for `pid` carrying exactly `payload` bytes, the
+    /// remainder stuffed via the adaptation field.
+    fn ts_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0xFFu8; TS_UNIT];
+        pkt[0] = SYNC;
+        pkt[1] = ((pid >> 8) as u8 & 0x1F) | if pusi { 0x40 } else { 0x00 };
+        pkt[2] = (pid & 0xFF) as u8;
+        let body = TS_UNIT - 4;
+        assert!(payload.len() <= body);
+        if payload.len() == body {
+            pkt[3] = 0x10; // payload only
+            pkt[4..].copy_from_slice(payload);
+        } else {
+            pkt[3] = 0x30; // adaptation field (stuffing) + payload
+            let af_len = body - payload.len() - 1;
+            pkt[4] = af_len as u8;
+            if af_len > 0 {
+                pkt[5] = 0x00; // af flags; the rest stays 0xFF stuffing
+            }
+            let start = 5 + af_len;
+            pkt[start..start + payload.len()].copy_from_slice(payload);
+        }
+        pkt
+    }
+
+    /// A PES start whose ES payload is `es` (header_data_length = 0).
+    fn pes_start(es: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        v.extend_from_slice(es);
+        v
+    }
+
+    /// Two interleaved PIDs; AUs span packets; both PIDs end mid-AU, so the
+    /// trailing accumulators must never be flushed. Completed AUs in emission
+    /// order: pid 0x100 `[1,2,3,4,5]`, pid 0x200 `[9,9,8]`, pid 0x100 `[6]`.
+    fn dual_pid_stream() -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend(ts_packet(0x100, true, &pes_start(&[1, 2, 3])));
+        d.extend(ts_packet(0x200, true, &pes_start(&[9, 9])));
+        d.extend(ts_packet(0x100, false, &[4, 5]));
+        d.extend(ts_packet(0x200, false, &[8]));
+        d.extend(ts_packet(0x100, true, &pes_start(&[6]))); // completes [1,2,3,4,5]
+        d.extend(ts_packet(0x200, true, &pes_start(&[7, 7]))); // completes [9,9,8]
+        d.extend(ts_packet(0x100, true, &pes_start(&[0xAB]))); // completes [6]
+        d.extend(ts_packet(0x200, false, &[0xCD])); // partials [0xAB] and [7,7,0xCD] never flush
+        d
+    }
+
+    #[test]
+    fn streamed_windows_match_one_shot() {
+        let d = dual_pid_stream();
+        let layout = Layout { first: 0, stride: TS_UNIT };
+        let pids = [0x100u16, 0x200];
+
+        let mut one_buf = Vec::new();
+        let mut one_chunks = Vec::new();
+        let mut st = EsStreamer::new(layout, &pids, usize::MAX);
+        assert!(!st.next_window(&d, &mut one_buf, &mut one_chunks, usize::MAX));
+        assert_eq!(one_buf, [1, 2, 3, 4, 5, 9, 9, 8, 6]);
+        assert_eq!(one_chunks.iter().map(|c| c.size).collect::<Vec<_>>(), [5, 3, 1]);
+
+        // Tiny windows: identical bytes, AU sequence, and byte total. The pause
+        // after the first emission leaves pid 0x200's AU half-accumulated, so a
+        // partial AU straddling a window boundary is carried and emitted intact.
+        let mut st = EsStreamer::new(layout, &pids, usize::MAX);
+        let (mut buf, mut chunks) = (Vec::new(), Vec::new());
+        let mut all = Vec::new();
+        let mut sizes = Vec::new();
+        let mut total = 0u64;
+        loop {
+            buf.clear();
+            chunks.clear();
+            let more = st.next_window(&d, &mut buf, &mut chunks, 1);
+            all.extend_from_slice(&buf);
+            sizes.extend(chunks.iter().map(|c| c.size));
+            total += buf.len() as u64;
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(all, one_buf);
+        assert_eq!(sizes, [5, 3, 1]);
+        assert_eq!(total, one_buf.len() as u64);
+    }
+
+    #[test]
+    fn full_demux_keeps_head_and_exposes_plan() {
+        // PAT (program 1 -> PMT 0x0100) + the 2-stream PMT from
+        // `pmt_parses_hevc_and_dovi_streams` + three video packets forming one
+        // completed AU and a trailing partial.
+        let pat: [u8; 16] = [
+            0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00, // header
+            0x00, 0x01, 0xE1, 0x00, // program 1 -> 0x0100
+            0x00, 0x00, 0x00, 0x00, // CRC
+        ];
+        let pmt: [u8; 35] = [
+            0x02, 0xB0, 0x20, 0x00, 0x01, 0xC1, 0x00, 0x00, // table header
+            0xF0, 0x11, 0xF0, 0x00, // PCR PID 0x1011, program_info_length 0
+            0x24, 0xF0, 0x11, 0xF0, 0x00, // ES1: HEVC PID 0x1011
+            0x06, 0xF0, 0x15, 0xF0, 0x09, // ES2: private PID 0x1015, es_info 9
+            0xB0, 0x07, 0x01, 0x00, 0x0E, 0x36, 0x80, 0x8F, 0x6F, // DV descriptor
+            0x00, 0x00, 0x00, 0x00, // CRC
+        ];
+        let mut pat_payload = vec![0x00]; // pointer_field
+        pat_payload.extend_from_slice(&pat);
+        let mut pmt_payload = vec![0x00];
+        pmt_payload.extend_from_slice(&pmt);
+        let mut d = Vec::new();
+        d.extend(ts_packet(PID_PAT, true, &pat_payload));
+        d.extend(ts_packet(0x0100, true, &pmt_payload));
+        d.extend(ts_packet(0x1011, true, &pes_start(&[0x11, 0x22])));
+        d.extend(ts_packet(0x1011, true, &pes_start(&[0x33]))); // completes [0x11,0x22]
+        d.extend(ts_packet(0x1011, false, &[0x44])); // trailing partial
+
+        let default = demux(&d, false).expect("default demux");
+        assert!(default.ts_stream.is_none());
+
+        let full = demux(&d, true).expect("full demux");
+        let plan = full.ts_stream.as_ref().expect("full exposes the streaming plan");
+        assert_eq!(plan.video_pids, [0x1011, 0x1015]);
+        assert!(full.bitrate.is_none(), "the streaming scan supplies the full-path rate");
+        // The metadata pass is the same bounded head reassembly either way.
+        assert_eq!(full.reassembled, default.reassembled);
+        assert_eq!(full.chunks.len(), 1);
     }
 
     #[test]

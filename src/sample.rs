@@ -10,7 +10,7 @@ use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use rayon::prelude::*;
 
 use crate::avc::nal as avc_nal;
-use crate::container::{Chunk, Codec, Demux, NalFormat};
+use crate::container::{ts, Chunk, Codec, Demux, NalFormat};
 use crate::dv::levels::DvAggregate;
 use crate::dv::rpu::{parse_avc_rpu, parse_hevc_rpu};
 use crate::hdr::sei::{self, SeiFindings};
@@ -25,6 +25,12 @@ pub struct Options {
 pub struct Scan {
     pub dv: DvAggregate,
     pub sei: SeiFindings,
+    /// Exact completed-AU byte total of a `--full` TS/M2TS streaming walk —
+    /// equal to what the old whole-stream reassembly buffer held (the trailing
+    /// partial AU is excluded by both), so `main.rs` can compute the same
+    /// video-stream bitrate. `Some(0)` is meaningful (no video bytes ⇒ no
+    /// rate, as before); `None` on every other path.
+    pub es_bytes: Option<u64>,
 }
 
 /// RPUs plus SEI findings from a single access unit.
@@ -33,9 +39,30 @@ struct ChunkScan {
     sei: SeiFindings,
 }
 
+/// Access units extracted per rayon batch before sequential aggregation, so a
+/// `--full` scan never holds every frame's parsed RPU alive at once.
+/// Deliberately larger than any realistic `--samples`, so the bounded default
+/// path stays a single batch — the same shape as the old one-shot collect.
+///
+/// Aggregation order is load-bearing: `DvAggregate` has first-wins fields and
+/// its L5 insertion order is the rendered order, and `SeiFindings::merge` is
+/// first-wins — so batches run in index order and aggregate sequentially
+/// within each batch (rayon's indexed collect preserves order). Never replace
+/// this with a parallel reduce of partial aggregates.
+const AGG_BATCH: usize = 1024;
+
 pub fn scan(demux: &Demux, data: &[u8], opts: &Options) -> Scan {
+    // TS/M2TS `--full`: the elementary stream was never materialized by demux;
+    // stream it here in bounded windows. Checked before the empty-chunks early
+    // return — the head metadata window may hold no completed AU even though
+    // the stream has plenty — and before `no_rpu`, which still needs the walk's
+    // byte count for the exact video bitrate.
+    if let Some(plan) = demux.ts_stream.as_ref() {
+        return scan_ts_full(data, plan, demux, opts);
+    }
+
     if opts.no_rpu || demux.chunks.is_empty() {
-        return Scan { dv: DvAggregate::default(), sei: SeiFindings::default() };
+        return Scan { dv: DvAggregate::default(), sei: SeiFindings::default(), es_bytes: None };
     }
 
     let indices = select_indices(demux.chunks.len(), opts.samples, opts.full, demux.sps_chunk);
@@ -44,22 +71,62 @@ pub fn scan(demux: &Demux, data: &[u8], opts: &Options) -> Scan {
     // provides one (TS/M2TS), else directly into the mmap.
     let source: &[u8] = demux.reassembled.as_deref().unwrap_or(data);
 
-    // Extract RPUs + SEI in parallel across sampled chunks.
-    let outs: Vec<ChunkScan> = indices
-        .par_iter()
-        .map(|&i| extract_chunk(source, demux.chunks[i], demux.nal_format, &demux.codec))
-        .collect();
-
+    let selected: Vec<Chunk> = indices.iter().map(|&i| demux.chunks[i]).collect();
     let mut dv = DvAggregate::default();
-    let mut merged_sei = SeiFindings::default();
-    for out in &outs {
-        for rpu in &out.rpus {
-            dv.add(rpu);
-        }
-        merged_sei.merge(&out.sei);
-    }
+    let mut sei = SeiFindings::default();
+    scan_chunks(source, &selected, demux.nal_format, &demux.codec, &mut dv, &mut sei);
 
-    Scan { dv, sei: merged_sei }
+    Scan { dv, sei, es_bytes: None }
+}
+
+/// Extract RPUs + SEI from `chunks` in parallel batches, aggregating each
+/// batch sequentially in index order (see `AGG_BATCH` for why order matters),
+/// so peak liveness is one batch of parsed RPUs rather than all of them.
+fn scan_chunks(
+    source: &[u8],
+    chunks: &[Chunk],
+    fmt: NalFormat,
+    codec: &Codec,
+    dv: &mut DvAggregate,
+    sei: &mut SeiFindings,
+) {
+    for batch in chunks.chunks(AGG_BATCH) {
+        let outs: Vec<ChunkScan> =
+            batch.par_iter().map(|&c| extract_chunk(source, c, fmt, codec)).collect();
+        for out in &outs {
+            for rpu in &out.rpus {
+                dv.add(rpu);
+            }
+            sei.merge(&out.sei);
+        }
+    }
+}
+
+/// `--full` TS/M2TS: drive the resumable reassembler over the whole stream in
+/// bounded windows, scanning each window's access units with the ordinary
+/// batch machinery and reusing one scratch buffer (capacity is retained across
+/// `clear`, so steady state is a single ~`STREAM_WINDOW_BYTES` allocation).
+/// Under `--no-rpu` the walk still runs, extraction skipped, purely to count
+/// the completed-AU bytes the exact video bitrate needs.
+fn scan_ts_full(data: &[u8], plan: &ts::TsFullStream, demux: &Demux, opts: &Options) -> Scan {
+    let mut st = plan.streamer();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut dv = DvAggregate::default();
+    let mut sei = SeiFindings::default();
+    let mut es_bytes: u64 = 0;
+    loop {
+        buf.clear();
+        chunks.clear();
+        let more = st.next_window(data, &mut buf, &mut chunks, ts::STREAM_WINDOW_BYTES);
+        es_bytes += buf.len() as u64;
+        if !opts.no_rpu {
+            scan_chunks(&buf, &chunks, demux.nal_format, &demux.codec, &mut dv, &mut sei);
+        }
+        if !more {
+            return Scan { dv, sei, es_bytes: Some(es_bytes) };
+        }
+    }
 }
 
 /// RPUs + SEI findings from a single access unit's NAL stream.
@@ -173,7 +240,121 @@ pub(crate) fn select_indices(
 
 #[cfg(test)]
 mod tests {
-    use super::select_indices;
+    use super::*;
+    use crate::model::ColorInfo;
+
+    #[test]
+    fn ts_full_scan_streams_and_counts_es_bytes() {
+        // Dual-PID stream mirroring ts.rs's streamer tests: three completed AUs
+        // totalling 9 ES bytes; trailing partials on both PIDs excluded.
+        let mut data = Vec::new();
+        data.extend(ts_packet(0x100, true, &pes_start(&[1, 2, 3])));
+        data.extend(ts_packet(0x200, true, &pes_start(&[9, 9])));
+        data.extend(ts_packet(0x100, false, &[4, 5]));
+        data.extend(ts_packet(0x200, false, &[8]));
+        data.extend(ts_packet(0x100, true, &pes_start(&[6])));
+        data.extend(ts_packet(0x200, true, &pes_start(&[7, 7])));
+        data.extend(ts_packet(0x100, true, &pes_start(&[0xAB])));
+        data.extend(ts_packet(0x200, false, &[0xCD]));
+
+        let layout = ts::detect_layout(&data).expect("layout");
+        let demux = Demux {
+            container: "MPEG-2 TS",
+            codec: Codec::Hevc,
+            nal_format: NalFormat::AnnexB,
+            width: 0,
+            height: 0,
+            fps: None,
+            duration_secs: None,
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+            stereo: None,
+            color: ColorInfo::default(),
+            dv_config: None,
+            dv_dual_track: true,
+            mastering: None,
+            content_light: None,
+            bitrate: None,
+            chunks: Vec::new(), // head window empty: the plan must still walk
+            sps_chunk: None,
+            reassembled: Some(Vec::new()),
+            ts_stream: Some(ts::TsFullStream::new(layout, vec![0x100, 0x200])),
+        };
+
+        let opts = Options { samples: 16, full: true, no_rpu: false };
+        assert_eq!(scan(&demux, &data, &opts).es_bytes, Some(9));
+        // --no-rpu still walks the stream: the exact byte count is what the
+        // full-path bitrate is computed from.
+        let opts = Options { samples: 16, full: true, no_rpu: true };
+        assert_eq!(scan(&demux, &data, &opts).es_bytes, Some(9));
+    }
+
+    /// One 188-byte TS packet carrying exactly `payload`, adaptation-stuffed.
+    fn ts_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0xFFu8; 188];
+        pkt[0] = 0x47;
+        pkt[1] = ((pid >> 8) as u8 & 0x1F) | if pusi { 0x40 } else { 0x00 };
+        pkt[2] = (pid & 0xFF) as u8;
+        pkt[3] = 0x30;
+        let af_len = 188 - 4 - payload.len() - 1;
+        pkt[4] = af_len as u8;
+        if af_len > 0 {
+            pkt[5] = 0x00;
+        }
+        let start = 5 + af_len;
+        pkt[start..start + payload.len()].copy_from_slice(payload);
+        pkt
+    }
+
+    /// A PES start whose ES payload is `es` (header_data_length = 0).
+    fn pes_start(es: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        v.extend_from_slice(es);
+        v
+    }
+
+    /// An Annex-B HEVC prefix-SEI NAL carrying a content-light message.
+    fn sei_cll_nal(max_cll: u16, max_fall: u16) -> Vec<u8> {
+        let mut v = vec![0x00, 0x00, 0x01, 0x4E, 0x01, 0x90, 0x04];
+        v.extend_from_slice(&max_cll.to_be_bytes());
+        v.extend_from_slice(&max_fall.to_be_bytes());
+        v.push(0x80); // rbsp trailing
+        v
+    }
+
+    #[test]
+    fn batched_aggregation_preserves_first_wins_order() {
+        // More chunks than one batch, so the loop spans batches. Chunk 0
+        // carries CLL (100, 50); a chunk in the second batch carries
+        // (999, 999). First-wins must see chunk 0's values regardless of
+        // batching, and the second batch must still be visited at all.
+        let n = AGG_BATCH + 7;
+        let mut source = Vec::new();
+        let mut chunks = Vec::new();
+        for i in 0..n {
+            let nal = if i == 0 {
+                sei_cll_nal(100, 50)
+            } else if i == AGG_BATCH + 3 {
+                sei_cll_nal(999, 999)
+            } else {
+                vec![0x00, 0x00, 0x01, 0x02, 0x01, 0x00] // non-SEI filler NAL
+            };
+            chunks.push(Chunk { offset: source.len() as u64, size: nal.len() as u64 });
+            source.extend_from_slice(&nal);
+        }
+        let mut dv = DvAggregate::default();
+        let mut sei = SeiFindings::default();
+        scan_chunks(&source, &chunks, NalFormat::AnnexB, &Codec::Hevc, &mut dv, &mut sei);
+        let cl = sei.content_light.expect("cll aggregated");
+        assert_eq!((cl.max_cll, cl.max_fall), (100, 50));
+
+        // Only the second-batch chunk carries CLL: it must be reachable too.
+        let mut sei = SeiFindings::default();
+        scan_chunks(&source[..], &chunks[1..], NalFormat::AnnexB, &Codec::Hevc, &mut dv, &mut sei);
+        let cl = sei.content_light.expect("second batch scanned");
+        assert_eq!((cl.max_cll, cl.max_fall), (999, 999));
+    }
 
     #[test]
     fn select_indices_pins_the_sps_chunk() {

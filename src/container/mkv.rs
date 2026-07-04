@@ -415,6 +415,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         chunks,
         sps_chunk: None,
         reassembled: None,
+        ts_stream: None,
     })
 }
 
