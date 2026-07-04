@@ -109,7 +109,9 @@ never parse bytes native-endian.
   `is_remote`, decided from the open handle (Windows `FileRemoteProtocolInfo`), which costs no
   extra network round-trip and is correct through mapped drives, UNC, symlinks, and subst.
 - `progress.rs` — `--full` progress reporting (`--progress auto|bar|json|off`): a `\r`-rewritten
-  stderr bar in the active theme's palette, or NDJSON events on stderr (contract documented in
+  stderr bar in the active theme's palette (one line **per phase**, persisted at its final state
+  when the next phase starts — two phases on one resetting line read as a loop/hang, a real
+  user report), or NDJSON events on stderr (contract documented in
   `docs/SCHEMA.md`, "Progress events"; the event structs live here, *not* in `model.rs`, so the
   report schema and its golden shape test are untouched). One `Progress` per file, created in
   `main` and threaded through `container::demux` and `sample::scan`; two byte-denominated

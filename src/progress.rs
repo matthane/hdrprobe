@@ -29,8 +29,13 @@ use crate::render::Palette;
 #[derive(Copy, Clone)]
 pub enum Mode {
     Off,
-    /// Single stderr line, `\r`-rewritten, erased when the file finishes.
-    /// `color` carries the active theme's palette when stderr takes ANSI.
+    /// One stderr line per phase, `\r`-rewritten while the phase runs. A
+    /// completed phase's line **persists** at its final state and the next
+    /// phase starts a fresh line — consecutive phases read as steps, never as
+    /// a bar that restarted (an MKV `--full` is indexing *then* scanning; a
+    /// second 0% on the same line looks like a hang). Only a failed file's
+    /// in-progress line is erased, so the diagnostic prints clean. `color`
+    /// carries the active theme's palette when stderr takes ANSI.
     Bar { color: Option<&'static Palette> },
     /// One compact JSON object per stderr line (see `docs/SCHEMA.md`,
     /// "Progress events").
@@ -134,6 +139,9 @@ impl Progress {
         if matches!(self.mode, Mode::Off) {
             return;
         }
+        // A previous phase's bar line stays on screen at its final state; the
+        // new phase draws on a fresh line (see `Mode::Bar`).
+        self.persist_bar();
         self.phase.set(Some(phase));
         self.total.set(total_bytes);
         self.done.set(0);
@@ -181,11 +189,13 @@ impl Progress {
         self.emit(done, total);
     }
 
-    /// File finished successfully: erase the bar / emit the JSON `done` event.
-    /// Error paths skip this and rely on `Drop`, which only erases the bar.
+    /// File finished successfully: keep the final bar line / emit the JSON
+    /// `done` event. Error paths skip this and rely on `Drop`, which erases
+    /// the in-progress line instead.
     pub fn finish(&self) {
         match self.mode {
-            Mode::Off | Mode::Bar { .. } => self.clear_bar(),
+            Mode::Off => {}
+            Mode::Bar { .. } => self.persist_bar(),
             Mode::Json => {
                 let line = serde_json::to_string(&Event {
                     event: "done",
@@ -245,6 +255,21 @@ impl Progress {
                 eprintln!("{line}");
             }
         }
+    }
+
+    /// Freeze the on-screen bar line: redraw it at the phase's final recorded
+    /// state, then move past it so it stays as a step record (idempotent;
+    /// no-op for other modes or when nothing was drawn).
+    fn persist_bar(&self) {
+        if !matches!(self.mode, Mode::Bar { .. }) || self.bar_width.get() == 0 {
+            return;
+        }
+        // The last throttled frame may be stale; refresh before freezing.
+        self.emit(self.done.get(), self.total.get());
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err);
+        let _ = err.flush();
+        self.bar_width.set(0);
     }
 
     /// Blank out an on-screen bar line (idempotent; no-op for other modes).
