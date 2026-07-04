@@ -159,6 +159,12 @@ fn main() -> ExitCode {
     let mut json_reports: Vec<serde_json::Value> = Vec::new();
     let mut had_error = false;
 
+    // The masthead prints once per run, only on the colored interactive text
+    // path — quiet, JSON/NDJSON, and piped output stay machine-clean.
+    if use_color && format == Format::Text && !cli.quiet {
+        out_buf.push_str(&render::render_banner());
+    }
+
     for path in &paths {
         match process_file(path, &cli) {
             Ok(report) => match format {

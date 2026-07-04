@@ -14,6 +14,25 @@ pub struct RenderOpts {
 
 const LABEL_W: usize = 16;
 
+/// The interactive-terminal masthead: a two-row half-block "HDRPROBE" in the
+/// phosphor palette (bright top row, mid bottom — a CRT falloff), with the
+/// crate version faint alongside. Decoration only: `main` prints it once per
+/// run, and only for colored text output (never quiet/JSON/pipes), so
+/// machine consumers and logs never see it.
+pub fn render_banner() -> String {
+    let c = Colorizer { on: true };
+    let mut s = String::new();
+    let _ = writeln!(s, "{}", c.bright("█ █ █▀▄ █▀█ █▀█ █▀█ █▀█ █▄▄ █▀▀"));
+    let _ = writeln!(
+        s,
+        "{}  {}",
+        c.value("█▀█ █▄▀ █▀▄ █▀▀ █▀▄ █▄█ █▄█ ██▄"),
+        c.faint(concat!("v", env!("CARGO_PKG_VERSION")))
+    );
+    s.push('\n');
+    s
+}
+
 pub fn render(r: &Report, o: &RenderOpts) -> String {
     let mut s = String::new();
     let c = Colorizer { on: o.color };
