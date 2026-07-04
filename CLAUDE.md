@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 87 unit tests
+cargo test                     # 99 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -115,9 +115,23 @@ never parse bytes native-endian.
   payloads are never copied up front. **Every container backend is hand-rolled on purpose** —
   do *not* add `matroska-demuxer`/`mp4`/etc.; they copy frame data and hide byte offsets, which
   breaks this model. The **one exception is TS/M2TS**, which scatters the elementary stream
-  across packets: it fills `Demux::reassembled: Option<Vec<u8>>` and `chunks` index into *that*.
-  `sample.rs` picks the source via `reassembled.as_deref().unwrap_or(mmap)`. All other backends
-  leave it `None`. **Fragmented MP4 (fMP4/CMAF) stays zero-copy too**: its moov `stbl` tables are
+  across packets: it fills `Demux::reassembled: Option<Vec<u8>>` (the bounded head window only)
+  and `chunks` index into *that*. `sample.rs` picks the source via
+  `reassembled.as_deref().unwrap_or(mmap)`. All other backends leave it `None`. Under `--full`
+  the whole video ES is **never materialized**: demux exposes `Demux::ts_stream`
+  (`ts::TsFullStream`) and `sample::scan` drives the resumable `ts::EsStreamer` through the file
+  in `ts::STREAM_WINDOW_BYTES` windows, reusing one scratch buffer — so a `--full` scan of a huge
+  M2TS holds ~150 MB of heap, not the whole video track (measured: 1.4 GB M2TS, 1.87 GB → 155 MB
+  peak private commit; the old path scaled with file size, an OOM on a 60 GB remux). Partial AUs
+  carry across windows inside the streamer; the trailing AU still accumulating at EOF is never
+  flushed (no terminating PES start bounds it), matching the historical one-shot pass and the
+  bitrate byte count. Don't reintroduce a whole-stream buffer, and don't flush that trailing AU.
+  The sampler itself is memory-bounded the same way for **every** container: `sample::scan_chunks`
+  extracts in `AGG_BATCH` parallel batches and aggregates each batch sequentially in index order,
+  so `--full` never holds every frame's parsed RPU at once. That order is load-bearing
+  (`DvAggregate` has first-wins fields and its L5 insertion order is the rendered order;
+  `SeiFindings::merge` is first-wins) — **never replace the batch loop with a parallel reduce of
+  partial aggregates**. **Fragmented MP4 (fMP4/CMAF) stays zero-copy too**: its moov `stbl` tables are
   present but *empty* (a silently empty report, not an error), so when they yield no samples and
   `moof` boxes exist, `mp4.rs` builds the index from each fragment's `tfhd`/`trun` tables instead
   (`build_fragment_index`) — sizes/durations fall back tfhd → `mvex` trex defaults, every traf is
@@ -244,7 +258,9 @@ never parse bytes native-endian.
   same branch Profile 4 uses); its Rec.709 VUI (`0,1,1,1,0`) collapses to a single `BT.709` label
   because primaries == transfer (unlike P5, whose encoding differs from its colour space).
 - **`--full` changes demux behaviour, not just sampling.** It threads into `container::demux(..,
-  full)`: TS reassembles the whole stream (vs a single head window of `ts::HEAD_SCAN_BYTES`), raw
+  full)`: TS streams the whole video ES through the sampler in bounded `ts::STREAM_WINDOW_BYTES`
+  windows — demux itself stays a head-window metadata pass, plus an SPS-rescue walk only when the
+  head held no SPS at all (vs the default's single head window of `ts::HEAD_SCAN_BYTES`), raw
   HEVC scans every byte (vs a single head window of `annexb::HEAD_SCAN_BYTES`, 8 MiB, dropping the
   boundary-cut trailing NAL), MKV indexes every cluster (vs a head byte-window of
   `HEAD_SPAN_BYTES` — without this, walking every block header page-faults the whole multi-GB movie
@@ -272,9 +288,9 @@ never parse bytes native-endian.
   the bounded walk when the muxer filled that field.
 - **TS/M2TS default reads to the *first IDR*, not byte 0.** TS carries no container box, so
   resolution/colour/frame rate come only from the in-band SPS — which rides the first IDR, typically
-  ~one 4K GOP (~10 MiB) in. So `ts::Limits::sampled` is a *single* head window bounded by `HEAD_SCAN_BYTES`
-  (24 MiB, ~2× the observed SPS depth) with the AU/byte caps lifted so the read isn't cut short
-  before that IDR. Don't "optimize" this down to a few MiB (drops resolution/colour, and L5 falls
+  ~one 4K GOP (~10 MiB) in. So `ts::head_reassemble` is a *single* head window whose only bound is
+  a packet budget sized to `HEAD_SCAN_BYTES` (24 MiB, ~2× the observed SPS depth), so the read
+  isn't cut short before that IDR. Don't "optimize" this down to a few MiB (drops resolution/colour, and L5 falls
   back to raw offsets) or reintroduce the old whole-file window spread (defeats the remote win).
   **Duration is the one exception that also reads the tail:** TS has no duration box, so — like
   MediaInfo — it comes from `last_PCR - first_PCR` on the PCR PID. The first PCR is free from the
@@ -342,8 +358,12 @@ never parse bytes native-endian.
   MKV prefers the mkvmerge
   `BPS` statistics tag (what MediaInfo reports — used verbatim since it already spans the video
   track's own duration, which the Segment duration only approximates), else `NUMBER_OF_BYTES`, else
-  the summed block index *only when complete* (`!stopped_early`); TS sums the reassembled stream
-  under `--full`. Otherwise an *overall* rate (file length ÷ duration, labelled distinctly because it
+  the summed block index *only when complete* (`!stopped_early`); TS under `--full` sums the
+  streamed completed-AU bytes (`sample::Scan::es_bytes`, applied as the report's rate in `main.rs`
+  since the total exists only after the streaming scan — demux leaves `bitrate` unset on that
+  path, and `Some(0)` bytes still yields `None`, never 0 b/s; `--full --no-rpu` still walks the
+  stream count-only so the exact rate survives). Otherwise an *overall* rate (file length ÷
+  duration, labelled distinctly because it
   counts audio + overhead) or `None` (no duration: raw HEVC/AV1). Never divide a bounded head-window
   index by the full runtime. **MKV reads the statistics `Tags` via one bounded tail seek**: mkvmerge
   writes `Tags` after the clusters, past the head window, so the demux follows the front SeekHead's
