@@ -34,10 +34,11 @@ unreadable or corrupt.
 
 ## Consuming the output
 
-**Streams.** JSON goes to stdout; diagnostics go to stderr. The two never mix, so stdout is
-always parseable regardless of how many inputs failed. `-o <path>` writes the same bytes to a
-file instead of stdout; there is no difference in content, so shell redirection and `-o` are
-interchangeable.
+**Streams.** JSON reports go to stdout; diagnostics go to stderr. The two never mix, so stdout
+is always parseable regardless of how many inputs failed. `-o <path>` writes the same bytes to
+a file instead of stdout; there is no difference in content, so shell redirection and `-o` are
+interchangeable. With `--full --progress json`, stderr additionally carries machine-readable
+progress events (see "Progress events" below); stdout is unaffected.
 
 **Choosing a mode.** `--json` suits one-shot inspection of a known input count. For scanning
 libraries or piping through line-oriented tools, prefer `--format ndjson`: it always emits
@@ -83,6 +84,44 @@ prints `[]`; under `--format ndjson` it prints nothing.
 directory argument can yield either. A consumer that cannot predict its input count should
 either use `--format ndjson` or normalize after parsing, e.g. in Python:
 `reports = data if isinstance(data, list) else [data]`.
+
+## Progress events (stderr)
+
+A `--full` scan of a large file can run for minutes (it reads every access unit), so hdrprobe
+can report progress while it works. `--progress json` emits one compact JSON object per
+**stderr** line; the report stream on stdout is byte-identical with or without it. Progress
+reporting exists only under `--full`: the default fast path finishes in milliseconds and never
+emits events (nor does `--progress bar`, the human display, ever appear there).
+
+Consumer rule: parse stderr line by line and skip any line that is not valid JSON — non-JSON
+lines are human diagnostics (`error: ...`), which share the stream. Events carry
+`hdrprobe_schema_version` and follow the same versioning and conventions as the `Report`
+(unknown fields must be tolerated; absent means omitted).
+
+Two event shapes, distinguished by `event`:
+
+| Field | Type | Present | Meaning |
+|---|---|---|---|
+| `event` | string | always | `"progress"` or `"done"` |
+| `hdrprobe_schema_version` | string | always | Same contract version as the reports |
+| `file` | string | always | The input path, exactly as the report's `file` will render it |
+| `file_index` | integer | always | 1-based position of this file in the run |
+| `file_count` | integer | always | Total files in the run |
+| `phase` | string | `progress` only | `"index"` (a demux-time whole-file walk) or `"scan"` (the per-frame scan) |
+| `bytes_done` | integer | `progress` only | Bytes processed within the phase |
+| `bytes_total` | integer | `progress` only | The phase's byte denominator |
+| `percent` | number | `progress` only | `bytes_done / bytes_total`, one decimal |
+| `elapsed_ms` | number | always | Milliseconds since this file's processing started |
+
+Per file: each phase opens with a `percent: 0` line, updates are throttled (at most a few per
+second), and the `scan` phase always closes with a `percent: 100` line; an `index` phase may
+end short of 100 when the walk legitimately stops early, so treat the next phase's opening
+line or the `done` event as the phase boundary, never a specific percentage. A `done` event
+follows when the file's report is complete; a file that fails produces no `done` event — its
+diagnostic line takes that place. Phases are sequential, and which ones appear depends on the
+container (an MKV indexes then scans; TS/M2TS normally only scans). Percentages are monotonic
+within a phase. Events describe pacing, not content: nothing in them appears in, or changes,
+the `Report`.
 
 ## Schema versioning
 

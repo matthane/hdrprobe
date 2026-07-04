@@ -14,6 +14,7 @@ use anyhow::{bail, Result};
 
 use crate::bits::BitReader;
 use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
+use crate::progress::Progress;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Codec {
@@ -120,8 +121,10 @@ pub struct Demux {
 
 /// Detect the container type and demux it. `full` requests an exhaustive scan
 /// where it changes demux behaviour (TS/M2TS walks the whole stream rather
-/// than a bounded head sample).
-pub fn demux(path: &Path, data: &[u8], full: bool) -> Result<Demux> {
+/// than a bounded head sample). `progress` receives `Phase::Index` ticks from
+/// the backends whose `--full` demux walks the whole file; it's a no-op sink
+/// on the default path.
+pub fn demux(path: &Path, data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -130,10 +133,10 @@ pub fn demux(path: &Path, data: &[u8], full: bool) -> Result<Demux> {
 
     let by_ext = match ext.as_str() {
         "mp4" | "m4v" | "mov" | "m4a" => Some(mp4::demux(data)),
-        "mkv" | "webm" | "mka" => Some(mkv::demux(data, full)),
-        "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full)),
-        "ivf" | "obu" => Some(av1::demux(data, full)),
-        "ts" | "m2ts" | "mts" => Some(ts::demux(data, full)),
+        "mkv" | "webm" | "mka" => Some(mkv::demux(data, full, progress)),
+        "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full, progress)),
+        "ivf" | "obu" => Some(av1::demux(data, full, progress)),
+        "ts" | "m2ts" | "mts" => Some(ts::demux(data, full, progress)),
         _ => None,
     };
 
@@ -145,7 +148,7 @@ pub fn demux(path: &Path, data: &[u8], full: bool) -> Result<Demux> {
     match by_ext {
         Some(Ok(demux)) => return Ok(demux),
         Some(Err(e)) => {
-            if let Some(Ok(demux)) = sniff_demux(data, full) {
+            if let Some(Ok(demux)) = sniff_demux(data, full, progress) {
                 return Ok(demux);
             }
             return Err(e);
@@ -154,7 +157,7 @@ pub fn demux(path: &Path, data: &[u8], full: bool) -> Result<Demux> {
     }
 
     // Unknown extension: dispatch purely by magic bytes.
-    if let Some(res) = sniff_demux(data, full) {
+    if let Some(res) = sniff_demux(data, full, progress) {
         return res;
     }
 
@@ -163,21 +166,21 @@ pub fn demux(path: &Path, data: &[u8], full: bool) -> Result<Demux> {
 
 /// Pick a backend from magic bytes / structural probes alone (extension ignored).
 /// `None` when nothing matches.
-fn sniff_demux(data: &[u8], full: bool) -> Option<Result<Demux>> {
+fn sniff_demux(data: &[u8], full: bool, progress: &Progress) -> Option<Result<Demux>> {
     if data.len() >= 12 && &data[4..8] == b"ftyp" {
         return Some(mp4::demux(data));
     }
     if starts_with_ebml(data) {
-        return Some(mkv::demux(data, full));
+        return Some(mkv::demux(data, full, progress));
     }
     if av1::is_ivf(data) || av1::is_obu_stream(data) {
-        return Some(av1::demux(data, full));
+        return Some(av1::demux(data, full, progress));
     }
     if ts::detect_layout(data).is_some() {
-        return Some(ts::demux(data, full));
+        return Some(ts::demux(data, full, progress));
     }
     if starts_with_start_code(data) {
-        return Some(annexb::demux(data, full));
+        return Some(annexb::demux(data, full, progress));
     }
     None
 }

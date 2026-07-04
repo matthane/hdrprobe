@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
 use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
+use crate::progress::{Phase, Progress};
 
 // --- EBML element IDs (stored with their length-descriptor marker retained). ---
 const ID_SEGMENT: u32 = 0x1853_8067;
@@ -264,10 +265,17 @@ fn front_seekhead_offset_of(data: &[u8], target: u32) -> Option<usize> {
     None
 }
 
-pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
+pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
     // Locate the Segment among the top-level elements (EBML header precedes it).
     let (seg_start, seg_end) =
         segment_extent(data).context("no Segment element (not a Matroska file)")?;
+
+    // `--full` indexes every cluster — a whole-file walk worth reporting
+    // (over a network mount it faults the entire file in). The default's
+    // bounded head walk is milliseconds and stays silent.
+    if full {
+        progress.begin(Phase::Index, seg_end as u64);
+    }
 
     let mut timestamp_scale = TIMESTAMP_SCALE_DEFAULT;
     let mut duration_ticks: Option<f64> = None;
@@ -287,6 +295,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
 
     let mut p = seg_start;
     while p < seg_end {
+        progress.update(p as u64);
         let Some((id, p1)) = read_id(data, p) else { break };
         let Some((size, p2)) = read_size(data, p1) else { break };
         match id {
@@ -343,6 +352,10 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
             },
         }
     }
+
+    // Close the index walk at its true final position (the loop tick reports
+    // the position *before* each element).
+    progress.update(p.min(seg_end) as u64);
 
     let track = track.context("no video track found in Matroska file")?;
 

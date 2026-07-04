@@ -9,13 +9,14 @@ mod hdr;
 mod hevc;
 mod model;
 mod prefetch;
+mod progress;
 mod render;
 mod sample;
 mod shell;
 mod sidecar;
 
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -66,6 +67,12 @@ struct Cli {
     #[arg(long, value_enum, env = "HDRPROBE_THEME", default_value_t = Theme::Paper)]
     theme: Theme,
 
+    /// Progress reporting for --full scans (the fast path finishes in
+    /// milliseconds and never reports): auto shows a bar when stderr is a
+    /// terminal, json emits one machine-readable event per stderr line.
+    #[arg(long, value_enum, default_value_t = ProgressWhen::Auto)]
+    progress: ProgressWhen,
+
     /// One-line summary per file.
     #[arg(short, long)]
     quiet: bool,
@@ -103,6 +110,14 @@ enum ColorWhen {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ProgressWhen {
+    Auto,
+    Bar,
+    Json,
+    Off,
 }
 
 fn main() -> ExitCode {
@@ -159,6 +174,29 @@ fn main() -> ExitCode {
         }
     };
 
+    // Progress is `--full`-only (the fast path is over in milliseconds) and
+    // lives entirely on stderr — stdout stays the pure report stream. Under
+    // `auto` the bar needs an interactive stderr; the bar's colour follows the
+    // same --color policy as the report, checked against stderr's own
+    // capability.
+    let progress_mode = if !cli.full {
+        progress::Mode::Off
+    } else {
+        let bar_color = match cli.color {
+            ColorWhen::Always => true,
+            ColorWhen::Never => false,
+            ColorWhen::Auto => supports_color::on(supports_color::Stream::Stderr).is_some(),
+        };
+        let bar = progress::Mode::Bar { color: bar_color.then(|| cli.theme.palette()) };
+        match cli.progress {
+            ProgressWhen::Auto if std::io::stderr().is_terminal() => bar,
+            ProgressWhen::Auto => progress::Mode::Off,
+            ProgressWhen::Bar => bar,
+            ProgressWhen::Json => progress::Mode::Json,
+            ProgressWhen::Off => progress::Mode::Off,
+        }
+    };
+
     let mut out_buf = String::new();
     let mut json_reports: Vec<serde_json::Value> = Vec::new();
     let mut had_error = false;
@@ -169,26 +207,32 @@ fn main() -> ExitCode {
         out_buf.push_str(&render::render_banner(cli.theme));
     }
 
-    for path in &paths {
-        match process_file(path, &cli) {
-            Ok(report) => match format {
-                Format::Text => {
-                    if cli.quiet {
-                        out_buf.push_str(&render::render_quiet(&report));
-                        out_buf.push('\n');
-                    } else {
-                        let opts = render_opts(&cli, use_color);
-                        out_buf.push_str(&render::render(&report, &opts));
+    for (i, path) in paths.iter().enumerate() {
+        let progress = progress::Progress::new(progress_mode, path, i + 1, paths.len());
+        match process_file(path, &cli, &progress) {
+            Ok(report) => {
+                progress.finish();
+                match format {
+                    Format::Text => {
+                        if cli.quiet {
+                            out_buf.push_str(&render::render_quiet(&report));
+                            out_buf.push('\n');
+                        } else {
+                            let opts = render_opts(&cli, use_color);
+                            out_buf.push_str(&render::render(&report, &opts));
+                            out_buf.push('\n');
+                        }
+                    }
+                    Format::Json => json_reports.push(serde_json::to_value(&report).unwrap()),
+                    Format::Ndjson => {
+                        out_buf.push_str(&serde_json::to_string(&report).unwrap());
                         out_buf.push('\n');
                     }
                 }
-                Format::Json => json_reports.push(serde_json::to_value(&report).unwrap()),
-                Format::Ndjson => {
-                    out_buf.push_str(&serde_json::to_string(&report).unwrap());
-                    out_buf.push('\n');
-                }
-            },
+            }
             Err(e) => {
+                // Drop erases any live bar line so the diagnostic prints clean.
+                drop(progress);
                 had_error = true;
                 eprintln!("error: {}: {:#}", path.display(), e);
             }
@@ -244,7 +288,7 @@ fn render_opts(cli: &Cli, color: bool) -> RenderOpts {
     }
 }
 
-fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
+fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result<Report> {
     // Metadata sidecars (raw RPU, DV XML, HDR10+ JSON) carry no picture data and
     // skip the whole video pipeline. `None` means "not a sidecar" — fall through.
     if let Some(report) = sidecar::try_process(path).with_context(|| format!("parsing {}", path.display()))? {
@@ -264,7 +308,7 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
     let remote = prefetch::is_remote(&file);
     let warmed_head = prefetch::warm_metadata(remote, &file, path, &mmap);
 
-    let demux = container::demux(path, &mmap, cli.full).context("demux failed")?;
+    let demux = container::demux(path, &mmap, cli.full, progress).context("demux failed")?;
 
     // The sampled access units are scattered across the whole file (worst for
     // MP4, whose sample index spans a multi-GB mdat), so warm exactly the
@@ -275,7 +319,7 @@ fn process_file(path: &Path, cli: &Cli) -> Result<Report> {
     }
 
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
-    let scan = sample::scan(&demux, &mmap, &opts);
+    let scan = sample::scan(&demux, &mmap, &opts, progress);
 
     let is_av1 = matches!(demux.codec, container::Codec::Av1);
     let mut dv = scan

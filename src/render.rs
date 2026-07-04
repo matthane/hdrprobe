@@ -37,7 +37,7 @@ pub enum Theme {
 }
 
 impl Theme {
-    fn palette(self) -> &'static Palette {
+    pub(crate) fn palette(self) -> &'static Palette {
         match self {
             Theme::Green => &GREEN,
             Theme::Amber => &AMBER,
@@ -618,11 +618,11 @@ fn human_duration(secs: f64) -> String {
 /// scheme makes unmissable. Each field is the SGR parameter string for one
 /// role; the values are hand-tuned per theme (the ramp is perceptual, not a
 /// linear scale), with `warn` carrying the bright ink behind inverse video.
-struct Palette {
-    bright: &'static str,
-    value: &'static str,
-    label: &'static str,
-    faint: &'static str,
+pub(crate) struct Palette {
+    pub(crate) bright: &'static str,
+    pub(crate) value: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) faint: &'static str,
     warn: &'static str,
 }
 

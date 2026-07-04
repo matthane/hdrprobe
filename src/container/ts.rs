@@ -31,6 +31,7 @@ use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::{parse_sps, SpsInfo};
 use crate::model::{Bitrate, ColorInfo};
+use crate::progress::{Phase, Progress};
 
 const SYNC: u8 = 0x47;
 const TS_UNIT: usize = 188;
@@ -86,7 +87,7 @@ pub fn detect_layout(data: &[u8]) -> Option<Layout> {
     None
 }
 
-pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
+pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
     let layout = detect_layout(data).context("not a recognized TS/M2TS stream")?;
     let (pcr_pid, streams) = parse_psi(data, layout).context("no PMT / program map found")?;
 
@@ -129,7 +130,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         // whole-stream pass would have found. A rescue hit's chunk index is
         // window-relative, meaningless against the head chunks — and unneeded:
         // the `--full` scan covers every AU, so nothing must be pinned.
-        best = sps_rescue(data, layout, &video_pids, &codec);
+        best = sps_rescue(data, layout, &video_pids, &codec, progress);
         sps_chunk = None;
     }
     let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_fields(best);
@@ -415,6 +416,13 @@ impl EsStreamer {
         self.finished = true;
         false
     }
+
+    /// Absolute byte offset of the walk within the stream — monotonic, ends
+    /// within one packet of EOF. Progress reporting's numerator; never affects
+    /// parsing.
+    pub fn position(&self) -> usize {
+        self.cursor
+    }
 }
 
 /// One-shot head reassembly for the default (non-`--full`) metadata pass: a
@@ -672,11 +680,18 @@ fn sps_fields(
 /// the same UHD-width early exit the per-window search uses, else at end of
 /// stream. The result's `chunk` index is window-relative — callers must not
 /// use it against the head chunks.
-fn sps_rescue(data: &[u8], layout: Layout, pids: &[u16], codec: &Codec) -> Option<SpsCommon> {
+fn sps_rescue(
+    data: &[u8],
+    layout: Layout,
+    pids: &[u16],
+    codec: &Codec,
+    progress: &Progress,
+) -> Option<SpsCommon> {
     let mut st = EsStreamer::new(layout, pids, usize::MAX);
     let mut buf = Vec::new();
     let mut chunks = Vec::new();
     let mut best: Option<SpsCommon> = None;
+    progress.begin(Phase::Index, data.len() as u64);
     loop {
         buf.clear();
         chunks.clear();
@@ -689,6 +704,7 @@ fn sps_rescue(data: &[u8], layout: Layout, pids: &[u16], codec: &Codec) -> Optio
         if !more || best.as_ref().is_some_and(|b| b.width >= 3840) {
             return best;
         }
+        progress.update(st.position() as u64);
     }
 }
 
@@ -958,10 +974,12 @@ mod tests {
         let mut all = Vec::new();
         let mut sizes = Vec::new();
         let mut total = 0u64;
+        let mut positions = Vec::new();
         loop {
             buf.clear();
             chunks.clear();
             let more = st.next_window(&d, &mut buf, &mut chunks, 1);
+            positions.push(st.position());
             all.extend_from_slice(&buf);
             sizes.extend(chunks.iter().map(|c| c.size));
             total += buf.len() as u64;
@@ -972,6 +990,9 @@ mod tests {
         assert_eq!(all, one_buf);
         assert_eq!(sizes, [5, 3, 1]);
         assert_eq!(total, one_buf.len() as u64);
+        // The progress cursor is monotonic and ends at the walk's end.
+        assert!(positions.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*positions.last().unwrap(), d.len());
     }
 
     #[test]
@@ -1003,10 +1024,10 @@ mod tests {
         d.extend(ts_packet(0x1011, true, &pes_start(&[0x33]))); // completes [0x11,0x22]
         d.extend(ts_packet(0x1011, false, &[0x44])); // trailing partial
 
-        let default = demux(&d, false).expect("default demux");
+        let default = demux(&d, false, &Progress::off()).expect("default demux");
         assert!(default.ts_stream.is_none());
 
-        let full = demux(&d, true).expect("full demux");
+        let full = demux(&d, true, &Progress::off()).expect("full demux");
         let plan = full.ts_stream.as_ref().expect("full exposes the streaming plan");
         assert_eq!(plan.video_pids, [0x1011, 0x1015]);
         assert!(full.bitrate.is_none(), "the streaming scan supplies the full-path rate");

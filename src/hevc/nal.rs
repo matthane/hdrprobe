@@ -24,14 +24,36 @@ fn nal_type(header_byte: u8) -> u8 {
 /// Split an Annex-B byte stream into NAL units (3- or 4-byte start codes).
 /// `base` is the offset of `data` within the file, recorded into the ranges.
 pub fn split_annexb(data: &[u8], out: &mut Vec<NalRef>) {
+    // The no-op tick body leaves `next_tick` dead, so the monomorphized copy
+    // carries no gate at all — this stays the hot per-chunk path.
+    split_annexb_impl(data, out, |_| {});
+}
+
+/// `split_annexb` with a byte-position callback every ~`TICK_BYTES`, for
+/// progress on the `--full` whole-stream walk (a raw elementary stream can be
+/// tens of GB, and this split is its only pass over the bytes).
+pub fn split_annexb_ticked(data: &[u8], out: &mut Vec<NalRef>, tick: impl FnMut(usize)) {
+    split_annexb_impl(data, out, tick);
+}
+
+/// Byte interval between `split_annexb_ticked` callbacks.
+const TICK_BYTES: usize = 2 << 20;
+
+#[inline]
+fn split_annexb_impl(data: &[u8], out: &mut Vec<NalRef>, mut tick: impl FnMut(usize)) {
     let n = data.len();
     let mut i = 0usize;
+    let mut next_tick = TICK_BYTES;
     // If the buffer doesn't begin with a start code, treat offset 0 as an
     // implicit NAL boundary. (Our access-unit chunks start at a NAL header,
     // not a start code, so the first NAL would otherwise be dropped.)
     let starts_with_sc = n >= 3 && data[0] == 0 && data[1] == 0 && (data[2] == 1 || (n >= 4 && data[2] == 0 && data[3] == 1));
     let mut nal_start: Option<usize> = if starts_with_sc { None } else { Some(0) };
     while i + 3 <= n {
+        if i >= next_tick {
+            tick(i);
+            next_tick = i + TICK_BYTES;
+        }
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
             let payload = i + 3;
             if let Some(prev) = nal_start.take() {
@@ -110,6 +132,28 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].nal_type, 62);
         assert_eq!(out[1].nal_type, 33);
+    }
+
+    #[test]
+    fn ticked_split_matches_plain_and_fires() {
+        // A buffer past the tick interval: identical NAL list either way, and
+        // the callback reports monotonically increasing positions.
+        let mut data = vec![0u8; TICK_BYTES + 4096];
+        for (i, sc) in [0usize, 1000, TICK_BYTES - 100, TICK_BYTES + 500].iter().enumerate() {
+            data[*sc..*sc + 4].copy_from_slice(&[0, 0, 1, (33 << 1) ^ (i as u8 & 1)]);
+        }
+        let (mut plain, mut ticked) = (Vec::new(), Vec::new());
+        split_annexb(&data, &mut plain);
+        let mut ticks: Vec<usize> = Vec::new();
+        split_annexb_ticked(&data, &mut ticked, |pos| ticks.push(pos));
+        assert_eq!(plain.len(), ticked.len());
+        assert!(plain
+            .iter()
+            .zip(&ticked)
+            .all(|(a, b)| (a.start, a.end, a.nal_type) == (b.start, b.end, b.nal_type)));
+        assert!(!ticks.is_empty(), "a walk past TICK_BYTES must tick");
+        assert!(ticks.windows(2).all(|w| w[0] < w[1]));
+        assert!(ticks.iter().all(|&p| p <= data.len()));
     }
 
     #[test]

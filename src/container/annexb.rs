@@ -7,6 +7,7 @@ use crate::container::{Chunk, Codec, Demux, NalFormat};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::parse_sps;
 use crate::model::ColorInfo;
+use crate::progress::{Phase, Progress};
 
 /// Bytes NAL-split by the default (non-`--full`) scan: a single head window,
 /// the same bounded-default shape TS and raw AV1 use. Everything the report
@@ -17,9 +18,15 @@ use crate::model::ColorInfo;
 /// on a network volume (the same coupling `av1::HEAD_SCAN_BYTES` keeps).
 pub const HEAD_SCAN_BYTES: usize = 8 << 20; // 8 MiB
 
-pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
+pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
     let mut nals: Vec<NalRef> = Vec::new();
-    if full || data.len() <= HEAD_SCAN_BYTES {
+    if full {
+        // The whole-stream split is `--full`'s single pass over every byte of
+        // a possibly huge raw stream — the one walk worth reporting here.
+        progress.begin(Phase::Index, data.len() as u64);
+        nal::split_annexb_ticked(data, &mut nals, |pos| progress.update(pos as u64));
+        progress.update(data.len() as u64);
+    } else if data.len() <= HEAD_SCAN_BYTES {
         nal::split_annexb(data, &mut nals);
     } else {
         split_head(data, &mut nals);

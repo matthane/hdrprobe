@@ -169,7 +169,8 @@ For scripting against the JSON output, every object and field is documented in
 |---|---|
 | `-j, --json` | JSON instead of text (an array when several files are given) |
 | `--format <fmt>` | `text` (default), `json`, or `ndjson` (one object per line) |
-| `-f, --full` | Exhaustive per-frame scan: all distinct L5, a full trim-target census, and scene counts. Trades speed for completeness. |
+| `-f, --full` | Exhaustive per-frame scan: all distinct L5, a full trim-target census, and scene counts. Trades speed for completeness. Shows a live progress bar in the terminal. |
+| `--progress <mode>` | Progress reporting for `--full` scans: `auto` (default, bar on an interactive terminal), `bar`, `json` (machine-readable events on stderr, see [docs/SCHEMA.md](docs/SCHEMA.md)), or `off` |
 | `--no-rpu` | Report the container DV configuration only, skipping RPU parsing. Effectively instant. |
 | `-s, --samples <N>` | Number of seek points to sample (default 16). Higher values capture more distinct L5 areas. |
 | `--sections <list>` | Comma-separated list drawn from `general,hdr,dv,hdr10plus` |
