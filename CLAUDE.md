@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 111 unit tests
+cargo test                     # 115 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -339,9 +339,22 @@ never parse bytes native-endian.
   `sample::select_indices` over the container's exact chunk ranges so the sampler's scattered
   AU faults arrive warm — it skips ranges inside `warm_metadata`'s return, the *coalesced*
   contiguous warmed prefix from byte 0 (an MKV head that merges into its block span counts
-  whole). The chunk warm is skipped under `--full` (every chunk is read anyway;
-  pre-reading a whole movie would regress), under `--no-rpu` (no chunk is read), and for TS
-  (chunks index into `reassembled`, not the file). The `sidx`/`mfra` ranges are a **hint
+  whole). The chunk warm is skipped under `--full` (every chunk is read anyway; its `--full`
+  counterpart is the `Frontier` below), under `--no-rpu` (no chunk is read), and for TS
+  (chunks index into `reassembled`, not the file). **`--full` on a strict-remote volume
+  tailgates `prefetch::Frontier`**, a bounded look-ahead warm riding the progress-tick sites:
+  each whole-file walk calls `ensure(pos)`/`ensure_to(end)` so the file crosses the wire once,
+  linearly, instead of thousands of scattered fault round-trips. The bytes land in the OS page
+  cache only (owned heap unchanged), the look-ahead is capped (`FRONTIER_AHEAD`, with exact
+  known spans — an MKV cluster, a scan batch, a TS window — warmed whole since they're consumed
+  immediately), and the frontier is monotonic per file, so a scan pass over ranges the index
+  pass streamed warms nothing (on a file larger than RAM those pages may be evicted; that pass
+  degrades to today's scattered-but-parallel faults — the accepted limit of a two-pass design).
+  Gating is `is_remote_strict`, not `is_remote`: the plain verdict errs remote off-Windows
+  (fine for cheap bounded warms), the strict one errs local (Linux resolves
+  `/proc/self/mounts`; unknown platforms decline) because a forced linear read of a local disk
+  would regress. TS windows and heap-buffer chunk lists never touch the frontier with buffer
+  offsets — only real file positions go in. The `sidx`/`mfra` ranges are a **hint
   only**: the fragment index is always built from the `moof` boxes themselves, so a wrong or
   missing index wastes a warm but can never change output. Couplings that remain numeric and easy to break
   silently: **raw AV1 and raw HEVC** — `av1::HEAD_SCAN_BYTES` (the bounded head walk for both

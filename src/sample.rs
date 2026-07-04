@@ -15,6 +15,7 @@ use crate::dv::levels::DvAggregate;
 use crate::dv::rpu::{parse_avc_rpu, parse_hevc_rpu};
 use crate::hdr::sei::{self, SeiFindings};
 use crate::hevc::nal::{self, NalRef};
+use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
 pub struct Options {
@@ -52,14 +53,20 @@ struct ChunkScan {
 /// this with a parallel reduce of partial aggregates.
 const AGG_BATCH: usize = 1024;
 
-pub fn scan(demux: &Demux, data: &[u8], opts: &Options, progress: &Progress) -> Scan {
+pub fn scan(
+    demux: &Demux,
+    data: &[u8],
+    opts: &Options,
+    progress: &Progress,
+    frontier: &Frontier,
+) -> Scan {
     // TS/M2TS `--full`: the elementary stream was never materialized by demux;
     // stream it here in bounded windows. Checked before the empty-chunks early
     // return — the head metadata window may hold no completed AU even though
     // the stream has plenty — and before `no_rpu`, which still needs the walk's
     // byte count for the exact video bitrate.
     if let Some(plan) = demux.ts_stream.as_ref() {
-        return scan_ts_full(data, plan, demux, opts, progress);
+        return scan_ts_full(data, plan, demux, opts, progress, frontier);
     }
 
     if opts.no_rpu || demux.chunks.is_empty() {
@@ -69,14 +76,17 @@ pub fn scan(demux: &Demux, data: &[u8], opts: &Options, progress: &Progress) -> 
     let indices = select_indices(demux.chunks.len(), opts.samples, opts.full, demux.sps_chunk);
 
     // Chunks index into the reassembled elementary stream when the container
-    // provides one (TS/M2TS), else directly into the mmap.
+    // provides one (TS/M2TS), else directly into the mmap. The frontier only
+    // means anything against the file, so a heap-buffer source gets the no-op.
     let source: &[u8] = demux.reassembled.as_deref().unwrap_or(data);
+    let off = Frontier::off();
+    let frontier = if demux.reassembled.is_none() { frontier } else { &off };
 
     let selected: Vec<Chunk> = indices.iter().map(|&i| demux.chunks[i]).collect();
     progress.begin(Phase::Scan, selected.iter().map(|c| c.size).sum());
     let mut dv = DvAggregate::default();
     let mut sei = SeiFindings::default();
-    scan_chunks(source, &selected, demux.nal_format, &demux.codec, &mut dv, &mut sei, progress);
+    scan_chunks(source, &selected, demux.nal_format, &demux.codec, &mut dv, &mut sei, progress, frontier);
 
     Scan { dv, sei, es_bytes: None }
 }
@@ -84,6 +94,7 @@ pub fn scan(demux: &Demux, data: &[u8], opts: &Options, progress: &Progress) -> 
 /// Extract RPUs + SEI from `chunks` in parallel batches, aggregating each
 /// batch sequentially in index order (see `AGG_BATCH` for why order matters),
 /// so peak liveness is one batch of parsed RPUs rather than all of them.
+#[allow(clippy::too_many_arguments)] // two aggregators in, two passive sinks along for the ride
 fn scan_chunks(
     source: &[u8],
     chunks: &[Chunk],
@@ -92,12 +103,19 @@ fn scan_chunks(
     dv: &mut DvAggregate,
     sei: &mut SeiFindings,
     progress: &Progress,
+    frontier: &Frontier,
 ) {
-    // Progress ticks at the batch boundary — on the aggregating thread,
-    // between rayon collects, never inside the par_iter closure (the sink is
-    // single-threaded by design).
+    // Progress and frontier tick at the batch boundary — on the aggregating
+    // thread, between rayon collects, never inside the par_iter closure (both
+    // sinks are single-threaded by design).
     let mut done: u64 = 0;
     for batch in chunks.chunks(AGG_BATCH) {
+        // Warm the batch's file span before its parallel extraction faults it
+        // (chunks are file-ordered on every mmap-indexed container, so the
+        // remote reads stay linear, one batch span at a time).
+        if let Some(last) = batch.last() {
+            frontier.ensure_to(last.offset + last.size);
+        }
         let outs: Vec<ChunkScan> =
             batch.par_iter().map(|&c| extract_chunk(source, c, fmt, codec)).collect();
         for out in &outs {
@@ -123,6 +141,7 @@ fn scan_ts_full(
     demux: &Demux,
     opts: &Options,
     progress: &Progress,
+    frontier: &Frontier,
 ) -> Scan {
     let mut st = plan.streamer();
     let mut buf: Vec<u8> = Vec::new();
@@ -132,16 +151,35 @@ fn scan_ts_full(
     let mut es_bytes: u64 = 0;
     // Progress by the streamer's file cursor against the whole mmap — the walk
     // reads every packet, so file position is the honest denominator. The
-    // per-window `scan_chunks` gets a no-op sink; the window loop owns the
-    // phase.
+    // per-window `scan_chunks` gets no-op sinks; the window loop owns the
+    // phase, and its chunk offsets index the scratch buffer, not the file.
     progress.begin(Phase::Scan, data.len() as u64);
+    // One window consumes more *file* bytes than its ES target (packet
+    // overhead, other PIDs), so the frontier warms the upcoming window's file
+    // span, adapted from the last window's observed density.
+    let mut warm_span = ts::STREAM_WINDOW_BYTES as u64 * 2;
     loop {
         buf.clear();
         chunks.clear();
+        let pos0 = st.position() as u64;
+        frontier.ensure_to(pos0.saturating_add(warm_span));
         let more = st.next_window(data, &mut buf, &mut chunks, ts::STREAM_WINDOW_BYTES);
+        let used = st.position() as u64 - pos0;
+        if used > 0 {
+            warm_span = used + used / 4;
+        }
         es_bytes += buf.len() as u64;
         if !opts.no_rpu {
-            scan_chunks(&buf, &chunks, demux.nal_format, &demux.codec, &mut dv, &mut sei, &Progress::off());
+            scan_chunks(
+                &buf,
+                &chunks,
+                demux.nal_format,
+                &demux.codec,
+                &mut dv,
+                &mut sei,
+                &Progress::off(),
+                &Frontier::off(),
+            );
         }
         if !more {
             // The cursor stops short of EOF by a partial packet; pin 100%.
@@ -306,11 +344,11 @@ mod tests {
         };
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
-        assert_eq!(scan(&demux, &data, &opts, &Progress::off()).es_bytes, Some(9));
+        assert_eq!(scan(&demux, &data, &opts, &Progress::off(), &Frontier::off()).es_bytes, Some(9));
         // --no-rpu still walks the stream: the exact byte count is what the
         // full-path bitrate is computed from.
         let opts = Options { samples: 16, full: true, no_rpu: true };
-        assert_eq!(scan(&demux, &data, &opts, &Progress::off()).es_bytes, Some(9));
+        assert_eq!(scan(&demux, &data, &opts, &Progress::off(), &Frontier::off()).es_bytes, Some(9));
     }
 
     /// One 188-byte TS packet carrying exactly `payload`, adaptation-stuffed.
@@ -368,13 +406,13 @@ mod tests {
         }
         let mut dv = DvAggregate::default();
         let mut sei = SeiFindings::default();
-        scan_chunks(&source, &chunks, NalFormat::AnnexB, &Codec::Hevc, &mut dv, &mut sei, &Progress::off());
+        scan_chunks(&source, &chunks, NalFormat::AnnexB, &Codec::Hevc, &mut dv, &mut sei, &Progress::off(), &Frontier::off());
         let cl = sei.content_light.expect("cll aggregated");
         assert_eq!((cl.max_cll, cl.max_fall), (100, 50));
 
         // Only the second-batch chunk carries CLL: it must be reachable too.
         let mut sei = SeiFindings::default();
-        scan_chunks(&source[..], &chunks[1..], NalFormat::AnnexB, &Codec::Hevc, &mut dv, &mut sei, &Progress::off());
+        scan_chunks(&source[..], &chunks[1..], NalFormat::AnnexB, &Codec::Hevc, &mut dv, &mut sei, &Progress::off(), &Frontier::off());
         let cl = sei.content_light.expect("second batch scanned");
         assert_eq!((cl.max_cll, cl.max_fall), (999, 999));
     }

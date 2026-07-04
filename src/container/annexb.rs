@@ -7,6 +7,7 @@ use crate::container::{Chunk, Codec, Demux, NalFormat};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::parse_sps;
 use crate::model::ColorInfo;
+use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
 /// Bytes NAL-split by the default (non-`--full`) scan: a single head window,
@@ -18,13 +19,19 @@ use crate::progress::{Phase, Progress};
 /// on a network volume (the same coupling `av1::HEAD_SCAN_BYTES` keeps).
 pub const HEAD_SCAN_BYTES: usize = 8 << 20; // 8 MiB
 
-pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
+pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) -> Result<Demux> {
     let mut nals: Vec<NalRef> = Vec::new();
     if full {
         // The whole-stream split is `--full`'s single pass over every byte of
-        // a possibly huge raw stream — the one walk worth reporting here.
+        // a possibly huge raw stream — the one walk worth reporting here, and
+        // the one the frontier keeps linear on a remote volume (the 2 MiB tick
+        // stride sits well inside the frontier's look-ahead).
         progress.begin(Phase::Index, data.len() as u64);
-        nal::split_annexb_ticked(data, &mut nals, |pos| progress.update(pos as u64));
+        frontier.ensure(0);
+        nal::split_annexb_ticked(data, &mut nals, |pos| {
+            frontier.ensure(pos as u64);
+            progress.update(pos as u64);
+        });
         progress.update(data.len() as u64);
     } else if data.len() <= HEAD_SCAN_BYTES {
         nal::split_annexb(data, &mut nals);

@@ -31,6 +31,7 @@ use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::{parse_sps, SpsInfo};
 use crate::model::{Bitrate, ColorInfo};
+use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
 const SYNC: u8 = 0x47;
@@ -87,7 +88,7 @@ pub fn detect_layout(data: &[u8]) -> Option<Layout> {
     None
 }
 
-pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
+pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) -> Result<Demux> {
     let layout = detect_layout(data).context("not a recognized TS/M2TS stream")?;
     let (pcr_pid, streams) = parse_psi(data, layout).context("no PMT / program map found")?;
 
@@ -130,7 +131,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
         // whole-stream pass would have found. A rescue hit's chunk index is
         // window-relative, meaningless against the head chunks — and unneeded:
         // the `--full` scan covers every AU, so nothing must be pinned.
-        best = sps_rescue(data, layout, &video_pids, &codec, progress);
+        best = sps_rescue(data, layout, &video_pids, &codec, progress, frontier);
         sps_chunk = None;
     }
     let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_fields(best);
@@ -686,16 +687,27 @@ fn sps_rescue(
     pids: &[u16],
     codec: &Codec,
     progress: &Progress,
+    frontier: &Frontier,
 ) -> Option<SpsCommon> {
     let mut st = EsStreamer::new(layout, pids, usize::MAX);
     let mut buf = Vec::new();
     let mut chunks = Vec::new();
     let mut best: Option<SpsCommon> = None;
     progress.begin(Phase::Index, data.len() as u64);
+    // One window consumes more *file* bytes than its ES target (packet
+    // overhead, other PIDs), so the frontier warms the upcoming window's file
+    // span, adapted from the last window's observed density.
+    let mut warm_span = STREAM_WINDOW_BYTES as u64 * 2;
     loop {
         buf.clear();
         chunks.clear();
+        let pos0 = st.position() as u64;
+        frontier.ensure_to(pos0.saturating_add(warm_span));
         let more = st.next_window(data, &mut buf, &mut chunks, STREAM_WINDOW_BYTES);
+        let used = st.position() as u64 - pos0;
+        if used > 0 {
+            warm_span = used + used / 4;
+        }
         if let Some(w) = best_sps(&buf, &chunks, codec) {
             if best.as_ref().is_none_or(|b| w.width > b.width) {
                 best = Some(w);
@@ -1024,10 +1036,10 @@ mod tests {
         d.extend(ts_packet(0x1011, true, &pes_start(&[0x33]))); // completes [0x11,0x22]
         d.extend(ts_packet(0x1011, false, &[0x44])); // trailing partial
 
-        let default = demux(&d, false, &Progress::off()).expect("default demux");
+        let default = demux(&d, false, &Progress::off(), &Frontier::off()).expect("default demux");
         assert!(default.ts_stream.is_none());
 
-        let full = demux(&d, true, &Progress::off()).expect("full demux");
+        let full = demux(&d, true, &Progress::off(), &Frontier::off()).expect("full demux");
         let plan = full.ts_stream.as_ref().expect("full exposes the streaming plan");
         assert_eq!(plan.video_pids, [0x1011, 0x1015]);
         assert!(full.bitrate.is_none(), "the streaming scan supplies the full-path rate");

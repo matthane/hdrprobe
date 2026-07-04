@@ -308,7 +308,20 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     let remote = prefetch::is_remote(&file);
     let warmed_head = prefetch::warm_metadata(remote, &file, path, &mmap);
 
-    let demux = container::demux(path, &mmap, cli.full, progress).context("demux failed")?;
+    // `--full` on a genuinely remote volume: the whole-file walks tailgate a
+    // bounded look-ahead warm (`prefetch::Frontier`), so the file crosses the
+    // wire once, linearly, instead of thousands of scattered page-fault
+    // round-trips. Off everywhere else — local `--full` and the default path
+    // are unchanged. `warm_metadata` above still covers the tail extents (TS
+    // last-PCR, MKV `Tags`, `mfra`) a front-first stream reaches last.
+    let frontier = if cli.full && prefetch::is_remote_strict(&file, path) {
+        prefetch::Frontier::new(&file, size)
+    } else {
+        prefetch::Frontier::off()
+    };
+
+    let demux =
+        container::demux(path, &mmap, cli.full, progress, &frontier).context("demux failed")?;
 
     // The sampled access units are scattered across the whole file (worst for
     // MP4, whose sample index spans a multi-GB mdat), so warm exactly the
@@ -319,7 +332,7 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     }
 
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
-    let scan = sample::scan(&demux, &mmap, &opts, progress);
+    let scan = sample::scan(&demux, &mmap, &opts, progress, &frontier);
 
     let is_av1 = matches!(demux.codec, container::Codec::Av1);
     let mut dv = scan

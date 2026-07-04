@@ -112,6 +112,82 @@ pub fn is_remote(_file: &File) -> bool {
     true
 }
 
+/// Strict remote verdict, the gate for the `--full` frontier warm. The plain
+/// `is_remote` errs toward `true` off-Windows because the bounded warms it
+/// gates are cheap either way; the frontier streams the *whole file*, and
+/// forcing a linear read of a genuinely local disk would be a regression — so
+/// this one errs toward `false`: Windows keeps the handle-based verdict, Linux
+/// resolves the path's mount against `/proc/self/mounts` (string parsing, no
+/// FFI, so it holds across glibc and musl), and every other platform declines.
+#[cfg(windows)]
+pub fn is_remote_strict(file: &File, _path: &Path) -> bool {
+    is_remote(file)
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_remote_strict(_file: &File, path: &Path) -> bool {
+    let Ok(canon) = path.canonicalize() else { return false };
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else { return false };
+    network_fstype(&canon, &mounts)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+pub fn is_remote_strict(_file: &File, _path: &Path) -> bool {
+    false
+}
+
+/// Filesystem types that mean "bytes cross a network for every read".
+#[cfg(any(target_os = "linux", test))]
+const NETWORK_FSTYPES: &[&str] =
+    &["cifs", "smb3", "nfs", "nfs4", "9p", "fuse.sshfs", "davfs", "afs", "ceph"];
+
+/// Whether the mount holding `path` (longest mount-point prefix wins) is a
+/// network filesystem, per a `/proc/self/mounts`-formatted table. Fields are
+/// whitespace-separated with spaces octal-escaped (`\040`), so mount points
+/// with spaces decode before matching. Pure, for testability; unknown or
+/// unparseable input is `false` (the frontier just stays off).
+#[cfg(any(target_os = "linux", test))]
+fn network_fstype(path: &Path, mounts: &str) -> bool {
+    let path = path.to_string_lossy();
+    let mut best: Option<(usize, bool)> = None;
+    for line in mounts.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(_dev), Some(mount), Some(fstype)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let mount = unescape_mount(mount);
+        let is_prefix = path == mount
+            || (path.starts_with(&mount)
+                && (mount == "/" || path[mount.len()..].starts_with(['/', '\\'])));
+        if is_prefix && best.is_none_or(|(len, _)| mount.len() >= len) {
+            best = Some((mount.len(), NETWORK_FSTYPES.contains(&fstype)));
+        }
+    }
+    best.is_some_and(|(_, net)| net)
+}
+
+/// Decode the octal escapes `/proc/self/mounts` uses for whitespace in mount
+/// points (`\040` space, `\011` tab, plus `\012`/`\134`).
+#[cfg(any(target_os = "linux", test))]
+fn unescape_mount(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            if let Ok(code) = u8::from_str_radix(&s[i + 1..i + 4], 8) {
+                out.push(code);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Warm the container metadata region so a network filesystem streams it in a
 /// pipelined read instead of many synchronous page faults. Best-effort and a
 /// no-op on local volumes (`remote` is the caller's `is_remote` verdict, decided
@@ -293,6 +369,85 @@ pub fn warm_sample_chunks(
     warm_ranges(file, ranges);
 }
 
+/// How far the frontier warm runs ahead of the `--full` walk. This is the hard
+/// bound on the *extra* page-cache footprint the warm can create beyond what
+/// parsing itself is about to read — the frontier never streams the file ahead
+/// of consumption, it keeps a bounded pipeline window in front of it. The walk
+/// triggers a refill once it closes within half of this.
+const FRONTIER_AHEAD: u64 = 32 << 20; // 32 MiB
+
+/// Bounded look-ahead warmer for the `--full` walks, which are all
+/// forward-sequential in file offset. Each walk tick calls `ensure(pos)`; when
+/// `pos` closes on the warmed frontier, the next `FRONTIER_AHEAD` window is
+/// pulled in with one pipelined positioned read, so on a network volume the
+/// file crosses the wire once, linearly, at line rate — instead of thousands
+/// of scattered synchronous page-fault round-trips — and every subsequent mmap
+/// fault is a cache hit.
+///
+/// Memory: the bytes land in the OS page cache (clean file-backed pages,
+/// reclaimed before anything else), never in owned heap — the process's own
+/// memory bounds are untouched, and the cache the warm runs ahead of the
+/// parser is capped at `FRONTIER_AHEAD`. The frontier is monotonic per file
+/// and shared across phases: a scan pass over ranges the index pass already
+/// streamed warms nothing (on a file larger than RAM those pages may have been
+/// evicted — that pass degrades to today's scattered-but-parallel faults, the
+/// documented limit of a two-pass design).
+///
+/// Gated by `is_remote_strict` and `--full` in `main`; `off()` everywhere else
+/// (local volumes, the default path, chunk lists that index a heap buffer
+/// rather than the file, tests). Single-threaded `Cell` state like
+/// `progress::Progress` — tick sites hold `&self` through long call chains.
+/// Timing-only, same silent-regression class as the other warms: tests and the
+/// corpus `-q` gate cannot catch a breakage; only a real network path shows it.
+pub struct Frontier<'a> {
+    file: Option<&'a File>,
+    len: u64,
+    warmed_to: std::cell::Cell<u64>,
+}
+
+impl Frontier<'_> {
+    /// Disabled sink: every call is a no-op.
+    pub fn off() -> Frontier<'static> {
+        Frontier { file: None, len: 0, warmed_to: std::cell::Cell::new(0) }
+    }
+
+    pub fn new(file: &File, len: u64) -> Frontier<'_> {
+        Frontier { file: Some(file), len, warmed_to: std::cell::Cell::new(0) }
+    }
+
+    /// The walk is at `pos`: keep `[pos, pos + FRONTIER_AHEAD)` warm, reading
+    /// only bytes past the current frontier (never re-reads, clamps at EOF).
+    /// Cheap when disabled or comfortably behind the frontier — one compare.
+    pub fn ensure(&self, pos: u64) {
+        if pos.saturating_add(FRONTIER_AHEAD / 2) >= self.warmed_to.get() {
+            self.fill(pos.saturating_add(FRONTIER_AHEAD));
+        }
+    }
+
+    /// Batch form for the chunk scan: make everything up to `end` warm before
+    /// the batch's parallel extraction faults it. Chunks tile the file densely
+    /// on every mmap-indexed container, so warming straight through from the
+    /// frontier (rather than skipping container-overhead gaps) keeps the wire
+    /// read linear.
+    pub fn ensure_to(&self, end: u64) {
+        if end > self.warmed_to.get() {
+            self.fill(end);
+        }
+    }
+
+    /// Warm `[warmed_to, target)` (clamped to EOF) and advance the frontier.
+    fn fill(&self, target: u64) {
+        let Some(file) = self.file else { return };
+        let target = target.min(self.len);
+        let from = self.warmed_to.get();
+        if target <= from {
+            return;
+        }
+        warm(file, from, (target - from) as usize);
+        self.warmed_to.set(target);
+    }
+}
+
 /// Sequentially read `len` bytes from `offset` into a scratch buffer and discard
 /// them, pulling the range into the OS/SMB cache. Positioned reads leave the
 /// file cursor and the mmap untouched; errors are ignored (parsing still works,
@@ -345,6 +500,60 @@ fn looks_like_mkv(path: &Path, data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn frontier_advances_monotonically_and_clamps_at_eof() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("hdrprobe_frontier_smoke");
+        std::fs::write(&path, vec![0xAAu8; 4096]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let f = super::Frontier::new(&file, 4096);
+        f.ensure(0); // first tick fills the whole (tiny) file
+        assert_eq!(f.warmed_to.get(), 4096, "clamped to EOF, not pos+AHEAD");
+        let before = f.warmed_to.get();
+        f.ensure(100); // behind the frontier: nothing to re-read
+        f.ensure_to(2048); // already covered
+        assert_eq!(f.warmed_to.get(), before);
+
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn frontier_ensure_triggers_only_near_the_edge() {
+        // A large nominal length with no file: `fill` is a no-op, so only the
+        // trigger arithmetic is observable — but `off()` must never advance.
+        let f = super::Frontier::off();
+        f.ensure(1 << 40);
+        f.ensure_to(1 << 40);
+        assert_eq!(f.warmed_to.get(), 0, "disabled frontier never moves");
+    }
+
+    #[test]
+    fn network_fstype_matches_longest_mount_prefix() {
+        let mounts = "\
+/dev/sda1 / ext4 rw 0 0
+//nas/media /mnt/nas cifs rw 0 0
+/dev/sdb1 /mnt/nas/local ext4 rw 0 0
+server:/export /mnt/n\\040f\\040s nfs4 rw 0 0
+";
+        let net = |p: &str| super::network_fstype(Path::new(p), mounts);
+        assert!(net("/mnt/nas/movie.mkv"), "cifs mount");
+        assert!(!net("/mnt/nas/local/movie.mkv"), "deeper local mount wins");
+        assert!(!net("/home/user/movie.mkv"), "root ext4");
+        assert!(net("/mnt/n f s/movie.mkv"), "octal-escaped mount point decodes");
+        assert!(!net("/mnt/nascar/movie.mkv"), "prefix must end at a separator");
+    }
+
+    #[test]
+    fn unescape_mount_decodes_octal_whitespace() {
+        assert_eq!(super::unescape_mount("/mnt/n\\040f\\040s"), "/mnt/n f s");
+        assert_eq!(super::unescape_mount("/plain"), "/plain");
+        assert_eq!(super::unescape_mount("trailing\\04"), "trailing\\04");
+    }
+
     #[test]
     fn merge_ranges_coalesces_overlaps_and_drops_empties() {
         // Out-of-order input; the 2nd range overlaps the 1st, the adjacent 3rd

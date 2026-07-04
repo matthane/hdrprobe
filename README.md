@@ -228,7 +228,9 @@ hdrprobe reads only the bytes it needs. It memory-maps the file and samples a sp
 points in parallel rather than scanning the whole stream, so cost stays flat regardless of file
 size. On remote volumes (SMB and NFS) it warms the regions it is about to parse ahead of time,
 so a scan does not stall on hundreds of round-trips. The `--full` flag trades this speed for
-completeness, lifting the sampling bounds for an honest whole-stream census.
+completeness, lifting the sampling bounds for an honest whole-stream census. A deep scan of a
+file on a network share streams it across the wire once at full speed, instead of thousands of
+small reads, with the progress bar pacing the transfer.
 
 Malformed input is handled gracefully. The third-party RPU and HDR10+ parsers can panic on
 some inputs, so they are isolated with `catch_unwind`. One corrupt file never aborts a

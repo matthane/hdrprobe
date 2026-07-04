@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
 use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
+use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
 // --- EBML element IDs (stored with their length-descriptor marker retained). ---
@@ -265,7 +266,7 @@ fn front_seekhead_offset_of(data: &[u8], target: u32) -> Option<usize> {
     None
 }
 
-pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
+pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) -> Result<Demux> {
     // Locate the Segment among the top-level elements (EBML header precedes it).
     let (seg_start, seg_end) =
         segment_extent(data).context("no Segment element (not a Matroska file)")?;
@@ -296,6 +297,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
     let mut p = seg_start;
     while p < seg_end {
         progress.update(p as u64);
+        frontier.ensure(p as u64);
         let Some((id, p1)) = read_id(data, p) else { break };
         let Some((size, p2)) = read_size(data, p1) else { break };
         match id {
@@ -330,6 +332,9 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress) -> Result<Demux> {
                 match size {
                     Some(s) => {
                         let end = (p2 + s as usize).min(seg_end);
+                        // A cluster can outrun the rolling look-ahead (tens of
+                        // MB); warm its exact span before walking its blocks.
+                        frontier.ensure_to(end as u64);
                         parse_cluster(data, p2, end, false, video_track, &mut chunks, head_limit);
                         p = end;
                     }
