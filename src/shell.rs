@@ -11,9 +11,11 @@
 //!   machine-wide state.
 //! - **`SystemFileAssociations\.ext`, not a ProgID** — adds a verb for the
 //!   extension without owning or altering the file's default handler.
-//! - **`cmd /c "… & pause"`** — hdrprobe is a console app; launched bare from a
-//!   verb its window would close before the report could be read, so the verb
-//!   runs it under `cmd` and pauses. See [`command_for`] for the exact quoting.
+//! - **`cmd /c "cls & … & pause"`** — hdrprobe is a console app; launched bare
+//!   from a verb its window would close before the report could be read, so the
+//!   verb runs it under `cmd`, clears the console first (wiping the UNC-cwd
+//!   warning `cmd` prints on network files), and pauses after. See
+//!   [`command_for`] for the exact quoting.
 //! - **Raw advapi32 FFI, no crate** — mirrors the `prefetch` module's direct
 //!   `kernel32` calls and avoids a new dependency in the release binary.
 //!
@@ -32,14 +34,20 @@ fn all_exts() -> impl Iterator<Item = &'static str> {
 
 /// Build the verb's command string for a given `hdrprobe.exe` path.
 ///
-/// The stored value is `cmd /c ""<exe>" "%1" & pause"`. `cmd /c` strips the
-/// first and last quote of its argument whenever the command contains special
-/// characters (here `&`), so the outer pair is deliberate padding: after `cmd`
-/// removes it, what runs is `"<exe>" "%1" & pause` — the quoted exe, the quoted
-/// selected file (`%1`), then a pause so the console stays open for reading.
+/// The stored value is `cmd /c "cls & "<exe>" "%1" & pause"`. `cmd /c` strips
+/// the first and last quote of its argument whenever the command contains
+/// special characters (here `&`), so the outer pair is deliberate padding:
+/// after `cmd` removes it, what runs is `cls & "<exe>" "%1" & pause` — clear
+/// the console, the quoted exe, the quoted selected file (`%1`), then a pause
+/// so the console stays open for reading. The leading `cls` matters on
+/// network files: Explorer starts the verb with the file's folder as the
+/// working directory, and when that's a UNC path `cmd` opens by printing a
+/// three-line "UNC paths are not supported" warning — `cls` wipes it so the
+/// report starts at the top of a clean console. Only the verb clears; running
+/// hdrprobe from an existing terminal never does.
 #[cfg(windows)]
 fn command_for(exe: &str) -> String {
-    format!("cmd /c \"\"{exe}\" \"%1\" & pause\"")
+    format!("cmd /c \"cls & \"{exe}\" \"%1\" & pause\"")
 }
 
 #[cfg(windows)]
@@ -183,10 +191,11 @@ mod tests {
     #[test]
     fn command_quoting_pads_for_cmd_stripping() {
         // The outer quote pair is padding `cmd /c` strips; what actually runs is
-        // the quoted exe, the quoted selected file, then pause.
+        // cls (wiping cmd's UNC-cwd warning on network files), the quoted exe,
+        // the quoted selected file, then pause.
         assert_eq!(
             command_for(r"C:\Program Files\hdrprobe.exe"),
-            r#"cmd /c ""C:\Program Files\hdrprobe.exe" "%1" & pause""#
+            r#"cmd /c "cls & "C:\Program Files\hdrprobe.exe" "%1" & pause""#
         );
     }
 
