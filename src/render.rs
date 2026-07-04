@@ -38,6 +38,12 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     let c = Colorizer { on: o.color };
     let mut notes = Footnotes::default();
 
+    // Each section carries one bright headline for quick glancing (General's
+    // Video, HDR's Format, DV's and HDR10+'s Profile) — video inputs only. A
+    // metadata sidecar (no codec) surfaces too few lines for a single bold
+    // value to read as anything but odd, so its report stays headline-free.
+    let sidecar = r.general.codec.is_empty();
+
     // Colored: phosphor banner glyph, faint size. Plain: the classic
     // "name  (size)" shape, unchanged for pipes and logs.
     if c.on {
@@ -65,7 +71,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         }
         // Video files show fps in the Video line; a metadata-only sidecar (no
         // codec) has no Video line, so it surfaces its frame rate on its own.
-        if r.general.codec.is_empty() {
+        if sidecar {
             if let Some(fps) = r.general.fps {
                 kv(&mut s, &c, "Frame rate", &format!("{:.3} fps", fps));
             }
@@ -83,8 +89,8 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             );
         }
         let video = video_line(r);
-        if !video.is_empty() && !r.general.codec.is_empty() {
-            kv(&mut s, &c, "Video", &video);
+        if !video.is_empty() && !sidecar {
+            kv_styled(&mut s, &c, "Video", &c.bright(&video));
         }
         let color = color_line(r);
         if !color.is_empty() {
@@ -136,10 +142,11 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             // (for a future backend schema) but omitted from this report: the
             // profile and MEL/FEL tag already convey the layer structure, and
             // the per-track BL flag reads as misleading on dual-track P7.
+            let profile_value = if sidecar { c.value(&dv.profile) } else { c.bright(&dv.profile) };
             let profile = if dv.profile_compat_assumed {
-                format!("{}{}", c.bright(&dv.profile), c.tag("compat assumed"))
+                format!("{}{}", profile_value, c.tag("compat assumed"))
             } else {
-                c.bright(&dv.profile)
+                profile_value
             };
             kv_styled(&mut s, &c, "Profile", &profile);
 
@@ -307,8 +314,11 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     if o.show_hdr10plus {
         if let Some(hp) = &r.hdr10plus {
             let _ = writeln!(s, "{}", c.section("HDR10+"));
+            // The section's bright headline, mirroring the DV Profile line
+            // (and like it, plain for an HDR10+ JSON sidecar).
             if let Some(p) = hp.profile {
-                kv(&mut s, &c, "Profile", &p.to_string());
+                let styled = if sidecar { c.value(&p.to_string()) } else { c.bright(&p.to_string()) };
+                kv_styled(&mut s, &c, "Profile", &styled);
             }
             kv(&mut s, &c, "Application", &format!("v{}", hp.application_version));
             kv(&mut s, &c, "Windows", &hp.num_windows.to_string());
