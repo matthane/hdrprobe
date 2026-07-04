@@ -259,6 +259,17 @@ excluded by config.
   head window; the last comes from a *bounded* trailing window (`ts::TAIL_SCAN_BYTES`, 4 MiB). Head
   + tail only, never the middle. A discontinuity flag in the sampled tail, a missing PCR, or an
   implausible span yields `None` rather than a wrong number (`ts::pcr_duration`).
+- **The sampler always pins the SPS-carrying AU (`Demux::sps_chunk`).** Per-GOP prefix SEIs (HLG
+  alt-transfer, ST.2086 mastering, CLL) ride only RAP access units, and a TS capture (or a raw ES
+  cut) often starts mid-GOP: chunk 0 is then a pre-IDR picture and the sparse sample spread rarely
+  lands on one of the few RAPs, so those SEIs were silently missed (corpus-external repro: an HLG
+  broadcast capture classified SDR, because broadcast HLG is signalled *only* by the alt-transfer
+  SEI over a BT.2020-10 VUI — MKV/MP4 don't hit this since their chunk 0 is a sync sample by
+  construction, which is exactly why the same file remuxed to MKV read correctly). The TS and
+  raw-HEVC backends record the chunk whose SPS filled the metadata fields and
+  `sample::select_indices` inserts it into every sampled set; `prefetch::warm_sample_chunks`
+  replays the same call with the same `sps_chunk`, so the warm stays aligned with what the
+  sampler faults.
 - **NAS speed rides on the prefetch warms, and warm regressions are silent.** Everything here is
   timing-only: tests pass and `-q` is unchanged when it breaks; the regression only shows on a
   real network path. Warming is gated by `prefetch::is_remote`, decided from the open handle
