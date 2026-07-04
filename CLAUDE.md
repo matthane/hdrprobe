@@ -119,13 +119,18 @@ excluded by config.
   **Never re-add `panic = "abort"` to the release profile** — it turns the guard into a no-op.
 - **Report title-stable DV levels only.** Show profile/level/compat, L254 (CM version), L6, L9,
   L11, and the *set* of L2/L8 trim targets. Never emit L1 or per-shot trim *values*.
-  **MaxCLL/MaxFALL is HDR10 (CTA-861.3) signaling with no consumer on an IPT-PQ-c2 base**, and
-  such streams still carry L6 on every frame — real mastering luminance, zeroed CLL
-  (corpus-verified, including Dolby's own P5 demo). So for an IPT base (compat id 0 —
-  P5/P20/AV1 10.0 — or a bare P5 label) the text report drops the L6 line (`render.rs`) and the
-  HDR section's CLL *and* Mastering lines never fall back to L6 (`hdr::assemble`, both gated on
-  `base` — the L6 mastering half is just the grade's display, already on the DV Mastering line);
-  a *signalled* MDCV/CLL box or SEI still shows, and the JSON keeps `dolby_vision.l6` verbatim. **L5 is the
+  **MaxCLL/MaxFALL is HDR10 (CTA-861.3) signaling whose only consumer is an HDR10 base**
+  (compat id 1, or 6 for UHD Blu-ray). Every other base still carries L6 on every frame but it
+  is inert there: on IPT-PQ-c2 (compat 0: P5/P20/AV1 10.0) and HLG (compat 4: 8.4/10.4) the CLL
+  half is a zeroed placeholder (corpus-verified, including Dolby's own P5 demo and the 8.4/10.4
+  samples), and an SDR base signals no static metadata either (the P9 corpus file's *filled* L6
+  is not counter-evidence: it is a frankenstein built from a real HDR title's RPU, not Dolby P9
+  tooling output). So unless the base is HDR10 the text report drops the L6 line (`render.rs`;
+  with no compat id the profile major decides: P7/P8 default to HDR10, P4/P5 do not) and the HDR
+  section's CLL *and* Mastering lines never fall back to L6 (`hdr::assemble`, both gated on
+  `hdr10_base`; the L6 mastering half is just the grade's display, already on the DV Mastering
+  line); a *signalled* MDCV/CLL box or SEI still shows, and the JSON keeps `dolby_vision.l6`
+  verbatim. **L5 is the
   deliberate exception**: it varies with aspect changes, so it's sampled and shown as the set of
   distinct active areas, labelled `[sampled]` (vs `[full scan]` under `--full`). The **trim-target
   set carries the same `[sampled]`/`[full scan]` tag**: the L8 half is per-shot in real titles

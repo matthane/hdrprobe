@@ -71,21 +71,29 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
 
     let format = formats.join(" + ");
 
+    // L6 is the DV carriage of HDR10 static metadata, and Dolby's
+    // profiles/levels spec defines it as meaningful only for the compat-id-1
+    // (HDR10) base signal — so both L6 fallbacks below apply only on an HDR10
+    // base. Every other base has no consumer for it: IPT-PQ-c2 (P5/P20/AV1
+    // 10.0) has no viewable base at all, HLG (8.4/10.4) is scene-referred and
+    // consumes no static metadata (corpus 8.4/10.4 titles carry a zeroed L6
+    // placeholder, exactly like P5), and an SDR base likewise signals none.
+    let hdr10_base = base.is_some_and(|b| b.starts_with("HDR10"));
+
     // Prefer container mastering, then the SEI ST.2086 message, then DV L6.
     // This line means the *base layer's own* declared display, so the L6
-    // fallback — like the CLL one below — applies only when there is a
-    // standards-viewable base to describe. On an IPT-PQ-c2 base (`base ==
-    // None`) the stream declares nothing itself (corpus P5 files carry no
-    // MDCV box/SEI), and L6's mastering half is just the grade's display
-    // re-encoded, already shown authoritatively on the DV Mastering line
-    // (DM header source_min/max_pq) — falling back would duplicate it as a
-    // base-layer fact. A signalled MDCV on an IPT stream still shows.
+    // fallback is gated on an HDR10 base, where L6 by spec mirrors the base's
+    // MDCV SEI. On any other base the stream declares nothing itself, and
+    // L6's mastering half is just the grade's display re-encoded, already
+    // shown authoritatively on the DV Mastering line (DM header
+    // source_min/max_pq) — falling back would duplicate it as a base-layer
+    // fact. A signalled MDCV always shows regardless of base.
     let mastering = demux
         .mastering
         .clone()
         .or_else(|| sei.mastering.clone())
         .or_else(|| {
-            base?;
+            hdr10_base.then_some(())?;
             dv.and_then(|d| d.l6.as_ref()).map(|l6| MasteringDisplay {
                 max_luminance: l6.max_mastering as f64,
                 min_luminance: l6.min_mastering as f64 / 10000.0,
@@ -100,15 +108,13 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
 
     // MaxCLL/MaxFALL is HDR10 static-metadata convention (CTA-861.3; Dolby's
     // profiles/levels spec names it only in the compat-id-1 base-signal
-    // definition), so the L6 fallback applies only when the title has a
-    // standards-viewable base at all. An IPT-PQ-c2 base (Profile 5/20, AV1
-    // 10.0 — exactly the `base == None` cases) has no consumer for CLL, and
-    // its L6, when carried, is a zeroed placeholder (corpus P5 files and
-    // Dolby's own demo alike), so falling back would render noise. A CLL the
-    // container/SEI actually signals still shows — observed bytes are always
-    // reported.
+    // definition), so the L6 fallback applies only on an HDR10 base. No other
+    // base consumes CLL, and the L6 of an IPT or HLG title is a zeroed
+    // placeholder (corpus P5, 8.4 and 10.4 files and Dolby's own demo alike),
+    // so falling back would render noise. A CLL the container/SEI actually
+    // signals still shows — observed bytes are always reported.
     let content_light = demux.content_light.or(sei.content_light).or_else(|| {
-        base?;
+        hdr10_base.then_some(())?;
         dv.and_then(|d| d.l6.as_ref()).map(|l6| crate::model::ContentLight::new(l6.max_cll, l6.max_fall))
     });
 

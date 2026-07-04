@@ -209,13 +209,21 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     kv(&mut s, &c, "L5 active area", &areas);
                 }
             }
-            // L6's CLL fields exist to feed HDR10 signaling (CTA-861.3), so on an
-            // IPT-PQ-c2 base — compat id 0 (P5/P20/AV1 10.0) or a bare P5 label
-            // with no config — they're a zeroed placeholder or, if filled, inert
-            // for playback. Keep the line out of the text report; the JSON still
-            // carries `l6` verbatim (the mastering half is real either way).
-            let ipt_base = dv.bl_compatibility_id == Some(0) || dv.profile.starts_with('5');
-            if let Some(l6) = dv.l6.as_ref().filter(|_| !ipt_base) {
+            // L6's CLL fields exist to feed HDR10 signaling (CTA-861.3), which
+            // only an HDR10-compatible base consumes — compat id 1, or 6 (the
+            // UHD Blu-ray HDR10 base). On every other base (IPT-PQ-c2 compat 0,
+            // HLG compat 4, SDR compat 2) they're a zeroed placeholder or, if
+            // filled, inert for playback — corpus 8.4/10.4 titles carry the same
+            // zeroed L6 as P5. Keep the line out of the text report; the JSON
+            // still carries `l6` verbatim (the mastering half is real either
+            // way). Without a compat id the profile label's minor digit is the
+            // convention default, so gate on the major: P7/P8 default to an
+            // HDR10 base (7.6/8.1), while P4 (SDR) and a bare P5 (IPT) don't.
+            let hdr10_base = match dv.bl_compatibility_id {
+                Some(id) => id == 1 || id == 6,
+                None => dv.profile.starts_with('7') || dv.profile.starts_with('8'),
+            };
+            if let Some(l6) = dv.l6.as_ref().filter(|_| hdr10_base) {
                 let flag = if l6.zeroed { format!("  {}", c.warn("(zeroed)")) } else { String::new() };
                 kv(&mut s, &c, "L6 content light", &format!("MaxCLL {} · MaxFALL {}{}", l6.max_cll, l6.max_fall, flag));
             }
