@@ -60,6 +60,27 @@ fn push_nal(data: &[u8], start: usize, mut end: usize, out: &mut Vec<NalRef>) {
     out.push(NalRef { nal_type: t, start, end });
 }
 
+/// Split a length-prefixed (HVCC / ISOBMFF) sample into NAL units.
+/// `nlen` is the NAL length field size in bytes (1..=4, from hvcC).
+pub fn split_length_prefixed(data: &[u8], nlen: u8, out: &mut Vec<NalRef>) {
+    let nlen = nlen as usize;
+    let mut i = 0usize;
+    while i + nlen <= data.len() {
+        let mut len = 0usize;
+        for k in 0..nlen {
+            len = (len << 8) | data[i + k] as usize;
+        }
+        let start = i + nlen;
+        let end = start + len;
+        if len == 0 || end > data.len() {
+            break;
+        }
+        let t = nal_type(data[start]);
+        out.push(NalRef { nal_type: t, start, end });
+        i = end;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,26 +123,5 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].nal_type, 62);
         assert_eq!(out[1].nal_type, 33);
-    }
-}
-
-/// Split a length-prefixed (HVCC / ISOBMFF) sample into NAL units.
-/// `nlen` is the NAL length field size in bytes (1..=4, from hvcC).
-pub fn split_length_prefixed(data: &[u8], nlen: u8, out: &mut Vec<NalRef>) {
-    let nlen = nlen as usize;
-    let mut i = 0usize;
-    while i + nlen <= data.len() {
-        let mut len = 0usize;
-        for k in 0..nlen {
-            len = (len << 8) | data[i + k] as usize;
-        }
-        let start = i + nlen;
-        let end = start + len;
-        if len == 0 || end > data.len() {
-            break;
-        }
-        let t = nal_type(data[start]);
-        out.push(NalRef { nal_type: t, start, end });
-        i = end;
     }
 }

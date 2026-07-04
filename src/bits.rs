@@ -69,29 +69,6 @@ impl<'a> BitReader<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exp_golomb_unsigned() {
-        // ue: '1'=0, '010'=1, '011'=2, '00100'=3.
-        let data = [0b1_010_011_0, 0b0100_0000];
-        let mut r = BitReader::new(&data);
-        assert_eq!(r.read_ue(), Some(0));
-        assert_eq!(r.read_ue(), Some(1));
-        assert_eq!(r.read_ue(), Some(2));
-        assert_eq!(r.read_ue(), Some(3));
-    }
-
-    #[test]
-    fn ebsp_strips_emulation_prevention() {
-        // 00 00 03 00 -> 00 00 00 ; trailing 03 kept when not preceded by 00 00.
-        let input = [0x00, 0x00, 0x03, 0x00, 0x01, 0x03];
-        assert_eq!(ebsp_to_rbsp(&input), vec![0x00, 0x00, 0x00, 0x01, 0x03]);
-    }
-}
-
 /// Strip HEVC/AVC emulation-prevention bytes (00 00 03 -> 00 00) producing an RBSP.
 pub fn ebsp_to_rbsp(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
@@ -115,4 +92,29 @@ pub fn ebsp_to_rbsp(data: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exp_golomb_unsigned() {
+        // ue: '1'=0, '010'=1, '011'=2, '00100'=3.
+        // Underscores mark the codeword boundaries, not nibbles.
+        #[allow(clippy::unusual_byte_groupings)]
+        let data = [0b1_010_011_0, 0b0100_0000];
+        let mut r = BitReader::new(&data);
+        assert_eq!(r.read_ue(), Some(0));
+        assert_eq!(r.read_ue(), Some(1));
+        assert_eq!(r.read_ue(), Some(2));
+        assert_eq!(r.read_ue(), Some(3));
+    }
+
+    #[test]
+    fn ebsp_strips_emulation_prevention() {
+        // 00 00 03 00 -> 00 00 00 ; trailing 03 kept when not preceded by 00 00.
+        let input = [0x00, 0x00, 0x03, 0x00, 0x01, 0x03];
+        assert_eq!(ebsp_to_rbsp(&input), vec![0x00, 0x00, 0x00, 0x01, 0x03]);
+    }
 }
