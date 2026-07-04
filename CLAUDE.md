@@ -68,7 +68,7 @@ excluded by config.
 - `sidecar/` — metadata-only inputs that bypass the video pipeline: `rpu_bin.rs` (raw DV RPU
   `.bin`/`.rpu`), `dv_xml.rs` (DV CM XML), `hdr10plus_json.rs` (hdr10plus_tool JSON); `mod.rs`
   detects by extension and renders through the ordinary `Report`. DV sidecars carry no
-  resolution, so L5 is sized against an assumed UHD canvas (`ASSUMED_CANVAS`) and labelled.
+  resolution, so L5 is sized against an assumed UHD canvas (`ASSUMED_CANVAS`) and footnoted.
   A DV XML's Level-0 globals **frame rate** and **mastering display**, and its **schema version**,
   are read straight from the raw XML in `dv_xml.rs` (`<EditRate>`, `<MasteringDisplay>`
   peak/min/primaries, and the root `version` attribute / `<Version>` child — the same pair libdovi
@@ -132,8 +132,9 @@ excluded by config.
   line); a *signalled* MDCV/CLL box or SEI still shows, and the JSON keeps `dolby_vision.l6`
   verbatim. **L5 is the
   deliberate exception**: it varies with aspect changes, so it's sampled and shown as the set of
-  distinct active areas, labelled `[sampled]` (vs `[full scan]` under `--full`). The **trim-target
-  set carries the same `[sampled]`/`[full scan]` tag**: the L8 half is per-shot in real titles
+  distinct active areas, marked with the sampled footnote (a `*` on the row label, explained once
+  beside the timing footer; a `--full` scan carries no mark — absence reads as complete). The
+  **trim-target set carries the same sampled footnote**: the L8 half is per-shot in real titles
   (corpus-verified: a BD original whose head shots carry only the 100-nit L8 while other scenes
   add 600), so a sampled union may be incomplete. An L8 trim's
   `target_display_index` maps to nits via `levels::resolve_l8_nits`: a **custom index (255, common

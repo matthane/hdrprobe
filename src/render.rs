@@ -18,12 +18,24 @@ const LABEL_W: usize = 16;
 pub fn render(r: &Report, o: &RenderOpts) -> String {
     let mut s = String::new();
     let c = Colorizer { on: o.color };
+    let mut notes = Footnotes::default();
 
-    let _ = writeln!(s, "{}  ({})", c.bold(&r.file), human_size(r.size_bytes));
+    // Colored: phosphor banner glyph, faint size. Plain: the classic
+    // "name  (size)" shape, unchanged for pipes and logs.
+    if c.on {
+        let _ = writeln!(
+            s,
+            "{} {}",
+            c.bright(&format!("▮ {}", r.file)),
+            c.faint(&format!("· {}", human_size(r.size_bytes)))
+        );
+    } else {
+        let _ = writeln!(s, "{}  ({})", r.file, human_size(r.size_bytes));
+    }
     s.push('\n');
 
     if o.show_general {
-        let _ = writeln!(s, "{}", c.header("General"));
+        let _ = writeln!(s, "{}", c.section("General"));
         kv(&mut s, &c, "Container", &r.general.container);
         // Sidecar schema version (a DV XML's root `version` attribute); video
         // inputs never carry one, so the line only appears for sidecars.
@@ -45,8 +57,12 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 BitrateScope::VideoStream => "video stream",
                 BitrateScope::Overall => "overall",
             };
-            let tag = c.dim(&format!("[{}]", scope));
-            kv(&mut s, &c, "Bitrate", &format!("{}   {}", human_bitrate(br.bits_per_sec), tag));
+            kv_styled(
+                &mut s,
+                &c,
+                "Bitrate",
+                &format!("{}{}", c.value(&human_bitrate(br.bits_per_sec)), c.tag(scope)),
+            );
         }
         let video = video_line(r);
         if !video.is_empty() && !r.general.codec.is_empty() {
@@ -61,8 +77,8 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
 
     if o.show_hdr {
         if let Some(hdr) = &r.hdr {
-            let _ = writeln!(s, "{}", c.header("HDR"));
-            kv(&mut s, &c, "Format", &hdr.format);
+            let _ = writeln!(s, "{}", c.section("HDR"));
+            kv_styled(&mut s, &c, "Format", &c.bright(&hdr.format));
             if let Some(m) = &hdr.mastering {
                 // Gamut first, luminance after: "DCI-P3 D65 · max 1000  min 0.0001 cd/m²".
                 let prim = m.primaries.as_ref().map(|p| format!("{p} · ")).unwrap_or_default();
@@ -74,8 +90,9 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 );
             }
             if let Some(cl) = &hdr.content_light {
-                let flag = if cl.zeroed { format!("  {}", c.warn("(zeroed)")) } else { String::new() };
-                kv(&mut s, &c, "Content light", &format!("MaxCLL {} · MaxFALL {}{}", cl.max_cll, cl.max_fall, flag));
+                let flag = if cl.zeroed { format!("  {}", c.warn("zeroed")) } else { String::new() };
+                let light = c.value(&format!("MaxCLL {} · MaxFALL {}", cl.max_cll, cl.max_fall));
+                kv_styled(&mut s, &c, "Content light", &format!("{}{}", light, flag));
             }
             s.push('\n');
         }
@@ -83,7 +100,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
 
     if o.show_dv {
         if let Some(dv) = &r.dolby_vision {
-            let _ = writeln!(s, "{}", c.header("Dolby Vision"));
+            let _ = writeln!(s, "{}", c.section("Dolby Vision"));
 
             if let Some(census) = &dv.census {
                 // Census stats lead the section (consistent across all input
@@ -102,11 +119,11 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             // profile and MEL/FEL tag already convey the layer structure, and
             // the per-track BL flag reads as misleading on dual-track P7.
             let profile = if dv.profile_compat_assumed {
-                format!("{}   {}", c.value(&dv.profile), c.dim("[compat assumed]"))
+                format!("{}{}", c.bright(&dv.profile), c.tag("compat assumed"))
             } else {
-                c.value(&dv.profile)
+                c.bright(&dv.profile)
             };
-            kv(&mut s, &c, "Profile", &profile);
+            kv_styled(&mut s, &c, "Profile", &profile);
 
             // The DV level only defines the codec bit-rate envelope; it says
             // nothing useful at a glance, so it's kept on the model but not
@@ -132,9 +149,9 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     .map(|p| {
                         let tag = md
                             .primaries_level
-                            .map(|l| format!("{} ", c.dim(&format!("[L{l}]"))))
+                            .map(|l| format!("{} ", c.prov(&format!("L{l}"))))
                             .unwrap_or_default();
-                        format!("{p} {tag}· ")
+                        format!("{} {}{}", c.value(p), tag, c.value("· "))
                     })
                     .unwrap_or_default();
                 // The grade out-brights the base layer's declared mastering: a
@@ -142,47 +159,45 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 // stripping the EL (e.g. a P7 -> P8 conversion) would lose them.
                 let expansion = dv
                     .fel_brightness_expansion
-                    .map(|_| format!("  {}", c.warn("(FEL brightness expansion)")))
+                    .map(|_| format!("  {}", c.warn("FEL brightness expansion")))
                     .unwrap_or_default();
-                kv(
-                    &mut s,
-                    &c,
-                    "Mastering",
-                    &format!(
-                        "{}max {}  min {} cd/m²{}",
-                        prim,
-                        fmt_num(md.max_luminance),
-                        fmt_num(md.min_luminance),
-                        expansion
-                    ),
-                );
+                let lum = c.value(&format!(
+                    "max {}  min {} cd/m²",
+                    fmt_num(md.max_luminance),
+                    fmt_num(md.min_luminance)
+                ));
+                kv_styled(&mut s, &c, "Mastering", &format!("{}{}{}", prim, lum, expansion));
             }
             if !dv.trim_targets.is_empty() {
                 // The target set is a union over the RPUs actually read, and the
                 // L8 half is per-shot in real titles (a BD original whose head
                 // shots carry only the 100-nit L8 while later scenes add 600),
-                // so a sampled union may be incomplete — tagged like L5.
-                let scan_tag = if dv.sampled { "[sampled]" } else { "[full scan]" };
+                // so a sampled union may be incomplete — footnoted like L5. A
+                // full scan is complete, so it carries no caveat mark.
+                let mark = if dv.sampled { notes.mark(SAMPLED_NOTE) } else { "" };
                 let list = dv
                     .trim_targets
                     .iter()
                     .map(|t| {
                         let tag = t.levels.iter().map(|l| format!("L{l}")).collect::<Vec<_>>().join("/");
-                        format!("{} nits {}", t.nits, c.dim(&format!("[{tag}]")))
+                        format!("{} {}", c.value(&format!("{} nits", t.nits)), c.prov(&tag))
                     })
                     .collect::<Vec<_>>()
-                    .join(", ");
-                kv(&mut s, &c, "Trim targets", &format!("{}   {}", list, c.dim(scan_tag)));
+                    .join(&c.value(", "));
+                kv_styled(&mut s, &c, &format!("Trim targets{mark}"), &list);
             }
             if !dv.l5_active_areas.is_empty() {
                 // The set of distinct active areas is shown inline (joined by
                 // " + ") rather than one line per area: offsets are the raw L5
-                // signal, the active area is derived. The [sampled]/[full scan]/
-                // [assumes canvas] tag describes the whole set, so it renders once.
-                let tag = match dv.l5_assumed_canvas {
-                    Some([w, h]) => format!("[assumes {}×{} canvas]", w, h),
-                    None if dv.sampled => "[sampled]".to_string(),
-                    None => "[full scan]".to_string(),
+                // signal, the active area is derived. The sampled/assumed-canvas
+                // caveat describes the whole set, so it rides the label as one
+                // footnote mark; a full scan carries no mark.
+                let mark = match dv.l5_assumed_canvas {
+                    Some([w, h]) => notes.mark(&format!(
+                        "assumes a {w}×{h} canvas; DV sidecars carry no resolution"
+                    )),
+                    None if dv.sampled => notes.mark(SAMPLED_NOTE),
+                    None => "",
                 };
                 let offsets = dv
                     .l5_active_areas
@@ -193,11 +208,11 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 // More than one distinct active area means the aspect ratio
                 // changes across the title — worth flagging as special.
                 let variable = if dv.l5_active_areas.len() > 1 {
-                    format!("  {}", c.warn("(variable)"))
+                    format!("  {}", c.warn("variable"))
                 } else {
                     String::new()
                 };
-                kv(&mut s, &c, "L5 offsets", &format!("{}{}   {}", offsets, variable, c.dim(&tag)));
+                kv_styled(&mut s, &c, &format!("L5 offsets{mark}"), &format!("{}{}", c.value(&offsets), variable));
                 let areas = dv
                     .l5_active_areas
                     .iter()
@@ -224,8 +239,9 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 None => dv.profile.starts_with('7') || dv.profile.starts_with('8'),
             };
             if let Some(l6) = dv.l6.as_ref().filter(|_| hdr10_base) {
-                let flag = if l6.zeroed { format!("  {}", c.warn("(zeroed)")) } else { String::new() };
-                kv(&mut s, &c, "L6 content light", &format!("MaxCLL {} · MaxFALL {}{}", l6.max_cll, l6.max_fall, flag));
+                let flag = if l6.zeroed { format!("  {}", c.warn("zeroed")) } else { String::new() };
+                let light = c.value(&format!("MaxCLL {} · MaxFALL {}", l6.max_cll, l6.max_fall));
+                kv_styled(&mut s, &c, "L6 content light", &format!("{}{}", light, flag));
             }
             // L9 folds into the Mastering line above when recognized; a
             // standalone line remains only when it couldn't ride there (no
@@ -272,7 +288,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     // The section exists only when HDR10+ metadata was found, like Dolby Vision.
     if o.show_hdr10plus {
         if let Some(hp) = &r.hdr10plus {
-            let _ = writeln!(s, "{}", c.header("HDR10+"));
+            let _ = writeln!(s, "{}", c.section("HDR10+"));
             if let Some(p) = hp.profile {
                 kv(&mut s, &c, "Profile", &p.to_string());
             }
@@ -285,11 +301,59 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         }
     }
 
+    // Footnotes collected from marked labels render once at the bottom, beside
+    // the timing footer, so per-line caveats never clutter the values they
+    // qualify. They print regardless of show_timing: a mark without its
+    // explanation would dangle.
+    for (mark, text) in notes.lines() {
+        let _ = writeln!(s, "{}", c.faint(&format!("{mark} {text}")));
+    }
+
     if o.show_timing {
-        let _ = writeln!(s, "{} {}", c.accent("⚡"), c.dim(&format!("{:.0} ms", r.elapsed_ms)));
+        if c.on {
+            let _ = writeln!(s, "{}", c.faint(&format!("▸ {:.0} ms", r.elapsed_ms)));
+        } else {
+            let _ = writeln!(s, "⚡ {:.0} ms", r.elapsed_ms);
+        }
     }
 
     s
+}
+
+/// The one caveat most reports carry: the default pipeline reads a spread of
+/// RPUs, so RPU-derived sets (trim targets, L5 areas) may be incomplete.
+const SAMPLED_NOTE: &str = "sampled from a spread of RPUs; --full reads every one";
+
+/// Caveat footnotes referenced from row labels ("Trim targets*") and spelled
+/// out once at the report's foot. Only caveats register — a full scan needs no
+/// excuse, so it gets no mark and the marker's absence reads as completeness.
+/// Registering the same text twice reuses the first marker, so the trim and L5
+/// lines of a sampled report share one asterisk.
+#[derive(Default)]
+struct Footnotes {
+    notes: Vec<String>,
+}
+
+impl Footnotes {
+    const MARKS: [&'static str; 3] = ["*", "†", "‡"];
+
+    fn mark(&mut self, text: &str) -> &'static str {
+        let i = match self.notes.iter().position(|n| n == text) {
+            Some(i) => i,
+            None => {
+                self.notes.push(text.to_string());
+                self.notes.len() - 1
+            }
+        };
+        Self::MARKS[i.min(Self::MARKS.len() - 1)]
+    }
+
+    fn lines(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.notes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (Self::MARKS[i.min(Self::MARKS.len() - 1)], n.as_str()))
+    }
 }
 
 /// One-line summary for `--quiet`.
@@ -312,7 +376,16 @@ pub fn render_quiet(r: &Report) -> String {
 }
 
 fn kv(s: &mut String, c: &Colorizer, label: &str, value: &str) {
-    let pad = " ".repeat(LABEL_W.saturating_sub(label.len()));
+    kv_styled(s, c, label, &c.value(value));
+}
+
+/// Like `kv`, but the value already carries its own styling (mixed value/tag/
+/// warning segments), so it isn't re-wrapped — ANSI codes don't nest, and a
+/// wrapper around an inner reset would drop the colour mid-line.
+fn kv_styled(s: &mut String, c: &Colorizer, label: &str, value: &str) {
+    // Char count, not byte length: a footnote marker on the label (†, ‡) is
+    // multi-byte but single-column, and byte-based padding would misalign it.
+    let pad = " ".repeat(LABEL_W.saturating_sub(label.chars().count()));
     let _ = writeln!(s, "  {}{}  {}", c.label(label), pad, value);
 }
 
@@ -476,6 +549,14 @@ fn human_duration(secs: f64) -> String {
     }
 }
 
+/// Phosphor-CRT palette: one green hue at four intensities. Brightness is the
+/// visual hierarchy — bright for headline facts (file name, HDR format, DV
+/// profile, section names), mid for ordinary values, low for labels, faint
+/// for tags and rules — and warnings invert the video, which a single-hue
+/// scheme makes unmissable. The layout (banner, footnotes, line structure) is
+/// shared between modes; with colour off the intensities vanish, so the
+/// tag/provenance/warning helpers fall back to the bracket conventions
+/// (`[tag]`, `(warning)`) that carry the same semantics in plain text.
 struct Colorizer {
     on: bool,
 }
@@ -488,26 +569,61 @@ impl Colorizer {
             text.to_string()
         }
     }
-    fn bold(&self, t: &str) -> String {
-        self.wrap("1", t)
+    /// Headline values.
+    fn bright(&self, t: &str) -> String {
+        self.wrap("1;38;2;120;255;160", t)
     }
-    fn header(&self, t: &str) -> String {
-        self.wrap("1;36", t)
-    }
-    fn label(&self, t: &str) -> String {
-        self.wrap("0", t)
-    }
+    /// Ordinary values.
     fn value(&self, t: &str) -> String {
-        self.wrap("1", t)
+        self.wrap("38;2;80;210;120", t)
     }
-    fn dim(&self, t: &str) -> String {
-        self.wrap("2", t)
+    /// Row labels.
+    fn label(&self, t: &str) -> String {
+        self.wrap("38;2;55;140;85", t)
     }
+    /// Faintest level: tags, rules, the timing footer.
+    fn faint(&self, t: &str) -> String {
+        self.wrap("38;2;38;95;60", t)
+    }
+    /// A whole-line qualifier tag ([video stream], [compat assumed]) — the
+    /// sampling caveats use `Footnotes` instead. Carries its own leading
+    /// separator: coloured it hangs off the value as a faint " · tag", plain
+    /// it keeps the classic three-space "[tag]".
+    fn tag(&self, t: &str) -> String {
+        if self.on {
+            self.faint(&format!(" · {t}"))
+        } else {
+            format!("   [{t}]")
+        }
+    }
+    /// A per-value provenance tag (L2, L9): faint beside its value when
+    /// coloured, bracketed when plain.
+    fn prov(&self, t: &str) -> String {
+        if self.on {
+            self.faint(t)
+        } else {
+            format!("[{t}]")
+        }
+    }
+    /// A warning: inverse-video uppercase chip when coloured, the classic
+    /// parenthesis when plain.
     fn warn(&self, t: &str) -> String {
-        self.wrap("33", t)
+        if self.on {
+            format!("\x1b[7;38;2;120;255;160m {} \x1b[0m", t.to_uppercase())
+        } else {
+            format!("({t})")
+        }
     }
-    fn accent(&self, t: &str) -> String {
-        self.wrap("33", t)
+    /// Section header: an uppercase ruled line when coloured, the bare name
+    /// when plain.
+    fn section(&self, name: &str) -> String {
+        if self.on {
+            let up = name.to_uppercase();
+            let fill = "─".repeat(60usize.saturating_sub(up.chars().count()));
+            format!("{} {} {}", self.faint("──"), self.bright(&up), self.faint(&fill))
+        } else {
+            name.to_string()
+        }
     }
 }
 
