@@ -11,11 +11,17 @@
 //!   machine-wide state.
 //! - **`SystemFileAssociations\.ext`, not a ProgID** — adds a verb for the
 //!   extension without owning or altering the file's default handler.
-//! - **`cmd /c "cls & … & pause"`** — hdrprobe is a console app; launched bare
-//!   from a verb its window would close before the report could be read, so the
-//!   verb runs it under `cmd`, clears the console first (wiping the UNC-cwd
-//!   warning `cmd` prints on network files), and pauses after. See
-//!   [`command_for`] for the exact quoting.
+//! - **A sized, cleared, paused console** — hdrprobe is a console app; launched
+//!   bare from a verb its window would close before the report could be read,
+//!   so the verb runs a `cmd /c "cls & … & pause"` chain: clear the startup
+//!   noise (the UNC-cwd warning `cmd` prints on network files), report, pause.
+//!   The fresh window is sized to fit a full report without scrolling, and
+//!   *how* depends on the console host: Windows Terminal ignores client resize
+//!   APIs (`mode con` only reflows the hidden buffer — measured on WT 1.24:
+//!   the window stays at profile size), but honours its own `--size` launch
+//!   option, so when WT is installed the verb launches through `wt -w new
+//!   --size`; without WT a leading `mode con` sizes the classic conhost. See
+//!   [`command_for_wt`]/[`command_for`] for the exact quoting.
 //! - **Raw advapi32 FFI, no crate** — mirrors the `prefetch` module's direct
 //!   `kernel32` calls and avoids a new dependency in the release binary.
 //!
@@ -32,22 +38,62 @@ fn all_exts() -> impl Iterator<Item = &'static str> {
     crate::VIDEO_EXTS.iter().chain(SIDECAR_EXTS).copied()
 }
 
-/// Build the verb's command string for a given `hdrprobe.exe` path.
+/// The verb window's dimensions: a worst-case report (masthead, all four
+/// sections, footnote, pause prompt — about 40 rows; the widest Video line is
+/// ~95 columns) fits without scrolling, with headroom for wrapped long paths.
+#[cfg(windows)]
+const WINDOW_SIZE: (u32, u32) = (110, 45); // (cols, lines)
+
+/// Build the verb's command string for the classic-conhost host (no Windows
+/// Terminal installed).
 ///
-/// The stored value is `cmd /c "cls & "<exe>" "%1" & pause"`. `cmd /c` strips
-/// the first and last quote of its argument whenever the command contains
-/// special characters (here `&`), so the outer pair is deliberate padding:
-/// after `cmd` removes it, what runs is `cls & "<exe>" "%1" & pause` — clear
-/// the console, the quoted exe, the quoted selected file (`%1`), then a pause
-/// so the console stays open for reading. The leading `cls` matters on
-/// network files: Explorer starts the verb with the file's folder as the
-/// working directory, and when that's a UNC path `cmd` opens by printing a
-/// three-line "UNC paths are not supported" warning — `cls` wipes it so the
-/// report starts at the top of a clean console. Only the verb clears; running
-/// hdrprobe from an existing terminal never does.
+/// The stored value is `cmd /c "mode con: cols=C lines=L & cls & "<exe>" "%1"
+/// & pause"`. `cmd /c` strips the first and last quote of its argument
+/// whenever the command contains special characters (here `&`), so the outer
+/// pair is deliberate padding: after `cmd` removes it, what runs is the mode
+/// resize (honoured by conhost; Windows Terminal ignores it, which is why the
+/// WT host gets [`command_for_wt`] instead), `cls` (wiping the UNC-cwd warning
+/// `cmd` prints when Explorer starts the verb in a network folder), the quoted
+/// exe, the quoted selected file (`%1`), then a pause so the console stays
+/// open for reading. Only the verb's fresh window is resized/cleared; an
+/// existing terminal session never sees any of this.
 #[cfg(windows)]
 fn command_for(exe: &str) -> String {
-    format!("cmd /c \"cls & \"{exe}\" \"%1\" & pause\"")
+    let (cols, lines) = WINDOW_SIZE;
+    format!("cmd /c \"mode con: cols={cols} lines={lines} & cls & \"{exe}\" \"%1\" & pause\"")
+}
+
+/// Build the verb's command string for the Windows Terminal host.
+///
+/// The stored value is `"<wt>" -w new --size C,L cmd /c "cls & \"<exe>\"
+/// \"%1\" & pause"`. WT ignores client resize APIs, so the size rides its own
+/// `--size` launch option and `-w new` guarantees a standalone window (never
+/// a tab glommed onto an existing one). The inner quotes around the exe and
+/// `%1` are backslash-escaped so they survive wt's argv split as literal
+/// quotes; wt then hands `cmd` the same `cls & "<exe>" "%1" & pause` chain
+/// the conhost verb runs. Verified end-to-end on WT 1.24: the window opens at
+/// the requested size and spaced paths parse through all three layers.
+///
+/// Known limit: wt splits its command line on bare `;`, so a *path*
+/// containing a semicolon misparses under this verb (the conhost fallback
+/// doesn't split). That's accepted — `%1` can't be escaped statically.
+#[cfg(windows)]
+fn command_for_wt(wt: &str, exe: &str) -> String {
+    let (cols, lines) = WINDOW_SIZE;
+    format!(
+        "\"{wt}\" -w new --size {cols},{lines} cmd /c \"cls & \\\"{exe}\\\" \\\"%1\\\" & pause\""
+    )
+}
+
+/// Locate the Windows Terminal launcher: the per-user execution alias at a
+/// stable path (present whenever WT is installed with app execution aliases
+/// enabled, the default). Resolved at install time; if WT is added or removed
+/// later, re-running `--install-shell` re-picks the host.
+#[cfg(windows)]
+fn wt_path() -> Option<String> {
+    let base = std::env::var("LOCALAPPDATA").ok()?;
+    let wt = format!("{base}\\Microsoft\\WindowsApps\\wt.exe");
+    std::path::Path::new(&wt).exists().then_some(wt)
 }
 
 #[cfg(windows)]
@@ -135,7 +181,13 @@ mod imp {
     pub fn install() -> Result<()> {
         let exe = std::env::current_exe().context("locating the hdrprobe executable")?;
         let exe = exe.to_string_lossy().into_owned();
-        let command = super::command_for(&exe);
+        // Prefer the Windows Terminal host when it's installed: it's the
+        // Windows 11 default console, and only its own launch option can size
+        // the window (see `command_for_wt`).
+        let command = match super::wt_path() {
+            Some(wt) => super::command_for_wt(&wt, &exe),
+            None => super::command_for(&exe),
+        };
         let icon = format!("{exe},0");
 
         let mut n = 0;
@@ -191,11 +243,22 @@ mod tests {
     #[test]
     fn command_quoting_pads_for_cmd_stripping() {
         // The outer quote pair is padding `cmd /c` strips; what actually runs is
-        // cls (wiping cmd's UNC-cwd warning on network files), the quoted exe,
-        // the quoted selected file, then pause.
+        // the conhost window resize, cls (wiping cmd's UNC-cwd warning on
+        // network files), the quoted exe, the quoted selected file, then pause.
         assert_eq!(
             command_for(r"C:\Program Files\hdrprobe.exe"),
-            r#"cmd /c "cls & "C:\Program Files\hdrprobe.exe" "%1" & pause""#
+            r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" "%1" & pause""#
+        );
+    }
+
+    #[test]
+    fn wt_command_escapes_inner_quotes_for_argv() {
+        // The exe/%1 quotes are backslash-escaped so wt's argv split keeps
+        // them literal; the window size rides wt's own --size option since WT
+        // ignores mode con.
+        assert_eq!(
+            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe"),
+            r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" \"%1\" & pause""#
         );
     }
 
