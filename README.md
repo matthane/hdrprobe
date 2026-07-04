@@ -21,7 +21,7 @@ file and reads only the bytes it needs, so it stays fast regardless of file size
   Color             BT.2020 · PQ (SMPTE ST 2084) · limited
 
 ── HDR ─────────────────────────────────────────────────────────
-  Format            Dolby Vision + HDR10+ + HDR10 (fallback)
+  Format            Dolby Vision / HDR10+ / HDR10 (fallback)
   Mastering         DCI-P3 D65 · max 1000  min 0.0001 cd/m²
   Content light     MaxCLL 737 · MaxFALL 130
 

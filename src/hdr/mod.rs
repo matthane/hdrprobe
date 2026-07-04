@@ -69,7 +69,7 @@ pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> H
         formats.push(b.to_string());
     }
 
-    let format = formats.join(" + ");
+    let format = formats.join(" / ");
 
     // L6 is the DV carriage of HDR10 static metadata, and Dolby's
     // profiles/levels spec defines it as meaningful only for the compat-id-1

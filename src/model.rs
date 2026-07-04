@@ -129,7 +129,7 @@ pub struct ColorInfo {
 
 #[derive(Debug, Serialize)]
 pub struct Hdr {
-    /// Classified format string, e.g. "Dolby Vision + HDR10 (fallback)".
+    /// Classified format string, e.g. "Dolby Vision / HDR10 (fallback)".
     pub format: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mastering: Option<MasteringDisplay>,
@@ -353,7 +353,7 @@ mod tests {
                 },
             },
             hdr: Some(Hdr {
-                format: "Dolby Vision + HDR10 (fallback)".to_string(),
+                format: "Dolby Vision / HDR10 (fallback)".to_string(),
                 mastering: Some(MasteringDisplay {
                     max_luminance: 1000.0,
                     min_luminance: 0.0001,

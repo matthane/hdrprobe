@@ -236,7 +236,7 @@ Present for every video input; absent for sidecars.
 
 ### `format` values
 
-The string is a ` + `-joined list built from, in order:
+The string is a ` / `-joined list built from, in order:
 
 1. `Dolby Vision` when a DV section is present.
 2. `HDR10+` when HDR10+ metadata is present.
@@ -245,9 +245,9 @@ The string is a ` + `-joined list built from, in order:
    DV stream has no independently viewable base (Profile 5 and Profile 20, whose base is
    IPT-PQ-c2).
 
-Examples: `"SDR"`, `"HDR10"`, `"HLG"`, `"HDR10+ + HDR10"`, `"Dolby Vision"`,
-`"Dolby Vision + HDR10 (fallback)"`, `"Dolby Vision + HDR10+ + HDR10 (fallback)"`,
-`"Dolby Vision + SDR (fallback)"`, `"Dolby Vision + HLG (fallback)"`.
+Examples: `"SDR"`, `"HDR10"`, `"HLG"`, `"HDR10+ / HDR10"`, `"Dolby Vision"`,
+`"Dolby Vision / HDR10 (fallback)"`, `"Dolby Vision / HDR10+ / HDR10 (fallback)"`,
+`"Dolby Vision / SDR (fallback)"`, `"Dolby Vision / HLG (fallback)"`.
 
 ## Object: `MasteringDisplay`
 
