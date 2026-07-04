@@ -118,6 +118,13 @@ pub struct Demux {
     /// the head metadata window). Every other backend, and the TS default
     /// path, leaves it `None`.
     pub ts_stream: Option<ts::TsFullStream>,
+    /// MKV under `--full` only: the plan `sample::scan` uses to walk every
+    /// cluster in bounded windows (`mkv::BlockStreamer`), extracting each
+    /// window's blocks as they are discovered — index and scan fused into one
+    /// pass over the file. When `Some`, the sampler ignores `chunks` (the head
+    /// metadata window). Every other backend, and the MKV default path, leaves
+    /// it `None`.
+    pub mkv_stream: Option<mkv::MkvFullStream>,
 }
 
 /// Detect the container type and demux it. `full` requests an exhaustive scan
@@ -141,7 +148,7 @@ pub fn demux(
 
     let by_ext = match ext.as_str() {
         "mp4" | "m4v" | "mov" | "m4a" => Some(mp4::demux(data)),
-        "mkv" | "webm" | "mka" => Some(mkv::demux(data, full, progress, frontier)),
+        "mkv" | "webm" | "mka" => Some(mkv::demux(data, full)),
         "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full, progress, frontier)),
         "ivf" | "obu" => Some(av1::demux(data, full, progress, frontier)),
         "ts" | "m2ts" | "mts" => Some(ts::demux(data, full, progress, frontier)),
@@ -184,7 +191,7 @@ fn sniff_demux(
         return Some(mp4::demux(data));
     }
     if starts_with_ebml(data) {
-        return Some(mkv::demux(data, full, progress, frontier));
+        return Some(mkv::demux(data, full));
     }
     if av1::is_ivf(data) || av1::is_obu_stream(data) {
         return Some(av1::demux(data, full, progress, frontier));

@@ -376,16 +376,23 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         format_version: None,
         width: if demux.width > 0 { Some(demux.width) } else { None },
         height: if demux.height > 0 { Some(demux.height) } else { None },
-        fps: demux.fps,
+        // MKV `--full` without a DefaultDuration: the exact frame count exists
+        // only after the streaming walk, so the count ÷ duration fallback the
+        // demux's complete index used to compute lands here instead — same
+        // inputs, same value.
+        fps: demux.fps.or_else(|| match (scan.frame_count, demux.duration_secs) {
+            (Some(n), Some(d)) if n > 0 && d > 0.0 => Some(n as f64 / d),
+            _ => None,
+        }),
         duration_secs: demux.duration_secs,
-        // TS/M2TS `--full`: the exact video ES byte count exists only after the
-        // streaming scan, so the demux left the rate unset and it is computed
-        // here — the same value the old whole-stream reassembly produced
-        // (`Some(0)` es_bytes ⇒ `None`, as before).
-        bitrate: match scan.es_bytes {
-            Some(bytes) => model::Bitrate::video_stream(bytes, demux.duration_secs),
-            None => demux.bitrate,
-        },
+        // A container-known rate wins (MKV statistics tags); the `--full`
+        // streaming walks (TS ES bytes, MKV block bytes) fill the gap with the
+        // exact sum their demux could no longer compute — the same value the
+        // old whole-stream paths produced (`Some(0)` es_bytes ⇒ `None`, as
+        // before).
+        bitrate: demux.bitrate.or_else(|| {
+            scan.es_bytes.and_then(|bytes| model::Bitrate::video_stream(bytes, demux.duration_secs))
+        }),
         bit_depth: demux.bit_depth,
         chroma: demux.chroma.clone(),
         stereo: demux.stereo.clone(),

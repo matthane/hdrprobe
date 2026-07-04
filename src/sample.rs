@@ -31,8 +31,14 @@ pub struct Scan {
     /// equal to what the old whole-stream reassembly buffer held (the trailing
     /// partial AU is excluded by both), so `main.rs` can compute the same
     /// video-stream bitrate. `Some(0)` is meaningful (no video bytes ⇒ no
-    /// rate, as before); `None` on every other path.
+    /// rate, as before); `None` on every other path. The MKV `--full`
+    /// streaming walk fills it too (exact summed block bytes — what the old
+    /// exhaustive index summed in `mkv::demux`).
     pub es_bytes: Option<u64>,
+    /// Exact video-block count of a `--full` MKV streaming walk, `None`
+    /// elsewhere: feeds the fps fallback (count ÷ duration) the demux computed
+    /// from its own complete index before the walk moved here.
+    pub frame_count: Option<u64>,
 }
 
 /// RPUs plus SEI findings from a single access unit.
@@ -69,8 +75,17 @@ pub fn scan(
         return scan_ts_full(data, plan, demux, opts, progress, frontier);
     }
 
+    // MKV `--full`: demux kept only its bounded head index; walk every cluster
+    // here, extracting each window's blocks as they are discovered (index and
+    // scan fused — one pass over the file). Also before the `no_rpu` early
+    // return: the walk's byte and frame totals feed the exact bitrate and the
+    // fps fallback either way.
+    if let Some(plan) = demux.mkv_stream.as_ref() {
+        return scan_mkv_full(data, plan, demux, opts, progress, frontier);
+    }
+
     if opts.no_rpu || demux.chunks.is_empty() {
-        return Scan { dv: DvAggregate::default(), sei: SeiFindings::default(), es_bytes: None };
+        return Scan { dv: DvAggregate::default(), sei: SeiFindings::default(), es_bytes: None, frame_count: None };
     }
 
     let indices = select_indices(demux.chunks.len(), opts.samples, opts.full, demux.sps_chunk);
@@ -88,7 +103,7 @@ pub fn scan(
     let mut sei = SeiFindings::default();
     scan_chunks(source, &selected, demux.nal_format, &demux.codec, &mut dv, &mut sei, progress, frontier);
 
-    Scan { dv, sei, es_bytes: None }
+    Scan { dv, sei, es_bytes: None, frame_count: None }
 }
 
 /// Extract RPUs + SEI from `chunks` in parallel batches, aggregating each
@@ -184,7 +199,58 @@ fn scan_ts_full(
         if !more {
             // The cursor stops short of EOF by a partial packet; pin 100%.
             progress.update(data.len() as u64);
-            return Scan { dv, sei, es_bytes: Some(es_bytes) };
+            return Scan { dv, sei, es_bytes: Some(es_bytes), frame_count: None };
+        }
+        progress.update(st.position() as u64);
+    }
+}
+
+/// `--full` MKV: drive the resumable cluster walker over the whole Segment in
+/// bounded windows, scanning each window's blocks with the ordinary batch
+/// machinery as they are discovered — the index pass and the scan pass fused,
+/// so the file is read once, in order, at any size (the old shape indexed
+/// every cluster in demux and then re-read every block here; on a remote file
+/// larger than RAM that meant two transfers). Chunks are absolute file ranges
+/// (unlike TS's buffer-relative ones), already warmed by the walker's frontier
+/// ticks. Under `--no-rpu` the walk still runs, extraction skipped, to count
+/// the exact block bytes (bitrate) and blocks (fps fallback).
+fn scan_mkv_full(
+    data: &[u8],
+    plan: &crate::container::mkv::MkvFullStream,
+    demux: &Demux,
+    opts: &Options,
+    progress: &Progress,
+    frontier: &Frontier,
+) -> Scan {
+    let mut st = plan.streamer();
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut dv = DvAggregate::default();
+    let mut sei = SeiFindings::default();
+    let mut es_bytes: u64 = 0;
+    let mut frame_count: u64 = 0;
+    // One phase, one bar: position over the whole mmap, like the TS walk.
+    progress.begin(Phase::Scan, data.len() as u64);
+    loop {
+        chunks.clear();
+        let more =
+            st.next_window(data, &mut chunks, crate::container::mkv::STREAM_SPAN_BYTES, frontier);
+        es_bytes += chunks.iter().map(|c| c.size).sum::<u64>();
+        frame_count += chunks.len() as u64;
+        if !opts.no_rpu {
+            scan_chunks(
+                data,
+                &chunks,
+                demux.nal_format,
+                &demux.codec,
+                &mut dv,
+                &mut sei,
+                &Progress::off(),
+                frontier,
+            );
+        }
+        if !more {
+            progress.update(data.len() as u64);
+            return Scan { dv, sei, es_bytes: Some(es_bytes), frame_count: Some(frame_count) };
         }
         progress.update(st.position() as u64);
     }
@@ -341,6 +407,7 @@ mod tests {
             sps_chunk: None,
             reassembled: Some(Vec::new()),
             ts_stream: Some(ts::TsFullStream::new(layout, vec![0x100, 0x200])),
+            mkv_stream: None,
         };
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
@@ -382,6 +449,78 @@ mod tests {
         v.extend_from_slice(&max_fall.to_be_bytes());
         v.push(0x80); // rbsp trailing
         v
+    }
+
+    /// Minimal EBML element with a 1-byte size (payloads stay < 127).
+    fn ebml(id: &[u8], payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 0x7F);
+        let mut v = id.to_vec();
+        v.push(0x80 | payload.len() as u8);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn mkv_full_scan_streams_blocks_and_counts() {
+        // Segment { Cluster{SimpleBlock(CLL SEI)}, Cluster{SimpleBlock(filler)} }
+        // walked via the streaming plan: exact byte/frame totals either way,
+        // extraction only without --no-rpu.
+        let cll = sei_cll_nal(300, 60);
+        let filler = vec![0x00, 0x00, 0x01, 0x02, 0x01, 0x00];
+        let block = |payload: &[u8]| {
+            let mut b = vec![0x81, 0x00, 0x00, 0x00]; // track 1, timecode, flags
+            b.extend_from_slice(payload);
+            ebml(&[0xA3], &b)
+        };
+        let cluster_id = [0x1F, 0x43, 0xB6, 0x75];
+        let mut seg = ebml(&cluster_id, &block(&cll));
+        seg.extend(ebml(&cluster_id, &block(&filler)));
+        let data = ebml(&[0x18, 0x53, 0x80, 0x67], &seg);
+        let seg_start = data.len() - seg.len();
+
+        let demux = Demux {
+            container: "Matroska",
+            codec: Codec::Hevc,
+            nal_format: NalFormat::AnnexB,
+            width: 3840,
+            height: 2160,
+            fps: None,
+            duration_secs: None,
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+            stereo: None,
+            color: ColorInfo::default(),
+            dv_config: None,
+            dv_dual_track: false,
+            mastering: None,
+            content_light: None,
+            bitrate: None,
+            chunks: Vec::new(), // head window ignored: the plan walks
+            sps_chunk: None,
+            reassembled: None,
+            ts_stream: None,
+            mkv_stream: Some(crate::container::mkv::MkvFullStream::new(
+                seg_start,
+                data.len(),
+                1,
+            )),
+        };
+        let total = (cll.len() + filler.len()) as u64;
+
+        let opts = Options { samples: 16, full: true, no_rpu: false };
+        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        assert_eq!(s.es_bytes, Some(total));
+        assert_eq!(s.frame_count, Some(2));
+        let cl = s.sei.content_light.expect("CLL extracted from the streamed block");
+        assert_eq!((cl.max_cll, cl.max_fall), (300, 60));
+
+        // --no-rpu: the walk still yields the exact totals, extraction skipped.
+        let opts = Options { samples: 16, full: true, no_rpu: true };
+        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        assert_eq!(s.es_bytes, Some(total));
+        assert_eq!(s.frame_count, Some(2));
+        assert!(s.sei.content_light.is_none());
     }
 
     #[test]

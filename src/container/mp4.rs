@@ -442,6 +442,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         sps_chunk: None,
         reassembled: None,
         ts_stream: None,
+        mkv_stream: None,
     }
 }
 

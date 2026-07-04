@@ -5,7 +5,12 @@
 //!
 //! Bounded by default like the other backends: the fast path indexes only a head
 //! byte-window of blocks (`HEAD_SPAN_BYTES`) so large movies don't page in the
-//! whole file to walk every block header; `--full` indexes every cluster.
+//! whole file to walk every block header. `--full` does **not** index up front:
+//! demux keeps the same bounded head pass and exposes `MkvFullStream` on
+//! `Demux::mkv_stream`; `sample::scan` then drives the resumable `BlockStreamer`
+//! through the clusters in bounded windows, scanning each window's blocks as
+//! they are discovered — index and scan fused into one pass, so a remote file
+//! crosses the wire once regardless of size (see `prefetch::Frontier`).
 //!
 //! Single-track only: Profile 7 dual-track (EL in BlockAdditions) is deferred to M7.
 
@@ -14,7 +19,6 @@ use anyhow::{Context, Result};
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
 use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
 use crate::prefetch::Frontier;
-use crate::progress::{Phase, Progress};
 
 // --- EBML element IDs (stored with their length-descriptor marker retained). ---
 const ID_SEGMENT: u32 = 0x1853_8067;
@@ -266,17 +270,10 @@ fn front_seekhead_offset_of(data: &[u8], target: u32) -> Option<usize> {
     None
 }
 
-pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) -> Result<Demux> {
+pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     // Locate the Segment among the top-level elements (EBML header precedes it).
     let (seg_start, seg_end) =
         segment_extent(data).context("no Segment element (not a Matroska file)")?;
-
-    // `--full` indexes every cluster — a whole-file walk worth reporting
-    // (over a network mount it faults the entire file in). The default's
-    // bounded head walk is milliseconds and stays silent.
-    if full {
-        progress.begin(Phase::Index, seg_end as u64);
-    }
 
     let mut timestamp_scale = TIMESTAMP_SCALE_DEFAULT;
     let mut duration_ticks: Option<f64> = None;
@@ -296,8 +293,6 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
 
     let mut p = seg_start;
     while p < seg_end {
-        progress.update(p as u64);
-        frontier.ensure(p as u64);
         let Some((id, p1)) = read_id(data, p) else { break };
         let Some((size, p2)) = read_size(data, p1) else { break };
         match id {
@@ -327,14 +322,14 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             }
             ID_CLUSTER => {
                 let video_track = track.as_ref().map(|t| t.track_number);
-                // Fast path bounds indexing to a head byte-window; `--full` scans all.
-                let head_limit = if full { None } else { Some(HEAD_SPAN_BYTES) };
+                // Always a bounded head walk — under `--full` the exhaustive
+                // cluster pass belongs to `sample::scan`, which streams it via
+                // `Demux::mkv_stream` fused with the extraction (one pass over
+                // the file, not an index pass plus a scan pass).
+                let head_limit = Some(HEAD_SPAN_BYTES);
                 match size {
                     Some(s) => {
                         let end = (p2 + s as usize).min(seg_end);
-                        // A cluster can outrun the rolling look-ahead (tens of
-                        // MB); warm its exact span before walking its blocks.
-                        frontier.ensure_to(end as u64);
                         parse_cluster(data, p2, end, false, video_track, &mut chunks, head_limit);
                         p = end;
                     }
@@ -357,10 +352,6 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             },
         }
     }
-
-    // Close the index walk at its true final position (the loop tick reports
-    // the position *before* each element).
-    progress.update(p.min(seg_end) as u64);
 
     let track = track.context("no video track found in Matroska file")?;
 
@@ -404,11 +395,20 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         Some(Bitrate::video_stream_bps(bps))
     } else if let Some(bytes) = vstat.and_then(|s| s.number_of_bytes) {
         Bitrate::video_stream(bytes, duration_secs)
+    } else if full {
+        // No statistics tag: the streaming scan sums the exact block bytes
+        // (`sample::Scan::es_bytes`, applied in main.rs — the same value the
+        // old exhaustive index summed here), so leave the rate unset rather
+        // than report the head window or the file-length overall rate.
+        None
     } else if !stopped_early {
         Bitrate::video_stream(chunks.iter().map(|c| c.size).sum::<u64>(), duration_secs)
     } else {
         Bitrate::overall(data.len() as u64, duration_secs)
     };
+
+    let mkv_stream =
+        full.then_some(MkvFullStream { seg_start, seg_end, video_track: track.track_number });
 
     Ok(Demux {
         container: "Matroska",
@@ -434,7 +434,114 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         sps_chunk: None,
         reassembled: None,
         ts_stream: None,
+        mkv_stream,
     })
+}
+
+/// Everything `sample::scan` needs to drive the exhaustive `--full` cluster
+/// walk without demux having indexed it. Carried on `Demux::mkv_stream`,
+/// `Some` only under `--full`. The mirror of `ts::TsFullStream`, for the same
+/// reason: fusing discovery with extraction means the file is read once, in
+/// order — on a remote volume that is one wire transfer at any file size.
+#[derive(Debug, Clone)]
+pub struct MkvFullStream {
+    seg_start: usize,
+    seg_end: usize,
+    video_track: u64,
+}
+
+impl MkvFullStream {
+    #[cfg(test)]
+    pub(crate) fn new(seg_start: usize, seg_end: usize, video_track: u64) -> Self {
+        MkvFullStream { seg_start, seg_end, video_track }
+    }
+
+    /// A fresh walker over the whole Segment. It starts at the Segment's first
+    /// child, re-skipping the head metadata elements demux already parsed
+    /// (element-header reads only — cheap), so every cluster is walked exactly
+    /// once — by the streamer.
+    pub fn streamer(&self) -> BlockStreamer {
+        BlockStreamer {
+            p: self.seg_start,
+            seg_end: self.seg_end,
+            video_track: self.video_track,
+            finished: false,
+        }
+    }
+}
+
+/// File span each `BlockStreamer` window covers before yielding back to the
+/// scan loop. Bounds the per-window chunk list; a window may overshoot by up
+/// to one cluster (the walk only pauses at cluster boundaries).
+pub const STREAM_SPAN_BYTES: u64 = 64 << 20; // 64 MiB
+
+/// Resumable walker over the Segment's clusters: appends the video track's
+/// block byte ranges (absolute file offsets, unlike TS's buffer-relative
+/// chunks) window by window, reusing `parse_cluster` unbounded. The `frontier`
+/// is warmed per element and per known cluster extent, so on a remote volume
+/// the block headers *and* payloads the window (and its subsequent extraction)
+/// touch arrive in linear pipelined reads.
+pub struct BlockStreamer {
+    p: usize,
+    seg_end: usize,
+    video_track: u64,
+    finished: bool,
+}
+
+impl BlockStreamer {
+    /// Append the video blocks of the clusters between the current position
+    /// and ~`target_span` file bytes ahead (or the Segment's end). Returns
+    /// `true` while more input remains.
+    pub fn next_window(
+        &mut self,
+        data: &[u8],
+        chunks: &mut Vec<Chunk>,
+        target_span: u64,
+        frontier: &Frontier,
+    ) -> bool {
+        if self.finished {
+            return false;
+        }
+        let window_start = self.p;
+        while self.p < self.seg_end {
+            frontier.ensure(self.p as u64);
+            let Some((id, p1)) = read_id(data, self.p) else { break };
+            let Some((size, p2)) = read_size(data, p1) else { break };
+            match id {
+                ID_CLUSTER => match size {
+                    Some(s) => {
+                        let end = (p2 + s as usize).min(self.seg_end);
+                        // A cluster can outrun the rolling look-ahead (tens of
+                        // MB); warm its exact extent — headers and payloads —
+                        // before walking its blocks.
+                        frontier.ensure_to(end as u64);
+                        parse_cluster(data, p2, end, false, Some(self.video_track), chunks, None);
+                        self.p = end;
+                    }
+                    None => {
+                        // Unknown-size cluster: parse until the next level-1 element.
+                        self.p =
+                            parse_cluster(data, p2, self.seg_end, true, Some(self.video_track), chunks, None);
+                    }
+                },
+                _ => match size {
+                    Some(s) => self.p = (p2 + s as usize).min(self.seg_end),
+                    None => break,
+                },
+            }
+            if (self.p - window_start) as u64 >= target_span {
+                return true;
+            }
+        }
+        self.finished = true;
+        false
+    }
+
+    /// Absolute byte offset of the walk — monotonic, ends at the Segment's
+    /// end. Progress reporting's numerator; never affects parsing.
+    pub fn position(&self) -> usize {
+        self.p
+    }
 }
 
 /// End offset of a Segment child; unknown-size non-cluster children are rare and
@@ -1115,6 +1222,61 @@ mod tests {
         v.push(0x80 | payload.len() as u8);
         v.extend_from_slice(payload);
         v
+    }
+
+    /// An unlaced SimpleBlock element for `track` carrying `payload`.
+    fn sb(track: u8, payload: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x80 | track, 0x00, 0x00, 0x00]; // vint track, timecode, flags
+        b.extend_from_slice(payload);
+        el(&[0xA3], &b)
+    }
+
+    fn cluster(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for b in blocks {
+            body.extend_from_slice(b);
+        }
+        el(&ID_CLUSTER.to_be_bytes(), &body)
+    }
+
+    #[test]
+    fn block_streamer_windows_match_one_shot() {
+        // Segment { filler, Cluster{v,other,v}, filler, Cluster{v} }: the walk
+        // skips non-cluster elements and other tracks, in demux order.
+        let mut seg = el(&ID_ATTACHMENTS.to_be_bytes(), &[0u8; 40]);
+        seg.extend(cluster(&[sb(1, &[1, 2, 3]), sb(2, &[9, 9]), sb(1, &[4, 5])]));
+        seg.extend(el(&ID_CHAPTERS.to_be_bytes(), &[0u8; 8]));
+        seg.extend(cluster(&[sb(1, &[6])]));
+        let data = el(&ID_SEGMENT.to_be_bytes(), &seg);
+        let seg_start = data.len() - seg.len();
+        let plan = MkvFullStream::new(seg_start, data.len(), 1);
+
+        let mut all: Vec<Chunk> = Vec::new();
+        let mut st = plan.streamer();
+        assert!(!st.next_window(&data, &mut all, u64::MAX, &Frontier::off()));
+        assert_eq!(all.iter().map(|c| c.size).collect::<Vec<_>>(), [3, 2, 1]);
+        // Chunk offsets are absolute file ranges.
+        assert_eq!(&data[all[0].offset as usize..][..3], &[1, 2, 3]);
+        assert_eq!(&data[all[2].offset as usize..][..1], &[6]);
+
+        // Tiny windows: one cluster per window, identical chunks, monotonic
+        // position ending at the Segment's end.
+        let mut st = plan.streamer();
+        let (mut got, mut chunks) = (Vec::new(), Vec::new());
+        let mut positions = Vec::new();
+        loop {
+            chunks.clear();
+            let more = st.next_window(&data, &mut chunks, 1, &Frontier::off());
+            positions.push(st.position());
+            got.extend_from_slice(&chunks);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(got.len(), all.len());
+        assert!(got.iter().zip(&all).all(|(a, b)| (a.offset, a.size) == (b.offset, b.size)));
+        assert!(positions.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*positions.last().unwrap(), data.len());
     }
 
     #[test]

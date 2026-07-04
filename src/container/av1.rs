@@ -278,6 +278,7 @@ fn build_demux(
         sps_chunk: None,
         reassembled: None,
         ts_stream: None,
+        mkv_stream: None,
     }
 }
 

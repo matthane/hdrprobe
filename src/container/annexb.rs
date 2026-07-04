@@ -99,6 +99,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         sps_chunk,
         reassembled: None,
         ts_stream: None,
+        mkv_stream: None,
     })
 }
 

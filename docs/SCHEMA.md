@@ -119,9 +119,9 @@ end short of 100 when the walk legitimately stops early, so treat the next phase
 line or the `done` event as the phase boundary, never a specific percentage. A `done` event
 follows when the file's report is complete; a file that fails produces no `done` event — its
 diagnostic line takes that place. Phases are sequential, and which ones appear depends on the
-container (an MKV indexes then scans; TS/M2TS normally only scans). Percentages are monotonic
-within a phase. Events describe pacing, not content: nothing in them appears in, or changes,
-the `Report`.
+container (MKV and TS/M2TS scan in a single pass, so they normally emit only `scan`; raw
+HEVC/AV1 streams index then scan). Percentages are monotonic within a phase. Events describe
+pacing, not content: nothing in them appears in, or changes, the `Report`.
 
 ## Schema versioning
 
