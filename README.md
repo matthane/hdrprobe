@@ -1,4 +1,7 @@
-# hdrprobe
+```
+█ █ █▀▄ █▀█ █▀█ █▀█ █▀█ █▄▄ █▀▀
+█▀█ █▄▀ █▀▄ █▀▀ █▀▄ █▄█ █▄█ ██▄  v0.1.0
+```
 
 Fast HDR, HDR10+, and Dolby Vision metadata inspector.
 
@@ -8,36 +11,38 @@ path, writing temp files, or extracting a full RPU stream to disk first. It memo
 file and reads only the bytes it needs, so it stays fast regardless of file size.
 
 ```
-movie.mkv  (225.14 MiB)
+▮ movie.mkv · 225.14 MiB
 
-General
+── GENERAL ─────────────────────────────────────────────────────
   Container         Matroska
   Duration          30s
-  Bitrate           46.08 Mb/s   [video stream]
+  Bitrate           46.08 Mb/s · video stream
   Video             HEVC (Main 10, High tier @ L5.1) · 3840×2160 · 23.976 fps · 10-bit 4:2:0
   Color             BT.2020 · PQ (SMPTE ST 2084) · limited
 
-HDR
+── HDR ─────────────────────────────────────────────────────────
   Format            Dolby Vision + HDR10+ + HDR10 (fallback)
   Mastering         DCI-P3 D65 · max 1000  min 0.0001 cd/m²
   Content light     MaxCLL 737 · MaxFALL 130
 
-Dolby Vision
+── DOLBY VISION ────────────────────────────────────────────────
   Structure         Single track, dual layer
   Profile           7.6 (MEL)
   Content mapping   v4.0
-  Mastering         DCI-P3 D65 [L9] · max 1000  min 0.0001 cd/m²
-  Trim targets      100 nits [L2/L8], 600 nits [L2], 1000 nits [L2]
-  L5 offsets        L0 R0 T276 B276   [sampled]
+  Mastering         DCI-P3 D65 L9 · max 1000  min 0.0001 cd/m²
+  Trim targets*     100 nits L2/L8, 600 nits L2, 1000 nits L2
+  L5 offsets*       L0 R0 T276 B276
   L5 active area    3840×1608  (2.39:1)
   L6 content light  MaxCLL 737 · MaxFALL 130
   L11 APO           Movies · white point D65 · reference mode
 
-HDR10+
+── HDR10+ ──────────────────────────────────────────────────────
   Profile           B
   Application       v1
   Windows           1
   Target            400 nits
+
+* sampled from a spread of RPUs; --full reads every one
 ```
 
 ## What it reports
