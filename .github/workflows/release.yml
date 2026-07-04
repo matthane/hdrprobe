@@ -1,0 +1,153 @@
+# Release builds: five per-platform binaries attached to a draft GitHub release.
+#
+# Triggered by pushing a version tag (v0.1.0, ...). The workflow_dispatch trigger
+# exists so the whole pipeline can be exercised without cutting a release: a
+# manual run performs the gates and builds but skips the release job.
+#
+# Gates mirror CLAUDE.md's bar: zero build/clippy warnings (RUSTFLAGS=-Dwarnings),
+# all tests pass, and THIRD-PARTY-LICENSES.md matches the current dependency
+# tree (regenerate-and-diff, the release gate described in CLAUDE.md). The
+# corpus check (testfiles/) is local-only and gitignored, so it stays a manual
+# pre-tag step.
+#
+# Platform notes:
+# - Linux builds run on ubuntu-22.04 / ubuntu-22.04-arm so the binaries link
+#   against glibc 2.35 and run on older distros; 24.04 runners would silently
+#   raise the floor to 2.39.
+# - GitHub retired the free Intel macOS runners, so x86_64-apple-darwin is
+#   cross-compiled on the arm64 runner (Xcode ships both toolchains). Its tests
+#   still execute there via Rosetta 2.
+# - Windows shell integration (--install-shell) is Windows-only by design; the
+#   other binaries build it out via cfg and need nothing here.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  checks:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$crate" ]; then
+            echo "tag v$tag does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+
+      - name: Clippy (zero warnings)
+        run: cargo clippy --release --all-targets
+
+      - name: Tests
+        run: cargo test --release
+
+      - name: Third-party license attribution is current
+        env:
+          # -Dwarnings is our crate's bar; don't let it fail cargo-about's own build.
+          RUSTFLAGS: ""
+        run: |
+          cargo install --locked --features cli cargo-about
+          cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+          git diff --exit-code THIRD-PARTY-LICENSES.md
+
+  build:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Native on four of the five; x86_64-apple-darwin runs under Rosetta 2.
+      - name: Tests on target
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          name="hdrprobe-${version}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/hdrprobe" LICENSE THIRD-PARTY-LICENSES.md README.md docs/SCHEMA.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ($env:GITHUB_REF_TYPE -ne 'tag') {
+            $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          }
+          $name = "hdrprobe-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/hdrprobe.exe", LICENSE, THIRD-PARTY-LICENSES.md, README.md, docs/SCHEMA.md $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hdrprobe-${{ matrix.target }}
+          path: |
+            hdrprobe-*.tar.gz
+            hdrprobe-*.zip
+          if-no-files-found: error
+
+  # Draft release: the archives and a checksum file are attached, but nothing
+  # is published until the draft is reviewed and released by hand.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum hdrprobe-* > SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "hdrprobe $GITHUB_REF_NAME" \
+            dist/*

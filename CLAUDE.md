@@ -44,7 +44,17 @@ binary, not a nuisance: vet the license and confirm MIT-compatibility before add
 itself stays MIT (see `LICENSE`); dev-dependencies (not shipped) and the `hdrprobe` crate itself are
 excluded by config.
 
-## Module map (`src/`)
+## Release binaries
+
+Pushing a version tag (`v*`) runs `.github/workflows/release.yml`: it enforces the gates above
+(clippy/tests under `-Dwarnings`, the license drift check, tag == `Cargo.toml` version), builds and
+tests the binary for Windows x86_64, Linux x86_64 + aarch64, and macOS arm64 + Intel (Intel is
+cross-compiled on the arm64 runner and tested via Rosetta), and attaches the archives plus
+`SHA256SUMS` to a **draft** GitHub release for manual review. A `workflow_dispatch` run exercises
+the gates and builds without creating a release. The corpus `-q` check stays a manual pre-tag step
+(`testfiles/` is local-only). The code is deliberately portable outside `shell.rs`/`prefetch.rs`'s
+`cfg(windows)` branches — keep new platform-specific code behind `cfg` with a non-Windows path, and
+never parse bytes native-endian.
 
 - `main.rs` — clap CLI, per-file dispatch (sidecar files first, then the video pipeline), exit
   codes (0 ok / 1 usage / 2 unreadable).
