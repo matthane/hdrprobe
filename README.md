@@ -11,7 +11,7 @@ path, writing temp files, or extracting a full RPU stream to disk first. It memo
 file and reads only the bytes it needs, so it stays fast regardless of file size.
 
 ```
-▮ movie.mkv · 225.14 MiB
+▮ movie.mkv 225.14 MiB
 
 ── GENERAL ─────────────────────────────────────────────────────
   Container         Matroska

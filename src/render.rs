@@ -45,7 +45,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             s,
             "{} {}",
             c.bright(&format!("▮ {}", r.file)),
-            c.faint(&format!("· {}", human_size(r.size_bytes)))
+            c.faint(&human_size(r.size_bytes))
         );
     } else {
         let _ = writeln!(s, "{}  ({})", r.file, human_size(r.size_bytes));
@@ -597,11 +597,12 @@ impl Colorizer {
     }
     /// A whole-line qualifier tag ([video stream], [compat assumed]) — the
     /// sampling caveats use `Footnotes` instead. Carries its own leading
-    /// separator: coloured it hangs off the value as a faint " · tag", plain
-    /// it keeps the classic three-space "[tag]".
+    /// spacing: coloured it hangs off the value as a faint " tag" (a dim
+    /// qualifier, not a separate element, so no `·` — matching `prov`),
+    /// plain it keeps the classic three-space "[tag]".
     fn tag(&self, t: &str) -> String {
         if self.on {
-            self.faint(&format!(" · {t}"))
+            self.faint(&format!(" {t}"))
         } else {
             format!("   [{t}]")
         }
