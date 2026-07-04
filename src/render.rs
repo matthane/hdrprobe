@@ -6,21 +6,59 @@ use crate::model::{BitrateScope, ColorInfo, Report};
 
 pub struct RenderOpts {
     pub color: bool,
+    pub theme: Theme,
     pub show_general: bool,
     pub show_hdr: bool,
     pub show_dv: bool,
     pub show_hdr10plus: bool,
 }
 
+/// A colour theme picks the ink for the fixed four-role hierarchy (see
+/// `Colorizer`); which role each element gets never varies by theme, so a
+/// new theme is four tuned colours, not a layout decision. Themes only touch
+/// coloured output — plain text is byte-identical under every theme.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Theme {
+    /// Green phosphor (P1 CRT).
+    Green,
+    /// Amber phosphor (P3 CRT).
+    Amber,
+    /// Warm red.
+    Red,
+    /// Cyan-blue phosphor.
+    Ice,
+    /// Violet-purple.
+    Purple,
+    /// Neutral paper-white — the default.
+    Paper,
+    /// Bold/dim intensity only, no colours of its own: inherits the
+    /// terminal's scheme, and works on terminals without truecolor.
+    Mono,
+}
+
+impl Theme {
+    fn palette(self) -> &'static Palette {
+        match self {
+            Theme::Green => &GREEN,
+            Theme::Amber => &AMBER,
+            Theme::Red => &RED,
+            Theme::Ice => &ICE,
+            Theme::Purple => &PURPLE,
+            Theme::Paper => &PAPER,
+            Theme::Mono => &MONO,
+        }
+    }
+}
+
 const LABEL_W: usize = 16;
 
 /// The interactive-terminal masthead: a two-row half-block "HDRPROBE" in the
-/// phosphor palette (bright top row, mid bottom — a CRT falloff), with the
+/// theme palette (bright top row, mid bottom — a CRT falloff), with the
 /// crate version faint alongside. Decoration only: `main` prints it once per
 /// run, and only for colored text output (never quiet/JSON/pipes), so
 /// machine consumers and logs never see it.
-pub fn render_banner() -> String {
-    let c = Colorizer { on: true };
+pub fn render_banner(theme: Theme) -> String {
+    let c = Colorizer { on: true, palette: theme.palette() };
     let mut s = String::new();
     let _ = writeln!(s, "{}", c.bright("█ █ █▀▄ █▀█ █▀█ █▀█ █▀█ █▄▄ █▀▀"));
     let _ = writeln!(
@@ -35,7 +73,7 @@ pub fn render_banner() -> String {
 
 pub fn render(r: &Report, o: &RenderOpts) -> String {
     let mut s = String::new();
-    let c = Colorizer { on: o.color };
+    let c = Colorizer { on: o.color, palette: o.theme.palette() };
     let mut notes = Footnotes::default();
 
     // Each section carries one bright headline for quick glancing (General's
@@ -573,21 +611,93 @@ fn human_duration(secs: f64) -> String {
     }
 }
 
-/// Phosphor-CRT palette: one green hue at four intensities. Brightness is the
+/// Phosphor-CRT palette: one hue at four intensities. Brightness is the
 /// visual hierarchy — bright for headline facts (file name, HDR format, DV
 /// profile, section names), mid for ordinary values, low for labels, faint
 /// for tags and rules — and warnings invert the video, which a single-hue
-/// scheme makes unmissable. The layout (banner, footnotes, line structure) is
-/// shared between modes; with colour off the intensities vanish, so the
-/// tag/provenance/warning helpers fall back to the bracket conventions
-/// (`[tag]`, `(warning)`) that carry the same semantics in plain text.
+/// scheme makes unmissable. Each field is the SGR parameter string for one
+/// role; the values are hand-tuned per theme (the ramp is perceptual, not a
+/// linear scale), with `warn` carrying the bright ink behind inverse video.
+struct Palette {
+    bright: &'static str,
+    value: &'static str,
+    label: &'static str,
+    faint: &'static str,
+    warn: &'static str,
+}
+
+const GREEN: Palette = Palette {
+    bright: "1;38;2;120;255;160",
+    value: "38;2;80;210;120",
+    label: "38;2;55;140;85",
+    faint: "38;2;38;95;60",
+    warn: "7;38;2;120;255;160",
+};
+
+const AMBER: Palette = Palette {
+    bright: "1;38;2;255;205;120",
+    value: "38;2;225;165;70",
+    label: "38;2;160;115;50",
+    faint: "38;2;110;80;35",
+    warn: "7;38;2;255;205;120",
+};
+
+const RED: Palette = Palette {
+    bright: "1;38;2;255;150;125",
+    value: "38;2;230;105;85",
+    label: "38;2;165;75;62",
+    faint: "38;2;115;52;45",
+    warn: "7;38;2;255;150;125",
+};
+
+const ICE: Palette = Palette {
+    bright: "1;38;2;140;230;255",
+    value: "38;2;90;190;225",
+    label: "38;2;60;130;160",
+    faint: "38;2;40;90;115",
+    warn: "7;38;2;140;230;255",
+};
+
+const PURPLE: Palette = Palette {
+    bright: "1;38;2;215;165;255",
+    value: "38;2;180;125;230",
+    label: "38;2;128;88;165",
+    faint: "38;2;88;62;115",
+    warn: "7;38;2;215;165;255",
+};
+
+const PAPER: Palette = Palette {
+    bright: "1;38;2;240;240;235",
+    value: "38;2;200;200;195",
+    label: "38;2;140;140;135",
+    faint: "38;2;100;100;95",
+    warn: "7;38;2;240;240;235",
+};
+
+/// No colour of its own — bold/dim against the terminal's scheme. `value` is
+/// deliberately empty (unstyled default foreground): `wrap` passes an empty
+/// code through untouched.
+const MONO: Palette = Palette {
+    bright: "1",
+    value: "",
+    label: "2",
+    faint: "2",
+    warn: "7",
+};
+
+/// Applies the four-role hierarchy from one theme's `Palette`. The layout
+/// (banner, footnotes, line structure) is shared between modes; with colour
+/// off the intensities vanish, so the tag/provenance/warning helpers fall
+/// back to the bracket conventions (`[tag]`, `(warning)`) that carry the
+/// same semantics in plain text.
 struct Colorizer {
     on: bool,
+    palette: &'static Palette,
 }
 
 impl Colorizer {
     fn wrap(&self, code: &str, text: &str) -> String {
-        if self.on {
+        if self.on && !code.is_empty() {
             format!("\x1b[{}m{}\x1b[0m", code, text)
         } else {
             text.to_string()
@@ -595,19 +705,19 @@ impl Colorizer {
     }
     /// Headline values.
     fn bright(&self, t: &str) -> String {
-        self.wrap("1;38;2;120;255;160", t)
+        self.wrap(self.palette.bright, t)
     }
     /// Ordinary values.
     fn value(&self, t: &str) -> String {
-        self.wrap("38;2;80;210;120", t)
+        self.wrap(self.palette.value, t)
     }
     /// Row labels.
     fn label(&self, t: &str) -> String {
-        self.wrap("38;2;55;140;85", t)
+        self.wrap(self.palette.label, t)
     }
     /// Faintest level: tags, rules, the timing footer.
     fn faint(&self, t: &str) -> String {
-        self.wrap("38;2;38;95;60", t)
+        self.wrap(self.palette.faint, t)
     }
     /// A whole-line qualifier tag (the bitrate scope: [video stream],
     /// [overall]) — the
@@ -635,7 +745,7 @@ impl Colorizer {
     /// parenthesis when plain.
     fn warn(&self, t: &str) -> String {
         if self.on {
-            format!("\x1b[7;38;2;120;255;160m {} \x1b[0m", t.to_uppercase())
+            format!("\x1b[{}m {} \x1b[0m", self.palette.warn, t.to_uppercase())
         } else {
             format!("({t})")
         }

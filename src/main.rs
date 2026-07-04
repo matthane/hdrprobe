@@ -25,7 +25,7 @@ use clap::{Parser, ValueEnum};
 use memmap2::Mmap;
 
 use crate::model::{General, Hdr10Plus, Report};
-use crate::render::RenderOpts;
+use crate::render::{RenderOpts, Theme};
 
 #[derive(Parser, Debug)]
 #[command(name = "hdrprobe", version, about = "Fast HDR / Dolby Vision metadata inspector")]
@@ -61,6 +61,10 @@ struct Cli {
     /// Colour output: auto, always, never.
     #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
     color: ColorWhen,
+
+    /// Colour theme for coloured output.
+    #[arg(long, value_enum, env = "HDRPROBE_THEME", default_value_t = Theme::Paper)]
+    theme: Theme,
 
     /// One-line summary per file.
     #[arg(short, long)]
@@ -162,7 +166,7 @@ fn main() -> ExitCode {
     // The masthead prints once per run, only on the colored interactive text
     // path — quiet, JSON/NDJSON, and piped output stay machine-clean.
     if use_color && format == Format::Text && !cli.quiet {
-        out_buf.push_str(&render::render_banner());
+        out_buf.push_str(&render::render_banner(cli.theme));
     }
 
     for path in &paths {
@@ -232,6 +236,7 @@ fn render_opts(cli: &Cli, color: bool) -> RenderOpts {
     }
     RenderOpts {
         color,
+        theme: cli.theme,
         show_general: g,
         show_hdr: h,
         show_dv: d,
