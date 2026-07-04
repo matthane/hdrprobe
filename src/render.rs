@@ -193,7 +193,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 // More than one distinct active area means the aspect ratio
                 // changes across the title — worth flagging as special.
                 let variable = if dv.l5_active_areas.len() > 1 {
-                    format!("  {}", c.good("(variable)"))
+                    format!("  {}", c.warn("(variable)"))
                 } else {
                     String::new()
                 };
@@ -505,9 +505,6 @@ impl Colorizer {
     }
     fn warn(&self, t: &str) -> String {
         self.wrap("33", t)
-    }
-    fn good(&self, t: &str) -> String {
-        self.wrap("32", t)
     }
     fn accent(&self, t: &str) -> String {
         self.wrap("33", t)
