@@ -230,7 +230,6 @@ fn render_opts(cli: &Cli, color: bool) -> RenderOpts {
         show_hdr: h,
         show_dv: d,
         show_hdr10plus: hp,
-        show_timing: true,
     }
 }
 

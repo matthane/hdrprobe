@@ -10,7 +10,6 @@ pub struct RenderOpts {
     pub show_hdr: bool,
     pub show_dv: bool,
     pub show_hdr10plus: bool,
-    pub show_timing: bool,
 }
 
 const LABEL_W: usize = 16;
@@ -301,20 +300,12 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         }
     }
 
-    // Footnotes collected from marked labels render once at the bottom, beside
-    // the timing footer, so per-line caveats never clutter the values they
-    // qualify. They print regardless of show_timing: a mark without its
-    // explanation would dangle.
+    // Footnotes collected from marked labels render once at the report's
+    // foot, so per-line caveats never clutter the values they qualify. The
+    // elapsed time is JSON-only (`elapsed_ms`); the text report doesn't
+    // show it.
     for (mark, text) in notes.lines() {
         let _ = writeln!(s, "{}", c.faint(&format!("{mark} {text}")));
-    }
-
-    if o.show_timing {
-        if c.on {
-            let _ = writeln!(s, "{}", c.faint(&format!("▸ {:.0} ms", r.elapsed_ms)));
-        } else {
-            let _ = writeln!(s, "⚡ {:.0} ms", r.elapsed_ms);
-        }
     }
 
     s

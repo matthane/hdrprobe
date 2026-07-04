@@ -133,7 +133,7 @@ excluded by config.
   verbatim. **L5 is the
   deliberate exception**: it varies with aspect changes, so it's sampled and shown as the set of
   distinct active areas, marked with the sampled footnote (a `*` on the row label, explained once
-  beside the timing footer; a `--full` scan carries no mark — absence reads as complete). The
+  at the report's foot; a `--full` scan carries no mark — absence reads as complete). The
   **trim-target set carries the same sampled footnote**: the L8 half is per-shot in real titles
   (corpus-verified: a BD original whose head shots carry only the 100-nit L8 while other scenes
   add 600), so a sampled union may be incomplete. An L8 trim's
