@@ -413,6 +413,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         content_light: track.content_light,
         bitrate,
         chunks,
+        sps_chunk: None,
         reassembled: None,
     })
 }

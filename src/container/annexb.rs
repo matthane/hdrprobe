@@ -35,6 +35,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     // No container timing box, so frame rate — like colour — comes only from the
     // SPS VUI, when the encoder signalled it.
     let mut fps = None;
+    let mut sps_offset = None;
     for n in &nals {
         if n.nal_type == nal::NAL_SPS {
             if let Some(sps) = parse_sps(&data[n.start..n.end]) {
@@ -47,12 +48,18 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
                     color = crate::container::color_from_vui(vui);
                 }
                 fps = sps.frame_rate;
+                sps_offset = Some(n.start as u64);
                 break;
             }
         }
     }
 
     let chunks = group_into_aus(&nals);
+    // The AU carrying that SPS is a RAP — the AU the per-GOP prefix SEIs ride.
+    // A stream cut mid-GOP starts with non-RAP AUs, so the sampler must be
+    // pointed at this one explicitly (see `Demux::sps_chunk`).
+    let sps_chunk = sps_offset
+        .and_then(|off| chunks.iter().position(|c| c.offset <= off && off < c.offset + c.size));
 
     Ok(Demux {
         container: "raw HEVC (Annex-B)",
@@ -75,6 +82,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         content_light: None,
         bitrate: None,
         chunks,
+        sps_chunk,
         reassembled: None,
     })
 }

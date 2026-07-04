@@ -93,6 +93,16 @@ pub struct Demux {
     /// usable duration.
     pub bitrate: Option<Bitrate>,
     pub chunks: Vec<Chunk>,
+    /// Index into `chunks` of the access unit whose SPS filled the metadata
+    /// fields — a random-access point. A TS capture (or a raw ES cut) often
+    /// starts mid-GOP: the leading AUs then precede the first IDR, and the
+    /// per-GOP prefix SEIs (HLG alt-transfer, ST.2086 mastering, CLL) ride
+    /// only RAP AUs, so the sampler must always include this chunk or those
+    /// SEIs are silently missed (the head run covers only pre-IDR AUs and the
+    /// even spread rarely lands on the few RAPs). `None` when no in-band SPS
+    /// was located or the container's chunk 0 is a sync sample by
+    /// construction (MP4/MKV).
+    pub sps_chunk: Option<usize>,
     /// Owned elementary-stream bytes for containers whose payload is not a
     /// contiguous byte range in the file (TS/M2TS reassembles scattered PES
     /// payloads). When `Some`, `chunks` index into this buffer instead of the

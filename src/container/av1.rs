@@ -245,6 +245,7 @@ fn build_demux(
         content_light: None,
         bitrate: None,
         chunks,
+        sps_chunk: None,
         reassembled: None,
     }
 }

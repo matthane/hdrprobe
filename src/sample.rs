@@ -38,7 +38,7 @@ pub fn scan(demux: &Demux, data: &[u8], opts: &Options) -> Scan {
         return Scan { dv: DvAggregate::default(), sei: SeiFindings::default() };
     }
 
-    let indices = select_indices(demux.chunks.len(), opts.samples, opts.full);
+    let indices = select_indices(demux.chunks.len(), opts.samples, opts.full, demux.sps_chunk);
 
     // Chunks index into the reassembled elementary stream when the container
     // provides one (TS/M2TS), else directly into the mmap.
@@ -127,12 +127,22 @@ fn extract_chunk(data: &[u8], chunk: Chunk, fmt: NalFormat, codec: &Codec) -> Ch
     ChunkScan { rpus, sei: sei_findings }
 }
 
-/// Choose access-unit indices to sample: a head run plus an even spread.
+/// Choose access-unit indices to sample: a head run plus an even spread, plus
+/// `must_include` (the demux's `sps_chunk`) when the container located one.
+/// That index is the first RAP access unit — the AU the per-GOP prefix SEIs
+/// (HLG alt-transfer, mastering, CLL) ride — and in a stream that starts
+/// mid-GOP (common for TS captures) neither the head run nor the sparse
+/// spread reliably lands on a RAP, so it is pinned explicitly.
 ///
 /// `pub(crate)` because `prefetch::warm_sample_chunks` calls it with the same
 /// inputs to warm exactly the chunks `scan` will fault on a network volume —
 /// selection must stay deterministic so the two never diverge.
-pub(crate) fn select_indices(n: usize, samples: usize, full: bool) -> Vec<usize> {
+pub(crate) fn select_indices(
+    n: usize,
+    samples: usize,
+    full: bool,
+    must_include: Option<usize>,
+) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
@@ -153,5 +163,31 @@ pub(crate) fn select_indices(n: usize, samples: usize, full: bool) -> Vec<usize>
         let pos = (k + 1) * (n - 1) / (remaining + 1);
         set.insert(pos);
     }
+    if let Some(m) = must_include {
+        if m < n {
+            set.insert(m);
+        }
+    }
     set.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_indices;
+
+    #[test]
+    fn select_indices_pins_the_sps_chunk() {
+        // A TS-like shape: many AUs, few samples, and the RAP at an index the
+        // head run and even spread both miss (the LG HLG demo's layout: first
+        // IDR ~25 AUs in, spread stride ~92).
+        let picked = select_indices(1101, 16, false, Some(25));
+        assert!(picked.contains(&25), "the SPS/RAP chunk must always be sampled");
+        // Without the pin the same inputs must miss it (guards against the
+        // spread accidentally covering it and the test asserting nothing).
+        assert!(!select_indices(1101, 16, false, None).contains(&25));
+        // Out-of-range pin (defensive; a demux bug) is ignored, not a panic.
+        assert!(select_indices(10, 4, false, Some(99)).iter().all(|&i| i < 10));
+        // Full / small-file paths already take every chunk.
+        assert!(select_indices(8, 16, false, Some(3)).contains(&3));
+    }
 }

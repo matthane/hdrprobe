@@ -277,7 +277,7 @@ pub fn warm_sample_chunks(
     }
     let mut ranges: Vec<(u64, usize)> = Vec::new();
     let mut total = 0usize;
-    for i in crate::sample::select_indices(demux.chunks.len(), samples, false) {
+    for i in crate::sample::select_indices(demux.chunks.len(), samples, false, demux.sps_chunk) {
         let c = demux.chunks[i];
         let len = (c.size as usize).min(CHUNK_WARM_RANGE_CAP);
         // Already streamed by the metadata head warm (MKV/AV1 head chunks).

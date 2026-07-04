@@ -157,7 +157,8 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
 
     let limits = if full { Limits::full() } else { Limits::sampled() };
     let (buf, chunks) = reassemble(data, layout, &video_pids, &limits);
-    let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_metadata(&buf, &chunks, &codec);
+    let (width, height, bit_depth, chroma, codec_profile, color, fps, sps_chunk) =
+        sps_metadata(&buf, &chunks, &codec);
 
     // Duration from the transport clock (head+tail PCR delta). Prefer the PMT's
     // declared PCR PID, falling back to the video PID(s) — most streams carry the
@@ -203,6 +204,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         content_light: None,
         bitrate,
         chunks,
+        sps_chunk,
         reassembled: Some(buf),
     })
 }
@@ -625,6 +627,9 @@ struct SpsCommon {
     profile: String,
     color: ColorInfo,
     frame_rate: Option<f64>,
+    /// Index of the chunk the SPS was found in — a RAP access unit, which is
+    /// where the per-GOP prefix SEIs ride (see `Demux::sps_chunk`).
+    chunk: usize,
 }
 
 /// Recover resolution / bit depth / chroma / colour / frame rate from the widest
@@ -636,7 +641,7 @@ fn sps_metadata(
     buf: &[u8],
     chunks: &[Chunk],
     codec: &Codec,
-) -> (u32, u32, Option<u8>, Option<String>, Option<String>, ColorInfo, Option<f64>) {
+) -> (u32, u32, Option<u8>, Option<String>, Option<String>, ColorInfo, Option<f64>, Option<usize>) {
     let best = match codec {
         Codec::Avc => best_avc_sps(buf, chunks),
         _ => best_hevc_sps(buf, chunks),
@@ -650,15 +655,16 @@ fn sps_metadata(
             Some(c.profile),
             c.color,
             c.frame_rate,
+            Some(c.chunk),
         ),
-        None => (0, 0, None, None, None, ColorInfo::default(), None),
+        None => (0, 0, None, None, None, ColorInfo::default(), None, None),
     }
 }
 
 fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
-    let mut best: Option<SpsInfo> = None;
+    let mut best: Option<(usize, SpsInfo)> = None;
     let mut nals: Vec<NalRef> = Vec::new();
-    for c in chunks {
+    for (ci, c) in chunks.iter().enumerate() {
         let s = c.offset as usize;
         let e = (c.offset + c.size) as usize;
         if e > buf.len() {
@@ -669,17 +675,17 @@ fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         for n in &nals {
             if n.nal_type == nal::NAL_SPS {
                 if let Some(sps) = parse_sps(&buf[s + n.start..s + n.end]) {
-                    if best.as_ref().is_none_or(|b| sps.width > b.width) {
-                        best = Some(sps);
+                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
+                        best = Some((ci, sps));
                     }
                 }
             }
         }
-        if best.as_ref().is_some_and(|b| b.width >= 3840) {
+        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
             break;
         }
     }
-    best.map(|sps| SpsCommon {
+    best.map(|(chunk, sps)| SpsCommon {
         width: sps.width,
         height: sps.height,
         bit_depth: sps.bit_depth,
@@ -687,13 +693,14 @@ fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         profile: sps.profile_label(),
         color: sps.color.as_ref().map(crate::container::color_from_vui).unwrap_or_default(),
         frame_rate: sps.frame_rate,
+        chunk,
     })
 }
 
 fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
-    let mut best: Option<crate::avc::sps::SpsInfo> = None;
+    let mut best: Option<(usize, crate::avc::sps::SpsInfo)> = None;
     let mut nals: Vec<avc_nal::NalRef> = Vec::new();
-    for c in chunks {
+    for (ci, c) in chunks.iter().enumerate() {
         let s = c.offset as usize;
         let e = (c.offset + c.size) as usize;
         if e > buf.len() {
@@ -704,17 +711,17 @@ fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         for n in &nals {
             if n.nal_type == avc_nal::NAL_SPS {
                 if let Some(sps) = crate::avc::sps::parse_sps(&buf[s + n.start..s + n.end]) {
-                    if best.as_ref().is_none_or(|b| sps.width > b.width) {
-                        best = Some(sps);
+                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
+                        best = Some((ci, sps));
                     }
                 }
             }
         }
-        if best.as_ref().is_some_and(|b| b.width >= 3840) {
+        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
             break;
         }
     }
-    best.map(|sps| SpsCommon {
+    best.map(|(chunk, sps)| SpsCommon {
         width: sps.width,
         height: sps.height,
         bit_depth: sps.bit_depth,
@@ -722,6 +729,7 @@ fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         profile: sps.profile_label(),
         color: sps.color.as_ref().map(crate::container::color_from_vui).unwrap_or_default(),
         frame_rate: sps.frame_rate,
+        chunk,
     })
 }
 
