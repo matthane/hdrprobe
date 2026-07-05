@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 127 unit tests
+cargo test                     # 128 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -128,7 +128,7 @@ never parse bytes native-endian.
   report schema and its golden shape test are untouched). One `Progress` per file, created in
   `main` and threaded through `container::demux` and `sample::scan`; two byte-denominated
   phases, `Index` (a demux-time walk past the head window — only the rare metadata rescues:
-  TS/raw-HEVC `sps_rescue`, raw OBU's no-sequence-header fallback) and `Scan` (the sampler:
+  TS `sps_rescue`, raw-HEVC `rescue_sps`, raw OBU's no-sequence-header fallback) and `Scan` (the sampler:
   per-batch in `scan_chunks`; by walk position on the TS, MKV, and raw fused streaming paths —
   all single-phase, so a normal `--full` run of any container is one `Scan` from 0 to 100).
 
