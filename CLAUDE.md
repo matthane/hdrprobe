@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 120 unit tests
+cargo test                     # 125 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -124,9 +124,10 @@ never parse bytes native-endian.
   `docs/SCHEMA.md`, "Progress events"; the event structs live here, *not* in `model.rs`, so the
   report schema and its golden shape test are untouched). One `Progress` per file, created in
   `main` and threaded through `container::demux` and `sample::scan`; two byte-denominated
-  phases, `Index` (a demux-time whole-file walk: raw HEVC/AV1 full splits, TS `sps_rescue`)
-  and `Scan` (the sampler: per-batch in `scan_chunks`; per-window via `EsStreamer::position` /
-  `BlockStreamer::position` on the TS and MKV streaming paths — those two are single-phase).
+  phases, `Index` (a demux-time walk past the head window — only the rare metadata rescues:
+  TS/raw-HEVC `sps_rescue`, raw OBU's no-sequence-header fallback) and `Scan` (the sampler:
+  per-batch in `scan_chunks`; by walk position on the TS, MKV, and raw fused streaming paths —
+  all single-phase, so a normal `--full` run of any container is one `Scan` from 0 to 100).
 
 ## Invariants that are easy to violate
 
@@ -279,9 +280,8 @@ never parse bytes native-endian.
 - **`--full` changes demux behaviour, not just sampling.** It threads into `container::demux(..,
   full)`: TS streams the whole video ES through the sampler in bounded `ts::STREAM_WINDOW_BYTES`
   windows — demux itself stays a head-window metadata pass, plus an SPS-rescue walk only when the
-  head held no SPS at all (vs the default's single head window of `ts::HEAD_SCAN_BYTES`), raw
-  HEVC scans every byte (vs a single head window of `annexb::HEAD_SCAN_BYTES`, 8 MiB, dropping the
-  boundary-cut trailing NAL), **MKV streams like TS** — demux keeps the default's bounded head
+  head held no SPS at all (vs the default's single head window of `ts::HEAD_SCAN_BYTES`),
+  **MKV streams like TS** — demux keeps the default's bounded head
   walk (`HEAD_SPAN_BYTES`) and exposes `Demux::mkv_stream` (`mkv::MkvFullStream`); `sample::scan`
   drives the resumable `mkv::BlockStreamer` cluster-by-cluster in `mkv::STREAM_SPAN_BYTES`
   windows, extracting each window's blocks as they are discovered, so index and scan are **one
@@ -289,9 +289,23 @@ never parse bytes native-endian.
   exhaustive cluster index; on a >RAM remux that made the scan pass re-transfer the file). The
   exact block byte/frame totals the old index computed come back on `sample::Scan::{es_bytes,
   frame_count}`, applied in main.rs (bitrate fills only when the statistics tags didn't;
-  fps count÷duration only when `DefaultDuration` didn't) — and **raw AV1** walks the whole
-  stream (vs a single head window of `av1::HEAD_SCAN_BYTES`, 8 MiB). Keep new backends
-  consistent — bounded by default, exhaustive under `--full`. A backend
+  fps count÷duration only when `DefaultDuration` didn't) — and **raw HEVC/AV1 fuse the same
+  way**: demux keeps its bounded head walk (`annexb::HEAD_SCAN_BYTES` / `av1::HEAD_SCAN_BYTES`,
+  8 MiB) on every path and sets `Demux::raw_stream` (`container::RawFullStream`);
+  `sample::scan_raw_full` drives the format's whole-stream walk (`annexb::walk_aus`,
+  `av1::walk_obu_tus`, `av1::walk_ivf_frames`), extracting each `AGG_BATCH` of completed AUs
+  right behind the walk front, so the file is read once at any size (the old shape split the
+  whole stream in demux and re-read every AU in the scan — two wire transfers on a >RAM remote
+  file). What the demux-time exhaustive walk used to compute comes back on the `Scan`: raw
+  AV1's exact frame count and duration (`Scan::{frame_count,duration_secs}`) and IVF's
+  whole-stream average fps (`Scan::fps`), applied in main.rs only where demux left the field
+  `None`. Two rescue walks remain demux-time, both rare: raw HEVC scans forward for an SPS only
+  when the head window held none (early-exits at the first parsable hit, resuming at the
+  boundary of the NAL the head window cut — mirroring TS's `sps_rescue`), and raw OBU falls
+  back to the old exhaustive demux walk only when the head held no sequence header (near-dead:
+  the sniffer requires a TD/SEQ first OBU, and OBU has no resync marker so a bounded mid-file
+  rescue can't exist). Keep new backends
+  consistent — bounded by default, fused single-pass under `--full`. A backend
   that bounds its `chunks` index must not derive fps/frame-count from `chunks.len()` in the bounded
   path. **The bounded default is always head-only, never a spread of mid-file windows**: every
   format reads a minimal head region to fill the fields, `[sampled]` tags flag what could vary
@@ -363,11 +377,11 @@ never parse bytes native-endian.
   linearly, instead of thousands of scattered fault round-trips. The bytes land in the OS page
   cache only (owned heap unchanged), the look-ahead is capped (`FRONTIER_AHEAD`, with exact
   known spans — an MKV cluster, a scan batch, a TS window — warmed whole since they're consumed
-  immediately), and the frontier is monotonic per file. MKV, TS/M2TS, and MP4 are single-pass
-  under `--full` (fused or moov-indexed), so one transfer covers them at any file size; only the
-  raw HEVC/AV1 elementary-stream paths still walk twice (index then scan) — on a >RAM raw file
-  the second pass degrades to scattered-but-parallel faults, the accepted limit there (raw ES
-  files of remux size aren't a real workload).
+  immediately), and the frontier is monotonic per file. Every container is single-pass under
+  `--full` (fused or moov-indexed) — MKV/TS stream in windows, MP4 scans its moov-indexed
+  chunks in file order, and raw HEVC/AV1 fuse their whole-stream walk with extraction in
+  `sample::scan_raw_full` — so one transfer covers any file size; the only whole-file demux
+  walks left are the rare metadata rescues (no SPS / no sequence header in the head window).
   Gating is `is_remote_strict`, not `is_remote`: the plain verdict errs remote off-Windows
   (fine for cheap bounded warms), the strict one errs local (Linux resolves
   `/proc/self/mounts`; unknown platforms decline) because a forced linear read of a local disk
@@ -428,10 +442,11 @@ never parse bytes native-endian.
   step); keep new tick sites on that pattern, and keep `Off` free — every default-path call
   runs through it. The JSON contract (SCHEMA.md "Progress events"): a `progress` event's
   percentages are monotonic per phase, the `Scan` phase always closes at 100% (an `Index` walk
-  may legitimately end short — never fake its 100%), and `done` is emitted only for a file that
-  produced a report. The hot `nal::split_annexb` stays tick-free: the no-op-closure
-  monomorphization of `split_annexb_impl` compiles the gate out; only
-  `split_annexb_ticked` (the raw-HEVC `--full` walk) pays for it.
+  may legitimately end short — never fake its 100%; `Index` now appears only for the rescue
+  walks, since every container's ordinary `--full` work is a single fused `Scan`), and `done`
+  is emitted only for a file that produced a report. The hot `nal::split_annexb` stays
+  tick-free: the no-op-closure monomorphization of `split_annexb_impl` compiles the gate out;
+  only `split_annexb_streamed` (the raw-HEVC `--full` fused walk) pays for it.
 
 ## Verifying changes
 

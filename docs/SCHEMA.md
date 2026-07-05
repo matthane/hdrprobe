@@ -118,9 +118,10 @@ second), and the `scan` phase always closes with a `percent: 100` line; an `inde
 end short of 100 when the walk legitimately stops early, so treat the next phase's opening
 line or the `done` event as the phase boundary, never a specific percentage. A `done` event
 follows when the file's report is complete; a file that fails produces no `done` event — its
-diagnostic line takes that place. Phases are sequential, and which ones appear depends on the
-container (MKV and TS/M2TS scan in a single pass, so they normally emit only `scan`; raw
-HEVC/AV1 streams index then scan). Percentages are monotonic within a phase. Events describe
+diagnostic line takes that place. Phases are sequential. Every container normally scans in a
+single fused pass and emits only `scan`; an `index` phase appears only for the rare demux-time
+rescue walks (a TS or raw HEVC stream whose head window held no SPS, a raw AV1 OBU stream
+whose head held no sequence header). Percentages are monotonic within a phase. Events describe
 pacing, not content: nothing in them appears in, or changes, the `Report`.
 
 ## Schema versioning
