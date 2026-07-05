@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 126 unit tests
+cargo test                     # 127 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -293,7 +293,10 @@ never parse bytes native-endian.
   strips the **1-byte** AVC header, clears emulation prevention (`bits::ebsp_to_rbsp`), and calls
   `DoviRpu::parse_rpu` (which locates the `0x19` prefix). Don't route AVC through
   `parse_unspec62_nalu` — that strips a **2-byte** HEVC header. **Codec authority:** MP4 from the
-  sample entry (`avc1`/`avc3`/`dva1`/`dvav` → `Codec::Avc`), TS from PMT `stream_type` (`0x1B` AVC vs
+  sample entry (`avc1`/`avc3`/`dva1`/`dvav` → `Codec::Avc`), MKV from the `V_MPEG4/ISO/AVC` CodecID
+  (CodecPrivate is an `avcC`; `parse_avcc_record`'s embedded SPS supplies depth/chroma/profile —
+  also what gives an SDR AVC MKV its 8-bit / Hi10P 10-bit report), TS from PMT `stream_type`
+  (`0x1B` AVC vs
   `0x24` HEVC), falling back to DV profile 9 ⇒ AVC only when no video `stream_type` is present (a
   bare DV/EL PID). P9 has no EL and an SDR base (CCID 2 ⇒ `SDR (fallback)` in `hdr::assemble`, the
   same branch Profile 4 uses); its Rec.709 VUI (`0,1,1,1,0`) collapses to a single `BT.709` label
