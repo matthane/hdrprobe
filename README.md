@@ -138,7 +138,22 @@ correctly. In practice this combination is rare.
 
 ## Install
 
-Requires a Rust toolchain (1.85 or newer):
+### Download a prebuilt binary (recommended)
+
+The simplest way to get hdrprobe is to download a ready-to-run binary from the
+[latest release](https://github.com/matthane/hdrprobe/releases/latest). Grab the archive for
+your platform, unpack it, and run the `hdrprobe` binary. Prebuilt binaries are provided for:
+
+- Windows (x86_64)
+- Linux (x86_64, and ARM64 with both a standard and a fully-static build for minimal systems)
+- macOS (Apple Silicon and Intel)
+
+The binary is self-contained with no runtime dependencies, so you can drop it anywhere on your
+`PATH` and run it. Each release lists a `SHA256SUMS` file if you want to verify your download.
+
+### Build from source
+
+If you would rather build it yourself, you need a Rust toolchain (1.85 or newer):
 
 ```sh
 cargo build --release
