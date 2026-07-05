@@ -23,6 +23,12 @@ const CENSUS_LEVELS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 254];
 pub struct DvAggregate {
     profile: Option<u8>,
     el_type: Option<DoviELType>,
+    /// The RPU header's `vdr_bit_depth` (the composer's reconstructed-signal
+    /// depth), from the first RPU whose header carried the sequence-info block.
+    /// Every parsed RPU passed libdovi's header validation (BL/EL exactly
+    /// 10-bit, vdr <= 14), so the value is bounded; whether it *renders* is
+    /// decided at finalize (FEL only).
+    vdr_bit_depth: Option<u8>,
     rpu_count: usize,
     cm_v40: bool,
     /// L254 dm_version_index (CM v4.0 sub-version), from the first RPU carrying it.
@@ -101,6 +107,13 @@ impl DvAggregate {
         self.profile.get_or_insert(rpu.dovi_profile);
         if self.el_type.is_none() {
             self.el_type = rpu.el_type.clone();
+        }
+        // Header bit depths are only parsed when the sequence-info block is
+        // present (always, for an RPU libdovi accepted — validation requires
+        // the depths it carries); the gate keeps a defaulted 0 from reading
+        // as 8-bit if that ever changes.
+        if self.vdr_bit_depth.is_none() && rpu.header.vdr_seq_info_present_flag {
+            self.vdr_bit_depth = Some(8 + rpu.header.vdr_bit_depth_minus8 as u8);
         }
 
         let Some(dm) = &rpu.vdr_dm_data else { return };
@@ -228,6 +241,17 @@ impl DvAggregate {
             DoviELType::MEL => "MEL".to_string(),
         });
 
+        // Reconstructed bit depth: the header's signaled vdr_bit_depth, shown
+        // only when a FEL residual exists to actually reconstruct beyond the
+        // 10-bit base (P7 signals 12, P4 signals 14 — reported verbatim, never
+        // assumed from the profile). MEL and single-layer RPUs signal 12 too,
+        // but that is composer precision with no residual data behind it, so
+        // it stays off the report rather than misreading as content depth.
+        let reconstructed_bit_depth = match self.el_type {
+            Some(DoviELType::FEL) => self.vdr_bit_depth,
+            _ => None,
+        };
+
         // Compat id from the container dvcC/dvvC, else a DV XML's declared profile.
         // When neither carries it, the label's minor digit is a convention default
         // (P8 -> .1, P7 -> .6, P4 -> .2). That's only flagged as assumed for a
@@ -327,6 +351,7 @@ impl DvAggregate {
             el_present: el,
             rpu_present: rpu,
             el_type,
+            reconstructed_bit_depth,
             bl_compatibility_id: compat_id,
             compatibility,
             cm_version,
@@ -365,6 +390,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         el_present: cfg.el_present,
         rpu_present: cfg.rpu_present,
         el_type: None,
+        reconstructed_bit_depth: None,
         bl_compatibility_id: cfg.bl_compatibility_id,
         compatibility: cfg.bl_compatibility_id.and_then(compat_str),
         cm_version: None,
@@ -683,6 +709,43 @@ mod tests {
         for unmapped in [20, 22, 23] {
             assert_eq!(resolve_l8_nits(unmapped, &none), None);
         }
+    }
+
+    #[test]
+    fn reconstructed_bit_depth_is_signaled_and_fel_gated() {
+        // DoviRpu has private fields, so it can't be built by struct literal
+        // here; default-then-mutate the public ones the aggregate reads.
+        let rpu = |el_type: Option<DoviELType>, seq_info: bool, vdr_minus8: u64| {
+            let mut r = DoviRpu::default();
+            r.dovi_profile = 7;
+            r.el_type = el_type;
+            r.header.vdr_seq_info_present_flag = seq_info;
+            r.header.vdr_bit_depth_minus8 = vdr_minus8;
+            r
+        };
+        let finalize = |r: DoviRpu| {
+            let mut agg = DvAggregate::default();
+            agg.add(&r);
+            agg.finalize(3840, 2160, None, false, false, false).unwrap()
+        };
+
+        // A P7 FEL reports the header's signaled 12-bit VDR depth.
+        let dv = finalize(rpu(Some(DoviELType::FEL), true, 4));
+        assert_eq!(dv.reconstructed_bit_depth, Some(12));
+        // A P4 FEL signals 14-bit (corpus-verified); reported verbatim, never
+        // assumed to be 12 from "FEL".
+        let dv = finalize(rpu(Some(DoviELType::FEL), true, 6));
+        assert_eq!(dv.reconstructed_bit_depth, Some(14));
+        // MEL signals a vdr depth too, but its residual is empty — composer
+        // precision, not content depth — so the field stays absent.
+        let dv = finalize(rpu(Some(DoviELType::MEL), true, 4));
+        assert_eq!(dv.reconstructed_bit_depth, None);
+        // Single-layer (no EL type): absent.
+        let dv = finalize(rpu(None, true, 4));
+        assert_eq!(dv.reconstructed_bit_depth, None);
+        // No sequence-info block: the defaulted 0 must not read as "8-bit".
+        let dv = finalize(rpu(Some(DoviELType::FEL), false, 0));
+        assert_eq!(dv.reconstructed_bit_depth, None);
     }
 
     #[test]

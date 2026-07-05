@@ -16,7 +16,7 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "1.0";
+pub const SCHEMA_VERSION: &str = "1.1";
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -189,6 +189,17 @@ pub struct DolbyVision {
     pub rpu_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub el_type: Option<String>,
+    /// The composer's reconstructed signal bit depth, read verbatim from the
+    /// RPU header's `vdr_bit_depth` field (never derived from the profile:
+    /// Profile 7 signals 12, but Profile 4 signals 14). Present only for FEL
+    /// streams — the one case where a real residual reconstructs beyond the
+    /// 10-bit base layer (BL and EL depths are libdovi-validated to 10-bit on
+    /// every parsed RPU). MEL and single-layer RPUs *signal* a 12-bit value
+    /// too, but with no (or an empty) residual it describes composer
+    /// arithmetic precision, not content depth, so it is withheld there
+    /// rather than misread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconstructed_bit_depth: Option<u8>,
     /// BL compatibility id from dvcC/dvvC (0,1,2,4,...).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bl_compatibility_id: Option<u8>,
@@ -371,6 +382,7 @@ mod tests {
                 el_present: true,
                 rpu_present: true,
                 el_type: Some("FEL".to_string()),
+                reconstructed_bit_depth: Some(12),
                 bl_compatibility_id: Some(6),
                 compatibility: Some("HDR10-compatible".to_string()),
                 cm_version: Some("CM v4.0".to_string()),
@@ -490,6 +502,7 @@ mod tests {
             "dolby_vision.el_present",
             "dolby_vision.rpu_present",
             "dolby_vision.el_type",
+            "dolby_vision.reconstructed_bit_depth",
             "dolby_vision.bl_compatibility_id",
             "dolby_vision.compatibility",
             "dolby_vision.cm_version",
@@ -534,9 +547,9 @@ mod tests {
 
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "1.0");
+        assert_eq!(SCHEMA_VERSION, "1.1");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "1.0");
+        assert_eq!(v["hdrprobe_schema_version"], "1.1");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
         assert_eq!(v["hdr10plus"]["profile"], "B");

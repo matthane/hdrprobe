@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 1.0** (as of hdrprobe 0.1.0)
+**Schema version: 1.1**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -158,6 +158,11 @@ against every minor bump by construction.
 The version is enforced in the codebase: a unit test in `src/model.rs` pins the full set of
 serialized field paths and the version string, so any change to the output shape fails the
 build until the schema version, that test, and this document are updated together.
+
+Version history:
+
+- **1.1**: added `dolby_vision.reconstructed_bit_depth` (additive).
+- **1.0**: initial schema, as shipped in hdrprobe 0.1.0.
 
 ## Conventions
 
@@ -323,6 +328,7 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 | `el_present` | boolean | always | Enhancement layer present |
 | `rpu_present` | boolean | always | RPU substream present |
 | `el_type` | string | optional | `"FEL"` or `"MEL"`; absent for single-layer profiles and under `--no-rpu` (the kind is read from the RPU) |
+| `reconstructed_bit_depth` | integer | optional | The composer's reconstructed signal bit depth, read verbatim from the RPU header's `vdr_bit_depth` field: `12` for Profile 7 FEL, `14` for Profile 4 FEL (never assumed from the profile). Present only when `el_type` is `"FEL"`, the one case where a real residual reconstructs beyond the 10-bit base layer; MEL and single-layer RPUs signal a value too, but it describes composer arithmetic precision rather than content depth, so it is withheld. Absent under `--no-rpu` |
 | `bl_compatibility_id` | integer | optional | Raw `dv_bl_signal_compatibility_id` (0, 1, 2, 4, ...) from the container or a DV XML's declared profile; absent when neither carries it |
 | `compatibility` | string | optional | Human name for the id above: `"no cross-compatibility"`, `"HDR10-compatible"`, `"SDR-compatible"`, `"HLG-compatible"`. Absent for ids outside that set |
 | `cm_version` | string | optional | Content-mapping version from L254: `"CM v4.0"` or `"CM v2.9"`. Absent under `--no-rpu` |
@@ -437,8 +443,9 @@ the file is read).
 
 **`--no-rpu`.** The DV section is built from the container configuration alone: `profile`,
 `structure`, `level`, the presence booleans, `bl_compatibility_id`, and `compatibility` can
-appear; everything RPU-derived (`el_type`, `cm_version`, L5/L6/L9/L11 fields,
-`mastering_display`, `trim_targets`, `census`) is absent, and `rpu_count` is `0`.
+appear; everything RPU-derived (`el_type`, `reconstructed_bit_depth`, `cm_version`,
+L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `census`) is absent, and
+`rpu_count` is `0`.
 
 **`--samples <N>`.** Changes only how many seek points feed the sampled sets; it never changes
 the schema.

@@ -206,6 +206,17 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 let ver = cm.strip_prefix("CM ").unwrap_or(cm);
                 kv(&mut s, &c, "Content mapping", ver);
             }
+
+            // The reconstructed ("VDR") signal depth from the RPU header —
+            // model-gated to FEL, the one case where a real residual composes
+            // beyond the base layer: 12-bit on Profile 7, 14 on Profile 4. The
+            // "10-bit BL" half is a fact of every parsed RPU (libdovi validates
+            // the header's BL/EL depths to exactly 10), not a guess. Rendered
+            // for FEL sidecars too: unlike the profile, these are values the
+            // metadata itself carries.
+            if let Some(bits) = dv.reconstructed_bit_depth {
+                kv(&mut s, &c, "Reconstruction", &format!("{bits}-bit (10-bit BL + FEL residual)"));
+            }
             // The DV grade's mastering display comes from the DM data header
             // (source_min/max_pq), not a metadata level — so it renders with the
             // header-derived lines above, ahead of the L2..L11 level lines. The
