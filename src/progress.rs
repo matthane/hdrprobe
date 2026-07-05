@@ -84,7 +84,7 @@ pub struct Progress {
     mode: Mode,
     /// Full display path, for JSON events (matches the report's `file`).
     file: String,
-    /// Bare file name, truncated for the bar.
+    /// Bare file name, shown whole on the header line.
     name: String,
     file_index: usize,
     file_count: usize,
@@ -393,11 +393,10 @@ fn percent(done: u64, total: u64) -> f64 {
 
 /// Bar glyph cells.
 const BAR_CELLS: usize = 32;
-/// Longest file name shown on the header line before truncation.
-const HEADER_NAME_MAX: usize = 60;
 
 /// Render the per-file header line printed once above the first phase's bar:
-/// `Scanning: movie.m2ts  [2/7]` (`[k/N]` only for multi-file runs). Never
+/// `Scanning: movie.m2ts  [2/7]` (`[k/N]` only for multi-file runs). The name
+/// is printed whole — a long title wraps rather than losing its tail. Never
 /// `\r`-rewritten, so no display width is tracked for it.
 fn format_header(
     name: &str,
@@ -418,7 +417,7 @@ fn format_header(
     let mut line = String::new();
     line.push_str(&paint(label, "Scanning:"));
     line.push(' ');
-    line.push_str(&paint(bright, &truncate_name(name, HEADER_NAME_MAX)));
+    line.push_str(&paint(bright, name));
     if file_count > 1 {
         line.push_str("  ");
         line.push_str(&paint(faint, &format!("[{file_index}/{file_count}]")));
@@ -493,16 +492,6 @@ fn format_line(
     (line, width)
 }
 
-/// Keep a file name within `max` display characters, marking the cut with an
-/// ellipsis.
-fn truncate_name(name: &str, max: usize) -> String {
-    if name.chars().count() <= max {
-        return name.to_string();
-    }
-    let head: String = name.chars().take(max.saturating_sub(1)).collect();
-    format!("{head}…")
-}
-
 /// `m:ss`, or `h:mm:ss` from an hour up.
 fn format_eta(secs: u64) -> String {
     if secs >= 3600 {
@@ -541,19 +530,13 @@ mod tests {
     }
 
     #[test]
-    fn names_truncate_with_an_ellipsis() {
-        assert_eq!(truncate_name("movie.m2ts", 24), "movie.m2ts");
-        let long = "a_very_long_remux_file_name_indeed.m2ts";
-        let cut = truncate_name(long, 24);
-        assert_eq!(cut.chars().count(), 24);
-        assert!(cut.ends_with('…'));
-    }
-
-    #[test]
     fn header_line_plain_golden() {
-        // Single file: no [k/N]; multi-file runs carry the counter.
+        // Single file: no [k/N]; multi-file runs carry the counter. The name
+        // is never truncated, however long.
         assert_eq!(format_header("movie.m2ts", 1, 1, None), "Scanning: movie.m2ts");
         assert_eq!(format_header("movie.mkv", 2, 7, None), "Scanning: movie.mkv  [2/7]");
+        let long = "Indiana Jones and the Raiders of the Lost Ark (1981) - 4K.m2ts";
+        assert_eq!(format_header(long, 1, 1, None), format!("Scanning: {long}"));
     }
 
     #[test]
