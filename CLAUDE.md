@@ -1,6 +1,6 @@
 # CLAUDE.md — working notes for hdrprobe
 
-Fast HDR / Dolby Vision metadata inspector: one native Rust binary that memory-maps a video
+Fast HDR / HDR10+ / Dolby Vision metadata inspector: one native Rust binary that memory-maps a video
 file, demuxes without decoding, samples RPUs, and prints a sectioned report in well under 2s.
 It also parses metadata **sidecar** files (raw DV RPU, DV CM XML, HDR10+ JSON) into the same
 report. This file plus the module-level doc comments are the design reference — read the

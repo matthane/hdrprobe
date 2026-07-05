@@ -29,7 +29,7 @@ use crate::model::{General, Hdr10Plus, Report};
 use crate::render::{RenderOpts, Theme};
 
 #[derive(Parser, Debug)]
-#[command(name = "hdrprobe", version, about = "Fast HDR / Dolby Vision metadata inspector")]
+#[command(name = "hdrprobe", version, about = "Fast HDR / HDR10+ / Dolby Vision metadata inspector")]
 struct Cli {
     /// Input file(s) or directory(ies).
     #[arg(required_unless_present_any = ["install_shell", "uninstall_shell"])]
