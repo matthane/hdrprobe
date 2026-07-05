@@ -310,9 +310,18 @@ pub(crate) fn parse_hvcc_record(rec: &[u8]) -> Option<HvccInfo> {
     let profile_idc = rec[1] & 0x1F;
     let tier_high = (rec[1] >> 5) & 1 == 1;
     let level_idc = rec[12];
-    let chroma_idc = rec[16] & 0x03;
-    let bit_depth = (rec[17] & 0x07) + 8;
+    let mut chroma_idc = rec[16] & 0x03;
+    let mut bit_depth = (rec[17] & 0x07) + 8;
     let nal_len = (rec[21] & 0x03) + 1;
+    // The record's chroma/depth bytes are a summary some muxers zero out even
+    // on a Main-10 stream (seen in the wild: a 10-bit MP4 whose hvcC declared
+    // 8-bit luma). The embedded SPS is the bitstream's own word — prefer it
+    // when it parses, keeping the summary bytes as the fallback.
+    if let Some(sps) = crate::hevc::sps::find_sps_in_hvcc(rec).and_then(crate::hevc::sps::parse_sps)
+    {
+        bit_depth = sps.bit_depth;
+        chroma_idc = sps.chroma_format_idc;
+    }
     let chroma = match chroma_idc {
         0 => "monochrome",
         1 => "4:2:0",
@@ -476,6 +485,35 @@ mod tests {
     #[test]
     fn cicp_matrix_names_dolby_ipt() {
         assert_eq!(cicp_matrix(15), Some("IPT-PQ-c2"));
+    }
+
+    #[test]
+    fn parse_hvcc_prefers_the_embedded_sps_depth() {
+        // A real `hvcC` from a 10-bit Main-10 MP4 whose muxer zeroed the
+        // record's summary depth bytes (byte 17 declares 8-bit luma). The
+        // embedded SPS says 10-bit — the bitstream's own word must win, or the
+        // Video line under-reports the depth (MediaInfo agrees on 10).
+        let hvcc = [
+            0x01, 0x02, 0x20, 0x00, 0x00, 0x00, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xf0,
+            0x00, 0xfc, 0xfd, 0xf8, 0xf8, 0x00, 0x00, 0x03, 0x03, 0xa0, 0x00, 0x01, 0x00, 0x23,
+            0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00,
+            0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0x11, 0x40, 0xc0, 0x00, 0x00, 0xfa, 0x40,
+            0x00, 0x3a, 0x98, 0x20, 0x0f, 0xa6, 0x80, 0xa1, 0x00, 0x01, 0x00, 0x36, 0x42, 0x01,
+            0x01, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+            0x00, 0x78, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x13, 0x65, 0x11, 0x64, 0x91, 0x4a, 0xf0,
+            0x10, 0x50, 0x00, 0x00, 0x3e, 0x90, 0x00, 0x0e, 0xa6, 0x08, 0x03, 0xe9, 0xc0, 0x2b,
+            0xdc, 0xfc, 0x00, 0x0b, 0x71, 0xa0, 0x00, 0x2d, 0xc6, 0xe4, 0xa2, 0x00, 0x01, 0x00,
+            0x07, 0x44, 0x01, 0xc0, 0xac, 0xbe, 0x0e, 0xc9,
+        ];
+        let h = parse_hvcc_record(&hvcc).expect("valid hvcC");
+        assert_eq!(h.bit_depth, 10);
+        assert_eq!(h.chroma, "4:2:0");
+        assert_eq!(h.profile_str, "Main 10, Main tier @ L4");
+
+        // With the SPS arrays cut off, the summary bytes are the fallback.
+        let head_only = &hvcc[..23];
+        let h = parse_hvcc_record(head_only).expect("head-only hvcC");
+        assert_eq!(h.bit_depth, 8);
     }
 
     #[test]
