@@ -125,6 +125,28 @@ pub struct Demux {
     /// metadata window). Every other backend, and the MKV default path, leaves
     /// it `None`.
     pub mkv_stream: Option<mkv::MkvFullStream>,
+    /// Raw elementary streams (Annex-B HEVC, AV1 OBU/IVF) under `--full` only:
+    /// demux keeps its bounded head walk for metadata and `sample::scan` walks
+    /// the whole stream itself, splitting and extracting in one fused pass —
+    /// the mirror of `ts_stream`/`mkv_stream`, so the file is read once at any
+    /// size instead of an index pass plus a scan pass. When `Some`, the
+    /// sampler ignores `chunks` (the head metadata window). Every other
+    /// backend, and the raw default paths, leave it `None`.
+    pub raw_stream: Option<RawFullStream>,
+}
+
+/// Which raw-stream walk `sample::scan` must drive under `--full`. The walkers
+/// themselves live with their formats (`annexb::walk_aus`, `av1::walk_obu_tus`,
+/// `av1::walk_ivf_frames`); this only carries what demux already parsed and the
+/// walk cannot cheaply rediscover.
+#[derive(Debug, Clone, Copy)]
+pub enum RawFullStream {
+    HevcAnnexB,
+    Av1Obu,
+    /// `data_start` is the first frame header's offset (past the IVF file
+    /// header); `ticks_per_sec` is the header's rate/scale time base, needed to
+    /// turn the walk's timestamp span into the stream's true average fps.
+    Av1Ivf { data_start: usize, ticks_per_sec: f64 },
 }
 
 /// Detect the container type and demux it. `full` requests an exhaustive scan

@@ -10,7 +10,7 @@ use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use rayon::prelude::*;
 
 use crate::avc::nal as avc_nal;
-use crate::container::{ts, Chunk, Codec, Demux, NalFormat};
+use crate::container::{annexb, av1, ts, Chunk, Codec, Demux, NalFormat, RawFullStream};
 use crate::dv::levels::DvAggregate;
 use crate::dv::rpu::{parse_avc_rpu, parse_hevc_rpu};
 use crate::hdr::sei::{self, SeiFindings};
@@ -35,10 +35,20 @@ pub struct Scan {
     /// streaming walk fills it too (exact summed block bytes — what the old
     /// exhaustive index summed in `mkv::demux`).
     pub es_bytes: Option<u64>,
-    /// Exact video-block count of a `--full` MKV streaming walk, `None`
-    /// elsewhere: feeds the fps fallback (count ÷ duration) the demux computed
-    /// from its own complete index before the walk moved here.
+    /// Exact video-block count of a `--full` MKV streaming walk (feeds the fps
+    /// fallback, count ÷ duration, the demux computed from its own complete
+    /// index before the walk moved here) and of the `--full` raw AV1 fused
+    /// walks (temporal-delimiter / IVF frame count). `None` elsewhere.
     pub frame_count: Option<u64>,
+    /// Whole-stream average fps measured by the `--full` raw IVF fused walk —
+    /// the value the demux-time exhaustive walk used to compute before that
+    /// walk moved here. `None` on every other path (raw OBU's rate comes from
+    /// the sequence header, already on `Demux::fps`).
+    pub fps: Option<f64>,
+    /// Duration (frame count ÷ fps) recovered by the `--full` raw AV1 fused
+    /// walks — raw AV1 has no duration box, so it exists only once the whole
+    /// stream has been walked. `None` on every other path.
+    pub duration_secs: Option<f64>,
 }
 
 /// RPUs plus SEI findings from a single access unit.
@@ -84,8 +94,24 @@ pub fn scan(
         return scan_mkv_full(data, plan, demux, opts, progress, frontier);
     }
 
+    // Raw elementary streams `--full`: demux kept only its bounded head walk;
+    // split the whole stream here, extracting completed access units batch by
+    // batch as they are discovered (index and scan fused — one pass over the
+    // file, like MKV/TS above). Also before the `no_rpu` early return: the raw
+    // AV1 walk's frame count feeds the exact duration either way.
+    if let Some(plan) = demux.raw_stream.as_ref() {
+        return scan_raw_full(data, plan, demux, opts, progress, frontier);
+    }
+
     if opts.no_rpu || demux.chunks.is_empty() {
-        return Scan { dv: DvAggregate::default(), sei: SeiFindings::default(), es_bytes: None, frame_count: None };
+        return Scan {
+            dv: DvAggregate::default(),
+            sei: SeiFindings::default(),
+            es_bytes: None,
+            frame_count: None,
+            fps: None,
+            duration_secs: None,
+        };
     }
 
     let indices = select_indices(demux.chunks.len(), opts.samples, opts.full, demux.sps_chunk);
@@ -103,7 +129,7 @@ pub fn scan(
     let mut sei = SeiFindings::default();
     scan_chunks(source, &selected, demux.nal_format, &demux.codec, &mut dv, &mut sei, progress, frontier);
 
-    Scan { dv, sei, es_bytes: None, frame_count: None }
+    Scan { dv, sei, es_bytes: None, frame_count: None, fps: None, duration_secs: None }
 }
 
 /// Extract RPUs + SEI from `chunks` in parallel batches, aggregating each
@@ -199,7 +225,14 @@ fn scan_ts_full(
         if !more {
             // The cursor stops short of EOF by a partial packet; pin 100%.
             progress.update(data.len() as u64);
-            return Scan { dv, sei, es_bytes: Some(es_bytes), frame_count: None };
+            return Scan {
+                dv,
+                sei,
+                es_bytes: Some(es_bytes),
+                frame_count: None,
+                fps: None,
+                duration_secs: None,
+            };
         }
         progress.update(st.position() as u64);
     }
@@ -250,10 +283,108 @@ fn scan_mkv_full(
         }
         if !more {
             progress.update(data.len() as u64);
-            return Scan { dv, sei, es_bytes: Some(es_bytes), frame_count: Some(frame_count) };
+            return Scan {
+                dv,
+                sei,
+                es_bytes: Some(es_bytes),
+                frame_count: Some(frame_count),
+                fps: None,
+                duration_secs: None,
+            };
         }
         progress.update(st.position() as u64);
     }
+}
+
+/// `--full` raw elementary streams (Annex-B HEVC, AV1 OBU/IVF): drive the
+/// format's whole-stream walk here, batching completed access units into the
+/// ordinary `scan_chunks` machinery as they are discovered — the old
+/// demux-time index pass and the scan pass fused, so the file is read once,
+/// in order, at any size (the two-pass shape crossed the wire twice on a
+/// remote file larger than RAM). Chunks are absolute mmap ranges, the walk's
+/// byte position drives the single `Scan` phase and the remote-read frontier.
+/// Under `--no-rpu` the walk still runs count-only — the AV1 frame count is
+/// what the exact duration is computed from — with extraction skipped.
+fn scan_raw_full(
+    data: &[u8],
+    plan: &RawFullStream,
+    demux: &Demux,
+    opts: &Options,
+    progress: &Progress,
+    frontier: &Frontier,
+) -> Scan {
+    progress.begin(Phase::Scan, data.len() as u64);
+    let mut dv = DvAggregate::default();
+    let mut sei = SeiFindings::default();
+    let mut pending: Vec<Chunk> = Vec::with_capacity(AGG_BATCH);
+
+    // One tick site for all three walks: the walk position is monotonic and
+    // covers every byte, so it is the honest bar denominator.
+    let tick = |pos: usize| {
+        frontier.ensure(pos as u64);
+        progress.update(pos as u64);
+    };
+    // Extraction at every `AGG_BATCH` completed AUs, right behind the walk
+    // front while those pages are still resident — peak liveness stays one
+    // batch of parsed RPUs, exactly like `scan_chunks` over an indexed file.
+    macro_rules! push_au {
+        () => {
+            |c: Chunk| {
+                pending.push(c);
+                if pending.len() >= AGG_BATCH {
+                    flush_raw_batch(data, &mut pending, demux, opts.no_rpu, &mut dv, &mut sei, frontier);
+                }
+            }
+        };
+    }
+
+    let (frame_count, fps) = match plan {
+        RawFullStream::HevcAnnexB => {
+            annexb::walk_aus(data, tick, push_au!());
+            // A raw HEVC stream has no duration source (VUI timing gives a
+            // rate, not a length), so nothing beyond the extraction comes
+            // back from the walk.
+            (None, None)
+        }
+        RawFullStream::Av1Obu => {
+            let count = av1::walk_obu_tus(data, tick, push_au!());
+            (count, None)
+        }
+        RawFullStream::Av1Ivf { data_start, ticks_per_sec } => {
+            let walk = av1::walk_ivf_frames(data, *data_start, data.len(), tick, push_au!());
+            let fps = av1::ivf_fps(walk.frames, walk.span, *ticks_per_sec);
+            ((walk.frames > 0).then_some(walk.frames as u64), fps)
+        }
+    };
+    flush_raw_batch(data, &mut pending, demux, opts.no_rpu, &mut dv, &mut sei, frontier);
+    progress.update(data.len() as u64);
+
+    // Raw AV1's duration is frames ÷ fps — the same product the old demux-time
+    // exhaustive walk fed `build_demux`, now known only after this walk. The
+    // rate is the walk's own measurement (IVF) or the sequence header's
+    // constant rate already on the demux (OBU); raw HEVC stays duration-less.
+    let duration_secs = match (frame_count, fps.or(demux.fps)) {
+        (Some(n), Some(f)) if f > 0.0 => Some(n as f64 / f),
+        _ => None,
+    };
+    Scan { dv, sei, es_bytes: None, frame_count, fps, duration_secs }
+}
+
+/// Extract one accumulated batch of the raw fused walk's access units (unless
+/// `--no-rpu` skips extraction), then clear it for the next batch.
+fn flush_raw_batch(
+    data: &[u8],
+    pending: &mut Vec<Chunk>,
+    demux: &Demux,
+    no_rpu: bool,
+    dv: &mut DvAggregate,
+    sei: &mut SeiFindings,
+    frontier: &Frontier,
+) {
+    if !no_rpu && !pending.is_empty() {
+        scan_chunks(data, pending, demux.nal_format, &demux.codec, dv, sei, &Progress::off(), frontier);
+    }
+    pending.clear();
 }
 
 /// RPUs + SEI findings from a single access unit's NAL stream.
@@ -408,6 +539,7 @@ mod tests {
             reassembled: Some(Vec::new()),
             ts_stream: Some(ts::TsFullStream::new(layout, vec![0x100, 0x200])),
             mkv_stream: None,
+            raw_stream: None,
         };
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
@@ -505,6 +637,7 @@ mod tests {
                 data.len(),
                 1,
             )),
+            raw_stream: None,
         };
         let total = (cll.len() + filler.len()) as u64;
 
@@ -521,6 +654,125 @@ mod tests {
         assert_eq!(s.es_bytes, Some(total));
         assert_eq!(s.frame_count, Some(2));
         assert!(s.sei.content_light.is_none());
+    }
+
+    /// A minimal `Demux` for the raw fused-walk tests: chunks empty (the plan
+    /// walks), everything else inert.
+    fn raw_demux(codec: Codec, fps: Option<f64>, plan: RawFullStream) -> Demux {
+        let nal_format = match codec {
+            Codec::Hevc => NalFormat::AnnexB,
+            _ => NalFormat::LengthPrefixed(0),
+        };
+        Demux {
+            container: "raw",
+            codec,
+            nal_format,
+            width: 0,
+            height: 0,
+            fps,
+            duration_secs: None,
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+            stereo: None,
+            color: ColorInfo::default(),
+            dv_config: None,
+            dv_dual_track: false,
+            mastering: None,
+            content_light: None,
+            bitrate: None,
+            chunks: Vec::new(),
+            sps_chunk: None,
+            reassembled: None,
+            ts_stream: None,
+            mkv_stream: None,
+            raw_stream: Some(plan),
+        }
+    }
+
+    #[test]
+    fn raw_hevc_full_scan_fuses_walk_and_extraction() {
+        // Three AUs: [prefix SEI (CLL) + VCL], [VCL], [VCL] — the fused walk
+        // must extract from the AUs it discovers, with no demux index at all.
+        let cll = sei_cll_nal(777, 88);
+        let vcl = vec![0x00, 0x00, 0x01, 0x02, 0x01, 0x00];
+        let mut data = cll.clone();
+        for _ in 0..3 {
+            data.extend_from_slice(&vcl);
+        }
+        let demux = raw_demux(Codec::Hevc, None, RawFullStream::HevcAnnexB);
+
+        let opts = Options { samples: 16, full: true, no_rpu: false };
+        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        let cl = s.sei.content_light.expect("CLL from the fused walk");
+        assert_eq!((cl.max_cll, cl.max_fall), (777, 88));
+        // Raw HEVC has no duration source; nothing else comes back.
+        assert_eq!(s.es_bytes, None);
+        assert_eq!(s.frame_count, None);
+        assert_eq!(s.duration_secs, None);
+
+        // --no-rpu: the walk is count-only, extraction skipped.
+        let opts = Options { samples: 16, full: true, no_rpu: true };
+        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        assert!(s.sei.content_light.is_none());
+    }
+
+    #[test]
+    fn raw_obu_full_scan_counts_frames_and_derives_duration() {
+        // TD, [CLL metadata OBU], TD, TD → three temporal units. Frame count
+        // and duration (count ÷ the sequence header's rate, here 24 fps on the
+        // demux) must come back with or without extraction.
+        let td = [0x12u8, 0x00];
+        let mut data = td.to_vec();
+        data.extend_from_slice(&[0x2A, 0x05, 0x01, 0x03, 0xE8, 0x01, 0x90]); // CLL 1000/400
+        data.extend_from_slice(&td);
+        data.extend_from_slice(&td);
+        let demux = raw_demux(Codec::Av1, Some(24.0), RawFullStream::Av1Obu);
+
+        let opts = Options { samples: 16, full: true, no_rpu: false };
+        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        assert_eq!(s.frame_count, Some(3));
+        assert_eq!(s.duration_secs, Some(3.0 / 24.0));
+        assert_eq!(s.fps, None, "OBU rate is the sequence header's, not the walk's");
+        let cl = s.sei.content_light.expect("CLL from the fused walk");
+        assert_eq!((cl.max_cll, cl.max_fall), (1000, 400));
+
+        let opts = Options { samples: 16, full: true, no_rpu: true };
+        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        assert_eq!(s.frame_count, Some(3), "--no-rpu still walks for the totals");
+        assert_eq!(s.duration_secs, Some(3.0 / 24.0));
+        assert!(s.sei.content_light.is_none());
+    }
+
+    #[test]
+    fn raw_ivf_full_scan_measures_fps_and_duration() {
+        // Minimal IVF, 24 ticks/sec, three frames at ts 0,1,2: demuxed under
+        // `--full` the head walk defers fps/duration to the fused scan, which
+        // must measure 24 fps and 0.125 s — what the old demux-time exhaustive
+        // walk produced.
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(b"DKIF");
+        data[6..8].copy_from_slice(&32u16.to_le_bytes());
+        data[16..20].copy_from_slice(&24u32.to_le_bytes());
+        data[20..24].copy_from_slice(&1u32.to_le_bytes());
+        data[24..28].copy_from_slice(&3u32.to_le_bytes());
+        for ts in 0u64..3 {
+            data.extend_from_slice(&2u32.to_le_bytes());
+            data.extend_from_slice(&ts.to_le_bytes());
+            data.extend_from_slice(&[0x12, 0x00]); // one TD OBU per frame
+        }
+
+        let demux = crate::container::av1::demux(&data, true, &Progress::off(), &Frontier::off())
+            .expect("valid IVF");
+        assert_eq!(demux.fps, None, "under --full the fused scan owns the rate");
+        assert_eq!(demux.duration_secs, None);
+        assert!(demux.raw_stream.is_some());
+
+        let opts = Options { samples: 16, full: true, no_rpu: false };
+        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        assert_eq!(s.frame_count, Some(3));
+        assert_eq!(s.fps, Some(24.0));
+        assert_eq!(s.duration_secs, Some(0.125));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 
 use crate::av1::obu::{obus, OBU_SEQUENCE_HEADER, OBU_TEMPORAL_DELIMITER};
 use crate::av1::seq::{parse_sequence_header, SeqInfo};
-use crate::container::{Chunk, Codec, Demux, NalFormat};
+use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream};
 use crate::model::ColorInfo;
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
@@ -58,10 +58,11 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
 }
 
 /// IVF: 32-byte file header, then per-frame (4-byte LE size + 8-byte timestamp +
-/// frame bytes). Each IVF frame is one temporal unit → one chunk. Bounded to a
-/// head window by default (walk only up to `HEAD_SCAN_BYTES`), exhaustive under
-/// `--full`.
-fn demux_ivf(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) -> Result<Demux> {
+/// frame bytes). Each IVF frame is one temporal unit → one chunk. Always a
+/// bounded head walk here — under `--full` the whole-file frame walk belongs to
+/// the sampler's fused pass (`RawFullStream::Av1Ivf`), which recomputes the
+/// exact fps and frame count the old demux-time exhaustive walk produced.
+fn demux_ivf(data: &[u8], full: bool, _progress: &Progress, frontier: &Frontier) -> Result<Demux> {
     if data.len() < 32 {
         bail!("truncated IVF header");
     }
@@ -75,25 +76,68 @@ fn demux_ivf(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
     // The IVF header records the total frame count, so duration is exact even when
     // the frame walk is bounded to the head window. 0 = unfilled (some muxers).
     let header_frames = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
+    let ticks_per_sec = rate / scale;
+    let data_start = header_len.max(32);
 
-    // Small streams are walked whole (cheaper than bounding); big ones stop at the
-    // head window so cost is O(head) regardless of file size.
-    let walked_all = full || data.len() <= HEAD_SCAN_BYTES;
-    let scan_limit = if walked_all { data.len() } else { HEAD_SCAN_BYTES };
-
-    // `--full` walks every frame header — a whole-file pass worth reporting;
-    // the bounded default (or a small file walked whole) stays silent.
-    if full {
-        progress.begin(Phase::Index, scan_limit as u64);
-    }
+    // Small streams are walked whole (cheaper than bounding); big ones stop at
+    // the head window so demux cost is O(head) regardless of file size. Under
+    // `--full` the head walk only feeds the sequence-header search: fps and
+    // frame count come back exact from the fused scan instead.
+    let walked_all = !full && data.len() <= HEAD_SCAN_BYTES;
+    let scan_limit = if walked_all { data.len() } else { HEAD_SCAN_BYTES.min(data.len()) };
     let mut chunks = Vec::new();
-    let mut pos = header_len.max(32);
+    let walk = walk_ivf_frames(
+        data,
+        data_start,
+        scan_limit,
+        |pos| frontier.ensure(pos as u64),
+        |c| chunks.push(c),
+    );
+
+    let fps = if full { None } else { ivf_fps(walk.frames, walk.span, ticks_per_sec) };
+
+    let seq = chunks.iter().find_map(|c| find_seq_header(&data[c.offset as usize..(c.offset + c.size) as usize]));
+    // Exact frame count: the whole-file chunk count when we walked it all, else the
+    // header's total (when the muxer filled it) so duration survives the bounded
+    // walk. Under `--full` the fused scan supplies the exact count instead.
+    let frame_count = if full {
+        None
+    } else if walked_all {
+        (!chunks.is_empty()).then_some(chunks.len() as u64)
+    } else {
+        (header_frames > 0).then_some(header_frames as u64)
+    };
+    let raw_stream = full.then_some(RawFullStream::Av1Ivf { data_start, ticks_per_sec });
+    Ok(build_demux("raw AV1 (IVF)", width, height, fps, frame_count, seq, chunks, raw_stream))
+}
+
+/// Stats from an IVF frame-header walk: the walked frame count and the
+/// first→last timestamp span `ivf_fps` turns into an average rate.
+pub(crate) struct IvfWalk {
+    pub frames: usize,
+    pub span: u64,
+}
+
+/// Walk IVF frame headers from `from`, handing each frame's payload range to
+/// `emit` in file order. `limit` bounds where a new frame header may *start*
+/// (a frame extending past it is still emitted whole, the historical head-walk
+/// behaviour); pass `data.len()` for the whole stream. `tick` fires per frame
+/// with the header's byte position (progress + the remote-read frontier — the
+/// header-hopping walk itself touches only one page per frame).
+pub(crate) fn walk_ivf_frames(
+    data: &[u8],
+    from: usize,
+    limit: usize,
+    mut tick: impl FnMut(usize),
+    mut emit: impl FnMut(Chunk),
+) -> IvfWalk {
+    let mut pos = from;
+    let mut frames = 0usize;
     let mut first_ts: Option<u64> = None;
     let mut last_ts = 0u64;
     while pos + 12 <= data.len() {
-        progress.update(pos as u64);
-        frontier.ensure(pos as u64);
-        if pos >= scan_limit {
+        tick(pos);
+        if pos >= limit {
             break;
         }
         let size = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
@@ -105,34 +149,24 @@ fn demux_ivf(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         }
         first_ts.get_or_insert(ts);
         last_ts = ts;
-        chunks.push(Chunk { offset: frame_start as u64, size: size as u64 });
+        frames += 1;
+        emit(Chunk { offset: frame_start as u64, size: size as u64 });
         pos = frame_end;
     }
-    // Close the index walk at its true final position (the loop tick reports
-    // the position *before* each frame header).
-    progress.update(pos.min(scan_limit) as u64);
+    IvfWalk { frames, span: last_ts.saturating_sub(first_ts.unwrap_or(0)) }
+}
 
-    // fps = ticks/sec ÷ (mean ticks per frame) = (rate/scale)·(frames−1)/timespan.
-    // Constant-rate streams give the same answer over the head window as the whole
-    // file, so bounding the walk doesn't change it.
-    let ticks_per_sec = rate / scale;
-    let span = last_ts.saturating_sub(first_ts.unwrap_or(0));
-    let fps = match (chunks.len(), span) {
+/// IVF fps from a walked frame span: ticks/sec ÷ (mean ticks per frame) =
+/// `ticks_per_sec`·(frames−1)/`span`, snapped to the standard-rate grid.
+/// Constant-rate streams give the same answer over the head window as the
+/// whole file, so the bounded default and the `--full` fused walk agree.
+pub(crate) fn ivf_fps(frames: usize, span: u64, ticks_per_sec: f64) -> Option<f64> {
+    match (frames, span) {
         (n, s) if n > 1 && s > 0 => Some(ticks_per_sec * (n as f64 - 1.0) / s as f64),
         _ => None,
     }
     .filter(|&f| f > 0.0 && f <= 480.0)
-    .map(snap_to_standard_fps);
-
-    let seq = chunks.iter().find_map(|c| find_seq_header(&data[c.offset as usize..(c.offset + c.size) as usize]));
-    // Exact frame count: the whole-file chunk count when we walked it all, else the
-    // header's total (when the muxer filled it) so duration survives the bounded walk.
-    let frame_count = if walked_all {
-        (!chunks.is_empty()).then_some(chunks.len() as u64)
-    } else {
-        (header_frames > 0).then_some(header_frames as u64)
-    };
-    Ok(build_demux("raw AV1 (IVF)", width, height, fps, frame_count, seq, chunks))
+    .map(snap_to_standard_fps)
 }
 
 fn demux_obu(
@@ -142,56 +176,104 @@ fn demux_obu(
     progress: &Progress,
     frontier: &Frontier,
 ) -> Result<Demux> {
-    // Bounded head window by default (from the byte-0 boundary — OBU has no
-    // resync marker), whole stream under `--full` or when it fits the window.
-    let walked_all = full || data.len() <= HEAD_SCAN_BYTES;
-    let scan = if walked_all { data } else { &data[..HEAD_SCAN_BYTES] };
-    // `--full` walks every OBU header — report it; the byte gate in the sink
-    // absorbs the per-OBU tick frequency.
+    // Bounded head window on every path (from the byte-0 boundary — OBU has no
+    // resync marker). Under `--full` the whole-stream walk belongs to the
+    // sampler's fused pass (`RawFullStream::Av1Obu`), which returns the exact
+    // frame count the old demux-time exhaustive walk produced.
+    let head_all = data.len() <= HEAD_SCAN_BYTES;
+    let scan = if head_all { data } else { &data[..HEAD_SCAN_BYTES] };
+    let (mut chunks, mut frame_count) =
+        split_obu_temporal_units(scan, head_all, &Progress::off(), &Frontier::off());
+    let mut seq = find_seq_header(scan);
+
+    let mut raw_stream = None;
     if full {
-        progress.begin(Phase::Index, scan.len() as u64);
+        if seq.is_some() || head_all {
+            raw_stream = Some(RawFullStream::Av1Obu);
+            frame_count = None; // the fused scan supplies the exact count
+        } else {
+            // No sequence header in the head window: fall back to the old
+            // exhaustive demux walk rather than lose the metadata. OBU has no
+            // resync marker, so a bounded mid-file rescue can't exist — but a
+            // real stream leads with its sequence header (the sniffer requires
+            // a TD/SEQ first OBU), so this path is essentially dead. It keeps
+            // the old index-then-scan shape, the accepted cost here.
+            progress.begin(Phase::Index, data.len() as u64);
+            let (c, f) = split_obu_temporal_units(data, true, progress, frontier);
+            chunks = c;
+            frame_count = f;
+            seq = find_seq_header(data);
+            progress.update(data.len() as u64);
+        }
     }
-    let (chunks, frame_count) = split_obu_temporal_units(scan, walked_all, progress, frontier);
-    let seq = find_seq_header(scan);
+
     let (w, h) = seq.as_ref().map(|s| (s.width, s.height)).unwrap_or((0, 0));
     // The low-overhead OBU stream carries no timestamps, so a frame rate exists
     // only when the sequence header signals constant `timing_info()`.
     let fps = seq.as_ref().and_then(|s| s.fps);
-    Ok(build_demux(label, w, h, fps, frame_count, seq, chunks))
+    Ok(build_demux(label, w, h, fps, frame_count, seq, chunks, raw_stream))
 }
 
 /// Split a raw low-overhead OBU stream into temporal units (each starting at an
 /// `OBU_TEMPORAL_DELIMITER`) so downstream sampling has real access units. `data`
-/// is the byte range to walk — the whole stream under `--full`, else the head
-/// window. The boundary count is the exact frame count **only when the whole
-/// stream was walked** (`walked_all`); a bounded head window sees only a prefix,
-/// so `frame_count` is `None` there (and duration with it). Also `None` in the
-/// no-delimiter fallback, where the single whole-buffer chunk is not a frame count.
+/// is the byte range walked — the head window, or the whole stream on the
+/// `--full` no-sequence-header fallback. The boundary count is the exact frame
+/// count **only when the whole stream was walked** (`walked_all`); a bounded
+/// head window sees only a prefix, so `frame_count` is `None` there (and
+/// duration with it). Also `None` in the no-delimiter fallback, where the
+/// single whole-buffer chunk is not a frame count.
 fn split_obu_temporal_units(
     data: &[u8],
     walked_all: bool,
     progress: &Progress,
     frontier: &Frontier,
 ) -> (Vec<Chunk>, Option<u64>) {
-    let mut boundaries = Vec::new();
+    let mut chunks = Vec::new();
+    let count = walk_obu_tus(
+        data,
+        |pos| {
+            progress.update(pos as u64);
+            frontier.ensure(pos as u64);
+        },
+        |c| chunks.push(c),
+    );
+    (chunks, if walked_all { count } else { None })
+}
+
+/// Walk a low-overhead OBU stream, handing each temporal unit (a chunk from
+/// one `OBU_TEMPORAL_DELIMITER` to the next, the last running to the end) to
+/// `emit` in stream order. Returns the delimiter count — the exact frame count
+/// when `data` is the whole stream. A stream with no delimiter at all emits
+/// one whole-buffer chunk and returns `None` (that chunk is not a frame).
+/// `tick` fires per OBU with its byte position; the byte gate in the progress
+/// sink absorbs the frequency.
+pub(crate) fn walk_obu_tus(
+    data: &[u8],
+    mut tick: impl FnMut(usize),
+    mut emit: impl FnMut(Chunk),
+) -> Option<u64> {
+    let mut prev: Option<usize> = None;
+    let mut count = 0u64;
     for obu in obus(data) {
-        progress.update(obu.start as u64);
-        frontier.ensure(obu.start as u64);
+        tick(obu.start);
         if obu.obu_type == OBU_TEMPORAL_DELIMITER {
-            boundaries.push(obu.start);
+            if let Some(p) = prev {
+                emit(Chunk { offset: p as u64, size: (obu.start - p) as u64 });
+            }
+            prev = Some(obu.start);
+            count += 1;
         }
     }
-    if boundaries.is_empty() {
-        return (vec![Chunk { offset: 0, size: data.len() as u64 }], None);
+    match prev {
+        Some(p) => {
+            emit(Chunk { offset: p as u64, size: (data.len() - p) as u64 });
+            Some(count)
+        }
+        None => {
+            emit(Chunk { offset: 0, size: data.len() as u64 });
+            None
+        }
     }
-    let mut chunks = Vec::with_capacity(boundaries.len());
-    for i in 0..boundaries.len() {
-        let start = boundaries[i];
-        let end = boundaries.get(i + 1).copied().unwrap_or(data.len());
-        chunks.push(Chunk { offset: start as u64, size: (end - start) as u64 });
-    }
-    let frame_count = walked_all.then_some(boundaries.len() as u64);
-    (chunks, frame_count)
 }
 
 /// Broadcast/film frame rates a real stream is virtually always locked to,
@@ -231,6 +313,7 @@ fn find_seq_header(data: &[u8]) -> Option<SeqInfo> {
         .and_then(|o| parse_sequence_header(o.payload))
 }
 
+#[allow(clippy::too_many_arguments)] // a plain field bundle for the two raw AV1 entry points
 fn build_demux(
     label: &'static str,
     width: u32,
@@ -239,6 +322,7 @@ fn build_demux(
     frame_count: Option<u64>,
     seq: Option<SeqInfo>,
     chunks: Vec<Chunk>,
+    raw_stream: Option<RawFullStream>,
 ) -> Demux {
     // No timestamps or duration box in a raw AV1 stream, so duration is only
     // derivable as frames ÷ frame-rate — both of which we now have for free.
@@ -279,6 +363,7 @@ fn build_demux(
         reassembled: None,
         ts_stream: None,
         mkv_stream: None,
+        raw_stream,
     }
 }
 

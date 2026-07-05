@@ -400,15 +400,18 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         format_version: None,
         width: if demux.width > 0 { Some(demux.width) } else { None },
         height: if demux.height > 0 { Some(demux.height) } else { None },
-        // MKV `--full` without a DefaultDuration: the exact frame count exists
-        // only after the streaming walk, so the count ÷ duration fallback the
-        // demux's complete index used to compute lands here instead — same
-        // inputs, same value.
-        fps: demux.fps.or_else(|| match (scan.frame_count, demux.duration_secs) {
+        // The `--full` streaming walks recover what their demux's bounded pass
+        // no longer can: raw IVF's whole-stream average rate (`scan.fps`), and
+        // for MKV without a DefaultDuration the exact frame count feeding the
+        // count ÷ duration fallback the demux's complete index used to compute
+        // — same inputs, same values.
+        fps: demux.fps.or(scan.fps).or_else(|| match (scan.frame_count, demux.duration_secs) {
             (Some(n), Some(d)) if n > 0 && d > 0.0 => Some(n as f64 / d),
             _ => None,
         }),
-        duration_secs: demux.duration_secs,
+        // Raw AV1 `--full`: duration (frames ÷ fps) exists only after the
+        // fused walk counted the frames, so it lands here instead of demux.
+        duration_secs: demux.duration_secs.or(scan.duration_secs),
         // A container-known rate wins (MKV statistics tags); the `--full`
         // streaming walks (TS ES bytes, MKV block bytes) fill the gap with the
         // exact sum their demux could no longer compute — the same value the

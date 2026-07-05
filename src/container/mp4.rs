@@ -443,6 +443,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         reassembled: None,
         ts_stream: None,
         mkv_stream: None,
+        raw_stream: None,
     }
 }
 

@@ -48,8 +48,9 @@ pub enum Mode {
 /// The two long phases a `--full` run can spend real time in.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Phase {
-    /// Demux-time whole-file walk (MKV cluster indexing, raw HEVC/AV1 splits,
-    /// the TS SPS rescue).
+    /// Demux-time walk past the head window (the TS and raw-HEVC SPS rescues,
+    /// raw OBU's no-sequence-header fallback) — rare rescue paths; every
+    /// container's ordinary `--full` work is a single fused `Scan`.
     Index,
     /// The sampler's access-unit scan.
     Scan,

@@ -26,21 +26,27 @@ fn nal_type(header_byte: u8) -> u8 {
 pub fn split_annexb(data: &[u8], out: &mut Vec<NalRef>) {
     // The no-op tick body leaves `next_tick` dead, so the monomorphized copy
     // carries no gate at all — this stays the hot per-chunk path.
-    split_annexb_impl(data, out, |_| {});
+    split_annexb_impl(data, |n| out.push(n), |_| {});
 }
 
-/// `split_annexb` with a byte-position callback every ~`TICK_BYTES`, for
-/// progress on the `--full` whole-stream walk (a raw elementary stream can be
-/// tens of GB, and this split is its only pass over the bytes).
-pub fn split_annexb_ticked(data: &[u8], out: &mut Vec<NalRef>, tick: impl FnMut(usize)) {
-    split_annexb_impl(data, out, tick);
+/// `split_annexb` delivering each NAL to a callback instead of a `Vec`, with a
+/// byte-position tick every ~`TICK_BYTES`: the `--full` whole-stream walk over
+/// a raw elementary stream (tens of GB) consumes NALs as they are found, so it
+/// never holds the whole file's NAL list, and the tick drives progress and the
+/// remote-read frontier.
+pub fn split_annexb_streamed(
+    data: &[u8],
+    on_nal: impl FnMut(NalRef),
+    tick: impl FnMut(usize),
+) {
+    split_annexb_impl(data, on_nal, tick);
 }
 
-/// Byte interval between `split_annexb_ticked` callbacks.
+/// Byte interval between `split_annexb_streamed` tick callbacks.
 const TICK_BYTES: usize = 2 << 20;
 
 #[inline]
-fn split_annexb_impl(data: &[u8], out: &mut Vec<NalRef>, mut tick: impl FnMut(usize)) {
+fn split_annexb_impl(data: &[u8], mut on_nal: impl FnMut(NalRef), mut tick: impl FnMut(usize)) {
     let n = data.len();
     let mut i = 0usize;
     let mut next_tick = TICK_BYTES;
@@ -57,7 +63,7 @@ fn split_annexb_impl(data: &[u8], out: &mut Vec<NalRef>, mut tick: impl FnMut(us
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
             let payload = i + 3;
             if let Some(prev) = nal_start.take() {
-                push_nal(data, prev, i, out);
+                emit_nal(data, prev, i, &mut on_nal);
             }
             nal_start = Some(payload);
             i = payload;
@@ -66,11 +72,11 @@ fn split_annexb_impl(data: &[u8], out: &mut Vec<NalRef>, mut tick: impl FnMut(us
         }
     }
     if let Some(prev) = nal_start.take() {
-        push_nal(data, prev, n, out);
+        emit_nal(data, prev, n, &mut on_nal);
     }
 }
 
-fn push_nal(data: &[u8], start: usize, mut end: usize, out: &mut Vec<NalRef>) {
+fn emit_nal(data: &[u8], start: usize, mut end: usize, on_nal: &mut impl FnMut(NalRef)) {
     // Trim a trailing zero byte that belongs to the next 4-byte start code.
     while end > start && data[end - 1] == 0 {
         end -= 1;
@@ -79,7 +85,7 @@ fn push_nal(data: &[u8], start: usize, mut end: usize, out: &mut Vec<NalRef>) {
         return;
     }
     let t = nal_type(data[start]);
-    out.push(NalRef { nal_type: t, start, end });
+    on_nal(NalRef { nal_type: t, start, end });
 }
 
 /// Split a length-prefixed (HVCC / ISOBMFF) sample into NAL units.
@@ -135,21 +141,22 @@ mod tests {
     }
 
     #[test]
-    fn ticked_split_matches_plain_and_fires() {
+    fn streamed_split_matches_plain_and_ticks() {
         // A buffer past the tick interval: identical NAL list either way, and
-        // the callback reports monotonically increasing positions.
+        // the tick callback reports monotonically increasing positions.
         let mut data = vec![0u8; TICK_BYTES + 4096];
         for (i, sc) in [0usize, 1000, TICK_BYTES - 100, TICK_BYTES + 500].iter().enumerate() {
             data[*sc..*sc + 4].copy_from_slice(&[0, 0, 1, (33 << 1) ^ (i as u8 & 1)]);
         }
-        let (mut plain, mut ticked) = (Vec::new(), Vec::new());
+        let mut plain = Vec::new();
         split_annexb(&data, &mut plain);
+        let mut streamed: Vec<NalRef> = Vec::new();
         let mut ticks: Vec<usize> = Vec::new();
-        split_annexb_ticked(&data, &mut ticked, |pos| ticks.push(pos));
-        assert_eq!(plain.len(), ticked.len());
+        split_annexb_streamed(&data, |n| streamed.push(n), |pos| ticks.push(pos));
+        assert_eq!(plain.len(), streamed.len());
         assert!(plain
             .iter()
-            .zip(&ticked)
+            .zip(&streamed)
             .all(|(a, b)| (a.start, a.end, a.nal_type) == (b.start, b.end, b.nal_type)));
         assert!(!ticks.is_empty(), "a walk past TICK_BYTES must tick");
         assert!(ticks.windows(2).all(|w| w[0] < w[1]));
