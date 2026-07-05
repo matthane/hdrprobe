@@ -1,6 +1,6 @@
 ```
 █ █ █▀▄ █▀█ █▀█ █▀█ █▀█ █▄▄ █▀▀
-█▀█ █▄▀ █▀▄ █▀▀ █▀▄ █▄█ █▄█ ██▄  v0.1.0
+█▀█ █▄▀ █▀▄ █▀▀ █▀▄ █▄█ █▄█ ██▄  v0.2.0
 ```
 
 Fast HDR, HDR10+, and Dolby Vision metadata inspector.
@@ -77,9 +77,10 @@ layer's cross-compatibility id:
 | 20 | MV-HEVC | `20.0`, `20.4` |
 
 Alongside it, the track and layer structure (for dual-layer content), the content-mapping
-version (`v2.9`, or `v4.0` via L254), and the DV grade's own mastering display, which can
-differ from the base layer's: on a Profile 7 title a 4000-nit grade can sit over a 1000-nit
-HDR10 base.
+version (`v2.9`, or `v4.0` via L254), the reconstructed signal bit depth for full-enhancement
+(FEL) streams (12-bit on Profile 7, 14-bit on Profile 4), and the DV grade's own mastering
+display, which can differ from the base layer's: on a Profile 7 title a 4000-nit grade can sit
+over a 1000-nit HDR10 base.
 
 **Dynamic levels.** The distinct values seen across the title: `L5` offsets and active areas,
 `L6` content light, `L9` mastering gamut, `L11` APO (content type), and the set of `L2` / `L8`
@@ -105,7 +106,7 @@ hdrprobe reads both video containers and standalone metadata sidecar files.
 | Container | Codecs | Notes |
 |---|---|---|
 | MP4 / MOV | HEVC, AVC, AV1 | Single or dual track; an enhancement layer may ride its own track |
-| MKV / WebM | HEVC, AV1 | Single track; an enhancement layer may be interleaved into it |
+| MKV / WebM | HEVC, AVC, AV1 | Single track; an enhancement layer may be interleaved into it |
 | MPEG-TS / M2TS | HEVC, AVC | Single or dual track; an enhancement layer may ride its own track |
 | Raw HEVC | Annex-B | Elementary stream; profile inferred from the RPU |
 | Raw AV1 | IVF, low-overhead OBU | Elementary stream; the RPU rides an in-band metadata OBU |

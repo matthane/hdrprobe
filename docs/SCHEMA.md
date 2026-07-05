@@ -161,7 +161,7 @@ build until the schema version, that test, and this document are updated togethe
 
 Version history:
 
-- **1.1**: added `dolby_vision.reconstructed_bit_depth` (additive).
+- **1.1**: added `dolby_vision.reconstructed_bit_depth` (additive). Ships in hdrprobe 0.2.0.
 - **1.0**: initial schema, as shipped in hdrprobe 0.1.0.
 
 ## Conventions
