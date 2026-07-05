@@ -83,16 +83,19 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     let sidecar = r.general.codec.is_empty();
 
     // Colored: phosphor banner glyph, faint size. Plain: the classic
-    // "name  (size)" shape, unchanged for pipes and logs.
+    // "name  (size)" shape, unchanged for pipes and logs. Both show the bare
+    // file name (matching the `--full` scanning header); the full path stays
+    // on the JSON report's `file` field, where machine consumers need it.
+    let name = file_name(&r.file);
     if c.on {
         let _ = writeln!(
             s,
             "{} {}",
-            c.bright(&format!("▮ {}", r.file)),
+            c.bright(&format!("▮ {}", name)),
             c.faint(&human_size(r.size_bytes))
         );
     } else {
-        let _ = writeln!(s, "{}  ({})", r.file, human_size(r.size_bytes));
+        let _ = writeln!(s, "{}  ({})", name, human_size(r.size_bytes));
     }
     s.push('\n');
 
@@ -416,6 +419,13 @@ impl Footnotes {
             .enumerate()
             .map(|(i, n)| (Self::MARKS[i.min(Self::MARKS.len() - 1)], n.as_str()))
     }
+}
+
+/// The bare file name of a report's `file` path, for the report header.
+/// Falls back to the full string when a name can't be split off (e.g. a
+/// path ending in `..`) — never an empty header.
+fn file_name(path: &str) -> &str {
+    std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path)
 }
 
 /// One-line summary for `--quiet`.
