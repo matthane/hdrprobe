@@ -852,9 +852,16 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
 
     let cc = classify_codec(codec_id, codec_private);
 
-    // No container Colour element? Recover colour from the SPS in CodecPrivate.
-    if color.transfer.is_none() && matches!(cc.codec, Codec::Hevc) {
-        if let Some(c) = super::color_from_hvcc(codec_private) {
+    // No container Colour element? Recover colour from the SPS in CodecPrivate,
+    // with the codec's own record parser (same fallback MP4 applies to a
+    // missing `colr` box).
+    if color.transfer.is_none() {
+        let sps_color = match cc.codec {
+            Codec::Hevc => super::color_from_hvcc(codec_private),
+            Codec::Avc => super::color_from_avcc(codec_private),
+            _ => None,
+        };
+        if let Some(c) = sps_color {
             color = c;
         }
     }
@@ -902,6 +909,25 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             cfg.bit_depth = Some(h.bit_depth);
             cfg.chroma = Some(h.chroma.to_string());
             cfg.codec_profile = Some(h.profile_str);
+        }
+        cfg
+    } else if codec_id.starts_with(b"V_MPEG4/ISO/AVC") {
+        // CodecPrivate is an AVCDecoderConfigurationRecord; depth/chroma/profile
+        // come from its embedded SPS (not fixed header fields — see
+        // `parse_avcc_record`). Covers SDR AVC muxes (8-bit, or 10-bit Hi10P)
+        // and DV Profile 9, whose RPU the sampler finds by content.
+        let mut cfg = CodecConfig {
+            codec: Codec::Avc,
+            nal_format: NalFormat::LengthPrefixed(4),
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+        };
+        if let Some(a) = super::parse_avcc_record(codec_private) {
+            cfg.nal_format = NalFormat::LengthPrefixed(a.nal_len);
+            cfg.bit_depth = Some(a.bit_depth);
+            cfg.chroma = Some(a.chroma.to_string());
+            cfg.codec_profile = Some(a.profile_str);
         }
         cfg
     } else if codec_id.starts_with(b"V_AV1") {
@@ -1179,6 +1205,32 @@ mod tests {
         assert_eq!(read_size(&[0xFF], 0), Some((None, 1)));
         // 2-byte unknown size 0x7F 0xFF.
         assert_eq!(read_size(&[0x7F, 0xFF], 0), Some((None, 2)));
+    }
+
+    #[test]
+    fn classify_codec_avc() {
+        // The same real Profile-9 `avcC` record `container::tests` parses:
+        // High@L4, 4-byte NAL length, 8-bit 4:2:0 SPS. The MKV CodecPrivate for
+        // V_MPEG4/ISO/AVC is exactly that record, so classification must fill
+        // depth/chroma/profile from it (an SDR AVC MKV reports its bit depth).
+        let avcc = [
+            0x01, 0x64, 0x00, 0x28, 0xff, 0xe1, 0x00, 0x1d, 0x67, 0x64, 0x00, 0x28, 0xac, 0xb2,
+            0x00, 0xf0, 0x04, 0x4f, 0xcb, 0x80, 0xb5, 0x01, 0x01, 0x01, 0x40, 0x00, 0x00, 0x03,
+            0x00, 0x40, 0x00, 0x00, 0x0c, 0x03, 0xc6, 0x0c, 0x92, 0x01, 0x00, 0x06, 0x68, 0xeb,
+            0xc3, 0xcb, 0x22, 0xc0, 0xfd, 0xf8, 0xf8, 0x00,
+        ];
+        let cc = classify_codec(b"V_MPEG4/ISO/AVC", &avcc);
+        assert!(matches!(cc.codec, Codec::Avc));
+        assert!(matches!(cc.nal_format, NalFormat::LengthPrefixed(4)));
+        assert_eq!(cc.bit_depth, Some(8));
+        assert_eq!(cc.chroma.as_deref(), Some("4:2:0"));
+        assert_eq!(cc.codec_profile.as_deref(), Some("High @ L4"));
+
+        // A truncated CodecPrivate still classifies as AVC — the sampler needs
+        // the codec even when the record's SPS is unreadable.
+        let cc = classify_codec(b"V_MPEG4/ISO/AVC", &[0x01]);
+        assert!(matches!(cc.codec, Codec::Avc));
+        assert_eq!(cc.bit_depth, None);
     }
 
     #[test]
