@@ -260,8 +260,8 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 // The set of distinct active areas is shown inline (joined by
                 // " + ") rather than one line per area: offsets are the raw L5
                 // signal, the active area is derived. The sampled/assumed-canvas
-                // caveat describes the whole set, so it rides the label as one
-                // footnote mark; a full scan carries no mark.
+                // caveat describes the whole set, so both L5 labels share the
+                // same footnote mark; a full scan carries no mark.
                 let mark = match dv.l5_assumed_canvas {
                     Some([w, h]) => notes.mark(&format!(
                         "assumes a {w}×{h} canvas; DV sidecars carry no resolution"
@@ -291,7 +291,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     .collect::<Vec<_>>()
                     .join(" + ");
                 if !areas.is_empty() {
-                    kv(&mut s, &c, "L5 active area", &areas);
+                    kv(&mut s, &c, &format!("L5 active area{mark}"), &areas);
                 }
             }
             // L6's CLL fields exist to feed HDR10 signaling (CTA-861.3), which
