@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn readers_are_bounds_safe() {
-        // A truncated box must read 0, never panic (M8 malformed-file hardening).
+        // A truncated box must read 0, never panic (malformed-file hardening).
         let d = [0xAAu8, 0xBB, 0xCC];
         assert_eq!(read_u32(&d, 0), 0);
         assert_eq!(read_u16(&d, 2), 0);

@@ -54,7 +54,6 @@ impl<'a> BitReader<'a> {
     }
 
     /// Signed Exp-Golomb (se(v)).
-    #[allow(dead_code)] // used by SPS VUI / SEI parsing in later milestones
     pub fn read_se(&mut self) -> Option<i32> {
         let code = self.read_ue()?;
         let k = code.div_ceil(2) as i32;

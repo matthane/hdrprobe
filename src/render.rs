@@ -179,9 +179,9 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 kv(&mut s, &c, "Structure", structure);
             }
 
-            // The BL/EL/RPU carriage booleans are still collected on the model
-            // (for a future backend schema) but omitted from this report: the
-            // profile and MEL/FEL tag already convey the layer structure, and
+            // The BL/EL/RPU carriage booleans are serialized in the JSON report
+            // (part of the documented schema) but omitted from this text report:
+            // the profile and MEL/FEL tag already convey the layer structure, and
             // the per-track BL flag reads as misleading on dual-track P7.
             //
             // The profile describes a *stream* (its codec and base layer), not

@@ -12,7 +12,8 @@
 //! they are discovered — index and scan fused into one pass, so a remote file
 //! crosses the wire once regardless of size (see `prefetch::Frontier`).
 //!
-//! Single-track only: Profile 7 dual-track (EL in BlockAdditions) is deferred to M7.
+//! Single-track by design: the DV RPU rides the base-layer block, so a Profile 7
+//! EL residual (which would ride in a BlockAddition) is decode-only and never needed.
 
 use anyhow::{Context, Result};
 
@@ -1090,8 +1091,8 @@ fn parse_cluster(
         match id {
             ID_SIMPLEBLOCK => record_block(data, p2, cend, video_track, chunks),
             ID_BLOCKGROUP => {
-                // The primary frame rides in a Block child (BlockAdditions =
-                // dual-track EL, handled in M7).
+                // The primary frame rides in a Block child; a BlockAddition would
+                // carry the dual-track EL residual, which is decode-only and never needed.
                 let mut q = p2;
                 while q < cend {
                     let Some((cid, q1)) = read_id(data, q) else { break };
