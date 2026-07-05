@@ -200,11 +200,25 @@ fn main() -> ExitCode {
     let mut out_buf = String::new();
     let mut json_reports: Vec<serde_json::Value> = Vec::new();
     let mut had_error = false;
+    // At least one file drew a progress bar this run (drives the end-of-run
+    // screen clear below).
+    let mut bar_drawn = false;
 
     // The masthead prints once per run, only on the colored interactive text
-    // path — quiet, JSON/NDJSON, and piped output stay machine-clean.
-    if use_color && format == Format::Text && !cli.quiet {
-        out_buf.push_str(&render::render_banner(cli.theme));
+    // path — quiet, JSON/NDJSON, and piped output stay machine-clean. It goes
+    // out immediately (not into the report buffer) so a long `--full` scan
+    // shows it above the stderr progress bar, not after scanning finishes;
+    // with `--output` it stays buffered so it lands in the file.
+    let show_banner = use_color && format == Format::Text && !cli.quiet;
+    let banner_eager = show_banner && cli.output.is_none();
+    if show_banner {
+        let banner = render::render_banner(cli.theme);
+        if banner_eager {
+            print!("{banner}");
+            let _ = std::io::stdout().flush();
+        } else {
+            out_buf.push_str(&banner);
+        }
     }
 
     for (i, path) in paths.iter().enumerate() {
@@ -212,6 +226,7 @@ fn main() -> ExitCode {
         match process_file(path, &cli, &progress) {
             Ok(report) => {
                 progress.finish();
+                bar_drawn |= progress.bar_shown();
                 match format {
                     Format::Text => {
                         if cli.quiet {
@@ -247,6 +262,15 @@ fn main() -> ExitCode {
         };
         out_buf = serde_json::to_string_pretty(&v).unwrap();
         out_buf.push('\n');
+    }
+
+    // A finished bar-mode `--full` run clears the screen so the report starts
+    // clean, redrawing the masthead the clear wipes. Interactive decorated
+    // path only (the same one that printed the masthead eagerly), and never
+    // after an error — the stderr diagnostics must stay visible above the
+    // reports.
+    if banner_eager && bar_drawn && !had_error {
+        out_buf.insert_str(0, &format!("\x1b[2J\x1b[H{}", render::render_banner(cli.theme)));
     }
 
     if let Err(e) = write_output(&cli.output, &out_buf) {

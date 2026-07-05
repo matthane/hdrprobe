@@ -108,10 +108,19 @@ never parse bytes native-endian.
   round-trips. Timing only: parsing still runs against the mmap. Gated to remote volumes by
   `is_remote`, decided from the open handle (Windows `FileRemoteProtocolInfo`), which costs no
   extra network round-trip and is correct through mapped drives, UNC, symlinks, and subst.
-- `progress.rs` — `--full` progress reporting (`--progress auto|bar|json|off`): a `\r`-rewritten
-  stderr bar in the active theme's palette (one line **per phase**, persisted at its final state
-  when the next phase starts — two phases on one resetting line read as a loop/hang, a real
-  user report), or NDJSON events on stderr (contract documented in
+- `progress.rs` — `--full` progress reporting (`--progress auto|bar|json|off`): a stderr bar in
+  the active theme's palette — a `Scanning: <name>` header line once per file (it carries the
+  file name and the `[k/N]` counter), then **one** unlabeled `\r`-rewritten bar line for the
+  whole file beneath it (two-tone fill: solid bright cells plus a mid-tone `▓` half-cell at the
+  leading edge; the terminal cursor is hidden while the bar rewrites and restored on every exit
+  path, including the error `Drop`), no matter how many internal phases run: `bar_fraction` blends
+  an `Index` walk into the bar's first half and the scan that follows into the second (a lone
+  scan owns the whole bar — the common case), so the percent is monotonic by construction and
+  can never reset mid-file (a bar restarting at 0% reads as a loop/hang, a real user report —
+  never reintroduce a per-phase reset; the *JSON* events stay per-phase, that contract is
+  unchanged); after a fully successful interactive bar run, `main` clears the screen and redraws
+  the masthead so the report starts clean (skipped on any error so stderr diagnostics stay
+  visible) — or NDJSON events on stderr (contract documented in
   `docs/SCHEMA.md`, "Progress events"; the event structs live here, *not* in `model.rs`, so the
   report schema and its golden shape test are untouched). One `Progress` per file, created in
   `main` and threaded through `container::demux` and `sample::scan`; two byte-denominated
@@ -408,7 +417,10 @@ never parse bytes native-endian.
 - **Progress is `--full`-only, stderr-only, and single-threaded by design.** `main` resolves
   every `--progress` mode to `Off` unless `--full` is set (the fast path never reports), and
   nothing progress-related may ever write to stdout — SCHEMA.md promises stdout is the pure
-  report stream, and the corpus byte-identity gate implicitly checks it. The sink
+  report stream, and the corpus byte-identity gate implicitly checks it (the end-of-run screen
+  clear + masthead redraw in `main` is *report decoration* on the colored interactive text path,
+  the same gate as the masthead itself — it never fires for quiet/JSON/piped/`--output` runs or
+  after an error). The sink
   (`progress::Progress`) holds `Cell` state on purpose: every tick site is single-threaded —
   demux walk loops, the TS window loop, and `sample::scan_chunks`' batch boundary *between*
   rayon collects — so never hand it into a `par_iter` closure. `update` is byte-gated before it

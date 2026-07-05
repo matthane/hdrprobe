@@ -29,13 +29,16 @@ use crate::render::Palette;
 #[derive(Copy, Clone)]
 pub enum Mode {
     Off,
-    /// One stderr line per phase, `\r`-rewritten while the phase runs. A
-    /// completed phase's line **persists** at its final state and the next
-    /// phase starts a fresh line — consecutive phases read as steps, never as
-    /// a bar that restarted (an MKV `--full` is indexing *then* scanning; a
-    /// second 0% on the same line looks like a hang). Only a failed file's
-    /// in-progress line is erased, so the diagnostic prints clean. `color`
-    /// carries the active theme's palette when stderr takes ANSI.
+    /// A `Scanning: <name>` header line per file, then **one** `\r`-rewritten
+    /// stderr bar line for the whole file, no matter how many internal phases
+    /// run — the phases are an implementation detail the bar never surfaces
+    /// (no label either; the header already says what's happening). The bar
+    /// fraction is blended across phases (`bar_fraction`) and is monotonic by
+    /// construction, so the percent can never reset mid-file — a bar that
+    /// restarts at 0% reads as a loop/hang, a real user report; never
+    /// reintroduce one. Only a failed file's in-progress bar line is erased
+    /// (the header stays as context above the diagnostic). `color` carries
+    /// the active theme's palette when stderr takes ANSI.
     Bar { color: Option<&'static Palette> },
     /// One compact JSON object per stderr line (see `docs/SCHEMA.md`,
     /// "Progress events").
@@ -53,13 +56,6 @@ pub enum Phase {
 }
 
 impl Phase {
-    /// Human label for the bar.
-    fn label(self) -> &'static str {
-        match self {
-            Phase::Index => "indexing",
-            Phase::Scan => "scanning",
-        }
-    }
     /// Machine name for JSON events.
     fn name(self) -> &'static str {
         match self {
@@ -104,6 +100,23 @@ pub struct Progress {
     total_emitted: Cell<bool>,
     /// Display width of the bar line currently on screen (0 = none).
     bar_width: Cell<usize>,
+    /// The per-file `Scanning: <name>` header line was printed (bar mode
+    /// only) — also `main`'s signal that progress actually drew something,
+    /// so its end-of-run screen clear fires only when there is a bar to
+    /// clear.
+    header_drawn: Cell<bool>,
+    /// An `Index` phase ran for this file: `bar_fraction` maps it to the
+    /// bar's first half and the following scan to the second.
+    saw_index: Cell<bool>,
+    /// The file completed (`finish`): the bar closes at 100% even when the
+    /// last phase legitimately ended short (an index walk may).
+    finished: Cell<bool>,
+    /// The terminal cursor is hidden (DECTCEM) while the bar rewrites — a
+    /// blinking cursor at the line's end reads as jitter. Restored by
+    /// `persist_bar`/`clear_bar`, so every exit path (success *and* the
+    /// `Drop` on error) shows it again. ANSI-gated: only set when the bar
+    /// has a palette.
+    cursor_hidden: Cell<bool>,
 }
 
 impl Progress {
@@ -130,7 +143,17 @@ impl Progress {
             last_emit: Cell::new(now),
             total_emitted: Cell::new(false),
             bar_width: Cell::new(0),
+            header_drawn: Cell::new(false),
+            saw_index: Cell::new(false),
+            finished: Cell::new(false),
+            cursor_hidden: Cell::new(false),
         }
+    }
+
+    /// Whether a bar-mode header (and thus at least one bar line) hit the
+    /// terminal for this file.
+    pub fn bar_shown(&self) -> bool {
+        self.header_drawn.get()
     }
 
     /// Start (or switch to) a phase with a known byte denominator. Emits the
@@ -139,9 +162,24 @@ impl Progress {
         if matches!(self.mode, Mode::Off) {
             return;
         }
-        // A previous phase's bar line stays on screen at its final state; the
-        // new phase draws on a fresh line (see `Mode::Bar`).
-        self.persist_bar();
+        // The file's header line prints once, above the first phase's bar,
+        // with a blank line between them so the bar has room to breathe.
+        if let Mode::Bar { color } = self.mode {
+            if !self.header_drawn.replace(true) {
+                let mut err = std::io::stderr().lock();
+                let _ = writeln!(
+                    err,
+                    "{}\n",
+                    format_header(&self.name, self.file_index, self.file_count, color)
+                );
+                let _ = err.flush();
+            }
+        }
+        // The bar line is per-file, not per-phase: a new phase keeps rewriting
+        // the same line, its progress blended forward by `bar_fraction`.
+        if phase == Phase::Index {
+            self.saw_index.set(true);
+        }
         self.phase.set(Some(phase));
         self.total.set(total_bytes);
         self.done.set(0);
@@ -189,13 +227,19 @@ impl Progress {
         self.emit(done, total);
     }
 
-    /// File finished successfully: keep the final bar line / emit the JSON
-    /// `done` event. Error paths skip this and rely on `Drop`, which erases
-    /// the in-progress line instead.
+    /// File finished successfully: close the bar at 100% and keep its line /
+    /// emit the JSON `done` event. Error paths skip this and rely on `Drop`,
+    /// which erases the in-progress line instead.
     pub fn finish(&self) {
+        self.finished.set(true);
         match self.mode {
             Mode::Off => {}
-            Mode::Bar { .. } => self.persist_bar(),
+            Mode::Bar { .. } => {
+                // The scan phase already closed at 100%; the override matters
+                // when the last phase legitimately ended short of its total.
+                self.done.set(self.total.get());
+                self.persist_bar();
+            }
             Mode::Json => {
                 let line = serde_json::to_string(&Event {
                     event: "done",
@@ -215,25 +259,47 @@ impl Progress {
         }
     }
 
+    /// The whole-file fraction the bar shows, blended across phases: an
+    /// `Index` walk fills the first half, the scan that follows it the
+    /// second, and a scan with no preceding index owns the whole bar (the
+    /// common case — MKV/MP4/TS are single-phase). Monotonic by construction:
+    /// a phase switch can only move the needle forward, so the percent never
+    /// resets mid-file. `finish` pins it to 1.0 (an index walk may
+    /// legitimately end short of its total).
+    fn bar_fraction(&self) -> f64 {
+        if self.finished.get() {
+            return 1.0;
+        }
+        let total = self.total.get();
+        let frac = if total == 0 { 1.0 } else { self.done.get() as f64 / total as f64 };
+        match self.phase.get() {
+            Some(Phase::Index) => frac * 0.5,
+            Some(Phase::Scan) if self.saw_index.get() => 0.5 + frac * 0.5,
+            _ => frac,
+        }
+    }
+
     fn emit(&self, done: u64, total: u64) {
         let Some(phase) = self.phase.get() else { return };
         match self.mode {
             Mode::Off => {}
             Mode::Bar { color } => {
                 let (line, width) = format_line(
-                    phase,
-                    &self.name,
+                    self.bar_fraction(),
                     done,
                     total,
                     self.phase_started.get().elapsed(),
-                    self.file_index,
-                    self.file_count,
                     color,
                 );
                 // Rewrite in place, padding over any leftover from a longer
-                // previous line — works without ANSI erase sequences.
+                // previous line — works without ANSI erase sequences. The
+                // cursor hides for the bar's lifetime (colored terminals
+                // only); its blink at the line's end reads as jitter.
                 let pad = self.bar_width.get().saturating_sub(width);
                 let mut err = std::io::stderr().lock();
+                if color.is_some() && !self.cursor_hidden.replace(true) {
+                    let _ = write!(err, "\x1b[?25l");
+                }
                 let _ = write!(err, "\r{line}{:pad$}", "", pad = pad);
                 let _ = err.flush();
                 self.bar_width.set(width.max(self.bar_width.get()));
@@ -257,9 +323,9 @@ impl Progress {
         }
     }
 
-    /// Freeze the on-screen bar line: redraw it at the phase's final recorded
-    /// state, then move past it so it stays as a step record (idempotent;
-    /// no-op for other modes or when nothing was drawn).
+    /// Freeze the on-screen bar line: redraw it at its final recorded state,
+    /// then move past it so it stays on screen (idempotent; no-op for other
+    /// modes or when nothing was drawn).
     fn persist_bar(&self) {
         if !matches!(self.mode, Mode::Bar { .. }) || self.bar_width.get() == 0 {
             return;
@@ -268,6 +334,9 @@ impl Progress {
         self.emit(self.done.get(), self.total.get());
         let mut err = std::io::stderr().lock();
         let _ = writeln!(err);
+        if self.cursor_hidden.replace(false) {
+            let _ = write!(err, "\x1b[?25h");
+        }
         let _ = err.flush();
         self.bar_width.set(0);
     }
@@ -278,6 +347,9 @@ impl Progress {
         if width > 0 {
             let mut err = std::io::stderr().lock();
             let _ = write!(err, "\r{:width$}\r", "", width = width);
+            if self.cursor_hidden.replace(false) {
+                let _ = write!(err, "\x1b[?25h");
+            }
             let _ = err.flush();
         }
     }
@@ -320,24 +392,57 @@ fn percent(done: u64, total: u64) -> f64 {
 }
 
 /// Bar glyph cells.
-const BAR_CELLS: usize = 14;
-/// Longest file name shown before truncation.
-const NAME_MAX: usize = 24;
+const BAR_CELLS: usize = 32;
+/// Longest file name shown on the header line before truncation.
+const HEADER_NAME_MAX: usize = 60;
 
-/// Render one bar line; returns the string and its display width (the ANSI
-/// codes are zero-width). Pure, so it's testable without a terminal. Shape:
-/// `scanning  movie.m2ts  ██████────────  42%  118 MB/s  ETA 0:41  [2/7]`
-/// (rate/ETA appear once the phase has enough history; `[k/N]` only for
-/// multi-file runs). Fits an 80-column terminal at every field's widest.
-#[allow(clippy::too_many_arguments)]
-fn format_line(
-    phase: Phase,
+/// Render the per-file header line printed once above the first phase's bar:
+/// `Scanning: movie.m2ts  [2/7]` (`[k/N]` only for multi-file runs). Never
+/// `\r`-rewritten, so no display width is tracked for it.
+fn format_header(
     name: &str,
+    file_index: usize,
+    file_count: usize,
+    color: Option<&'static Palette>,
+) -> String {
+    let paint = |code: &str, text: &str| -> String {
+        match color {
+            Some(_) if !code.is_empty() => format!("\x1b[{code}m{text}\x1b[0m"),
+            _ => text.to_string(),
+        }
+    };
+    let (bright, label, faint) = match color {
+        Some(p) => (p.bright, p.label, p.faint),
+        None => ("", "", ""),
+    };
+    let mut line = String::new();
+    line.push_str(&paint(label, "Scanning:"));
+    line.push(' ');
+    line.push_str(&paint(bright, &truncate_name(name, HEADER_NAME_MAX)));
+    if file_count > 1 {
+        line.push_str("  ");
+        line.push_str(&paint(faint, &format!("[{file_index}/{file_count}]")));
+    }
+    line
+}
+
+/// Render the file's single bar line; returns the string and its display
+/// width (the ANSI codes are zero-width). Pure, so it's testable without a
+/// terminal. Shape (drawn under the file's header line, no label of its own
+/// — the header already says what's happening):
+/// `█████████████▓──────────────────  42%  118 MB/s  ETA 0:41`
+/// The fill is two-tone: solid bright cells, plus one mid-tone `▓` at the
+/// leading edge when the fraction lands in a cell's back half — sub-cell
+/// motion between full cells.
+/// `frac` is the whole-file blended fraction (drives the glyphs and the
+/// percent); `done`/`total`/`phase_elapsed` are the *current phase's* bytes
+/// and clock, so rate and ETA describe the work actually in flight. Fits an
+/// 80-column terminal at every field's widest.
+fn format_line(
+    frac: f64,
     done: u64,
     total: u64,
     phase_elapsed: Duration,
-    file_index: usize,
-    file_count: usize,
     color: Option<&'static Palette>,
 ) -> (String, usize) {
     let paint = |code: &str, text: &str| -> String {
@@ -346,17 +451,17 @@ fn format_line(
             _ => text.to_string(),
         }
     };
-    let (bright, value, label, faint) = match color {
-        Some(p) => (p.bright, p.value, p.label, p.faint),
-        None => ("", "", "", ""),
+    let (bright, value, faint) = match color {
+        Some(p) => (p.bright, p.value, p.faint),
+        None => ("", "", ""),
     };
 
-    let frac = if total == 0 { 1.0 } else { done as f64 / total as f64 };
-    let filled = (frac * BAR_CELLS as f64).floor() as usize;
-    let filled = filled.min(BAR_CELLS);
-    let pct = (frac * 100.0).floor() as u32;
+    let cells = frac * BAR_CELLS as f64;
+    let filled = (cells.floor() as usize).min(BAR_CELLS);
+    let half = filled < BAR_CELLS && cells - filled as f64 >= 0.5;
+    let empty = BAR_CELLS - filled - usize::from(half);
+    let pct = ((frac * 100.0).floor() as u32).min(100);
 
-    let shown = truncate_name(name, NAME_MAX);
     let mut line = String::new();
     let mut width = 0usize;
     let push = |code: &str, text: &str, out: &mut String, w: &mut usize| {
@@ -364,12 +469,11 @@ fn format_line(
         *w += text.chars().count();
     };
 
-    push(label, phase.label(), &mut line, &mut width);
-    push("", "  ", &mut line, &mut width);
-    push(label, &shown, &mut line, &mut width);
-    push("", "  ", &mut line, &mut width);
     push(bright, &"█".repeat(filled), &mut line, &mut width);
-    push(faint, &"─".repeat(BAR_CELLS - filled), &mut line, &mut width);
+    if half {
+        push(value, "▓", &mut line, &mut width);
+    }
+    push(faint, &"─".repeat(empty), &mut line, &mut width);
     push("", "  ", &mut line, &mut width);
     push(value, &format!("{pct:>3}%"), &mut line, &mut width);
 
@@ -384,11 +488,6 @@ fn format_line(
             push("", "  ", &mut line, &mut width);
             push(faint, &format!("ETA {}", format_eta(eta)), &mut line, &mut width);
         }
-    }
-
-    if file_count > 1 {
-        push("", "  ", &mut line, &mut width);
-        push(faint, &format!("[{file_index}/{file_count}]"), &mut line, &mut width);
     }
 
     (line, width)
@@ -451,50 +550,83 @@ mod tests {
     }
 
     #[test]
+    fn header_line_plain_golden() {
+        // Single file: no [k/N]; multi-file runs carry the counter.
+        assert_eq!(format_header("movie.m2ts", 1, 1, None), "Scanning: movie.m2ts");
+        assert_eq!(format_header("movie.mkv", 2, 7, None), "Scanning: movie.mkv  [2/7]");
+    }
+
+    #[test]
+    fn header_line_colored_wraps_plain_text() {
+        let palette: &'static Palette = crate::render::Theme::Green.palette();
+        let line = format_header("movie.mkv", 2, 7, Some(palette));
+        assert!(line.contains("\x1b["));
+        assert!(line.contains("Scanning:"));
+        assert!(line.contains("movie.mkv"));
+        assert!(line.contains("[2/7]"));
+    }
+
+    #[test]
     fn bar_line_plain_golden() {
-        // 42% of 1000 bytes, 500 MB/s pace, single file: no color, no [k/N].
-        let (line, width) = format_line(
-            Phase::Scan,
-            "movie.m2ts",
-            420,
-            1000,
-            Duration::from_secs(0), // too little history for rate/ETA
-            1,
-            1,
-            None,
-        );
-        assert_eq!(line, "scanning  movie.m2ts  █████─────────   42%");
+        // 42% of 1000 bytes: no color, too little history for rate/ETA.
+        // 0.42 * 32 = 13.44 cells: 13 solid, the .44 remainder below the
+        // half-cell threshold.
+        let (line, width) = format_line(0.42, 420, 1000, Duration::from_secs(0), None);
+        assert_eq!(line, "█████████████───────────────────   42%");
         assert_eq!(width, line.chars().count());
     }
 
     #[test]
-    fn bar_line_with_rate_eta_and_file_counter() {
+    fn bar_line_half_cell_edge() {
+        // 13.5 / 32 cells: 13 solid plus the mid-tone half-cell.
+        let (line, width) = format_line(13.5 / 32.0, 422, 1000, Duration::from_secs(0), None);
+        assert_eq!(line, "█████████████▓──────────────────   42%");
+        assert_eq!(width, line.chars().count());
+    }
+
+    #[test]
+    fn bar_line_with_rate_and_eta() {
         // 512 MiB of 1 GiB in 2s => ~268 MB/s, ETA 2s.
-        let (line, width) = format_line(
-            Phase::Index,
-            "movie.mkv",
-            512 << 20,
-            1 << 30,
-            Duration::from_secs(2),
-            2,
-            7,
-            None,
-        );
-        assert_eq!(line, "indexing  movie.mkv  ███████───────   50%  268 MB/s  ETA 0:02  [2/7]");
+        let (line, width) = format_line(0.5, 512 << 20, 1 << 30, Duration::from_secs(2), None);
+        assert_eq!(line, "████████████████────────────────   50%  268 MB/s  ETA 0:02");
         assert_eq!(width, line.chars().count());
     }
 
     #[test]
     fn bar_line_colored_has_zero_width_codes() {
         let palette: &'static Palette = crate::render::Theme::Green.palette();
-        let (line, width) =
-            format_line(Phase::Scan, "m.ts", 1000, 1000, Duration::from_secs(0), 1, 1, Some(palette));
+        let (line, width) = format_line(1.0, 1000, 1000, Duration::from_secs(0), Some(palette));
         // Same display width as the plain version, ANSI codes present.
-        let (plain, plain_width) =
-            format_line(Phase::Scan, "m.ts", 1000, 1000, Duration::from_secs(0), 1, 1, None);
+        let (plain, plain_width) = format_line(1.0, 1000, 1000, Duration::from_secs(0), None);
         assert_eq!(width, plain_width);
         assert!(line.contains("\x1b["));
         assert!(line.len() > plain.len());
+    }
+
+    /// The single bar spans the whole file: an index phase fills the first
+    /// half, the scan the second, and the fraction never moves backward at
+    /// the phase switch. `finish` pins it to 1.0.
+    #[test]
+    fn bar_fraction_blends_phases_monotonically() {
+        // Json mode writes to stderr — captured by the test harness, harmless.
+        let p = Progress::new(Mode::Json, Path::new("x.hevc"), 1, 1);
+        p.begin(Phase::Index, 100);
+        p.update(50);
+        assert_eq!(p.bar_fraction(), 0.25);
+        p.update(100);
+        assert_eq!(p.bar_fraction(), 0.5);
+        p.begin(Phase::Scan, 200); // switch lands exactly where index left off
+        assert_eq!(p.bar_fraction(), 0.5);
+        p.update(100);
+        assert_eq!(p.bar_fraction(), 0.75);
+        p.finish();
+        assert_eq!(p.bar_fraction(), 1.0);
+
+        // No index phase: the scan owns the whole bar.
+        let p = Progress::new(Mode::Json, Path::new("x.mkv"), 1, 1);
+        p.begin(Phase::Scan, 100);
+        p.update(40);
+        assert_eq!(p.bar_fraction(), 0.4);
     }
 
     #[test]
