@@ -120,7 +120,10 @@ never parse bytes native-endian.
   never reintroduce a per-phase reset; the *JSON* events stay per-phase, that contract is
   unchanged); after a fully successful interactive bar run, `main` clears the screen and redraws
   the masthead so the report starts clean (skipped on any error so stderr diagnostics stay
-  visible) — or NDJSON events on stderr (contract documented in
+  visible; ConPTY hosts scroll an ED2-cleared viewport into scrollback instead of erasing it, so
+  under the shell verb's hidden `--own-console` flag the clear adds ED3 `\x1b[3J` to purge that
+  history — never widen the ED3 past the flag, it would wipe a shared terminal's real scrollback) —
+  or NDJSON events on stderr (contract documented in
   `docs/SCHEMA.md`, "Progress events"; the event structs live here, *not* in `model.rs`, so the
   report schema and its golden shape test are untouched). One `Progress` per file, created in
   `main` and threaded through `container::demux` and `sample::scan`; two byte-denominated

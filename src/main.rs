@@ -96,6 +96,13 @@ struct Cli {
     /// Remove the right-click context-menu submenu (Windows).
     #[arg(long)]
     uninstall_shell: bool,
+
+    /// The console window exists solely for this run — set by the shell verb's
+    /// fresh window, never for a shared interactive terminal. Lets the
+    /// end-of-run clear purge scrollback too (see the clear below), which
+    /// would be destructive to a real session's history.
+    #[arg(long, hide = true)]
+    own_console: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -268,9 +275,14 @@ fn main() -> ExitCode {
     // clean, redrawing the masthead the clear wipes. Interactive decorated
     // path only (the same one that printed the masthead eagerly), and never
     // after an error — the stderr diagnostics must stay visible above the
-    // reports.
+    // reports. ConPTY hosts (Windows Terminal) implement ED2 by scrolling the
+    // old viewport into scrollback rather than erasing it, so the scan-time
+    // masthead and bar survive above the redraw; when the window is ours alone
+    // (the shell verb's --own-console) ED3 purges that history too. A shared
+    // terminal keeps its scrollback — never widen the purge past the flag.
     if banner_eager && bar_drawn && !had_error {
-        out_buf.insert_str(0, &format!("\x1b[2J\x1b[H{}", render::render_banner(cli.theme)));
+        let wipe = if cli.own_console { "\x1b[2J\x1b[3J\x1b[H" } else { "\x1b[2J\x1b[H" };
+        out_buf.insert_str(0, &format!("{wipe}{}", render::render_banner(cli.theme)));
     }
 
     if let Err(e) = write_output(&cli.output, &out_buf) {

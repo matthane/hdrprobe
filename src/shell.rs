@@ -19,6 +19,9 @@
 //!   bare from a verb its window would close before the report could be read,
 //!   so the verb runs a `cmd /c "cls & … & pause"` chain: clear the startup
 //!   noise (the UNC-cwd warning `cmd` prints on network files), report, pause.
+//!   hdrprobe itself gets the hidden `--own-console` flag, marking the window
+//!   as its alone so a Full run's end-of-report screen clear may purge
+//!   scrollback (see the clear in `main`).
 //!   The fresh window is sized to fit a full report without scrolling, and
 //!   *how* depends on the console host: Windows Terminal ignores client resize
 //!   APIs (`mode con` only reflows the hidden buffer — measured on WT 1.24:
@@ -52,8 +55,9 @@ const WINDOW_SIZE: (u32, u32) = (110, 45); // (cols, lines)
 /// Terminal installed). `full` inserts `--full` before the selected file for
 /// the exhaustive-scan menu entry.
 ///
-/// The stored value is `cmd /c "mode con: cols=C lines=L & cls & "<exe>" "%1"
-/// & pause"`. `cmd /c` strips the first and last quote of its argument
+/// The stored value is `cmd /c "mode con: cols=C lines=L & cls & "<exe>"
+/// --own-console "%1" & pause"`. `cmd /c` strips the first and last quote of
+/// its argument
 /// whenever the command contains special characters (here `&`), so the outer
 /// pair is deliberate padding: after `cmd` removes it, what runs is the mode
 /// resize (honoured by conhost; Windows Terminal ignores it, which is why the
@@ -61,24 +65,31 @@ const WINDOW_SIZE: (u32, u32) = (110, 45); // (cols, lines)
 /// `cmd` prints when Explorer starts the verb in a network folder), the quoted
 /// exe, the quoted selected file (`%1`), then a pause so the console stays
 /// open for reading. Only the verb's fresh window is resized/cleared; an
-/// existing terminal session never sees any of this.
+/// existing terminal session never sees any of this. `--own-console` tells
+/// hdrprobe the window is its alone, so a Full run's end-of-report screen
+/// clear may purge scrollback too (ConPTY hosts scroll cleared content into
+/// history instead of erasing it, which left the scan-time masthead visible
+/// above the redrawn report).
 #[cfg(windows)]
 fn command_for(exe: &str, full: bool) -> String {
     let (cols, lines) = WINDOW_SIZE;
     let flag = if full { "--full " } else { "" };
-    format!("cmd /c \"mode con: cols={cols} lines={lines} & cls & \"{exe}\" {flag}\"%1\" & pause\"")
+    format!(
+        "cmd /c \"mode con: cols={cols} lines={lines} & cls & \"{exe}\" --own-console {flag}\"%1\" & pause\""
+    )
 }
 
 /// Build a verb's command string for the Windows Terminal host. `full`
 /// inserts `--full` before the selected file, as in [`command_for`].
 ///
 /// The stored value is `"<wt>" -w new --size C,L cmd /c "cls & \"<exe>\"
-/// \"%1\" & pause"`. WT ignores client resize APIs, so the size rides its own
-/// `--size` launch option and `-w new` guarantees a standalone window (never
-/// a tab glommed onto an existing one). The inner quotes around the exe and
-/// `%1` are backslash-escaped so they survive wt's argv split as literal
-/// quotes; wt then hands `cmd` the same `cls & "<exe>" "%1" & pause` chain
-/// the conhost verb runs. Verified end-to-end on WT 1.24: the window opens at
+/// --own-console \"%1\" & pause"`. WT ignores client resize APIs, so the size
+/// rides its own `--size` launch option and `-w new` guarantees a standalone
+/// window (never a tab glommed onto an existing one). The inner quotes around
+/// the exe and `%1` are backslash-escaped so they survive wt's argv split as
+/// literal quotes; wt then hands `cmd` the same `cls & "<exe>" --own-console
+/// "%1" & pause` chain the conhost verb runs (`--own-console` as in
+/// [`command_for`]). Verified end-to-end on WT 1.24: the window opens at
 /// the requested size and spaced paths parse through all three layers.
 ///
 /// Known limit: wt splits its command line on bare `;`, so a *path*
@@ -89,7 +100,7 @@ fn command_for_wt(wt: &str, exe: &str, full: bool) -> String {
     let (cols, lines) = WINDOW_SIZE;
     let flag = if full { "--full " } else { "" };
     format!(
-        "\"{wt}\" -w new --size {cols},{lines} cmd /c \"cls & \\\"{exe}\\\" {flag}\\\"%1\\\" & pause\""
+        "\"{wt}\" -w new --size {cols},{lines} cmd /c \"cls & \\\"{exe}\\\" --own-console {flag}\\\"%1\\\" & pause\""
     )
 }
 
@@ -284,7 +295,7 @@ mod tests {
         // network files), the quoted exe, the quoted selected file, then pause.
         assert_eq!(
             command_for(r"C:\Program Files\hdrprobe.exe", false),
-            r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" "%1" & pause""#
+            r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" --own-console "%1" & pause""#
         );
     }
 
@@ -293,11 +304,11 @@ mod tests {
         // The submenu's "Full" verb is the same chain with --full ahead of %1.
         assert_eq!(
             command_for(r"C:\Program Files\hdrprobe.exe", true),
-            r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" --full "%1" & pause""#
+            r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" --own-console --full "%1" & pause""#
         );
         assert_eq!(
             command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", true),
-            r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" --full \"%1\" & pause""#
+            r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" --own-console --full \"%1\" & pause""#
         );
     }
 
@@ -308,7 +319,7 @@ mod tests {
         // ignores mode con.
         assert_eq!(
             command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", false),
-            r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" \"%1\" & pause""#
+            r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" --own-console \"%1\" & pause""#
         );
     }
 
