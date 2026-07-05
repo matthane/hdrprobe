@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 125 unit tests
+cargo test                     # 126 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -217,7 +217,28 @@ never parse bytes native-endian.
   (`levels::dv_profile_label`: `7.6`, `8.1`, `10.4`, …). **Profile 4 is dual-layer** (like P7): its EL presence and MEL/FEL tag come from
   the config + RPU the same way, and its **SDR base is inferred from the profile** in
   `hdr::assemble` (P4 is SDR-compatible by definition) since old P4 muxes carry neither a compat
-  id nor a base-layer transfer VUI.
+  id nor a base-layer transfer VUI. The **reconstructed bit depth**
+  (`model::DolbyVision::reconstructed_bit_depth`, the report's `Reconstruction` line) is the RPU
+  header's signaled `vdr_bit_depth` read verbatim — **never assumed from the profile**: P7 FEL
+  signals 12 but P4 FEL signals 14 (corpus-verified on every frame, in both the header and the DM
+  header's independent `signal_bit_depth`; libdovi's own P7-vs-P4 detector keys on
+  `vdr_bit_depth == 12`, and its P4 template carries `signal_bit_depth: 14`). The semantics and
+  name come from the field's public definition — ETSI GS CCM 001 v1.1.1 §"hdr_bit_depth_minus8":
+  "used to derive the bit depth of **the reconstructed HDR signal**" — with one caveat for
+  context: the ETSI-standardized subset allows only 10/12, so P4's 14 is Dolby-proprietary
+  signaling that predates the 2017 ETSI publication (which is why libdovi's validator accepts
+  `vdr_bit_depth_minus8 <= 6`, not ETSI's 4, and why Dolby's Profiles & Levels spec needs a
+  translation table to map DV profiles onto ETSI CCM profiles). It is **FEL-gated**
+  in `levels::finalize`: every RPU signals a vdr depth (MEL and single-layer titles all say 12,
+  corpus-verified), but only a FEL residual carries real data to reconstruct beyond the base
+  layer — elsewhere the value is composer arithmetic precision, so rendering it would misread as
+  content depth. The gate itself is Dolby-published, not community convention: "Dolby Vision
+  Profiles and Levels" v1.3.2 Annex II's MEL fingerprint (zero `nlq_offset`/`vdr_in_max`/
+  deadzone, `vdr_in_max_int` 1) is exactly what libdovi's `is_mel()` checks, so `el_type` FEL/MEL
+  follows Dolby's own detection method. The "10-bit BL" half of the rendered line is safe because
+  libdovi's header validation rejects any RPU whose BL/EL depths aren't exactly 10-bit (matching
+  ETSI CCM's `BL/EL_bit_depth_minus8` constraint and the 10-bit HEVC BL/EL codec in the P&L
+  spec's profile tables).
 - **FEL brightness expansion is a metadata verdict with hard gates.** The DV Mastering line's
   `(FEL brightness expansion)` badge (`levels::flag_fel_brightness_expansion`) fires only when
   the RPU is **FEL** *and* the grade's `source_max_pq` exceeds the **base layer's own** declared
