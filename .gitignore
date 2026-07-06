@@ -7,3 +7,6 @@
 
 # Tool logs / scratch
 *.log
+
+# Temporary dev reference material
+/dev
