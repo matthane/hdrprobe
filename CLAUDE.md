@@ -250,7 +250,18 @@ never parse bytes native-endian.
   displays say), never compare against the RPU's own L6 values (self-referential), and never flag
   sidecars (no base layer to expand beyond), so `main.rs` is the only caller. This is a metadata
   verdict only: confirming the general case would mean decoding and comparing composed-vs-BL
-  pixels, which hdrprobe never does, so a missing badge is not proof of no expansion.
+  pixels, which hdrprobe never does, so a missing badge is not proof of no expansion. Its
+  sibling verdict is the **`MDP mismatch` badge** (`levels::flag_mastering_primaries_mismatch`,
+  same main.rs-only call site, rendered on the same DV Mastering line, JSON
+  `dolby_vision.mastering_primaries_mismatch`): the grade's recognized **L9** gamut name vs the
+  base layer's **signalled** MDCV box / ST.2086 SEI label, compared by plain string equality
+  (both sides come from the one `hdr::primaries_label` value space, which already absorbed
+  quantization — never re-compare coordinates with a second tolerance). Hard gates: L9
+  provenance only (`primaries_level == 9`, so a DV XML's L0 never fires), a signalled BL label
+  only (never the L6 fallback, whose primaries *are* the L9 — self-comparison), both sides
+  recognized (unmatched coordinates suppress the verdict, never guess). The classic trigger is
+  re-encode drift (a BT.2020-claiming MDCV over a P3-D65 grade), so the badge is a provenance
+  observation, not an error claim.
 - **Extension dispatch falls back to content sniffing only on error.** `container::demux` picks a
   backend by extension and returns immediately on success — sniffing never runs on the happy path
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),
