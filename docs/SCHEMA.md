@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 1.1**
+**Schema version: 1.2**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -161,6 +161,7 @@ build until the schema version, that test, and this document are updated togethe
 
 Version history:
 
+- **1.2**: added `dolby_vision.mastering_primaries_mismatch` (additive). Unreleased.
 - **1.1**: added `dolby_vision.reconstructed_bit_depth` (additive). Ships in hdrprobe 0.2.0.
 - **1.0**: initial schema, as shipped in hdrprobe 0.1.0.
 
@@ -336,6 +337,7 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 | `l5_assumed_canvas` | array `[width, height]` | optional | Present only for DV sidecars, which record no resolution: the canvas (3840x2160) the active-area dimensions were computed against |
 | `mastering_display` | `MasteringDisplay` | optional | The DV grade's own mastering display (see the `MasteringDisplay` section). Its `primaries` is filled only from a recognized L9 (`primaries_level` 9) or a DV XML Level-0 (`primaries_level` 0); a CM v2.9 RPU carries no display gamut, so the field is luminance-only there |
 | `fel_brightness_expansion` | `FelBrightnessExpansion` | optional | Metadata indication that the FEL likely carries brightness beyond the base layer; see below |
+| `mastering_primaries_mismatch` | `MasteringPrimariesMismatch` | optional | The DV grade's L9 mastering gamut disagrees with the base layer's own signalled mastering primaries; see below |
 | `l6` | `L6` | optional | The RPU's L6 block: MaxCLL/MaxFALL and the mastering luminances (the DV carriage of HDR10-style static metadata) |
 | `l9_mastering` | string | optional | L9 mastering-display gamut name. The `MasteringDisplay.primaries` names plus `"custom"` (an L9 with unrecognized explicit chromaticities) and `"unknown"` (an unrecognized predefined index) |
 | `l11_content` | string | optional | L11 content type, named per Dolby's L11 (Dolby Vision IQ) definitions: `"Default"`, `"Movies"`, `"Game"`, `"Sport"`, `"User Generated Content"`, or `"Unknown"` for values outside the published 0-4 range |
@@ -357,6 +359,22 @@ expansion.
 |---|---|---|---|
 | `bl_max_nits` | float | always | The base layer's declared mastering max (container MDCV or ST.2086 SEI) |
 | `rpu_max_nits` | float | always | The DV grade's mastering max (`source_max_pq`) |
+
+## Object: `MasteringPrimariesMismatch`
+
+The evidence pair behind the mastering-primaries-mismatch flag. Set only for video inputs where
+both sides resolved to a recognized gamut name and the names differ: the DV grade's gamut from a
+recognized L9 block (`dolby_vision.mastering_display.primaries` with `primaries_level` 9), and
+the base layer's own declared mastering primaries from a *signalled* container MDCV box or
+ST.2086 SEI (never a fallback value). Both names come from the same gamut matcher, so the
+comparison is exact. The classic trigger is re-encode drift, such as a BT.2020-claiming MDCV
+written by an encoder over a DCI-P3 D65 grade. Unrecognized coordinates on either side suppress
+the comparison entirely, and a metadata sidecar (no base layer) never carries the object.
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `bl_primaries` | string | always | The base layer's declared mastering gamut name (container MDCV or ST.2086 SEI) |
+| `rpu_primaries` | string | always | The DV grade's mastering gamut name (L9) |
 
 ## Object: `L6`
 

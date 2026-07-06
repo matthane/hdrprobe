@@ -242,12 +242,23 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     .fel_brightness_expansion
                     .map(|_| format!("  {}", c.warn("FEL brightness expansion")))
                     .unwrap_or_default();
+                // The L9 gamut at the front of this line disagrees with the
+                // base layer's own declared mastering primaries (the HDR
+                // section's Mastering line) — usually re-encode drift, e.g. a
+                // BT.2020-claiming MDCV left over a P3-D65 grade. Both values
+                // already render on their own lines; the badge saves the
+                // cross-check.
+                let mismatch = dv
+                    .mastering_primaries_mismatch
+                    .as_ref()
+                    .map(|_| format!("  {}", c.warn("MDP mismatch")))
+                    .unwrap_or_default();
                 let lum = c.value(&format!(
                     "max {}  min {} cd/m²",
                     fmt_num(md.max_luminance),
                     fmt_num(md.min_luminance)
                 ));
-                kv_styled(&mut s, &c, "Mastering", &format!("{}{}{}", prim, lum, expansion));
+                kv_styled(&mut s, &c, "Mastering", &format!("{}{}{}{}", prim, lum, mismatch, expansion));
             }
             if !dv.trim_targets.is_empty() {
                 // The target set is a union over the RPUs actually read, and the

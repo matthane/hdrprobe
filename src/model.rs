@@ -16,7 +16,7 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "1.1";
+pub const SCHEMA_VERSION: &str = "1.2";
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -236,6 +236,15 @@ pub struct DolbyVision {
     /// needs a decode, which hdrprobe never does, so absence is not proof.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fel_brightness_expansion: Option<FelBrightnessExpansion>,
+    /// Metadata indication that the DV grade's mastering gamut (a recognized
+    /// L9) disagrees with the base layer's own declared mastering primaries (a
+    /// *signalled* container MDCV box or ST.2086 SEI, never a fallback), e.g.
+    /// a BT.2020-claiming MDCV over a DCI-P3 D65 L9 left behind by a re-encode.
+    /// Both labels come from the same gamut matcher, so plain inequality is the
+    /// verdict; unrecognized coordinates on either side never fire it. Video
+    /// inputs only: a metadata sidecar has no base layer to disagree with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mastering_primaries_mismatch: Option<MasteringPrimariesMismatch>,
     /// The RPU's L6 block: MaxCLL/MaxFALL plus the mastering luminances, in
     /// the bitstream's raw integer units.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,6 +297,15 @@ pub struct LevelPresence {
 pub struct FelBrightnessExpansion {
     pub bl_max_nits: f64,
     pub rpu_max_nits: f64,
+}
+
+/// The evidence pair behind the mastering-primaries-mismatch flag: the base
+/// layer's declared mastering gamut and the DV grade's L9 gamut, both as the
+/// shared matcher's label names.
+#[derive(Debug, Serialize, Clone)]
+pub struct MasteringPrimariesMismatch {
+    pub bl_primaries: String,
+    pub rpu_primaries: String,
 }
 
 /// One distinct trim target, in nits, plus the level(s) that produced it — 2
@@ -405,6 +423,10 @@ mod tests {
                     bl_max_nits: 1000.0,
                     rpu_max_nits: 4000.0,
                 }),
+                mastering_primaries_mismatch: Some(MasteringPrimariesMismatch {
+                    bl_primaries: "BT.2020".to_string(),
+                    rpu_primaries: "DCI-P3 D65".to_string(),
+                }),
                 l6: Some(L6 {
                     max_cll: 737,
                     max_fall: 130,
@@ -519,6 +541,8 @@ mod tests {
             "dolby_vision.mastering_display.primaries_level",
             "dolby_vision.fel_brightness_expansion.bl_max_nits",
             "dolby_vision.fel_brightness_expansion.rpu_max_nits",
+            "dolby_vision.mastering_primaries_mismatch.bl_primaries",
+            "dolby_vision.mastering_primaries_mismatch.rpu_primaries",
             "dolby_vision.l6.max_cll",
             "dolby_vision.l6.max_fall",
             "dolby_vision.l6.max_mastering",
@@ -547,9 +571,9 @@ mod tests {
 
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "1.1");
+        assert_eq!(SCHEMA_VERSION, "1.2");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "1.1");
+        assert_eq!(v["hdrprobe_schema_version"], "1.2");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
         assert_eq!(v["hdr10plus"]["profile"], "B");

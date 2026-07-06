@@ -13,7 +13,7 @@ use dolby_vision::rpu::rpu_data_nlq::DoviELType;
 use crate::container::DvConfig;
 use crate::model::{
     ActiveArea, DolbyVision, DvCensus, FelBrightnessExpansion, L6, LevelPresence,
-    MasteringDisplay, TrimTarget,
+    MasteringDisplay, MasteringPrimariesMismatch, TrimTarget,
 };
 
 /// Metadata levels we census, in report order.
@@ -358,9 +358,11 @@ impl DvAggregate {
             l5_active_areas,
             l5_assumed_canvas: None,
             mastering_display,
-            // Filled by `flag_fel_brightness_expansion` after the base layer's
-            // mastering display is known; the RPU alone can't decide this.
+            // Both filled after the base layer's mastering display is known
+            // (`flag_fel_brightness_expansion`, `flag_mastering_primaries_mismatch`);
+            // the RPU alone can't decide either.
             fel_brightness_expansion: None,
+            mastering_primaries_mismatch: None,
             l6: self.l6,
             l9_mastering: l9_label,
             l11_content: self.l11_content.map(content_type_name),
@@ -398,6 +400,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         l5_assumed_canvas: None,
         mastering_display: None,
         fel_brightness_expansion: None,
+        mastering_primaries_mismatch: None,
         l6: None,
         l9_mastering: None,
         l11_content: None,
@@ -433,6 +436,35 @@ pub fn flag_fel_brightness_expansion(dv: &mut DolbyVision, bl_max_nits: Option<f
     if rpu_max > bl_max * 1.1 {
         dv.fel_brightness_expansion =
             Some(FelBrightnessExpansion { bl_max_nits: bl_max, rpu_max_nits: rpu_max });
+    }
+}
+
+/// Flag a mastering-gamut disagreement: the DV grade's L9 primaries name (on
+/// `dv.mastering_display`, present only when a recognized L9 filled it) differs
+/// from the base layer's own declared mastering primaries (`bl_primaries`, the
+/// label from a *signalled* container MDCV box or ST.2086 SEI — never the L6
+/// fallback, whose primaries are the L9 itself, a self-comparison). Both names
+/// come from the one shared matcher (`hdr::primaries_label` / the L9 name
+/// table), so string inequality is the whole verdict — no tolerance here, the
+/// matcher already absorbed quantization. Gated to L9 (`primaries_level` 9):
+/// a DV XML's Level-0 fills the same field tagged 0, but that's a sidecar,
+/// which has no base layer to disagree with. Either side unrecognized or
+/// absent: no comparison, never a guess.
+pub fn flag_mastering_primaries_mismatch(dv: &mut DolbyVision, bl_primaries: Option<&str>) {
+    let Some(l9) = dv
+        .mastering_display
+        .as_ref()
+        .filter(|m| m.primaries_level == Some(9))
+        .and_then(|m| m.primaries.as_deref())
+    else {
+        return;
+    };
+    let Some(bl) = bl_primaries else { return };
+    if l9 != bl {
+        dv.mastering_primaries_mismatch = Some(MasteringPrimariesMismatch {
+            bl_primaries: bl.to_string(),
+            rpu_primaries: l9.to_string(),
+        });
     }
 }
 
@@ -792,6 +824,49 @@ mod tests {
         let mut d = dv(Some("FEL"), 4000.0);
         flag_fel_brightness_expansion(&mut d, Some(0.0));
         assert!(d.fel_brightness_expansion.is_none());
+    }
+
+    #[test]
+    fn mastering_primaries_mismatch_needs_l9_and_a_differing_signalled_label() {
+        let dv = |primaries: Option<&str>, level: Option<u8>| {
+            let cfg = DvConfig {
+                profile: 8,
+                level: None,
+                bl_present: true,
+                el_present: false,
+                rpu_present: true,
+                bl_compatibility_id: Some(1),
+            };
+            let mut d = container_only(&cfg, false);
+            d.mastering_display = Some(MasteringDisplay {
+                max_luminance: 4000.0,
+                min_luminance: 0.0001,
+                primaries: primaries.map(str::to_string),
+                primaries_level: level,
+            });
+            d
+        };
+        // The classic drift: a BT.2020-claiming MDCV over a P3-D65 L9.
+        let mut d = dv(Some("DCI-P3 D65"), Some(9));
+        flag_mastering_primaries_mismatch(&mut d, Some("BT.2020"));
+        let m = d.mastering_primaries_mismatch.expect("mismatch flagged");
+        assert_eq!((m.bl_primaries.as_str(), m.rpu_primaries.as_str()), ("BT.2020", "DCI-P3 D65"));
+        // Agreement stays unflagged.
+        let mut d = dv(Some("DCI-P3 D65"), Some(9));
+        flag_mastering_primaries_mismatch(&mut d, Some("DCI-P3 D65"));
+        assert!(d.mastering_primaries_mismatch.is_none());
+        // No recognized L9 (a CM v2.9 luminance-only display): no comparison.
+        let mut d = dv(None, None);
+        flag_mastering_primaries_mismatch(&mut d, Some("BT.2020"));
+        assert!(d.mastering_primaries_mismatch.is_none());
+        // A non-L9 provenance (a DV XML's Level-0) never fires the flag.
+        let mut d = dv(Some("DCI-P3 D65"), Some(0));
+        flag_mastering_primaries_mismatch(&mut d, Some("BT.2020"));
+        assert!(d.mastering_primaries_mismatch.is_none());
+        // No signalled BL primaries (unrecognized or absent MDCV): silent.
+        let mut d = dv(Some("DCI-P3 D65"), Some(9));
+        flag_mastering_primaries_mismatch(&mut d, None);
+        assert!(d.mastering_primaries_mismatch.is_none());
     }
 
     #[test]
