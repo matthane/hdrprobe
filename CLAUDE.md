@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 128 unit tests
+cargo test                     # 130 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -286,7 +286,19 @@ never parse bytes native-endian.
   sidecars via `DvAggregate::mark_metadata_only`: a video input — **even a raw HEVC/AV1 elementary
   stream with no dvcC** — has a base-layer VUI that officially backs the inference, so it's never
   flagged. Don't widen the flag to `cfg.is_none()`; raw bitstreams share that state but aren't
-  metadata-only.
+  metadata-only. **A bare Profile 5/10's compat digit is display-completed; the JSON stays
+  verbatim.** A raw elementary stream has no dvcC/dvvC to declare the minor, and neither profile
+  has a `dv_profile_label` convention default, so `render.rs::dv_profile_display` completes the
+  digit for the text report and `-q` line when it is certain: a bare "5" ⇒ "5.0" definitionally
+  (compat 0 is the only value the P&L spec admits for P5); a bare "10" (P10's compat set is
+  {0,1,2,4}) from the base layer's signalled CICP only when the deduction is airtight
+  (`infer_p10_compat`): IPT-PQ-c2 matrix ⇒ .0, explicit SDR gamma transfer ⇒ .2, PQ/HLG ⇒ .1/.4
+  but only over BT.2020 primaries *and* an explicit non-IPT matrix — IPT is itself PQ-encoded and
+  its convention (from P5) leaves CICP unspecified, so PQ alone can't exclude a 10.0 base;
+  anything less explicit stays a bare "10". Display only: the JSON
+  `profile`/`bl_compatibility_id`/`compatibility` keep the mux's declaration (the bare number /
+  null) so machine consumers get raw facts and draw their own inferences — never move this into
+  `levels.rs`/`model.rs`.
 - **AVC (Profile 9) RPU is found by *content*, not by NAL number.** The DV RPU rides in an H.264
   *unspecified* NAL (Dolby uses type 28; the range is 24..=31), payload = the RPU EBSP beginning
   with the `rpu_nal_prefix` byte `0x19`. `sample.rs` treats an unspecified-range NAL as an RPU only
