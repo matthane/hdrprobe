@@ -118,11 +118,14 @@ never parse bytes native-endian.
   scan owns the whole bar — the common case), so the percent is monotonic by construction and
   can never reset mid-file (a bar restarting at 0% reads as a loop/hang, a real user report —
   never reintroduce a per-phase reset; the *JSON* events stay per-phase, that contract is
-  unchanged); after a fully successful interactive bar run, `main` clears the screen and redraws
-  the masthead so the report starts clean (skipped on any error so stderr diagnostics stay
-  visible; ConPTY hosts scroll an ED2-cleared viewport into scrollback instead of erasing it, so
-  under the shell verb's hidden `--own-console` flag the clear adds ED3 `\x1b[3J` to purge that
-  history — never widen the ED3 past the flag, it would wipe a shared terminal's real scrollback) —
+  unchanged); on the decorated interactive path each *successful* file's whole progress display
+  (header, spacer, bar) is erased in place when it finishes (`Progress::finish_erased`: a
+  cursor-up over the header's wrapped-row count recorded at print time, then ED0) so the file's
+  streamed report prints where the header stood — the screen accumulates clean reports with the
+  live bar always at the bottom, and there is **no end-of-run screen clear** (one would wipe
+  reports the user is already reading; the old ED2/ED3 clear is gone, which also made the shell
+  verb's hidden `--own-console` flag inert — it stays accepted and stays in the verb command
+  strings because user registries persist them across upgrades) —
   or NDJSON events on stderr (contract documented in
   `docs/SCHEMA.md`, "Progress events"; the event structs live here, *not* in `model.rs`, so the
   report schema and its golden shape test are untouched). One `Progress` per file, created in
@@ -488,10 +491,13 @@ never parse bytes native-endian.
 - **Progress is `--full`-only, stderr-only, and single-threaded by design.** `main` resolves
   every `--progress` mode to `Off` unless `--full` is set (the fast path never reports), and
   nothing progress-related may ever write to stdout — SCHEMA.md promises stdout is the pure
-  report stream, and the corpus byte-identity gate implicitly checks it (the end-of-run screen
-  clear + masthead redraw in `main` is *report decoration* on the colored interactive text path,
-  the same gate as the masthead itself — it never fires for quiet/JSON/piped/`--output` runs or
-  after an error). The sink
+  report stream, and the corpus byte-identity gate implicitly checks it. Reports *stream*: each
+  file's report goes to stdout the moment that file finishes (text, quiet, and NDJSON; pretty
+  JSON still waits for its one closing array and `--output` keeps its single file write) — the
+  streamed bytes are exactly what the old end-of-run dump printed, so every piped/machine stream
+  is byte-identical, and the per-file `finish_erased` (the erase is stderr-side cursor movement,
+  never stdout bytes) fires only on the colored interactive text path, the same gate as the
+  masthead — never for quiet/JSON/piped/`--output` runs or after an error. The sink
   (`progress::Progress`) holds `Cell` state on purpose: every tick site is single-threaded —
   demux walk loops, the TS window loop, and `sample::scan_chunks`' batch boundary *between*
   rayon collects — so never hand it into a `par_iter` closure. `update` is byte-gated before it
