@@ -16,7 +16,7 @@
 //! `Instant::now()` runs at most once per gate step.
 
 use std::cell::Cell;
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -36,9 +36,12 @@ pub enum Mode {
     /// fraction is blended across phases (`bar_fraction`) and is monotonic by
     /// construction, so the percent can never reset mid-file — a bar that
     /// restarts at 0% reads as a loop/hang, a real user report; never
-    /// reintroduce one. Only a failed file's in-progress bar line is erased
-    /// (the header stays as context above the diagnostic). `color` carries
-    /// the active theme's palette when stderr takes ANSI.
+    /// reintroduce one. On the decorated interactive path a *successful*
+    /// file's whole display (header, spacer, bar) is erased so the streamed
+    /// report prints in its place (`finish_erased`); a failed file erases
+    /// only the in-progress bar line (the header stays as context above the
+    /// diagnostic). `color` carries the active theme's palette when stderr
+    /// takes ANSI.
     Bar { color: Option<&'static Palette> },
     /// One compact JSON object per stderr line (see `docs/SCHEMA.md`,
     /// "Progress events").
@@ -102,10 +105,12 @@ pub struct Progress {
     /// Display width of the bar line currently on screen (0 = none).
     bar_width: Cell<usize>,
     /// The per-file `Scanning: <name>` header line was printed (bar mode
-    /// only) — also `main`'s signal that progress actually drew something,
-    /// so its end-of-run screen clear fires only when there is a bar to
-    /// clear.
+    /// only).
     header_drawn: Cell<bool>,
+    /// Physical terminal rows the header line occupies (a long name wraps
+    /// rather than truncating), recorded when it prints so `finish_erased`
+    /// knows how far up the header's first row sits.
+    header_rows: Cell<usize>,
     /// An `Index` phase ran for this file: `bar_fraction` maps it to the
     /// bar's first half and the following scan to the second.
     saw_index: Cell<bool>,
@@ -145,16 +150,11 @@ impl Progress {
             total_emitted: Cell::new(false),
             bar_width: Cell::new(0),
             header_drawn: Cell::new(false),
+            header_rows: Cell::new(1),
             saw_index: Cell::new(false),
             finished: Cell::new(false),
             cursor_hidden: Cell::new(false),
         }
-    }
-
-    /// Whether a bar-mode header (and thus at least one bar line) hit the
-    /// terminal for this file.
-    pub fn bar_shown(&self) -> bool {
-        self.header_drawn.get()
     }
 
     /// Start (or switch to) a phase with a known byte denominator. Emits the
@@ -167,12 +167,18 @@ impl Progress {
         // with a blank line between them so the bar has room to breathe.
         if let Mode::Bar { color } = self.mode {
             if !self.header_drawn.replace(true) {
+                let (line, width) =
+                    format_header(&self.name, self.file_index, self.file_count, color);
+                // Rows the header wraps onto at the current terminal width —
+                // best-effort (a mid-scan resize rewraps under us), it only
+                // sizes `finish_erased`'s cursor-up.
+                let rows = match crate::stderr_terminal_width() {
+                    Some(cols) if cols > 0 => width.div_ceil(cols).max(1),
+                    _ => 1,
+                };
+                self.header_rows.set(rows);
                 let mut err = std::io::stderr().lock();
-                let _ = writeln!(
-                    err,
-                    "{}\n",
-                    format_header(&self.name, self.file_index, self.file_count, color)
-                );
+                let _ = writeln!(err, "{line}\n");
                 let _ = err.flush();
             }
         }
@@ -258,6 +264,32 @@ impl Progress {
                 eprintln!("{line}");
             }
         }
+    }
+
+    /// File finished successfully on the decorated interactive path: erase
+    /// the file's whole progress display (header, spacer, bar) instead of
+    /// persisting it, leaving the cursor where the header's first row stood
+    /// so the streamed report prints in its place. Falls back to `finish`
+    /// (persist the bar / emit the JSON `done`) when there is nothing safely
+    /// erasable: no palette (the cursor sequences would land in a redirect
+    /// as garbage), no header drawn, or stderr isn't a terminal.
+    pub fn finish_erased(&self) {
+        let erasable = matches!(self.mode, Mode::Bar { color: Some(_) })
+            && self.header_drawn.get()
+            && std::io::stderr().is_terminal();
+        if !erasable {
+            self.finish();
+            return;
+        }
+        self.finished.set(true);
+        // Blank the live bar line in place (also restores the cursor glyph),
+        // parking the cursor at its column 0; the spacer row and the header
+        // rows sit directly above it.
+        self.clear_bar();
+        let rows = 1 + self.header_rows.get();
+        let mut err = std::io::stderr().lock();
+        let _ = write!(err, "\x1b[{rows}A\x1b[0J");
+        let _ = err.flush();
     }
 
     /// The whole-file fraction the bar shows, blended across phases: an
@@ -398,13 +430,14 @@ const BAR_CELLS: usize = 32;
 /// Render the per-file header line printed once above the first phase's bar:
 /// `Scanning: movie.m2ts  [2/7]` (`[k/N]` only for multi-file runs). The name
 /// is printed whole — a long title wraps rather than losing its tail. Never
-/// `\r`-rewritten, so no display width is tracked for it.
+/// `\r`-rewritten; the returned display width (ANSI codes are zero-width)
+/// sizes the wrapped-row count `finish_erased` walks back over.
 fn format_header(
     name: &str,
     file_index: usize,
     file_count: usize,
     color: Option<&'static Palette>,
-) -> String {
+) -> (String, usize) {
     let paint = |code: &str, text: &str| -> String {
         match color {
             Some(_) if !code.is_empty() => format!("\x1b[{code}m{text}\x1b[0m"),
@@ -416,14 +449,19 @@ fn format_header(
         None => ("", "", ""),
     };
     let mut line = String::new();
-    line.push_str(&paint(label, "Scanning:"));
-    line.push(' ');
-    line.push_str(&paint(bright, name));
+    let mut width = 0usize;
+    let push = |code: &str, text: &str, out: &mut String, w: &mut usize| {
+        out.push_str(&paint(code, text));
+        *w += text.chars().count();
+    };
+    push(label, "Scanning:", &mut line, &mut width);
+    push("", " ", &mut line, &mut width);
+    push(bright, name, &mut line, &mut width);
     if file_count > 1 {
-        line.push_str("  ");
-        line.push_str(&paint(faint, &format!("[{file_index}/{file_count}]")));
+        push("", "  ", &mut line, &mut width);
+        push(faint, &format!("[{file_index}/{file_count}]"), &mut line, &mut width);
     }
-    line
+    (line, width)
 }
 
 /// Render the file's single bar line; returns the string and its display
@@ -533,21 +571,31 @@ mod tests {
     #[test]
     fn header_line_plain_golden() {
         // Single file: no [k/N]; multi-file runs carry the counter. The name
-        // is never truncated, however long.
-        assert_eq!(format_header("movie.m2ts", 1, 1, None), "Scanning: movie.m2ts");
-        assert_eq!(format_header("movie.mkv", 2, 7, None), "Scanning: movie.mkv  [2/7]");
+        // is never truncated, however long. The returned width is the plain
+        // display width (it sizes `finish_erased`'s wrapped-row walk-back).
+        let (line, width) = format_header("movie.m2ts", 1, 1, None);
+        assert_eq!(line, "Scanning: movie.m2ts");
+        assert_eq!(width, line.chars().count());
+        let (line, width) = format_header("movie.mkv", 2, 7, None);
+        assert_eq!(line, "Scanning: movie.mkv  [2/7]");
+        assert_eq!(width, line.chars().count());
         let long = "Indiana Jones and the Raiders of the Lost Ark (1981) - 4K.m2ts";
-        assert_eq!(format_header(long, 1, 1, None), format!("Scanning: {long}"));
+        let (line, width) = format_header(long, 1, 1, None);
+        assert_eq!(line, format!("Scanning: {long}"));
+        assert_eq!(width, line.chars().count());
     }
 
     #[test]
     fn header_line_colored_wraps_plain_text() {
         let palette: &'static Palette = crate::render::Theme::Green.palette();
-        let line = format_header("movie.mkv", 2, 7, Some(palette));
+        let (line, width) = format_header("movie.mkv", 2, 7, Some(palette));
         assert!(line.contains("\x1b["));
         assert!(line.contains("Scanning:"));
         assert!(line.contains("movie.mkv"));
         assert!(line.contains("[2/7]"));
+        // ANSI codes are zero-width: same display width as the plain render.
+        let (_, plain_width) = format_header("movie.mkv", 2, 7, None);
+        assert_eq!(width, plain_width);
     }
 
     #[test]

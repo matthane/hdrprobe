@@ -98,10 +98,14 @@ struct Cli {
     uninstall_shell: bool,
 
     /// The console window exists solely for this run — set by the shell verb's
-    /// fresh window, never for a shared interactive terminal. Lets the
-    /// end-of-run clear purge scrollback too (see the clear below), which
-    /// would be destructive to a real session's history.
+    /// fresh window, never for a shared interactive terminal. Currently inert:
+    /// it once let the end-of-run screen clear purge scrollback, but reports
+    /// now stream per file and nothing clears the screen. Still accepted (and
+    /// still emitted by `shell.rs`) because registered verb command strings in
+    /// user registries pass it — removing the flag would break every existing
+    /// install's right-click verbs.
     #[arg(long, hide = true)]
+    #[allow(dead_code)]
     own_console: bool,
 }
 
@@ -218,13 +222,17 @@ fn main() -> ExitCode {
     let mut out_buf = String::new();
     let mut json_reports: Vec<serde_json::Value> = Vec::new();
     let mut had_error = false;
-    // Full text reports already in `out_buf` (drives the between-reports
+    // Full text reports already emitted/buffered (drives the between-reports
     // divider; a buffer-emptiness check would miscount when the masthead is
     // buffered for `--output`).
     let mut text_reports = 0usize;
-    // At least one file drew a progress bar this run (drives the end-of-run
-    // screen clear below).
-    let mut bar_drawn = false;
+
+    // Each report goes out the moment its file finishes, so a long multi-file
+    // `--full` scan shows results as they're ready instead of after the last
+    // file. Only pretty JSON must wait for the end (one array), and
+    // `--output` keeps its single atomic file write. Byte-neutral: the
+    // streamed bytes are exactly what the end-of-run dump used to print.
+    let stream_reports = cli.output.is_none() && format != Format::Json;
 
     // The masthead prints once per run, only on the colored interactive text
     // path — quiet, JSON/NDJSON, and piped output stay machine-clean. It goes
@@ -247,13 +255,22 @@ fn main() -> ExitCode {
         let progress = progress::Progress::new(progress_mode, path, i + 1, paths.len());
         match process_file(path, &cli, &progress) {
             Ok(report) => {
-                progress.finish();
-                bar_drawn |= progress.bar_shown();
+                // On the decorated interactive path the finished file's
+                // header + bar are erased so its streamed report prints in
+                // their place — the screen accumulates clean reports with
+                // the live bar always at the bottom. Everywhere else the
+                // bar persists above the report (or JSON emits `done`).
+                if banner_eager {
+                    progress.finish_erased();
+                } else {
+                    progress.finish();
+                }
+                let mut piece = String::new();
                 match format {
                     Format::Text => {
                         if cli.quiet {
-                            out_buf.push_str(&render::render_quiet(&report));
-                            out_buf.push('\n');
+                            piece.push_str(&render::render_quiet(&report));
+                            piece.push('\n');
                         } else {
                             let opts =
                                 render_opts(&cli, use_color, wrap_width, i + 1, paths.len());
@@ -261,22 +278,29 @@ fn main() -> ExitCode {
                             // before the first or after the last, so a
                             // single-report run's output is unchanged.
                             if text_reports > 0 {
-                                out_buf.push_str(&render::render_divider(&opts));
+                                piece.push_str(&render::render_divider(&opts));
                             }
                             text_reports += 1;
-                            out_buf.push_str(&render::render(&report, &opts));
-                            out_buf.push('\n');
+                            piece.push_str(&render::render(&report, &opts));
+                            piece.push('\n');
                         }
                     }
                     Format::Json => json_reports.push(serde_json::to_value(&report).unwrap()),
                     Format::Ndjson => {
-                        out_buf.push_str(&serde_json::to_string(&report).unwrap());
-                        out_buf.push('\n');
+                        piece.push_str(&serde_json::to_string(&report).unwrap());
+                        piece.push('\n');
                     }
+                }
+                if stream_reports {
+                    print!("{piece}");
+                    let _ = std::io::stdout().flush();
+                } else {
+                    out_buf.push_str(&piece);
                 }
             }
             Err(e) => {
-                // Drop erases any live bar line so the diagnostic prints clean.
+                // Drop erases any live bar line so the diagnostic prints
+                // clean (the header stays as context above it).
                 drop(progress);
                 had_error = true;
                 eprintln!("error: {}: {:#}", path.display(), e);
@@ -294,20 +318,10 @@ fn main() -> ExitCode {
         out_buf.push('\n');
     }
 
-    // A finished bar-mode `--full` run clears the screen so the report starts
-    // clean, redrawing the masthead the clear wipes. Interactive decorated
-    // path only (the same one that printed the masthead eagerly), and never
-    // after an error — the stderr diagnostics must stay visible above the
-    // reports. ConPTY hosts (Windows Terminal) implement ED2 by scrolling the
-    // old viewport into scrollback rather than erasing it, so the scan-time
-    // masthead and bar survive above the redraw; when the window is ours alone
-    // (the shell verb's --own-console) ED3 purges that history too. A shared
-    // terminal keeps its scrollback — never widen the purge past the flag.
-    if banner_eager && bar_drawn && !had_error {
-        let wipe = if cli.own_console { "\x1b[2J\x1b[3J\x1b[H" } else { "\x1b[2J\x1b[H" };
-        out_buf.insert_str(0, &format!("{wipe}{}", render::render_banner(cli.theme)));
-    }
-
+    // There is no end-of-run screen clear: reports stream as files finish,
+    // so a clear here would wipe output the user is already reading. The
+    // decorated interactive path stays clean anyway — `finish_erased` above
+    // removes each file's progress display before its report prints.
     if let Err(e) = write_output(&cli.output, &out_buf) {
         eprintln!("error: writing output: {e}");
         return ExitCode::from(1);
@@ -363,6 +377,20 @@ fn render_opts(
 #[cfg(windows)]
 fn terminal_width() -> Option<usize> {
     use std::os::windows::io::AsRawHandle as _;
+    console_width(std::io::stdout().as_raw_handle())
+}
+
+/// Stderr counterpart, sizing the progress header's wrapped-row count for
+/// `progress::Progress::finish_erased`. Probed per header print, not per
+/// run — the bar redraws track a resize, so the erase should too.
+#[cfg(windows)]
+fn stderr_terminal_width() -> Option<usize> {
+    use std::os::windows::io::AsRawHandle as _;
+    console_width(std::io::stderr().as_raw_handle())
+}
+
+#[cfg(windows)]
+fn console_width(handle: std::os::windows::io::RawHandle) -> Option<usize> {
     #[repr(C)]
     struct Coord {
         x: i16,
@@ -396,7 +424,7 @@ fn terminal_width() -> Option<usize> {
         window: SmallRect { left: 0, top: 0, right: 0, bottom: 0 },
         maximum_window_size: Coord { x: 0, y: 0 },
     };
-    let ok = unsafe { GetConsoleScreenBufferInfo(std::io::stdout().as_raw_handle(), &mut info) };
+    let ok = unsafe { GetConsoleScreenBufferInfo(handle, &mut info) };
     if ok == 0 {
         return None;
     }
@@ -408,8 +436,20 @@ fn terminal_width() -> Option<usize> {
 /// Unix counterpart: the TIOCGWINSZ window size of stdout's tty.
 #[cfg(unix)]
 fn terminal_width() -> Option<usize> {
+    tty_width(libc::STDOUT_FILENO)
+}
+
+/// Stderr counterpart, sizing the progress header's wrapped-row count for
+/// `progress::Progress::finish_erased`.
+#[cfg(unix)]
+fn stderr_terminal_width() -> Option<usize> {
+    tty_width(libc::STDERR_FILENO)
+}
+
+#[cfg(unix)]
+fn tty_width(fd: libc::c_int) -> Option<usize> {
     let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
     (rc == 0 && ws.ws_col > 0).then(|| usize::from(ws.ws_col))
 }
 
@@ -417,6 +457,12 @@ fn terminal_width() -> Option<usize> {
 /// correct output, just longer than the window.
 #[cfg(not(any(windows, unix)))]
 fn terminal_width() -> Option<usize> {
+    None
+}
+
+/// No probe: the progress header is assumed to occupy a single row.
+#[cfg(not(any(windows, unix)))]
+fn stderr_terminal_width() -> Option<usize> {
     None
 }
 

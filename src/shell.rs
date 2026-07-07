@@ -25,8 +25,10 @@
 //!   so the verb runs a `cmd /c "cls & … & pause"` chain: clear the startup
 //!   noise (the UNC-cwd warning `cmd` prints on network files), report, pause.
 //!   hdrprobe itself gets the hidden `--own-console` flag, marking the window
-//!   as its alone so a Full run's end-of-report screen clear may purge
-//!   scrollback (see the clear in `main`).
+//!   as its alone. The flag is currently inert (reports stream per file, so
+//!   `main` no longer clears the screen at end of run) but stays in the
+//!   command string: the registry persists it across upgrades, so older
+//!   binaries still honour it and future decoration may rely on it.
 //!   The fresh window is sized to fit a full report without scrolling, and
 //!   *how* depends on the console host: Windows Terminal ignores client resize
 //!   APIs (`mode con` only reflows the hidden buffer — measured on WT 1.24:
@@ -88,10 +90,8 @@ fn verb_flags(full: bool, recursive: bool) -> String {
 /// exe, the quoted selected file (`%1`), then a pause so the console stays
 /// open for reading. Only the verb's fresh window is resized/cleared; an
 /// existing terminal session never sees any of this. `--own-console` tells
-/// hdrprobe the window is its alone, so a Full run's end-of-report screen
-/// clear may purge scrollback too (ConPTY hosts scroll cleared content into
-/// history instead of erasing it, which left the scan-time masthead visible
-/// above the redrawn report).
+/// hdrprobe the window is its alone (currently inert — see the module doc —
+/// but kept in the string for registry compatibility across upgrades).
 #[cfg(windows)]
 fn command_for(exe: &str, full: bool, recursive: bool) -> String {
     let (cols, lines) = WINDOW_SIZE;
