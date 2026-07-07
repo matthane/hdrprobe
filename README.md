@@ -11,24 +11,26 @@ path, writing temp files, or extracting a full RPU stream to disk first. It memo
 file and reads only the bytes it needs, so it stays fast regardless of file size.
 
 ```
-▮ movie.mkv 225.14 MiB
+▮ movie.mkv 68.55 GiB
 
-── GENERAL ─────────────────────────────────────────────────────
+── GENERAL ───────────────────────────────────────────────────────
   Container         Matroska
-  Duration          30s
-  Bitrate           46.08 Mb/s · video stream
-  Video             HEVC (Main 10, High tier @ L5.1) · 3840×2160 · 23.976 fps · 10-bit 4:2:0
+  Duration          2h 17m 04s
+  Bitrate           66.44 Mb/s · video stream
+  Video             HEVC (Main 10, High tier @ L5.1) · 3840×2160 ·
+                    23.976 fps · 10-bit 4:2:0
   Color             BT.2020 · PQ (SMPTE ST 2084) · limited
 
-── HDR ─────────────────────────────────────────────────────────
+── HDR ───────────────────────────────────────────────────────────
   Format            Dolby Vision / HDR10+ / HDR10 (fallback)
   Mastering         DCI-P3 D65 · max 1000  min 0.0001 cd/m²
   Content light     MaxCLL 737 · MaxFALL 130
 
-── DOLBY VISION ────────────────────────────────────────────────
+── DOLBY VISION ──────────────────────────────────────────────────
   Structure         Single track, dual layer
-  Profile           7.6 (MEL)
+  Profile           7.6 (FEL)
   Content mapping   v4.0
+  Reconstruction    12-bit (10-bit BL + FEL residual)
   Mastering         DCI-P3 D65 L9 · max 1000  min 0.0001 cd/m²
   Trim targets*     100 nits L2/L8, 600 nits L2, 1000 nits L2
   L5 offsets*       L0 R0 T276 B276
@@ -36,7 +38,7 @@ file and reads only the bytes it needs, so it stays fast regardless of file size
   L6 content light  MaxCLL 737 · MaxFALL 130
   L11 APO           Movies · white point D65 · reference mode
 
-── HDR10+ ──────────────────────────────────────────────────────
+── HDR10+ ────────────────────────────────────────────────────────
   Profile           B
   Application       v1
   Windows           1
@@ -47,19 +49,20 @@ file and reads only the bytes it needs, so it stays fast regardless of file size
 
 ## What it reports
 
-### General video
+### General video info
 
-Container, codec and profile, resolution, frame rate, bit depth, chroma subsampling, colour
-signalling (primaries, transfer, matrix, and range), and stereoscopic / multiview structure
-(MV-HEVC, such as Dolby Vision Profile 20).
+- Container, codec, and codec profile
+- Resolution, frame rate, bit depth, and chroma subsampling
+- Colour signalling: primaries, transfer, matrix, and range
+- Stereoscopic / multiview structure (MV-HEVC, such as Dolby Vision Profile 20)
 
-### HDR
+### HDR static metadata
 
-The static mastering display characteristics (ST.2086 min/max luminance and the mastering
-gamut, named when recognized: BT.2020, DCI-P3 D65, DCI-P3, or BT.709) and the MaxCLL / MaxFALL
-content light levels.
+- The static mastering display characteristics: ST.2086 min/max luminance and the mastering
+  gamut, named when recognized (BT.2020, DCI-P3 D65, DCI-P3, or BT.709)
+- MaxCLL / MaxFALL content light levels
 
-### Dolby Vision
+### Dolby Vision dynamic metadata
 
 Both the fixed identity of the stream and its title-stable dynamic metadata.
 
@@ -76,15 +79,22 @@ layer's cross-compatibility id:
 | 10 | AV1 | `10.0`, `10.1`, `10.4` |
 | 20 | MV-HEVC | `20.0`, `20.4` |
 
-Alongside it, the track and layer structure (for dual-layer content), the content-mapping
-version (`v2.9`, or `v4.0` via L254), the reconstructed signal bit depth for full-enhancement
-(FEL) streams (12-bit on Profile 7, 14-bit on Profile 4), and the DV grade's own mastering
-display, which can differ from the base layer's: on a Profile 7 title a 4000-nit grade can sit
-over a 1000-nit HDR10 base.
+Alongside the profile:
 
-**Dynamic levels.** The distinct values seen across the title: `L5` offsets and active areas,
-`L6` content light, `L9` mastering gamut, `L11` APO (content type), and the set of `L2` / `L8`
-trim targets.
+- Track and layer structure, for dual-layer content
+- Content-mapping version: `v2.9`, or `v4.0` via L254
+- Reconstructed signal bit depth for full-enhancement (FEL) streams: 12-bit on Profile 7,
+  14-bit on Profile 4
+- The DV grade's own mastering display, which can differ from the base layer's: on a Profile 7
+  title a 4000-nit grade can sit over a 1000-nit HDR10 base
+
+**Dynamic levels.** The distinct values seen across the title:
+
+- `L5` offsets and active areas
+- `L6` content light
+- `L9` mastering gamut
+- `L11` APO (content type, white point, and reference flag)
+- The set of `L2` / `L8` trim targets
 
 **Deliberately omitted.** The per-frame and per-shot analysis levels (`L1` brightness, `L3` L1
 offsets) and the per-shot trim values. These vary shot to shot rather than describing the title,
@@ -93,41 +103,60 @@ so they collapse to nothing meaningful once sampled or aggregated.
 RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoid/dovi_tool)
 (the `dolby_vision` crate); HDR10+ parsing uses the sibling `hdr10plus` crate.
 
-### HDR10+
+### HDR10+ dynamic metadata
 
-Presence, profile, application version, window count, and target display max luminance.
+- Presence and profile
+- Application version
+- Window count
+- Target display max luminance
+
+### Badges and footnotes
+
+Some lines carry a highlighted badge when the metadata shows something worth a second look:
+
+| Badge | Appears on | Meaning |
+|---|---|---|
+| `variable` | L5 offsets | More than one distinct active area: the picture's aspect ratio changes across the title |
+| `zeroed` | Content light, L6 content light | MaxCLL / MaxFALL are signalled but both zero, a placeholder left in by the authoring tool (a common real-world defect) |
+| `MDP mismatch` | DV Mastering | The Dolby Vision grade's mastering gamut (L9) disagrees with the base layer's own signalled mastering display primaries, usually drift left behind by a re-encode |
+| `FEL brightness expansion` | DV Mastering | The Dolby Vision grade's mastering display is brighter than the one declared for the base layer (for example a 4000-nit grade over a 1000-nit HDR10 base): the base layer is a tone-mapped rendition of a brighter master, and the full-enhancement layer's residual is what restores those highlights, so stripping it (a Profile 7 to 8 conversion) would discard them |
+
+These are observations about the metadata, not errors; the file still plays. They surface
+inconsistencies a normal player silently ignores but a remuxer or encoder may care about.
+
+A row label can also carry a footnote mark (`*`, `†`), spelled out once at the foot of the
+report:
+
+- **Sampled.** By default, RPU-derived sets (trim targets, L5 offsets and active areas) come
+  from a spread of sample points, so the set may be incomplete. `--full` reads every RPU and
+  drops the mark.
+- **Assumed canvas.** Dolby Vision sidecar files carry no resolution, so their L5 active areas
+  are computed against an assumed 3840×2160 master.
 
 ## Supported inputs
 
-hdrprobe reads both video containers and standalone metadata sidecar files.
+hdrprobe reads both video files and standalone metadata sidecar files:
 
-**Video containers.**
+| Input | Type | Codecs | Notes |
+|---|---|---|---|
+| MP4 / MOV | Video | HEVC, AVC, AV1 | Single or dual track; an enhancement layer may ride its own track |
+| MKV / WebM | Video | HEVC, AVC, AV1 | Single track; an enhancement layer may be interleaved into it |
+| MPEG-TS / M2TS | Video | HEVC, AVC | Single or dual track; an enhancement layer may ride its own track |
+| Raw HEVC (Annex-B) | Video | HEVC | Elementary stream; profile inferred from the RPU |
+| Raw AV1 (IVF or low-overhead OBU) | Video | AV1 | Elementary stream; the RPU rides an in-band metadata OBU |
+| Dolby Vision RPU (`.bin`, `.rpu`) | Sidecar | – | Raw RPU stream (for example from `dovi_tool extract-rpu`), aggregated across every frame |
+| Dolby Vision CM XML (`.xml`) | Sidecar | – | Dolby CM metadata (DolbyLabsMDF), aggregated per shot |
+| HDR10+ JSON (`.json`) | Sidecar | – | hdr10plus_tool metadata; reports the file-level profile and the first scene from a bounded head read |
 
-| Container | Codecs | Notes |
-|---|---|---|
-| MP4 / MOV | HEVC, AVC, AV1 | Single or dual track; an enhancement layer may ride its own track |
-| MKV / WebM | HEVC, AVC, AV1 | Single track; an enhancement layer may be interleaved into it |
-| MPEG-TS / M2TS | HEVC, AVC | Single or dual track; an enhancement layer may ride its own track |
-| Raw HEVC | Annex-B | Elementary stream; profile inferred from the RPU |
-| Raw AV1 | IVF, low-overhead OBU | Elementary stream; the RPU rides an in-band metadata OBU |
-
-Containers are matched by extension first, then by content: a file whose extension does not match
+Inputs are matched by extension first, then by content: a file whose extension does not match
 its bytes (for example a Transport Stream saved as `.mkv`) is still recognised and parsed
-correctly, at no cost to correctly-named files.
+correctly, at no cost to correctly-named files. Likewise each sidecar is identified by content
+rather than extension alone, so an unrelated `.bin`, `.xml`, or `.json` in a scanned directory
+is skipped.
 
-**Metadata sidecar files.** These carry no picture data, bypass the video pipeline entirely, and
-are rendered through the same report, so text, JSON, and quiet output all work unchanged.
-
-| Input | Extension | Notes |
-|---|---|---|
-| Dolby Vision RPU | `.bin`, `.rpu` | Raw RPU stream (for example from `dovi_tool extract-rpu`), aggregated across every frame |
-| Dolby Vision CM XML | `.xml` | Dolby CM metadata (DolbyLabsMDF), aggregated per shot |
-| HDR10+ JSON | `.json` | hdr10plus_tool metadata; reports the file-level profile and the first scene from a bounded head read |
-
-Each sidecar is identified by content rather than extension alone, so an unrelated `.bin`,
-`.xml`, or `.json` in a scanned directory is skipped. Because none of these formats records a
-resolution, the L5 active-area dimensions for the Dolby Vision sidecars are computed against an
-assumed UHD (3840x2160) master and labelled as assumed in the report.
+Sidecars carry no picture data, bypass the video pipeline entirely. Because none of these
+formats records a resolution, the L5 active-area dimensions for the Dolby Vision sidecars are
+computed against an assumed UHD (3840x2160) master and labelled as assumed in the report.
 
 A note on WebM: WebM is a subset of Matroska and is parsed by the same backend, but its codec
 whitelist does not include HEVC. The common Dolby Vision profiles (5, 7, and 8) are all HEVC,
