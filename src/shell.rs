@@ -4,11 +4,16 @@
 //! `--install-shell` registers a cascading verb under
 //! `HKCU\Software\Classes\SystemFileAssociations\.<ext>\shell\hdrprobe` for each
 //! extension hdrprobe understands (video + metadata sidecars), so any such file
-//! can be inspected from Explorer. The parent key carries `MUIVerb` +
-//! `SubCommands=""` (the static-cascade marker); the two leaf verbs live under
-//! its own `shell` subkey as `fast` and `full` — Explorer lists static subverbs
-//! in key-name order, so the names double as the menu order. "Full" runs the
-//! same command with `--full`. `--uninstall-shell` removes the whole tree.
+//! can be inspected from Explorer, plus the same verb under
+//! `HKCU\Software\Classes\Directory\shell\hdrprobe` so a whole folder can be —
+//! the folder verbs run the identical command with `-r` added, scanning every
+//! supported file beneath the folder (the CLI already takes directory
+//! arguments; `-r` descends into subdirectories). The parent key carries
+//! `MUIVerb` + `SubCommands=""` (the static-cascade marker); the two leaf
+//! verbs live under its own `shell` subkey as `fast` and `full` — Explorer
+//! lists static subverbs in key-name order, so the names double as the menu
+//! order. "Full" runs the same command with `--full`. `--uninstall-shell`
+//! removes the whole tree.
 //!
 //! Design choices that matter:
 //! - **HKCU, not HKLM** — per-user, so it needs no elevation and touches no
@@ -51,9 +56,26 @@ fn all_exts() -> impl Iterator<Item = &'static str> {
 #[cfg(windows)]
 const WINDOW_SIZE: (u32, u32) = (110, 45); // (cols, lines)
 
+/// The flags a verb inserts before the selected path: `--full` for the
+/// exhaustive-scan menu entry, `-r` for the folder verbs (Explorer hands the
+/// folder itself as `%1`; `-r` makes the scan descend into subfolders).
+/// Trailing-space-padded so it drops straight into the command templates.
+#[cfg(windows)]
+fn verb_flags(full: bool, recursive: bool) -> String {
+    let mut flags = String::new();
+    if full {
+        flags.push_str("--full ");
+    }
+    if recursive {
+        flags.push_str("-r ");
+    }
+    flags
+}
+
 /// Build a verb's command string for the classic-conhost host (no Windows
-/// Terminal installed). `full` inserts `--full` before the selected file for
-/// the exhaustive-scan menu entry.
+/// Terminal installed). `full` inserts `--full` before the selected path for
+/// the exhaustive-scan menu entry; `recursive` inserts `-r` for the folder
+/// verbs.
 ///
 /// The stored value is `cmd /c "mode con: cols=C lines=L & cls & "<exe>"
 /// --own-console "%1" & pause"`. `cmd /c` strips the first and last quote of
@@ -71,16 +93,17 @@ const WINDOW_SIZE: (u32, u32) = (110, 45); // (cols, lines)
 /// history instead of erasing it, which left the scan-time masthead visible
 /// above the redrawn report).
 #[cfg(windows)]
-fn command_for(exe: &str, full: bool) -> String {
+fn command_for(exe: &str, full: bool, recursive: bool) -> String {
     let (cols, lines) = WINDOW_SIZE;
-    let flag = if full { "--full " } else { "" };
+    let flag = verb_flags(full, recursive);
     format!(
         "cmd /c \"mode con: cols={cols} lines={lines} & cls & \"{exe}\" --own-console {flag}\"%1\" & pause\""
     )
 }
 
-/// Build a verb's command string for the Windows Terminal host. `full`
-/// inserts `--full` before the selected file, as in [`command_for`].
+/// Build a verb's command string for the Windows Terminal host. `full` and
+/// `recursive` insert their flags before the selected path, as in
+/// [`command_for`].
 ///
 /// The stored value is `"<wt>" -w new --size C,L cmd /c "cls & \"<exe>\"
 /// --own-console \"%1\" & pause"`. WT ignores client resize APIs, so the size
@@ -96,9 +119,9 @@ fn command_for(exe: &str, full: bool) -> String {
 /// containing a semicolon misparses under this verb (the conhost fallback
 /// doesn't split). That's accepted — `%1` can't be escaped statically.
 #[cfg(windows)]
-fn command_for_wt(wt: &str, exe: &str, full: bool) -> String {
+fn command_for_wt(wt: &str, exe: &str, full: bool, recursive: bool) -> String {
     let (cols, lines) = WINDOW_SIZE;
-    let flag = if full { "--full " } else { "" };
+    let flag = verb_flags(full, recursive);
     format!(
         "\"{wt}\" -w new --size {cols},{lines} cmd /c \"cls & \\\"{exe}\\\" --own-console {flag}\\\"%1\\\" & pause\""
     )
@@ -197,22 +220,55 @@ mod imp {
         Ok(())
     }
 
-    /// The verb key for one extension, root of the whole cascading entry.
-    fn verb_key(ext: &str) -> String {
-        format!("Software\\Classes\\SystemFileAssociations\\.{ext}\\shell\\hdrprobe")
+    /// The shell-class subkey under `Software\Classes` a verb tree hangs off:
+    /// `SystemFileAssociations\.<ext>` for each supported file type, plus
+    /// `Directory` for the folder verb.
+    fn assoc_key(ext: &str) -> String {
+        format!("SystemFileAssociations\\.{ext}")
     }
 
-    /// Delete one extension's verb tree. Returns whether it existed.
-    fn delete_verb(ext: &str) -> Result<bool> {
-        let sub = wide(&verb_key(ext));
+    const DIRECTORY_ASSOC: &str = "Directory";
+
+    /// The verb key for one shell class, root of the whole cascading entry.
+    fn verb_key(assoc: &str) -> String {
+        format!("Software\\Classes\\{assoc}\\shell\\hdrprobe")
+    }
+
+    /// Delete one shell class's verb tree. Returns whether it existed.
+    fn delete_verb(assoc: &str) -> Result<bool> {
+        let sub = wide(&verb_key(assoc));
         // SAFETY: `sub` is a valid NUL-terminated wide string; the hive is a
         // predefined handle. Deletes the verb key and all its subkeys.
         let rc = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr()) };
         match rc {
             ERROR_SUCCESS => Ok(true),
             ERROR_FILE_NOT_FOUND => Ok(false),
-            _ => bail!("removing registry key for .{ext} failed (code {rc})"),
+            _ => bail!("removing registry key for {assoc} failed (code {rc})"),
         }
+    }
+
+    /// Write one shell class's full cascading verb tree: wipe any previous
+    /// layout, then the `MUIVerb` + `SubCommands=""` cascade marker and the
+    /// `fast`/`full` leaf verbs.
+    fn write_verb_tree(assoc: &str, icon: &str, fast: &str, full: &str) -> Result<()> {
+        // Wipe any previous layout first (e.g. the pre-submenu single verb
+        // kept its `command` directly under the parent key), so an upgrade
+        // never leaves stale keys next to the cascade marker.
+        delete_verb(assoc)?;
+        let base = verb_key(assoc);
+        // `MUIVerb` + empty `SubCommands` marks a static cascading menu;
+        // the leaf verbs live under this key's own `shell` subkey and
+        // Explorer shows them in key-name order (`fast` before `full`).
+        set_value(&base, Some("MUIVerb"), "hdrprobe")?;
+        set_value(&base, Some("SubCommands"), "")?;
+        set_value(&base, Some("Icon"), icon)?;
+        for (verb, label, cmd) in [("fast", "Fast", fast), ("full", "Full", full)] {
+            let leaf = format!("{base}\\shell\\{verb}");
+            set_value(&leaf, None, label)?;
+            set_value(&leaf, Some("Icon"), icon)?;
+            set_value(&format!("{leaf}\\command"), None, cmd)?;
+        }
+        Ok(())
     }
 
     pub fn install() -> Result<()> {
@@ -222,39 +278,29 @@ mod imp {
         // Windows 11 default console, and only its own launch option can size
         // the window (see `command_for_wt`).
         let wt = super::wt_path();
-        let command = |full| match &wt {
-            Some(wt) => super::command_for_wt(wt, &exe, full),
-            None => super::command_for(&exe, full),
+        let command = |full, recursive| match &wt {
+            Some(wt) => super::command_for_wt(wt, &exe, full, recursive),
+            None => super::command_for(&exe, full, recursive),
         };
-        let fast = command(false);
-        let full = command(true);
+        let fast = command(false, false);
+        let full = command(true, false);
+        // The folder verbs run the same commands with `-r`: Explorer hands
+        // the folder as %1 and the recursive flag descends into subfolders.
+        let fast_dir = command(false, true);
+        let full_dir = command(true, true);
         let icon = format!("{exe},0");
 
         let mut n = 0;
         for ext in super::all_exts() {
-            // Wipe any previous layout first (e.g. the pre-submenu single verb
-            // kept its `command` directly under the parent key), so an upgrade
-            // never leaves stale keys next to the cascade marker.
-            delete_verb(ext)?;
-            let base = verb_key(ext);
-            // `MUIVerb` + empty `SubCommands` marks a static cascading menu;
-            // the leaf verbs live under this key's own `shell` subkey and
-            // Explorer shows them in key-name order (`fast` before `full`).
-            set_value(&base, Some("MUIVerb"), "hdrprobe")?;
-            set_value(&base, Some("SubCommands"), "")?;
-            set_value(&base, Some("Icon"), &icon)?;
-            for (verb, label, cmd) in [("fast", "Fast", &fast), ("full", "Full", &full)] {
-                let leaf = format!("{base}\\shell\\{verb}");
-                set_value(&leaf, None, label)?;
-                set_value(&leaf, Some("Icon"), &icon)?;
-                set_value(&format!("{leaf}\\command"), None, cmd)?;
-            }
+            write_verb_tree(&assoc_key(ext), &icon, &fast, &full)?;
             n += 1;
         }
+        write_verb_tree(DIRECTORY_ASSOC, &icon, &fast_dir, &full_dir)?;
 
-        println!("Registered the hdrprobe context-menu submenu for {n} file types.");
+        println!("Registered the hdrprobe context-menu submenu for {n} file types and folders.");
         println!("Fast runs: {fast}");
         println!("Full runs: {full}");
+        println!("Folder verbs add -r (recursive scan).");
         println!("On Windows 11 it's under \"Show more options\" in the right-click menu.");
         Ok(())
     }
@@ -262,11 +308,12 @@ mod imp {
     pub fn uninstall() -> Result<()> {
         let mut n = 0;
         for ext in super::all_exts() {
-            if delete_verb(ext)? {
+            if delete_verb(&assoc_key(ext))? {
                 n += 1;
             }
         }
-        println!("Removed the hdrprobe context-menu entry ({n} file types).");
+        let dirs = if delete_verb(DIRECTORY_ASSOC)? { " and folders" } else { "" };
+        println!("Removed the hdrprobe context-menu entry ({n} file types{dirs}).");
         Ok(())
     }
 }
@@ -294,7 +341,7 @@ mod tests {
         // the conhost window resize, cls (wiping cmd's UNC-cwd warning on
         // network files), the quoted exe, the quoted selected file, then pause.
         assert_eq!(
-            command_for(r"C:\Program Files\hdrprobe.exe", false),
+            command_for(r"C:\Program Files\hdrprobe.exe", false, false),
             r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" --own-console "%1" & pause""#
         );
     }
@@ -303,11 +350,11 @@ mod tests {
     fn full_command_inserts_the_flag_before_the_file() {
         // The submenu's "Full" verb is the same chain with --full ahead of %1.
         assert_eq!(
-            command_for(r"C:\Program Files\hdrprobe.exe", true),
+            command_for(r"C:\Program Files\hdrprobe.exe", true, false),
             r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" --own-console --full "%1" & pause""#
         );
         assert_eq!(
-            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", true),
+            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", true, false),
             r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" --own-console --full \"%1\" & pause""#
         );
     }
@@ -318,8 +365,26 @@ mod tests {
         // them literal; the window size rides wt's own --size option since WT
         // ignores mode con.
         assert_eq!(
-            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", false),
+            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", false, false),
             r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" --own-console \"%1\" & pause""#
+        );
+    }
+
+    #[test]
+    fn folder_commands_add_the_recursive_flag() {
+        // The Directory verb runs the same chain with -r ahead of %1 (the
+        // folder), descending into subfolders; Full stacks both flags.
+        assert_eq!(
+            command_for(r"C:\Program Files\hdrprobe.exe", false, true),
+            r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" --own-console -r "%1" & pause""#
+        );
+        assert_eq!(
+            command_for(r"C:\Program Files\hdrprobe.exe", true, true),
+            r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Program Files\hdrprobe.exe" --own-console --full -r "%1" & pause""#
+        );
+        assert_eq!(
+            command_for_wt(r"C:\WA\wt.exe", r"C:\Program Files\hdrprobe.exe", true, true),
+            r#""C:\WA\wt.exe" -w new --size 110,45 cmd /c "cls & \"C:\Program Files\hdrprobe.exe\" --own-console --full -r \"%1\" & pause""#
         );
     }
 

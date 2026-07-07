@@ -89,7 +89,7 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Register a right-click "hdrprobe" context-menu submenu with Fast and Full entries (Windows).
+    /// Register a right-click "hdrprobe" context-menu submenu with Fast and Full entries for supported files and folders (Windows).
     #[arg(long)]
     install_shell: bool,
 
