@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 141 unit tests
+cargo test                     # 142 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -520,7 +520,12 @@ never parse bytes native-endian.
   redirects, `--output`, JSON/NDJSON, and quiet — so every machine-consumed stream, the corpus
   `-q` gate, and any line that already fits stay byte-identical. Below `MIN_WRAP_WIDTH` reflow
   bows out to the terminal's own hard wrap. Never give the probe a fallback guess (`COLUMNS`
-  etc.): a wrong width would reflow piped output a consumer expects unwrapped.
+  etc.): a wrong width would reflow piped output a consumer expects unwrapped. **Rules follow
+  the same probe**: the section rules and the between-reports divider stretch to `wrap_width`
+  when it was probed (`Colorizer::rule_width` — full bleed, no cap, and no `MIN_WRAP_WIDTH`
+  floor, since a shrunk rule is safe where a shrunk value column isn't) and keep the fixed
+  `RULE_W` fallback on every unprobed stream, so piped text keeps its historical 64-column
+  divider byte-for-byte. The masthead stays fixed-width — it's glyph art, not a rule.
 
 ## Verifying changes
 
