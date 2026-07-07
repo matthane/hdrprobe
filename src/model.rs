@@ -260,8 +260,9 @@ pub struct DolbyVision {
     pub l11_white_point: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l11_reference_mode: Option<bool>,
-    /// Distinct L2/L8 trim targets (union across samples), each tagged with the
-    /// level(s) that produced it so provenance is per-value rather than aggregate.
+    /// Distinct trim targets: the L2/L8 union across the read RPUs plus any
+    /// L10-defined target displays (custom L8 targets, folded into the L8
+    /// set), each tagged with the level(s) that produced it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trim_targets: Vec<TrimTarget>,
     /// Number of RPUs successfully parsed.
@@ -309,8 +310,11 @@ pub struct MasteringPrimariesMismatch {
 }
 
 /// One distinct trim target, in nits, plus the level(s) that produced it — 2
-/// and/or 8. (L8's target display may be *defined* by L10, but the trim itself
-/// is still L8, so L10 is never listed here.)
+/// and/or 8. The 8 covers both read L8 trims and target displays defined by
+/// the title's global L10 metadata: a display index is a CM v4.0 (L8)
+/// mechanism by construction, so an L10-defined display is a custom L8 target
+/// even when its per-shot trims sit outside the sample. L10 itself is never
+/// listed — it is bitstream plumbing, not a trim level.
 #[derive(Debug, Serialize)]
 pub struct TrimTarget {
     pub nits: u32,

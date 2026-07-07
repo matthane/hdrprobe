@@ -287,29 +287,8 @@ impl DvAggregate {
 
         let compatibility = compat_id.and_then(compat_str);
 
-        // Resolve L8 trim targets to nits: a custom index (e.g. 255) is defined by
-        // an L10 block in this title; otherwise fall back to the predefined table.
-        // An index with neither a definition nor a table entry can't be stated in
-        // nits, so it's dropped rather than guessed. Merged with the L2 targets,
-        // but each nit value keeps the set of levels that produced it, so a value
-        // present in both L2 and L8 reads `[L2/L8]` while an L8-only one reads
-        // `[L8]`.
-        let mut target_levels: BTreeMap<u32, BTreeSet<u8>> = BTreeMap::new();
-        for nits in self.trim_targets {
-            target_levels.entry(nits).or_default().insert(2);
-        }
-        for &idx in &self.l8_target_indices {
-            if let Some(nits) = resolve_l8_nits(idx, &self.l10_targets) {
-                target_levels.entry(nits).or_default().insert(8);
-            }
-        }
-        let trim_targets = target_levels
-            .into_iter()
-            .map(|(nits, levels)| TrimTarget {
-                nits,
-                levels: levels.into_iter().collect(),
-            })
-            .collect();
+        let trim_targets =
+            merge_trim_targets(&self.trim_targets, &self.l8_target_indices, &self.l10_targets);
 
         let census = full.then(|| DvCensus {
             scene_cuts: self.scene_cuts,
@@ -670,6 +649,45 @@ fn resolve_l8_nits(idx: u8, l10_targets: &BTreeMap<u8, u32>) -> Option<u32> {
     l10_targets.get(&idx).copied().or_else(|| l8_index_to_nits(idx))
 }
 
+/// Merge the read L2/L8 trim targets and the title's L10-defined target
+/// displays into the rendered set. L8 indices resolve to nits via the L10 map
+/// (a custom index like 255 is defined by an L10 block in this title) or the
+/// predefined table; an index with neither can't be stated in nits, so it's
+/// dropped rather than guessed. Each nit value keeps the set of levels that
+/// produced it, so a value present in both L2 and L8 reads `[L2/L8]`.
+///
+/// An L10-defined display counts as an L8 target whether or not a read L8
+/// referenced it: L2 is self-contained (it carries its target's nits
+/// directly), so a display index is a CM v4.0 (L8) mechanism by construction —
+/// an L10 definition can serve nothing else. And unlike the per-shot trims,
+/// the definition rides every RPU's global extension payload (it is the
+/// compiled form of the CM XML's Level-0 target-display list — the displays
+/// trims were authored for), so it is title-level evidence independent of
+/// which shots a sample read. L10 itself never appears as a provenance tag;
+/// it is bitstream plumbing, not a trim level.
+fn merge_trim_targets(
+    l2_nits: &BTreeSet<u32>,
+    l8_indices: &BTreeSet<u8>,
+    l10_targets: &BTreeMap<u8, u32>,
+) -> Vec<TrimTarget> {
+    let mut target_levels: BTreeMap<u32, BTreeSet<u8>> = BTreeMap::new();
+    for &nits in l2_nits {
+        target_levels.entry(nits).or_default().insert(2);
+    }
+    for &idx in l8_indices {
+        if let Some(nits) = resolve_l8_nits(idx, l10_targets) {
+            target_levels.entry(nits).or_default().insert(8);
+        }
+    }
+    for &nits in l10_targets.values() {
+        target_levels.entry(nits).or_default().insert(8);
+    }
+    target_levels
+        .into_iter()
+        .map(|(nits, levels)| TrimTarget { nits, levels: levels.into_iter().collect() })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,5 +893,37 @@ mod tests {
         // definition wins (it describes the actual target on this master).
         let l10 = BTreeMap::from([(27u8, 1000u32)]);
         assert_eq!(resolve_l8_nits(27, &l10), Some(1000));
+    }
+
+    #[test]
+    fn l10_defined_target_missing_from_read_trims_is_surfaced_as_l8() {
+        // A custom 300-nit display defined by L10 whose L8 trims were never
+        // read (buried in unsampled shots): the definition is global — it rides
+        // every RPU — and a display index is an L8-only mechanism, so the
+        // target renders as an L8 target.
+        let l10 = BTreeMap::from([(255u8, 300u32)]);
+        let targets = merge_trim_targets(&BTreeSet::new(), &BTreeSet::new(), &l10);
+        assert_eq!(targets.len(), 1);
+        assert_eq!((targets[0].nits, targets[0].levels.as_slice()), (300, &[8u8][..]));
+        // A read L8 for the same display dedupes into the same entry.
+        let targets = merge_trim_targets(&BTreeSet::new(), &BTreeSet::from([255u8]), &l10);
+        assert_eq!(targets.len(), 1);
+        assert_eq!((targets[0].nits, targets[0].levels.as_slice()), (300, &[8u8][..]));
+    }
+
+    #[test]
+    fn merged_targets_keep_the_combined_provenance_shape() {
+        // A 100-nit target from both L2 and L8, a 600-nit L2-only value, and an
+        // unread 300-nit L10 definition: [L2/L8], [L2], [L8], sorted by nits.
+        let l2 = BTreeSet::from([100u32, 600]);
+        let l8 = BTreeSet::from([1u8]); // predefined 100-nit target
+        let l10 = BTreeMap::from([(255u8, 300u32)]);
+        let targets = merge_trim_targets(&l2, &l8, &l10);
+        let shape: Vec<(u32, &[u8])> =
+            targets.iter().map(|t| (t.nits, t.levels.as_slice())).collect();
+        assert_eq!(
+            shape,
+            vec![(100, &[2u8, 8][..]), (300, &[8u8][..]), (600, &[2u8][..])]
+        );
     }
 }

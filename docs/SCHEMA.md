@@ -161,7 +161,10 @@ build until the schema version, that test, and this document are updated togethe
 
 Version history:
 
-- **1.2**: added `dolby_vision.mastering_primaries_mismatch` (additive). Unreleased.
+- **1.2**: added `dolby_vision.mastering_primaries_mismatch` (additive). `trim_targets` now
+  also includes target displays defined by the title's global L10 metadata even when no read
+  trim referenced them, folded into the L8 set (a semantic broadening of `levels: [8]`, no new
+  field or value). Unreleased.
 - **1.1**: added `dolby_vision.reconstructed_bit_depth` (additive). Ships in hdrprobe 0.2.0.
 - **1.0**: initial schema, as shipped in hdrprobe 0.1.0.
 
@@ -343,7 +346,7 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 | `l11_content` | string | optional | L11 content type, named per Dolby's L11 (Dolby Vision IQ) definitions: `"Default"`, `"Movies"`, `"Game"`, `"Sport"`, `"User Generated Content"`, or `"Unknown"` for values outside the published 0-4 range |
 | `l11_white_point` | string | optional | L11 intended white point: `"D65"` (0, the default), `"D93"` (8), or `"code N"` for the other codes, which Dolby accepts but does not publicly name. Present only when L11 was seen |
 | `l11_reference_mode` | boolean | optional | L11 reference-mode flag; present only when L11 was seen |
-| `trim_targets` | array of `TrimTarget` | omitted when empty | Distinct L2/L8 trim target displays, in nits, sorted ascending |
+| `trim_targets` | array of `TrimTarget` | omitted when empty | Distinct trim target displays, in nits, sorted ascending: the L2/L8 trims read plus any L10-defined target displays (custom L8 targets, folded into the L8 set) |
 | `rpu_count` | integer | always | Number of RPUs successfully parsed (0 under `--no-rpu`) |
 | `sampled` | boolean | always | `true` when the DV facts reflect sampling; `false` under `--full`, for sidecars (exhaustive by construction), and under `--no-rpu` (nothing was sampled) |
 | `census` | `DvCensus` | optional | Exhaustive per-level census. Present under `--full` and for DV sidecars; absent for sampled video runs and `--no-rpu` |
@@ -397,7 +400,7 @@ the schema that needs a unit conversion to read in nits.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `nits` | integer | always | Target display peak luminance, cd/m² |
-| `levels` | array of integer | always | The metadata level(s) that produced this value: `[2]`, `[8]`, or `[2, 8]`. L10 never appears; it only defines the display an L8 trim points at |
+| `levels` | array of integer | always | The trim level(s) this value belongs to: `[2]`, `[8]`, or `[2, 8]`. `8` covers both read L8 trims and target displays defined by the title's global L10 metadata (a display index is a CM v4.0/L8 mechanism by construction, so an L10-defined display is a custom L8 target even when its per-shot trims sit outside the sample). L10 itself never appears |
 
 ## Object: `ActiveArea`
 
@@ -453,7 +456,9 @@ picture data: `codec` is `""`, `hdr` is absent, and `width`/`height`/`duration_s
 no `dolby_vision` section; DV sidecars have no `hdr10plus` section.
 
 **Default (sampled) run.** `dolby_vision.sampled` is `true`; `l5_active_areas` and
-`trim_targets` are unions over the sampled RPUs and may be incomplete; `census` is absent.
+`trim_targets` are unions over the sampled RPUs and may be incomplete (though the L10-defined
+custom targets folded into the L8 set are title-global — the definition rides every RPU, so
+those entries are complete from any sample); `census` is absent.
 
 **`--full`.** Every RPU is scanned: `sampled` is `false`, `census` appears, and TS inputs gain
 an exact video-stream `bitrate`. DV sidecars behave like `--full` by construction (every RPU in

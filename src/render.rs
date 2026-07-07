@@ -265,7 +265,11 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 // L8 half is per-shot in real titles (a BD original whose head
                 // shots carry only the 100-nit L8 while later scenes add 600),
                 // so a sampled union may be incomplete — footnoted like L5. A
-                // full scan is complete, so it carries no caveat mark.
+                // full scan is complete, so it carries no caveat mark. (The
+                // L10-defined custom targets folded into the L8 set are
+                // title-global and complete from any sample, but the set can
+                // still be missing preset-target trims, so the mark stays
+                // set-level.)
                 let mark = if dv.sampled { notes.mark(SAMPLED_NOTE) } else { "" };
                 let list = dv
                     .trim_targets
