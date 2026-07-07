@@ -98,7 +98,10 @@ Alongside the profile:
 
 **Deliberately omitted.** The per-frame and per-shot analysis levels (`L1` brightness, `L3` L1
 offsets) and the per-shot trim values. These vary shot to shot rather than describing the title,
-so they collapse to nothing meaningful once sampled or aggregated.
+so they collapse to nothing meaningful once sampled or aggregated. One title-stable fact about
+them is reported instead: when every frame is read (a `--full` scan or a sidecar file), a
+metadata cadence line says whether the dynamic metadata was authored shot-by-shot (the standard
+studio workflow) or frame-by-frame (typical of converted or automatically analysed metadata).
 
 RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoid/dovi_tool)
 (the `dolby_vision` crate); HDR10+ parsing uses the sibling `hdr10plus` crate.
@@ -214,7 +217,7 @@ For scripting against the JSON output, every object and field is documented in
 |---|---|
 | `-j, --json` | JSON instead of text (an array when several files are given) |
 | `--format <fmt>` | `text` (default), `json`, or `ndjson` (one object per line) |
-| `-f, --full` | Exhaustive per-frame scan: all distinct L5, a full trim-target census, and scene counts. Trades speed for completeness. Shows a live progress bar in the terminal. |
+| `-f, --full` | Exhaustive per-frame scan: all distinct L5, a full trim-target census, scene counts, and the shot-based vs frame-by-frame metadata cadence. Trades speed for completeness. Shows a live progress bar in the terminal. |
 | `--progress <mode>` | Progress reporting for `--full` scans: `auto` (default, bar on an interactive terminal), `bar`, `json` (machine-readable events on stderr, see [docs/SCHEMA.md](docs/SCHEMA.md)), or `off` |
 | `--no-rpu` | Report the container DV configuration only, skipping RPU parsing. Effectively instant. |
 | `-s, --samples <N>` | Number of seek points to sample (default 16). Higher values capture more distinct L5 areas. |

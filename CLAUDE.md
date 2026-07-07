@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 142 unit tests
+cargo test                     # 147 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -205,6 +205,27 @@ never parse bytes native-endian.
   authored for), so it is title-level evidence independent of sampling; presets never get L10,
   so this recovers only custom targets. Folded into the L8 set, rendered `[L8]` — `[L10]` would
   leak bitstream plumbing into a report whose readers know the L2/L8 trim levels.
+  The **metadata cadence** verdict (`model::MetadataCadence`, the `Metadata cadence` line) is the
+  one title-stable fact reported *about* the omitted per-shot levels: whether they were authored
+  shot-by-shot or frame-by-frame, decided by comparing consecutive frames' DM payloads
+  (`levels::dm_fingerprint` — extension blocks serialized to their bitstream form plus
+  `source_min/max_pq`; `scene_refresh_flag`, the composer/NLQ payload, and **L4** are excluded on
+  purpose: the flag so a shot's first frame compares equal to its shot, the composer so a FEL's
+  per-frame mapping can't masquerade as CM changes, and L4 because its temporal-filtering anchors
+  are a per-frame running average *by mechanism* even in shot-based authoring — corpus-verified
+  via dovi_tool export on the P7 FEL CM v2.9 clip, where adjacent same-shot frames differ only in
+  L4 while the clip's own CM XML is per-shot; with L4 in the fingerprint most of the corpus
+  misread as per-frame). Pairs count only when folds are *every* frame in stream order
+  (`DvAggregate::track_consecutive`: the `--full` scan and the RPU-bin sidecar's run collapse) or
+  come from the DV XML's declared shot/edit structure (`add_cadence_pairs`); the sampled default
+  never gets a verdict — a pair spanning a sampling gap would read as a change, so don't widen
+  the gate. The per-frame line is a *quarter* of pairs changed, not a majority: shot-based
+  changes are 1/(avg shot length), corpus-observed at 0–2.6% including decode-order stragglers at
+  open-GOP cuts, while per-frame titles observe 55–64% (static stretches produce equal
+  neighbours) and would halve again on a duplicated-frame high-rate stream — still above a
+  quarter. The RPU-bin and DV-XML paths cross-validate on the corpus feature (identical
+  pair/change counts from independent computations), and the P7 FEL MKV matches its own CM XML
+  exactly (6/713).
 - **DV facts and their sources.** BL **compatibility id** and DV **level** come from the
   `dvcC`/`dvvC` box, *not* the RPU. The DV Mastering line's **luminance** is the DM header's
   `source_min_pq`/`source_max_pq` (present in every CM version); its **gamut** comes only from a
