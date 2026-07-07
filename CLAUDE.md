@@ -504,6 +504,17 @@ never parse bytes native-endian.
   is emitted only for a file that produced a report. The hot `nal::split_annexb` stays
   tick-free: the no-op-closure monomorphization of `split_annexb_impl` compiles the gate out;
   only `split_annexb_streamed` (the raw-HEVC `--full` fused walk) pays for it.
+- **Value-line reflow is terminal-only and byte-neutral everywhere else.** kv rows longer than
+  the terminal wrap at their part separators (trailing ` ·`/`,`/` +`, or the unstyled double
+  space before a warning chip — never mid-part, never inside a chip) with continuations
+  indented to the value column (`render.rs::wrap_line`, ANSI-aware: a break inside a styled
+  span closes it at the line end and re-opens it on the continuation). The width is
+  `RenderOpts::wrap_width`, probed once per run by `main::terminal_width` (the stdout console
+  window: Win32 `GetConsoleScreenBufferInfo` / unix `TIOCGWINSZ`) and `None` for pipes,
+  redirects, `--output`, JSON/NDJSON, and quiet — so every machine-consumed stream, the corpus
+  `-q` gate, and any line that already fits stay byte-identical. Below `MIN_WRAP_WIDTH` reflow
+  bows out to the terminal's own hard wrap. Never give the probe a fallback guess (`COLUMNS`
+  etc.): a wrong width would reflow piped output a consumer expects unwrapped.
 
 ## Verifying changes
 
