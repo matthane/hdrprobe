@@ -207,6 +207,10 @@ fn main() -> ExitCode {
     let mut out_buf = String::new();
     let mut json_reports: Vec<serde_json::Value> = Vec::new();
     let mut had_error = false;
+    // Full text reports already in `out_buf` (drives the between-reports
+    // divider; a buffer-emptiness check would miscount when the masthead is
+    // buffered for `--output`).
+    let mut text_reports = 0usize;
     // At least one file drew a progress bar this run (drives the end-of-run
     // screen clear below).
     let mut bar_drawn = false;
@@ -240,7 +244,14 @@ fn main() -> ExitCode {
                             out_buf.push_str(&render::render_quiet(&report));
                             out_buf.push('\n');
                         } else {
-                            let opts = render_opts(&cli, use_color);
+                            let opts = render_opts(&cli, use_color, i + 1, paths.len());
+                            // Rule between consecutive reports only — never
+                            // before the first or after the last, so a
+                            // single-report run's output is unchanged.
+                            if text_reports > 0 {
+                                out_buf.push_str(&render::render_divider(&opts));
+                            }
+                            text_reports += 1;
                             out_buf.push_str(&render::render(&report, &opts));
                             out_buf.push('\n');
                         }
@@ -297,7 +308,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn render_opts(cli: &Cli, color: bool) -> RenderOpts {
+fn render_opts(cli: &Cli, color: bool, file_index: usize, file_count: usize) -> RenderOpts {
     let (mut g, mut h, mut d, mut hp) = (true, true, true, true);
     if let Some(list) = &cli.sections {
         g = false;
@@ -317,6 +328,8 @@ fn render_opts(cli: &Cli, color: bool) -> RenderOpts {
     RenderOpts {
         color,
         theme: cli.theme,
+        file_index,
+        file_count,
         show_general: g,
         show_hdr: h,
         show_dv: d,

@@ -7,6 +7,12 @@ use crate::model::{BitrateScope, ColorInfo, DolbyVision, General, Report};
 pub struct RenderOpts {
     pub color: bool,
     pub theme: Theme,
+    /// 1-based position of this report's file in the run, and the run's file
+    /// total — the report header echoes the progress header's `[k/N]` counter.
+    /// Multi-file runs only: with `file_count <= 1` no counter renders, so
+    /// single-file output is unchanged.
+    pub file_index: usize,
+    pub file_count: usize,
     pub show_general: bool,
     pub show_hdr: bool,
     pub show_dv: bool,
@@ -52,6 +58,10 @@ impl Theme {
 
 const LABEL_W: usize = 16;
 
+/// Full width of a colored section rule ("── NAME ───…": marks, spaces, name,
+/// fill). The report divider uses the same width so the rules align.
+const RULE_W: usize = 64;
+
 /// The interactive-terminal masthead: a two-row half-block "HDRPROBE" in the
 /// theme palette (bright top row, mid bottom — a CRT falloff), with the
 /// crate version faint alongside. Decoration only: `main` prints it once per
@@ -82,21 +92,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     // value to read as anything but odd, so its report stays headline-free.
     let sidecar = r.general.codec.is_empty();
 
-    // Colored: phosphor banner glyph, faint size. Plain: the classic
-    // "name  (size)" shape, unchanged for pipes and logs. Both show the bare
-    // file name (matching the `--full` scanning header); the full path stays
-    // on the JSON report's `file` field, where machine consumers need it.
-    let name = file_name(&r.file);
-    if c.on {
-        let _ = writeln!(
-            s,
-            "{} {}",
-            c.bright(&format!("▮ {}", name)),
-            c.faint(&human_size(r.size_bytes))
-        );
-    } else {
-        let _ = writeln!(s, "{}  ({})", name, human_size(r.size_bytes));
-    }
+    s.push_str(&report_header(&r.file, r.size_bytes, o, &c));
     s.push('\n');
 
     if o.show_general {
@@ -452,6 +448,45 @@ impl Footnotes {
 /// path ending in `..`) — never an empty header.
 fn file_name(path: &str) -> &str {
     std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path)
+}
+
+/// The per-report header line. Colored: phosphor banner glyph, faint size.
+/// Plain: the classic "name  (size)" shape, unchanged for pipes and logs.
+/// Both show the bare file name (matching the `--full` scanning header); the
+/// full path stays on the JSON report's `file` field, where machine consumers
+/// need it. A multi-file run appends the progress header's `[k/N]` counter
+/// (faint colored, bracketed plain) so each report says where it sits in the
+/// run; the counter is position-in-run, so a failed file leaves an honest gap
+/// in the sequence rather than renumbering the survivors.
+fn report_header(file: &str, size_bytes: u64, o: &RenderOpts, c: &Colorizer) -> String {
+    let name = file_name(file);
+    let counter = if o.file_count > 1 {
+        format!("  {}", c.faint(&format!("[{}/{}]", o.file_index, o.file_count)))
+    } else {
+        String::new()
+    };
+    if c.on {
+        format!(
+            "{} {}{}\n",
+            c.bright(&format!("▮ {}", name)),
+            c.faint(&human_size(size_bytes)),
+            counter
+        )
+    } else {
+        format!("{}  ({}){}\n", name, human_size(size_bytes), counter)
+    }
+}
+
+/// Divider between consecutive reports of a multi-file text run: a full-width
+/// *heavy* rule (`━`, vs the section rules' light `─` — same width, thicker
+/// stroke, so a report boundary reads differently from a section boundary),
+/// bright when colored (the section rules stay faint — weight and ink both
+/// separate the two). `main` inserts it between rendered reports only —
+/// never before the first or after the last — so a single-file run and every
+/// machine path (quiet, JSON, NDJSON) are unchanged.
+pub fn render_divider(o: &RenderOpts) -> String {
+    let c = Colorizer { on: o.color, palette: o.theme.palette() };
+    format!("{}\n\n", c.bright(&"━".repeat(RULE_W)))
 }
 
 /// One-line summary for `--quiet`.
@@ -860,7 +895,8 @@ impl Colorizer {
     fn section(&self, name: &str) -> String {
         if self.on {
             let up = name.to_uppercase();
-            let fill = "─".repeat(60usize.saturating_sub(up.chars().count()));
+            // "── " + name + " " + fill = RULE_W columns.
+            let fill = "─".repeat((RULE_W - 4).saturating_sub(up.chars().count()));
             format!("{} {} {}", self.faint("──"), self.bright(&up), self.faint(&fill))
         } else {
             name.to_string()
@@ -960,5 +996,42 @@ mod tests {
         let pq_no_primaries = cc(None, Some("PQ (SMPTE ST 2084)"), Some("BT.2020 NCL"));
         assert_eq!(infer_p10_compat(&pq_no_primaries), None);
         assert_eq!(infer_p10_compat(&ColorInfo::default()), None);
+    }
+
+    fn opts(color: bool, file_index: usize, file_count: usize) -> RenderOpts {
+        RenderOpts {
+            color,
+            theme: Theme::Paper,
+            file_index,
+            file_count,
+            show_general: true,
+            show_hdr: true,
+            show_dv: true,
+            show_hdr10plus: true,
+        }
+    }
+
+    /// The header's `[k/N]` counter renders only for multi-file runs; a
+    /// single-file report keeps its exact historical header shape.
+    #[test]
+    fn header_counter_multi_file_only() {
+        let c = Colorizer { on: false, palette: Theme::Paper.palette() };
+        let single = report_header("d:\\m\\movie.mkv", 1024, &opts(false, 1, 1), &c);
+        assert_eq!(single, "movie.mkv  (1.00 KiB)\n");
+        let multi = report_header("d:\\m\\movie.mkv", 1024, &opts(false, 2, 7), &c);
+        assert_eq!(multi, "movie.mkv  (1.00 KiB)  [2/7]\n");
+    }
+
+    /// The between-reports divider is a full-width heavy rule (`━`, distinct
+    /// from the section rules' light `─` but the same RULE_W columns), bare
+    /// when plain and bright-wrapped when colored, followed by one blank line
+    /// before the next report's header.
+    #[test]
+    fn divider_matches_section_rule_width() {
+        let rule = "━".repeat(RULE_W);
+        assert_eq!(render_divider(&opts(false, 2, 7)), format!("{rule}\n\n"));
+        let colored = render_divider(&opts(true, 2, 7));
+        assert!(colored.contains(&rule));
+        assert!(colored.starts_with('\x1b') && colored.ends_with("\n\n"));
     }
 }
