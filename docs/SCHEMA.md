@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 1.2**
+**Schema version: 1.3**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -161,6 +161,8 @@ build until the schema version, that test, and this document are updated togethe
 
 Version history:
 
+- **1.3**: added `dolby_vision.metadata_cadence` (additive): the shot-based vs frame-by-frame
+  authoring verdict with its evidence counts, present for `--full` video scans and DV sidecars.
 - **1.2**: added `dolby_vision.mastering_primaries_mismatch` (additive). `trim_targets` now
   also includes target displays defined by the title's global L10 metadata even when no read
   trim referenced them, folded into the L8 set (a semantic broadening of `levels: [8]`, no new
@@ -349,6 +351,7 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 | `trim_targets` | array of `TrimTarget` | omitted when empty | Distinct trim target displays, in nits, sorted ascending: the L2/L8 trims read plus any L10-defined target displays (custom L8 targets, folded into the L8 set) |
 | `rpu_count` | integer | always | Number of RPUs successfully parsed (0 under `--no-rpu`) |
 | `sampled` | boolean | always | `true` when the DV facts reflect sampling; `false` under `--full`, for sidecars (exhaustive by construction), and under `--no-rpu` (nothing was sampled) |
+| `metadata_cadence` | `MetadataCadence` | optional | Whether the dynamic metadata is authored shot-by-shot or frame-by-frame; see below. Present under `--full` and for DV sidecars; absent for sampled video runs (no adjacent frames to compare) and `--no-rpu` |
 | `census` | `DvCensus` | optional | Exhaustive per-level census. Present under `--full` and for DV sidecars; absent for sampled video runs and `--no-rpu` |
 
 ## Object: `FelBrightnessExpansion`
@@ -417,6 +420,25 @@ canvas dimensions minus the opposing offsets. For sidecars the canvas is assumed
 | `top` | integer | always | Top offset in pixels |
 | `bottom` | integer | always | Bottom offset in pixels |
 
+## Object: `MetadataCadence`
+
+The authoring cadence of the dynamic metadata, decided by comparing consecutive frames' DM
+payloads (extension blocks plus the grade's mastering range; the scene-refresh flag and the
+composer/NLQ payload are excluded, so a shot's first frame compares equal to the rest of its
+shot). Produced only when every frame's RPU was read in stream order: a `--full` video scan or
+a DV sidecar (the RPU bin's frame stream, or the DV XML's declared shot/edit structure). The
+verdict is `"per-frame"` when at least a quarter of the pairs changed, not an exact-zero test:
+a shot-based title still changes at its scene cuts (one change per shot transition, so a few
+percent of pairs at most), while per-frame analysis produces equal neighbours over static
+stretches and duplicated frames yet stays far above the quarter line. The counts are included
+so a consumer can see how decisive the verdict was.
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `cadence` | string | always | `"per-shot"` (frames within a shot share one DM payload, the standard CM authoring workflow) or `"per-frame"` (each frame carries its own values, e.g. converted or per-frame-analyzed metadata) |
+| `frame_pairs` | integer | always | Consecutive-frame DM comparisons made (frames minus 1 on an exhaustive read) |
+| `changed_pairs` | integer | always | How many of those comparisons differed |
+
 ## Object: `DvCensus`
 
 Exhaustive per-RPU statistics, only produced when every RPU in the title was scanned.
@@ -458,17 +480,17 @@ no `dolby_vision` section; DV sidecars have no `hdr10plus` section.
 **Default (sampled) run.** `dolby_vision.sampled` is `true`; `l5_active_areas` and
 `trim_targets` are unions over the sampled RPUs and may be incomplete (though the L10-defined
 custom targets folded into the L8 set are title-global — the definition rides every RPU, so
-those entries are complete from any sample); `census` is absent.
+those entries are complete from any sample); `census` and `metadata_cadence` are absent.
 
-**`--full`.** Every RPU is scanned: `sampled` is `false`, `census` appears, and TS inputs gain
-an exact video-stream `bitrate`. DV sidecars behave like `--full` by construction (every RPU in
-the file is read).
+**`--full`.** Every RPU is scanned: `sampled` is `false`, `census` and `metadata_cadence`
+appear, and TS inputs gain an exact video-stream `bitrate`. DV sidecars behave like `--full`
+by construction (every RPU in the file is read).
 
 **`--no-rpu`.** The DV section is built from the container configuration alone: `profile`,
 `structure`, `level`, the presence booleans, `bl_compatibility_id`, and `compatibility` can
 appear; everything RPU-derived (`el_type`, `reconstructed_bit_depth`, `cm_version`,
-L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `census`) is absent, and
-`rpu_count` is `0`.
+L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `metadata_cadence`, `census`) is
+absent, and `rpu_count` is `0`.
 
 **`--samples <N>`.** Changes only how many seek points feed the sampled sets; it never changes
 the schema.

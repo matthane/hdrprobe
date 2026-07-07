@@ -48,6 +48,11 @@ pub fn parse(data: &[u8]) -> Result<Payload> {
         .collect();
 
     let mut agg = DvAggregate::default();
+    // Runs are folded in stream order and cover every frame, so the aggregator
+    // can compare consecutive frames' DM payloads for the cadence verdict (a
+    // run's internal pairs are identical by construction; only run boundaries
+    // can differ).
+    agg.track_consecutive();
     for (rpu, frames) in &rpus {
         // All frames in a run share the RPU's own scene_refresh_flag, so the
         // scene-cut count weights the same way the per-frame fold would.

@@ -16,7 +16,7 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "1.2";
+pub const SCHEMA_VERSION: &str = "1.3";
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -269,9 +269,33 @@ pub struct DolbyVision {
     pub rpu_count: usize,
     /// True when the report reflects sampling rather than a full scan.
     pub sampled: bool,
+    /// Authoring cadence of the dynamic metadata, decided by comparing
+    /// consecutive frames' DM payloads. Present only when every frame's RPU
+    /// was read in stream order — a `--full` video scan or a DV sidecar; a
+    /// sampled video run has no adjacent frames to compare, so it carries
+    /// no verdict rather than a guessed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_cadence: Option<MetadataCadence>,
     /// Exhaustive per-level census, present only under `--full`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub census: Option<DvCensus>,
+}
+
+/// The metadata-cadence verdict plus the consecutive-frame evidence behind it.
+/// `frame_pairs` counts the adjacent-frame DM comparisons made (frames − 1 on
+/// an exhaustive read) and `changed_pairs` how many differed, so a consumer
+/// can see how decisive the majority verdict was: a shot-based title changes
+/// at its scene cuts only (a few percent), per-frame analysis at well over
+/// half.
+#[derive(Debug, Serialize)]
+pub struct MetadataCadence {
+    /// `"per-shot"` (frames within a shot share one DM payload — the standard
+    /// CM authoring workflow) or `"per-frame"` (each frame carries its own).
+    pub cadence: String,
+    /// Consecutive-frame DM payload comparisons made.
+    pub frame_pairs: usize,
+    /// How many of those comparisons differed.
+    pub changed_pairs: usize,
 }
 
 /// Exhaustive metadata census over every RPU in the title (`--full`).
@@ -445,6 +469,11 @@ mod tests {
                 trim_targets: vec![TrimTarget { nits: 100, levels: vec![2, 8] }],
                 rpu_count: 722,
                 sampled: false,
+                metadata_cadence: Some(MetadataCadence {
+                    cadence: "per-shot".to_string(),
+                    frame_pairs: 721,
+                    changed_pairs: 4,
+                }),
                 census: Some(DvCensus {
                     scene_cuts: 5,
                     dm_version_index: Some(2),
@@ -560,6 +589,9 @@ mod tests {
             "dolby_vision.trim_targets[].levels[]",
             "dolby_vision.rpu_count",
             "dolby_vision.sampled",
+            "dolby_vision.metadata_cadence.cadence",
+            "dolby_vision.metadata_cadence.frame_pairs",
+            "dolby_vision.metadata_cadence.changed_pairs",
             "dolby_vision.census.scene_cuts",
             "dolby_vision.census.dm_version_index",
             "dolby_vision.census.level_presence[].level",
@@ -575,9 +607,9 @@ mod tests {
 
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "1.2");
+        assert_eq!(SCHEMA_VERSION, "1.3");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "1.2");
+        assert_eq!(v["hdrprobe_schema_version"], "1.3");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
         assert_eq!(v["hdr10plus"]["profile"], "B");

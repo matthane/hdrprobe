@@ -14,6 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 dolby_vision = { version = "3.3.2", features = ["xml", "serde"] }
+# DM-payload fingerprinting for the metadata-cadence verdict
+# (`dv::levels::dm_fingerprint` serializes extension blocks through
+# `ExtMetadataBlock::write`, whose writer type this crate owns); already in
+# the tree via dolby_vision at the same version/features, so no new crate.
+bitvec_helpers = { version = "3.1.6", default-features = false, features = ["bitstream-io"] }
 memmap2 = "0.9"
 rayon = "1.10"
 clap = { version = "4.5", features = ["derive", "env"] }

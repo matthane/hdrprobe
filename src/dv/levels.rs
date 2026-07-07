@@ -5,19 +5,33 @@
 //! per-shot trim *values*.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 
+use bitvec_helpers::bitstream_io_writer::BitstreamIoWriter;
 use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlock;
 use dolby_vision::rpu::rpu_data_nlq::DoviELType;
+use dolby_vision::rpu::vdr_dm_data::VdrDmData;
 
 use crate::container::DvConfig;
 use crate::model::{
     ActiveArea, DolbyVision, DvCensus, FelBrightnessExpansion, L6, LevelPresence,
-    MasteringDisplay, MasteringPrimariesMismatch, TrimTarget,
+    MasteringDisplay, MasteringPrimariesMismatch, MetadataCadence, TrimTarget,
 };
 
 /// Metadata levels we census, in report order.
 const CENSUS_LEVELS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 254];
+
+/// Levels folded into [`dm_fingerprint`]: every block-bearing level libdovi
+/// models except L4. The title-constant levels (6/9/10/11/254) are included on
+/// purpose — they serialize identically on every frame, so they cost a few
+/// bytes and spare a judgment call about which levels count as "dynamic". L4
+/// is excluded because its temporal-filtering anchors are a per-frame running
+/// average by mechanism, present even in shot-based authoring (corpus-verified
+/// via dovi_tool export on the P7 FEL CM v2.9 clip: adjacent same-shot frames
+/// differ *only* in L4, while the clip's own CM XML is per-shot) — including
+/// it would misread every L4-carrying title as per-frame.
+const FINGERPRINT_LEVELS: &[u8] = &[1, 2, 3, 5, 6, 8, 9, 10, 11, 254, 255];
 
 #[derive(Default)]
 pub struct DvAggregate {
@@ -67,6 +81,19 @@ pub struct DvAggregate {
     /// Metadata-only sidecar (RPU bin / DV XML): no base layer to back a
     /// convention-default compat minor, so such a default is flagged as assumed.
     metadata_only: bool,
+    /// Whether folds arrive as *every* frame in stream order (the `--full`
+    /// video scan and the raw RPU-bin sidecar), enabling the consecutive-frame
+    /// DM comparison behind the metadata-cadence verdict. The sampled default
+    /// folds scattered frames, so it never sets this: a pair spanning a
+    /// sampling gap would read as a change.
+    track_consecutive: bool,
+    /// Previous folded frame's DM fingerprint, when tracking consecutively.
+    prev_dm_fp: Option<u64>,
+    /// Consecutive-frame DM comparisons made / how many differed. Also fed
+    /// directly by the DV XML path (`add_cadence_pairs`), whose fold order is
+    /// per-shot rather than stream order.
+    cadence_pairs: usize,
+    cadence_changes: usize,
 }
 
 impl DvAggregate {
@@ -80,6 +107,23 @@ impl DvAggregate {
     /// `[compat assumed]` flag when the compat minor is a convention default.
     pub fn mark_metadata_only(&mut self) {
         self.metadata_only = true;
+    }
+
+    /// Declare that every frame's RPU will be folded, in stream order, enabling
+    /// the consecutive-frame DM comparison behind the metadata-cadence verdict.
+    /// Callers: the `--full` video scan (all containers fold decode-order AUs)
+    /// and the raw RPU-bin sidecar (runs of identical frames, in stream order).
+    pub fn track_consecutive(&mut self) {
+        self.track_consecutive = true;
+    }
+
+    /// Fold externally computed cadence evidence: `pairs` consecutive-frame DM
+    /// comparisons of which `changes` differed. Used by the DV XML path, which
+    /// walks its declared shot/edit structure instead of folding frames in
+    /// stream order.
+    pub fn add_cadence_pairs(&mut self, pairs: usize, changes: usize) {
+        self.cadence_pairs += pairs;
+        self.cadence_changes += changes;
     }
 
     /// Fold in one real RPU (one frame). Scene-cut count comes from the RPU's own
@@ -119,6 +163,18 @@ impl DvAggregate {
         let Some(dm) = &rpu.vdr_dm_data else { return };
 
         self.scene_cuts += scene_cuts;
+        // Consecutive-frame DM comparison for the metadata-cadence verdict.
+        // A run of `weight` identical frames contributes its boundary pair
+        // against the previous fold plus `weight - 1` internal pairs, none of
+        // which change (identical frames by construction on both callers).
+        if self.track_consecutive {
+            let fp = dm_fingerprint(dm);
+            if let Some(prev) = self.prev_dm_fp.replace(fp) {
+                self.cadence_pairs += 1;
+                self.cadence_changes += usize::from(prev != fp);
+            }
+            self.cadence_pairs += weight.saturating_sub(1);
+        }
         // Mastering-display range of the DV grade, from the DM data header.
         // Title-stable in practice; a zero max is an absent/defaulted value.
         if self.source_pq.is_none() && dm.source_max_pq > 0 {
@@ -290,6 +346,8 @@ impl DvAggregate {
         let trim_targets =
             merge_trim_targets(&self.trim_targets, &self.l8_target_indices, &self.l10_targets);
 
+        let metadata_cadence = cadence_verdict(self.cadence_pairs, self.cadence_changes);
+
         let census = full.then(|| DvCensus {
             scene_cuts: self.scene_cuts,
             dm_version_index: self.dm_version_index,
@@ -350,9 +408,58 @@ impl DvAggregate {
             trim_targets,
             rpu_count: self.rpu_count,
             sampled: !full,
+            metadata_cadence,
             census,
         })
     }
+}
+
+/// Fingerprint of a DM payload's *content*: every extension-metadata block
+/// serialized to its exact bitstream form, plus the header's mastering range
+/// (`source_min/max_pq`), hashed. `scene_refresh_flag` is deliberately outside
+/// the fingerprint, so a shot's first frame — identical to the rest of the
+/// shot but for that flag — compares equal. The composer/NLQ payload is also
+/// outside on purpose: it can vary independently of the CM metadata (a FEL
+/// residual's mapping), and cadence is a CM-authoring fact. Equality is only
+/// ever checked between frames folded within one process run, so std's
+/// run-seeded hasher is fine.
+pub(crate) fn dm_fingerprint(dm: &VdrDmData) -> u64 {
+    let mut w = BitstreamIoWriter::with_capacity(128);
+    for &lvl in FINGERPRINT_LEVELS {
+        for block in dm.level_blocks_iter(lvl) {
+            // A block that refuses to serialize (reserved payloads) is skipped
+            // on every frame alike, so it skews nothing.
+            let _ = block.write(&mut w);
+        }
+    }
+    let _ = w.byte_align();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (dm.source_min_pq, dm.source_max_pq).hash(&mut h);
+    if let Some(bytes) = w.as_slice() {
+        bytes.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Classify the title's metadata cadence from consecutive-frame DM
+/// comparisons: per-shot (values change only at scene cuts — the standard CM
+/// authoring workflow) vs per-frame (each frame carries its own analysis, e.g.
+/// converted or per-frame-graded metadata). The line is a quarter of the
+/// pairs, not exact zero or a simple majority, because both classes carry
+/// bounded slack: shot-based changes are one per shot transition, so the
+/// fraction is 1/(average shot length) — corpus-observed at 0–2.6% even with
+/// decode-order stragglers at open-GOP cuts — while per-frame analysis
+/// produces equal neighbours over static stretches (corpus-observed at
+/// 55–64%: the HLG-converted and P20 live-analysis titles) and would halve
+/// again on a high-rate stream that duplicates each analysed frame, still
+/// staying above a quarter. No pairs at all (a single RPU, or nothing folded
+/// consecutively) yields `None`, never a guess.
+fn cadence_verdict(pairs: usize, changes: usize) -> Option<MetadataCadence> {
+    (pairs > 0).then(|| MetadataCadence {
+        cadence: if changes * 4 >= pairs { "per-frame" } else { "per-shot" }.to_string(),
+        frame_pairs: pairs,
+        changed_pairs: changes,
+    })
 }
 
 /// Build a DV section from the container config alone (no RPU parse), as used
@@ -388,6 +495,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         trim_targets: Vec::new(),
         rpu_count: 0,
         sampled: false,
+        metadata_cadence: None,
         census: None,
     }
 }
@@ -909,6 +1017,100 @@ mod tests {
         let targets = merge_trim_targets(&BTreeSet::new(), &BTreeSet::from([255u8]), &l10);
         assert_eq!(targets.len(), 1);
         assert_eq!((targets[0].nits, targets[0].levels.as_slice()), (300, &[8u8][..]));
+    }
+
+    /// The shared real RPU (a dovi_tool `.bin` payload): the cadence tests
+    /// need genuine DM data with extension blocks behind the fingerprint.
+    fn real_rpu() -> DoviRpu {
+        crate::dv::rpu::parse_avc_rpu(crate::dv::rpu::TEST_AVC_RPU_NAL).expect("test RPU parses")
+    }
+
+    /// The same RPU with its L1 analysis nudged — a frame carrying its own
+    /// per-frame values.
+    fn edited_rpu() -> DoviRpu {
+        let mut r = real_rpu();
+        let dm = r.vdr_dm_data.as_mut().expect("test RPU has DM data");
+        match dm.level_blocks_iter_mut(1).next() {
+            Some(ExtMetadataBlock::Level1(b)) => b.avg_pq ^= 1,
+            _ => panic!("test RPU carries an L1 block"),
+        }
+        r
+    }
+
+    #[test]
+    fn dm_fingerprint_tracks_content_not_the_scene_flag() {
+        let base = real_rpu();
+        let base_fp = dm_fingerprint(base.vdr_dm_data.as_ref().unwrap());
+        // The scene_refresh_flag is a cut marker, not content: a shot's first
+        // frame must fingerprint equal to the rest of its shot.
+        let mut flagged = real_rpu();
+        flagged.vdr_dm_data.as_mut().unwrap().scene_refresh_flag ^= 1;
+        assert_eq!(dm_fingerprint(flagged.vdr_dm_data.as_ref().unwrap()), base_fp);
+        // A changed analysis value must change the fingerprint.
+        let edited = edited_rpu();
+        assert_ne!(dm_fingerprint(edited.vdr_dm_data.as_ref().unwrap()), base_fp);
+    }
+
+    #[test]
+    fn cadence_counts_pairs_across_folds_and_weighted_runs() {
+        let base = real_rpu();
+        let edited = edited_rpu();
+        let mut agg = DvAggregate::default();
+        agg.track_consecutive();
+        agg.add_repeated(&base, 10, 1); // a shot: run of 10 identical frames
+        agg.add(&edited); // one frame carrying its own values
+        agg.add_repeated(&base, 3, 0); // back to the shot's values
+        let dv = agg.finalize(3840, 2160, None, true, false, false).unwrap();
+        let cad = dv.metadata_cadence.expect("consecutive folds yield a verdict");
+        // 9 internal pairs, boundary (change), boundary (change), 2 internal.
+        assert_eq!((cad.frame_pairs, cad.changed_pairs), (13, 2));
+        assert_eq!(cad.cadence, "per-shot");
+    }
+
+    #[test]
+    fn cadence_frequent_changes_read_per_frame() {
+        let base = real_rpu();
+        let edited = edited_rpu();
+        let mut agg = DvAggregate::default();
+        agg.track_consecutive();
+        for _ in 0..3 {
+            agg.add(&base);
+            agg.add(&edited);
+        }
+        let dv = agg.finalize(3840, 2160, None, true, false, false).unwrap();
+        let cad = dv.metadata_cadence.unwrap();
+        assert_eq!((cad.frame_pairs, cad.changed_pairs), (5, 5));
+        assert_eq!(cad.cadence, "per-frame");
+        // Per-frame analysis riding duplicated frames (a high-rate stream
+        // repeating each analysed frame) changes at only ~half of all pairs;
+        // still comfortably past the quarter line.
+        let mut agg = DvAggregate::default();
+        agg.track_consecutive();
+        for _ in 0..3 {
+            agg.add_repeated(&base, 2, 0);
+            agg.add_repeated(&edited, 2, 0);
+        }
+        let dv = agg.finalize(3840, 2160, None, true, false, false).unwrap();
+        let cad = dv.metadata_cadence.unwrap();
+        assert_eq!((cad.frame_pairs, cad.changed_pairs), (11, 5));
+        assert_eq!(cad.cadence, "per-frame");
+    }
+
+    #[test]
+    fn cadence_absent_without_consecutive_tracking_or_pairs() {
+        // Untracked folds (the sampled default's scattered frames): no verdict,
+        // never a guess — even though these two frames happen to differ.
+        let mut agg = DvAggregate::default();
+        agg.add(&real_rpu());
+        agg.add(&edited_rpu());
+        let dv = agg.finalize(3840, 2160, None, false, false, false).unwrap();
+        assert!(dv.metadata_cadence.is_none());
+        // A single tracked RPU has no pair to compare.
+        let mut agg = DvAggregate::default();
+        agg.track_consecutive();
+        agg.add(&real_rpu());
+        let dv = agg.finalize(3840, 2160, None, true, false, false).unwrap();
+        assert!(dv.metadata_cadence.is_none());
     }
 
     #[test]

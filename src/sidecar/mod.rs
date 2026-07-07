@@ -265,6 +265,30 @@ mod tests {
     }
 
     #[test]
+    fn rpu_bin_run_collapse_still_counts_cadence_pairs() {
+        // Three identical frames, dovi_tool bin form: Annex-B start codes, no
+        // NAL header byte, EBSP beginning with the 0x19 rpu_nal_prefix (the
+        // shared test RPU minus its 1-byte AVC wrapper). The run collapse folds
+        // them as one weighted run, which must still count 2 consecutive-frame
+        // pairs — none changed, so the cadence reads per-shot.
+        let payload = &crate::dv::rpu::TEST_AVC_RPU_NAL[1..];
+        let mut data = Vec::new();
+        for _ in 0..3 {
+            data.extend_from_slice(&[0, 0, 1]);
+            data.extend_from_slice(payload);
+        }
+        match rpu_bin::parse(&data).expect("valid RPU bin") {
+            Payload::DolbyVision(dv) => {
+                assert_eq!(dv.rpu_count, 3);
+                let cad = dv.metadata_cadence.expect("exhaustive read yields a verdict");
+                assert_eq!((cad.frame_pairs, cad.changed_pairs), (2, 0));
+                assert_eq!(cad.cadence, "per-shot");
+            }
+            _ => panic!("expected a DV payload"),
+        }
+    }
+
+    #[test]
     fn garbage_rpu_bin_errors_without_panic() {
         // Correct leading framing (start code + rpu_nal_prefix 0x19) but random
         // body: libdovi rejects it, and we surface an error rather than aborting.

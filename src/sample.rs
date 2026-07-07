@@ -126,6 +126,13 @@ pub fn scan(
     let selected: Vec<Chunk> = indices.iter().map(|&i| demux.chunks[i]).collect();
     progress.begin(Phase::Scan, selected.iter().map(|c| c.size).sum());
     let mut dv = DvAggregate::default();
+    // Under `--full` the selection is every AU in decode order, so consecutive
+    // folds are adjacent frames and the cadence verdict has real pairs to
+    // compare. The sampled default folds scattered AUs — a pair spanning a
+    // sampling gap would read as a change — so it stays untracked (no verdict).
+    if opts.full {
+        dv.track_consecutive();
+    }
     let mut sei = SeiFindings::default();
     scan_chunks(source, &selected, demux.nal_format, &demux.codec, &mut dv, &mut sei, progress, frontier);
 
@@ -188,6 +195,9 @@ fn scan_ts_full(
     let mut buf: Vec<u8> = Vec::new();
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut dv = DvAggregate::default();
+    // Windows arrive sequentially and each window's completed AUs are in
+    // stream order, so folds are adjacent frames — cadence pairs are real.
+    dv.track_consecutive();
     let mut sei = SeiFindings::default();
     let mut es_bytes: u64 = 0;
     // Progress by the streamer's file cursor against the whole mmap — the walk
@@ -258,6 +268,9 @@ fn scan_mkv_full(
     let mut st = plan.streamer();
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut dv = DvAggregate::default();
+    // Cluster windows arrive sequentially with blocks in stream order, so
+    // folds are adjacent frames — cadence pairs are real.
+    dv.track_consecutive();
     let mut sei = SeiFindings::default();
     let mut es_bytes: u64 = 0;
     let mut frame_count: u64 = 0;
@@ -315,6 +328,9 @@ fn scan_raw_full(
 ) -> Scan {
     progress.begin(Phase::Scan, data.len() as u64);
     let mut dv = DvAggregate::default();
+    // The fused walk emits completed AUs in stream order, batch after batch,
+    // so folds are adjacent frames — cadence pairs are real.
+    dv.track_consecutive();
     let mut sei = SeiFindings::default();
     let mut pending: Vec<Chunk> = Vec::with_capacity(AGG_BATCH);
 

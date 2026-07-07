@@ -193,6 +193,14 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 kv(&mut s, &c, "RPU count", &dv.rpu_count.to_string());
                 kv(&mut s, &c, "Scene cuts", &census.scene_cuts.to_string());
             }
+            // Shot-based vs frame-by-frame authoring, decided from adjacent
+            // frames' DM payloads — only exhaustive stream-order reads (a
+            // `--full` scan or a DV sidecar) produce it, so like the census
+            // lines it never reflects a sample. The text keeps the verdict;
+            // the JSON carries the pair counts behind it.
+            if let Some(cad) = &dv.metadata_cadence {
+                kv(&mut s, &c, "Metadata cadence", &cad.cadence);
+            }
             if let Some(structure) = &dv.structure {
                 kv(&mut s, &c, "Structure", structure);
             }

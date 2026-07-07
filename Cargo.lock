@@ -246,6 +246,7 @@ name = "hdrprobe"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "bitvec_helpers 3.1.6",
  "clap",
  "dolby_vision",
  "hdr10plus",

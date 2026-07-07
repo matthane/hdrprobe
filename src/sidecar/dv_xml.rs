@@ -18,13 +18,13 @@
 //! `catch_unwind` guard, turning any parser failure into a clean error.
 
 use anyhow::{bail, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use dolby_vision::rpu::generate::GenerateProfile;
 use dolby_vision::xml::{CmXmlParser, XmlParserOpts};
 
-use crate::dv::levels::DvAggregate;
+use crate::dv::levels::{dm_fingerprint, DvAggregate};
 use crate::dv::rpu::guard;
 use crate::model::MasteringDisplay;
 
@@ -186,6 +186,15 @@ pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
             GenerateProfile::Profile84 => 4,
         });
 
+        // Metadata-cadence evidence, carried across shots: the fold order
+        // below is per-shot (edits, then plain frames), not stream order, so
+        // the aggregator's consecutive tracking can't apply — instead replay
+        // the declared frame sequence from the shot/edit fingerprints, which
+        // is exact and cheap (one map lookup + compare per frame).
+        let mut prev_fp: Option<u64> = None;
+        let mut pairs = 0usize;
+        let mut changes = 0usize;
+
         for shot in &cfg.shots {
             if shot.duration == 0 {
                 continue;
@@ -208,6 +217,7 @@ pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
                 .filter(|&o| o < shot.duration)
                 .collect();
 
+            let mut edit_fps: BTreeMap<usize, u64> = BTreeMap::new();
             for &off in &offsets {
                 let edit = shot
                     .frame_edits
@@ -219,6 +229,7 @@ pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
                 for block in &edit.metadata_blocks {
                     edm.replace_metadata_block(block.clone()).ok()?;
                 }
+                edit_fps.insert(off, dm_fingerprint(edit_rpu.vdr_dm_data.as_ref()?));
                 // A scene cut only ever lands on frame 0 (or every frame in
                 // long-play mode).
                 let scene_cuts = usize::from(off == 0 || cfg.long_play_mode);
@@ -233,8 +244,21 @@ pub fn parse(data: &[u8]) -> Result<(Payload, GlobalMeta)> {
                 usize::from(!offsets.contains(&0))
             };
             agg.add_repeated(&shot_rpu, plain, plain_scene_cuts);
+
+            // Adjacent-frame comparisons over this shot's frames, including
+            // the pair spanning the previous shot's last frame — the same
+            // pair set the stream-order paths (RPU bin, `--full`) count.
+            let shot_fp = dm_fingerprint(shot_rpu.vdr_dm_data.as_ref()?);
+            for i in 0..shot.duration {
+                let fp = edit_fps.get(&i).copied().unwrap_or(shot_fp);
+                if let Some(prev) = prev_fp.replace(fp) {
+                    pairs += 1;
+                    changes += usize::from(prev != fp);
+                }
+            }
         }
 
+        agg.add_cadence_pairs(pairs, changes);
         Some(agg)
     });
 
