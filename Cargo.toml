@@ -25,6 +25,11 @@ anyhow = "1"
 thiserror = "2"
 hdr10plus = { version = "2.1.5", features = ["json"] }
 
+# Terminal width for value-line reflow (main.rs `terminal_width`); already in
+# the tree transitively via memmap2 on unix, so this adds no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

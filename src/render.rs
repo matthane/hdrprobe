@@ -7,6 +7,12 @@ use crate::model::{BitrateScope, ColorInfo, DolbyVision, General, Report};
 pub struct RenderOpts {
     pub color: bool,
     pub theme: Theme,
+    /// Visible column count of the output terminal, when stdout is one.
+    /// Value lines longer than this reflow at their part separators with
+    /// continuations indented to the value column (see `wrap_line`). `None`
+    /// (pipes, `--output` files, JSON/quiet paths) disables reflow, so every
+    /// machine-consumed byte stream is unchanged.
+    pub wrap_width: Option<usize>,
     /// 1-based position of this report's file in the run, and the run's file
     /// total — the report header echoes the progress header's `[k/N]` counter.
     /// Multi-file runs only: with `file_count <= 1` no counter renders, so
@@ -58,6 +64,16 @@ impl Theme {
 
 const LABEL_W: usize = 16;
 
+/// Visible column where values start: the 2-space gutter, the padded label,
+/// and the 2-space gap. Continuation lines of a reflowed row indent to here
+/// so wrapped values stay one aligned block under their first line.
+const VALUE_COL: usize = 2 + LABEL_W + 2;
+
+/// Below this terminal width reflow stops helping — values would wrap into a
+/// sliver next to the label column — so narrower terminals get the unwrapped
+/// line and the terminal's own hard wrap.
+const MIN_WRAP_WIDTH: usize = VALUE_COL + 20;
+
 /// Full width of a colored section rule ("── NAME ───…": marks, spaces, name,
 /// fill). The report divider uses the same width so the rules align.
 const RULE_W: usize = 64;
@@ -68,7 +84,7 @@ const RULE_W: usize = 64;
 /// run, and only for colored text output (never quiet/JSON/pipes), so
 /// machine consumers and logs never see it.
 pub fn render_banner(theme: Theme) -> String {
-    let c = Colorizer { on: true, palette: theme.palette() };
+    let c = Colorizer { on: true, palette: theme.palette(), wrap: None };
     let mut s = String::new();
     let _ = writeln!(s, "{}", c.bright("█ █ █▀▄ █▀█ █▀█ █▀█ █▀█ █▄▄ █▀▀"));
     let _ = writeln!(
@@ -83,7 +99,7 @@ pub fn render_banner(theme: Theme) -> String {
 
 pub fn render(r: &Report, o: &RenderOpts) -> String {
     let mut s = String::new();
-    let c = Colorizer { on: o.color, palette: o.theme.palette() };
+    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width };
     let mut notes = Footnotes::default();
 
     // Each section carries one bright headline for quick glancing (General's
@@ -485,7 +501,7 @@ fn report_header(file: &str, size_bytes: u64, o: &RenderOpts, c: &Colorizer) -> 
 /// never before the first or after the last — so a single-file run and every
 /// machine path (quiet, JSON, NDJSON) are unchanged.
 pub fn render_divider(o: &RenderOpts) -> String {
-    let c = Colorizer { on: o.color, palette: o.theme.palette() };
+    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: None };
     format!("{}\n\n", c.bright(&"━".repeat(RULE_W)))
 }
 
@@ -519,7 +535,161 @@ fn kv_styled(s: &mut String, c: &Colorizer, label: &str, value: &str) {
     // Char count, not byte length: a footnote marker on the label (†, ‡) is
     // multi-byte but single-column, and byte-based padding would misalign it.
     let pad = " ".repeat(LABEL_W.saturating_sub(label.chars().count()));
-    let _ = writeln!(s, "  {}{}  {}", c.label(label), pad, value);
+    let line = format!("  {}{}  {}", c.label(label), pad, value);
+    match c.wrap {
+        Some(w) if w >= MIN_WRAP_WIDTH => {
+            for l in wrap_line(&line, w) {
+                let _ = writeln!(s, "{l}");
+            }
+        }
+        _ => {
+            let _ = writeln!(s, "{line}");
+        }
+    }
+}
+
+/// One visible character of a styled line, tagged with the SGR parameter
+/// string active where it appears (`""` = unstyled). Decomposing the line
+/// this way makes reflow pure text layout: escape codes are zero-width by
+/// construction and a break inside a styled span re-opens the span on the
+/// continuation line for free when the cells are re-serialized.
+struct Cell<'a> {
+    style: &'a str,
+    ch: char,
+}
+
+/// Decompose a rendered line into per-character cells. Only the escape shape
+/// this renderer itself emits (`\x1b[<params>m`, non-nesting, `0` = reset) is
+/// recognized — the input is always our own `Colorizer` output.
+fn parse_cells(line: &str) -> Vec<Cell<'_>> {
+    let mut cells = Vec::new();
+    let mut style = "";
+    let mut it = line.char_indices().peekable();
+    while let Some((i, ch)) = it.next() {
+        if ch == '\x1b' && matches!(it.peek(), Some((_, '['))) {
+            it.next();
+            let start = i + 2;
+            let mut end = start;
+            for (j, c2) in it.by_ref() {
+                if c2 == 'm' {
+                    end = j;
+                    break;
+                }
+            }
+            let params = &line[start..end];
+            style = if params == "0" { "" } else { params };
+            continue;
+        }
+        cells.push(Cell { style, ch });
+    }
+    cells
+}
+
+/// Re-serialize cells to a styled string, grouping runs of one style into
+/// `\x1b[..m…\x1b[0m` spans (the same open+reset shape `Colorizer::wrap`
+/// emits). `indent` prepends the value-column margin for continuation lines.
+fn render_cells(cells: &[Cell<'_>], indent: bool) -> String {
+    let mut out = String::new();
+    if indent {
+        out.push_str(&" ".repeat(VALUE_COL));
+    }
+    let mut i = 0;
+    while i < cells.len() {
+        let style = cells[i].style;
+        let mut j = i + 1;
+        while j < cells.len() && cells[j].style == style {
+            j += 1;
+        }
+        if !style.is_empty() {
+            let _ = write!(out, "\x1b[{style}m");
+        }
+        out.extend(cells[i..j].iter().map(|c| c.ch));
+        if !style.is_empty() {
+            out.push_str("\x1b[0m");
+        }
+        i = j;
+    }
+    out
+}
+
+/// Break opportunities of a kv line, as `(end, resume)` cell indices: the
+/// line may end at `end` (exclusive) and continue at `resume`, dropping the
+/// separator whitespace between them. Breaks land only after a part
+/// separator — the ` · ` / `, ` / ` + ` joins the value builders use (the
+/// separator stays at line end, signalling continuation) — or at an unstyled
+/// double space (the gap before a warning chip or between value halves).
+/// Never inside a part, and never before the value column, so the label is
+/// untouchable. Single spaces are not candidates, which also keeps warning
+/// chips (styled spaces inside inverse video) whole.
+fn break_candidates(cells: &[Cell<'_>]) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    let n = cells.len();
+    for i in VALUE_COL..n {
+        let next_space = i + 1 < n && cells[i + 1].ch == ' ';
+        let sep = match cells[i].ch {
+            '·' | ',' => next_space,
+            '+' => next_space && cells[i - 1].ch == ' ',
+            ' ' => next_space && cells[i].style.is_empty() && cells[i + 1].style.is_empty(),
+            _ => false,
+        };
+        if !sep {
+            continue;
+        }
+        // A double space ends the line *before* the gap; a separator glyph
+        // stays on the line. A separator's padding spaces are consumed even
+        // when styled (they sit inside the separator's own span), but a
+        // double-space break stops at the first styled space — that space
+        // belongs to what follows (a warning chip's inverse-video lead pad),
+        // not to the gap.
+        let gap = cells[i].ch == ' ';
+        let end = if gap { i } else { i + 1 };
+        let mut resume = i + 1;
+        while resume < n && cells[resume].ch == ' ' && (!gap || cells[resume].style.is_empty()) {
+            resume += 1;
+        }
+        if resume < n {
+            v.push((end, resume));
+        }
+    }
+    v
+}
+
+/// Greedy reflow of one rendered kv line to `width` visible columns:
+/// continuation lines indent to the value column and re-open the style
+/// active at the break. Char count is the width measure — every glyph this
+/// report emits is single-column (the same assumption the label padding
+/// makes). A line that already fits is returned byte-identical; a part too
+/// long for any break overflows to the next separator (the terminal's hard
+/// wrap takes it from there) rather than breaking mid-part.
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    let cells = parse_cells(line);
+    if cells.len() <= width {
+        return vec![line.to_string()];
+    }
+    let candidates = break_candidates(&cells);
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    loop {
+        let indent = !out.is_empty();
+        let budget = if indent { width - VALUE_COL } else { width };
+        if cells.len() - start <= budget {
+            out.push(render_cells(&cells[start..], indent));
+            break;
+        }
+        let fit = candidates.iter().rev().find(|(end, _)| *end > start && end - start <= budget);
+        let chosen = fit.or_else(|| candidates.iter().find(|(end, _)| *end > start));
+        match chosen {
+            Some(&(end, resume)) => {
+                out.push(render_cells(&cells[start..end], indent));
+                start = resume;
+            }
+            None => {
+                out.push(render_cells(&cells[start..], indent));
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn video_line(r: &Report) -> String {
@@ -833,6 +1003,10 @@ const MONO: Palette = Palette {
 struct Colorizer {
     on: bool,
     palette: &'static Palette,
+    /// Terminal width for value-line reflow (`RenderOpts::wrap_width`).
+    /// Carried here because every `kv` call site already threads the
+    /// Colorizer; decoration paths (banner, divider, header) pass `None`.
+    wrap: Option<usize>,
 }
 
 impl Colorizer {
@@ -1002,6 +1176,7 @@ mod tests {
         RenderOpts {
             color,
             theme: Theme::Paper,
+            wrap_width: None,
             file_index,
             file_count,
             show_general: true,
@@ -1015,11 +1190,126 @@ mod tests {
     /// single-file report keeps its exact historical header shape.
     #[test]
     fn header_counter_multi_file_only() {
-        let c = Colorizer { on: false, palette: Theme::Paper.palette() };
+        let c = Colorizer { on: false, palette: Theme::Paper.palette(), wrap: None };
         let single = report_header("d:\\m\\movie.mkv", 1024, &opts(false, 1, 1), &c);
         assert_eq!(single, "movie.mkv  (1.00 KiB)\n");
         let multi = report_header("d:\\m\\movie.mkv", 1024, &opts(false, 2, 7), &c);
         assert_eq!(multi, "movie.mkv  (1.00 KiB)  [2/7]\n");
+    }
+
+    /// A plain line that fits the width comes back byte-identical in one
+    /// piece — reflow never rewrites what it doesn't have to.
+    #[test]
+    fn wrap_line_noop_when_it_fits() {
+        let line = "  Video             HEVC (Main 10) · 3840×2160 · 23.976 fps";
+        assert_eq!(wrap_line(line, 80), vec![line.to_string()]);
+    }
+
+    /// An overlong plain value breaks after a ` · ` separator (the trailing
+    /// dot signals continuation), the separator's space is consumed, and the
+    /// continuation indents to the value column.
+    #[test]
+    fn wrap_line_breaks_at_separators_with_hanging_indent() {
+        let line = "  Video             HEVC (Multiview Main 10, High tier @ L5) · 3840×2160 · 24.000 fps · 10-bit 4:2:0 · Stereoscopic 3D (2 views)";
+        let wrapped = wrap_line(line, 64);
+        assert_eq!(
+            wrapped,
+            vec![
+                "  Video             HEVC (Multiview Main 10, High tier @ L5) ·".to_string(),
+                format!("{}3840×2160 · 24.000 fps · 10-bit 4:2:0 ·", " ".repeat(VALUE_COL)),
+                format!("{}Stereoscopic 3D (2 views)", " ".repeat(VALUE_COL)),
+            ]
+        );
+        for l in &wrapped {
+            assert!(l.chars().count() <= 64, "line over width: {l:?}");
+        }
+    }
+
+    /// A break inside a styled span closes the span at the line end and
+    /// re-opens the same style on the continuation, so colour never bleeds
+    /// across the wrap and never drops mid-value.
+    #[test]
+    fn wrap_line_reopens_style_across_the_break() {
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None };
+        let value = c.bright("HEVC (Multiview Main 10, High tier @ L5) · 3840×2160 · 24.000 fps");
+        let line = format!("  {}{}  {}", c.label("Video"), " ".repeat(LABEL_W - 5), value);
+        let wrapped = wrap_line(&line, 64);
+        assert_eq!(wrapped.len(), 2);
+        let bright = format!("\x1b[{}m", Theme::Green.palette().bright);
+        // Every line's styling is self-contained: opens re-emitted, reset last.
+        assert!(wrapped[0].ends_with("\x1b[0m"));
+        assert!(wrapped[1].starts_with(&format!("{}{}", " ".repeat(VALUE_COL), bright)));
+        assert!(wrapped[1].ends_with("\x1b[0m"));
+        // Visible text survives the round trip exactly: the continuation
+        // indent stands in for the one separator space the break consumed.
+        let visible: String = parse_cells(&wrapped.join("")).iter().map(|c| c.ch).collect();
+        let flat: String = parse_cells(&line).iter().map(|c| c.ch).collect();
+        assert_eq!(visible.replace(&" ".repeat(VALUE_COL), " "), flat);
+    }
+
+    /// The unstyled double space before a warning chip is a break point: the
+    /// chip moves whole to the continuation line, never split internally
+    /// (its interior spaces are styled, so they are not candidates).
+    #[test]
+    fn wrap_line_moves_warning_chips_whole() {
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None };
+        let line = format!(
+            "  {}{}  {}{}  {}",
+            c.label("Mastering"),
+            " ".repeat(LABEL_W - 9),
+            c.value("BT.2020"),
+            c.value(" · max 4000  min 0.0001 cd/m²"),
+            c.warn("FEL brightness expansion")
+        );
+        let wrapped = wrap_line(&line, 60);
+        assert_eq!(wrapped.len(), 2);
+        let cells = parse_cells(&wrapped[1]);
+        let chip: String = cells.iter().map(|c| c.ch).collect();
+        // The chip's own inverse-video lead pad survives the break: the first
+        // cell past the indent is a *styled* space, part of the chip.
+        assert_eq!(chip, format!("{} FEL BRIGHTNESS EXPANSION ", " ".repeat(VALUE_COL)));
+        let lead = &cells[VALUE_COL];
+        assert!(lead.ch == ' ' && !lead.style.is_empty());
+    }
+
+    /// The rendered report reflows only when `wrap_width` is set: the same
+    /// report with `None` is untouched, so pipes and files never wrap.
+    #[test]
+    fn report_wraps_only_with_a_width() {
+        let r = Report {
+            hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
+            file: "movie.mp4".to_string(),
+            size_bytes: 0,
+            general: General {
+                container: "MP4 (ISOBMFF)".to_string(),
+                codec: "HEVC".to_string(),
+                codec_profile: Some("Multiview Main 10, High tier @ L5".to_string()),
+                format_version: None,
+                width: Some(3840),
+                height: Some(2160),
+                fps: Some(24.0),
+                duration_secs: None,
+                bitrate: None,
+                bit_depth: Some(10),
+                chroma: Some("4:2:0".to_string()),
+                stereo: Some("Stereoscopic 3D (2 views)".to_string()),
+                color: ColorInfo::default(),
+            },
+            hdr: None,
+            dolby_vision: None,
+            hdr10plus: None,
+            elapsed_ms: 0.0,
+        };
+        let plain = render(&r, &opts(false, 1, 1));
+        let video = plain.lines().find(|l| l.trim_start().starts_with("Video")).unwrap();
+        assert!(video.chars().count() > 64);
+        let mut o = opts(false, 1, 1);
+        o.wrap_width = Some(64);
+        let wrapped = render(&r, &o);
+        assert!(wrapped.lines().all(|l| l.chars().count() <= 64));
+        // Below the useful floor, reflow bows out entirely.
+        o.wrap_width = Some(30);
+        assert_eq!(render(&r, &o), plain);
     }
 
     /// The between-reports divider is a full-width heavy rule (`━`, distinct

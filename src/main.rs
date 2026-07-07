@@ -204,6 +204,17 @@ fn main() -> ExitCode {
         }
     };
 
+    // Long value lines reflow to the terminal width — interactive text
+    // reports only. Piped/redirected stdout and `--output` files have no
+    // terminal (the probes below fail on non-console handles), and the
+    // JSON/NDJSON/quiet machine paths never wrap, so every consumed byte
+    // stream keeps its exact historical shape.
+    let wrap_width = if cli.output.is_none() && format == Format::Text && !cli.quiet {
+        terminal_width()
+    } else {
+        None
+    };
+
     let mut out_buf = String::new();
     let mut json_reports: Vec<serde_json::Value> = Vec::new();
     let mut had_error = false;
@@ -244,7 +255,8 @@ fn main() -> ExitCode {
                             out_buf.push_str(&render::render_quiet(&report));
                             out_buf.push('\n');
                         } else {
-                            let opts = render_opts(&cli, use_color, i + 1, paths.len());
+                            let opts =
+                                render_opts(&cli, use_color, wrap_width, i + 1, paths.len());
                             // Rule between consecutive reports only — never
                             // before the first or after the last, so a
                             // single-report run's output is unchanged.
@@ -308,7 +320,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn render_opts(cli: &Cli, color: bool, file_index: usize, file_count: usize) -> RenderOpts {
+fn render_opts(
+    cli: &Cli,
+    color: bool,
+    wrap_width: Option<usize>,
+    file_index: usize,
+    file_count: usize,
+) -> RenderOpts {
     let (mut g, mut h, mut d, mut hp) = (true, true, true, true);
     if let Some(list) = &cli.sections {
         g = false;
@@ -328,6 +346,7 @@ fn render_opts(cli: &Cli, color: bool, file_index: usize, file_count: usize) -> 
     RenderOpts {
         color,
         theme: cli.theme,
+        wrap_width,
         file_index,
         file_count,
         show_general: g,
@@ -335,6 +354,70 @@ fn render_opts(cli: &Cli, color: bool, file_index: usize, file_count: usize) -> 
         show_dv: d,
         show_hdr10plus: hp,
     }
+}
+
+/// Visible column count of the terminal on stdout, `None` when stdout isn't
+/// one (pipes, redirects, files) — which is what gates value-line reflow, so
+/// no separate is-a-terminal check is needed. Probed once per run: a resize
+/// mid-run reflows from the next run.
+#[cfg(windows)]
+fn terminal_width() -> Option<usize> {
+    use std::os::windows::io::AsRawHandle as _;
+    #[repr(C)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+    #[repr(C)]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+    #[repr(C)]
+    struct ConsoleScreenBufferInfo {
+        size: Coord,
+        cursor_position: Coord,
+        attributes: u16,
+        window: SmallRect,
+        maximum_window_size: Coord,
+    }
+    extern "system" {
+        fn GetConsoleScreenBufferInfo(
+            handle: *mut core::ffi::c_void,
+            info: *mut ConsoleScreenBufferInfo,
+        ) -> i32;
+    }
+    let mut info = ConsoleScreenBufferInfo {
+        size: Coord { x: 0, y: 0 },
+        cursor_position: Coord { x: 0, y: 0 },
+        attributes: 0,
+        window: SmallRect { left: 0, top: 0, right: 0, bottom: 0 },
+        maximum_window_size: Coord { x: 0, y: 0 },
+    };
+    let ok = unsafe { GetConsoleScreenBufferInfo(std::io::stdout().as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return None;
+    }
+    // The visible window, not the (often much taller/wider) screen buffer.
+    let width = i32::from(info.window.right) - i32::from(info.window.left) + 1;
+    (width > 0).then_some(width as usize)
+}
+
+/// Unix counterpart: the TIOCGWINSZ window size of stdout's tty.
+#[cfg(unix)]
+fn terminal_width() -> Option<usize> {
+    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    (rc == 0 && ws.ws_col > 0).then(|| usize::from(ws.ws_col))
+}
+
+/// Platforms with neither probe don't reflow — the unwrapped line is always
+/// correct output, just longer than the window.
+#[cfg(not(any(windows, unix)))]
+fn terminal_width() -> Option<usize> {
+    None
 }
 
 fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result<Report> {
