@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 130 unit tests
+cargo test                     # 133 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -193,8 +193,15 @@ never parse bytes native-endian.
   `trim_target_nits()`, which guesses 100 for 255). The **provenance tag is per-value and dynamic** —
   each target carries its own `levels` (`model::TrimTarget`), so a single value renders `600 [L2]`,
   a value produced by both levels `100 [L2/L8]`, and an L8-only title like Profile 20 `300 [L8]`.
-  **L10 is never in the tag**: it only *defines* the display an L8 trim points at; the trim itself
-  is L8.
+  **L10 is never in the tag, but an L10-defined display counts as an L8 target**
+  (`levels::merge_trim_targets`): L2 is self-contained (it carries its target's nits directly),
+  so a display index is a CM v4.0/L8 mechanism by construction — an L10 definition can serve
+  nothing else, making the defined display a *custom L8 target* even when no read L8 referenced
+  it. Unlike the per-shot trims, the definition rides every RPU's global extension payload (it
+  is the compiled form of the CM XML's Level-0 target-display list — the displays trims were
+  authored for), so it is title-level evidence independent of sampling; presets never get L10,
+  so this recovers only custom targets. Folded into the L8 set, rendered `[L8]` — `[L10]` would
+  leak bitstream plumbing into a report whose readers know the L2/L8 trim levels.
 - **DV facts and their sources.** BL **compatibility id** and DV **level** come from the
   `dvcC`/`dvvC` box, *not* the RPU. The DV Mastering line's **luminance** is the DM header's
   `source_min_pq`/`source_max_pq` (present in every CM version); its **gamut** comes only from a
