@@ -1208,9 +1208,9 @@ mod tests {
     #[test]
     fn header_counter_multi_file_only() {
         let c = Colorizer { on: false, palette: Theme::Paper.palette(), wrap: None };
-        let single = report_header("d:\\m\\movie.mkv", 1024, &opts(false, 1, 1), &c);
+        let single = report_header("m/movie.mkv", 1024, &opts(false, 1, 1), &c);
         assert_eq!(single, "movie.mkv  (1.00 KiB)\n");
-        let multi = report_header("d:\\m\\movie.mkv", 1024, &opts(false, 2, 7), &c);
+        let multi = report_header("m/movie.mkv", 1024, &opts(false, 2, 7), &c);
         assert_eq!(multi, "movie.mkv  (1.00 KiB)  [2/7]\n");
     }
 
