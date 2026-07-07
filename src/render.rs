@@ -74,8 +74,14 @@ const VALUE_COL: usize = 2 + LABEL_W + 2;
 /// line and the terminal's own hard wrap.
 const MIN_WRAP_WIDTH: usize = VALUE_COL + 20;
 
-/// Full width of a colored section rule ("── NAME ───…": marks, spaces, name,
-/// fill). The report divider uses the same width so the rules align.
+/// Fallback width of a colored section rule ("── NAME ───…": marks, spaces,
+/// name, fill) and the between-reports divider, used when no terminal width
+/// was probed (pipes, `--output`, platforms without a probe). On a live
+/// terminal both rules stretch to `RenderOpts::wrap_width` instead — full
+/// bleed, no cap — so they track the window like value reflow does. Unlike
+/// reflow there is no `MIN_WRAP_WIDTH` bow-out: a shrunk rule is still a
+/// rule, and shrinking beats the hard wrap a fixed 64 columns would take in
+/// a narrower window.
 const RULE_W: usize = 64;
 
 /// The interactive-terminal masthead: a two-row half-block "HDRPROBE" in the
@@ -497,12 +503,14 @@ fn report_header(file: &str, size_bytes: u64, o: &RenderOpts, c: &Colorizer) -> 
 /// *heavy* rule (`━`, vs the section rules' light `─` — same width, thicker
 /// stroke, so a report boundary reads differently from a section boundary),
 /// bright when colored (the section rules stay faint — weight and ink both
-/// separate the two). `main` inserts it between rendered reports only —
-/// never before the first or after the last — so a single-file run and every
-/// machine path (quiet, JSON, NDJSON) are unchanged.
+/// separate the two). Sized like the section rules: the probed terminal
+/// width when there is one, `RULE_W` otherwise — so piped text keeps its
+/// exact historical divider. `main` inserts it between rendered reports only
+/// — never before the first or after the last — so a single-file run and
+/// every machine path (quiet, JSON, NDJSON) are unchanged.
 pub fn render_divider(o: &RenderOpts) -> String {
-    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: None };
-    format!("{}\n\n", c.bright(&"━".repeat(RULE_W)))
+    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width };
+    format!("{}\n\n", c.bright(&"━".repeat(c.rule_width())))
 }
 
 /// One-line summary for `--quiet`.
@@ -1003,9 +1011,10 @@ const MONO: Palette = Palette {
 struct Colorizer {
     on: bool,
     palette: &'static Palette,
-    /// Terminal width for value-line reflow (`RenderOpts::wrap_width`).
-    /// Carried here because every `kv` call site already threads the
-    /// Colorizer; decoration paths (banner, divider, header) pass `None`.
+    /// Terminal width for value-line reflow and rule sizing
+    /// (`RenderOpts::wrap_width`). Carried here because every `kv` call site
+    /// already threads the Colorizer; the banner and report header — the
+    /// decoration paths with nothing to size — pass `None`.
     wrap: Option<usize>,
 }
 
@@ -1064,13 +1073,21 @@ impl Colorizer {
             format!("({t})")
         }
     }
+    /// Width for section rules and the report divider: the probed terminal
+    /// width when present, `RULE_W` for pipes and files — the same gate that
+    /// keeps value reflow byte-neutral off-terminal, but with no minimum:
+    /// rules shrink safely where reflow would bow out.
+    fn rule_width(&self) -> usize {
+        self.wrap.unwrap_or(RULE_W)
+    }
     /// Section header: an uppercase ruled line when coloured, the bare name
     /// when plain.
     fn section(&self, name: &str) -> String {
         if self.on {
             let up = name.to_uppercase();
-            // "── " + name + " " + fill = RULE_W columns.
-            let fill = "─".repeat((RULE_W - 4).saturating_sub(up.chars().count()));
+            // "── " + name + " " + fill = rule_width() columns.
+            let fill =
+                "─".repeat(self.rule_width().saturating_sub(4).saturating_sub(up.chars().count()));
             format!("{} {} {}", self.faint("──"), self.bright(&up), self.faint(&fill))
         } else {
             name.to_string()
@@ -1313,9 +1330,10 @@ mod tests {
     }
 
     /// The between-reports divider is a full-width heavy rule (`━`, distinct
-    /// from the section rules' light `─` but the same RULE_W columns), bare
-    /// when plain and bright-wrapped when colored, followed by one blank line
-    /// before the next report's header.
+    /// from the section rules' light `─` but the same columns), bare when
+    /// plain and bright-wrapped when colored, followed by one blank line
+    /// before the next report's header. With no probed width (pipes, files)
+    /// it keeps its exact historical RULE_W columns.
     #[test]
     fn divider_matches_section_rule_width() {
         let rule = "━".repeat(RULE_W);
@@ -1323,5 +1341,25 @@ mod tests {
         let colored = render_divider(&opts(true, 2, 7));
         assert!(colored.contains(&rule));
         assert!(colored.starts_with('\x1b') && colored.ends_with("\n\n"));
+    }
+
+    /// On a live terminal the rules follow the probed width — wider and
+    /// narrower than RULE_W both — while `None` keeps the fallback. Unlike
+    /// value reflow there is no MIN_WRAP_WIDTH floor: a narrow window gets a
+    /// shrunk rule, not a hard-wrapped 64-column one.
+    #[test]
+    fn rules_follow_probed_terminal_width() {
+        for w in [30, 100] {
+            let mut o = opts(false, 2, 7);
+            o.wrap_width = Some(w);
+            assert_eq!(render_divider(&o), format!("{}\n\n", "━".repeat(w)));
+            let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: Some(w) };
+            let rule = c.section("General");
+            assert_eq!(parse_cells(&rule).len(), w, "section rule not {w} columns");
+        }
+        // No probe: the section rule keeps the RULE_W fallback.
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None };
+        let rule = c.section("General");
+        assert_eq!(parse_cells(&rule).len(), RULE_W);
     }
 }
