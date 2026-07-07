@@ -164,7 +164,7 @@ Version history:
 - **1.2**: added `dolby_vision.mastering_primaries_mismatch` (additive). `trim_targets` now
   also includes target displays defined by the title's global L10 metadata even when no read
   trim referenced them, folded into the L8 set (a semantic broadening of `levels: [8]`, no new
-  field or value). Unreleased.
+  field or value). Ships in hdrprobe 0.3.0.
 - **1.1**: added `dolby_vision.reconstructed_bit_depth` (additive). Ships in hdrprobe 0.2.0.
 - **1.0**: initial schema, as shipped in hdrprobe 0.1.0.
 
