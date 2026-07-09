@@ -267,7 +267,9 @@ fn scan_mkv_full(
     frontier: &Frontier,
 ) -> Scan {
     let mut st = plan.streamer();
-    let mut chunks: Vec<Chunk> = Vec::new();
+    // Blocks arrive routed per track; until the per-track aggregation lands,
+    // only the first track's are extracted (main consumes tracks[0]).
+    let mut outs: Vec<Vec<Chunk>> = vec![Vec::new(); plan.track_count()];
     let mut dv = DvAggregate::default();
     // Cluster windows arrive sequentially with blocks in stream order, so
     // folds are adjacent frames — cadence pairs are real.
@@ -278,15 +280,18 @@ fn scan_mkv_full(
     // One phase, one bar: position over the whole mmap, like the TS walk.
     progress.begin(Phase::Scan, data.len() as u64);
     loop {
-        chunks.clear();
+        for o in outs.iter_mut() {
+            o.clear();
+        }
         let more =
-            st.next_window(data, &mut chunks, crate::container::mkv::STREAM_SPAN_BYTES, frontier);
+            st.next_window(data, &mut outs, crate::container::mkv::STREAM_SPAN_BYTES, frontier);
+        let chunks = &outs[0];
         es_bytes += chunks.iter().map(|c| c.size).sum::<u64>();
         frame_count += chunks.len() as u64;
         if !opts.no_rpu {
             scan_chunks(
                 data,
-                &chunks,
+                chunks,
                 demux.tracks[0].nal_format,
                 &demux.tracks[0].codec,
                 &mut dv,

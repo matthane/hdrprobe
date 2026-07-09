@@ -12,8 +12,14 @@
 //! they are discovered — index and scan fused into one pass, so a remote file
 //! crosses the wire once regardless of size (see `prefetch::Frontier`).
 //!
-//! Single-track by design: the DV RPU rides the base-layer block, so a Profile 7
-//! EL residual (which would ride in a BlockAddition) is decode-only and never needed.
+//! Every independent video track is parsed and reported (a remux can carry e.g.
+//! a color and a black-and-white cut of the same title); blocks are routed per
+//! track number in one cluster walk, head-bounded or streamed alike. A DV
+//! Profile 7 pair still collapses to one logical track: the ordinary MKV mux
+//! interleaves BL+EL in a single track (the EL residual rides a BlockAddition,
+//! decode-only and never needed), and an atypical dual-track mux — a TrackEntry
+//! whose dvcC says `bl_present == 0` — is folded into its base layer's report
+//! rather than surfaced as an independent track (`group_tracks`).
 
 use anyhow::{Context, Result};
 
@@ -42,6 +48,7 @@ const ID_TRACKENTRY: u32 = 0xAE;
 const ID_TRACK_NUMBER: u32 = 0xD7;
 const ID_TRACK_UID: u32 = 0x73C5;
 const ID_TRACK_TYPE: u32 = 0x83;
+const ID_FLAG_DEFAULT: u32 = 0x88;
 const ID_CODEC_ID: u32 = 0x86;
 const ID_CODEC_PRIVATE: u32 = 0x63A2;
 const ID_DEFAULT_DURATION: u32 = 0x0023_E383;
@@ -278,18 +285,22 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
 
     let mut timestamp_scale = TIMESTAMP_SCALE_DEFAULT;
     let mut duration_ticks: Option<f64> = None;
-    let mut track: Option<TrackInfo> = None;
-    let mut chunks: Vec<Chunk> = Vec::new();
+    // EL-folded track groups, with a (track number -> group index) routing
+    // table and one chunk list per group, all parallel and in report order.
+    let mut groups: Vec<TrackGroup> = Vec::new();
+    let mut routes: Vec<(u64, usize)> = Vec::new();
+    let mut outs: Vec<Vec<Chunk>> = Vec::new();
     // Per-track statistics from the `Tags` element (mkvmerge writes it at the
     // front, inside the warmed head window). Collected regardless of element
-    // order and resolved against the video track's UID after the walk.
+    // order and resolved against each video track's UID after the walk.
     let mut stat_tags: Vec<TrackStats> = Vec::new();
     // Absolute offset of a tail-placed `Tags` element, learned from the front
     // SeekHead, so we can read it with one bounded seek if the head walk stops
     // before reaching it (mkvmerge writes `Tags` after the clusters).
     let mut tags_offset: Option<usize> = None;
     // Set when the default fast path stops indexing before the last cluster, so
-    // `chunks.len()` is a head window rather than the whole-file frame count.
+    // a group's chunk count is a head window rather than the whole-file frame
+    // count.
     let mut stopped_early = false;
 
     let mut p = seg_start;
@@ -304,8 +315,10 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
             }
             ID_TRACKS => {
                 let end = seg_child_end(p2, size, seg_end);
-                if track.is_none() {
-                    track = parse_tracks(data, p2, end);
+                if groups.is_empty() {
+                    groups = group_tracks(parse_tracks(data, p2, end));
+                    routes = group_routes(&groups);
+                    outs = vec![Vec::new(); groups.len()];
                 }
                 p = end;
             }
@@ -322,7 +335,6 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
                 p = end;
             }
             ID_CLUSTER => {
-                let video_track = track.as_ref().map(|t| t.track_number);
                 // Always a bounded head walk — under `--full` the exhaustive
                 // cluster pass belongs to `sample::scan`, which streams it via
                 // `Demux::mkv_stream` fused with the extraction (one pass over
@@ -331,18 +343,18 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
                 match size {
                     Some(s) => {
                         let end = (p2 + s as usize).min(seg_end);
-                        parse_cluster(data, p2, end, false, video_track, &mut chunks, head_limit);
+                        parse_cluster(data, p2, end, false, &routes, &mut outs, head_limit);
                         p = end;
                     }
                     None => {
                         // Unknown-size cluster: parse until the next level-1 element.
-                        p = parse_cluster(data, p2, seg_end, true, video_track, &mut chunks, head_limit);
+                        p = parse_cluster(data, p2, seg_end, true, &routes, &mut outs, head_limit);
                     }
                 }
                 // Static DV metadata (dvcC + first RPU) and HDR SEI sit in the
                 // opening frames, so once the indexed blocks span the head window
                 // there's no need to walk block headers across the whole file.
-                if head_reached(&chunks, head_limit) {
+                if head_reached(&outs, head_limit) {
                     stopped_early = true;
                     break;
                 }
@@ -354,7 +366,9 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         }
     }
 
-    let track = track.context("no video track found in Matroska file")?;
+    if groups.is_empty() {
+        anyhow::bail!("no video track found in Matroska file");
+    }
 
     // If the head walk didn't pass the `Tags` element (mkvmerge writes it after
     // the clusters), read it now via the SeekHead offset — one bounded tail seek
@@ -368,70 +382,157 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     let duration_secs = duration_ticks
         .map(|d| d * timestamp_scale as f64 / 1_000_000_000.0)
         .filter(|d| *d > 0.0);
-    let fps = match (track.default_duration_ns, duration_secs, chunks.len()) {
-        (Some(dd), _, _) if dd > 0 => Some(1_000_000_000.0 / dd as f64),
-        // Frame-count / duration fallback is only valid when we indexed every
-        // block; a bounded head window would divide a partial count by the full
-        // runtime and report a nonsensically low fps.
-        (_, Some(d), n) if d > 0.0 && n > 0 && !stopped_early => Some(n as f64 / d),
-        _ => None,
-    };
 
-    // Per-stream video bitrate, preferring the mkvmerge statistics tag for the
-    // video track — the source MediaInfo reports, and cheap to read. `BPS` is the
-    // exact per-stream rate (already over the video track's own duration, which a
-    // whole-file duration only approximates); `NUMBER_OF_BYTES` gives the exact
-    // size when only that is present. A track may carry several `Tag` entries
-    // (e.g. a SOURCE_ID tag before the statistics tag), so take the first with a
-    // usable value. Failing a tag, sum the block index when it's complete (whole
-    // file walked; a bounded head sample would undercount), else fall back to the
-    // container's overall rate from the file length.
-    let vstat = track.track_uid.and_then(|uid| {
-        stat_tags
-            .iter()
-            .filter(|s| s.track_uid == Some(uid))
-            .find(|s| s.bps.is_some() || s.number_of_bytes.is_some())
+    let mkv_stream = full.then_some(MkvFullStream {
+        seg_start,
+        seg_end,
+        groups: groups.iter().map(|g| g.members.clone()).collect(),
     });
-    let bitrate = if let Some(bps) = vstat.and_then(|s| s.bps) {
-        Some(Bitrate::video_stream_bps(bps))
-    } else if let Some(bytes) = vstat.and_then(|s| s.number_of_bytes) {
-        Bitrate::video_stream(bytes, duration_secs)
-    } else if full {
-        // No statistics tag: the streaming scan sums the exact block bytes
-        // (`sample::Scan::es_bytes`, applied in main.rs — the same value the
-        // old exhaustive index summed here), so leave the rate unset rather
-        // than report the head window or the file-length overall rate.
-        None
-    } else if !stopped_early {
-        Bitrate::video_stream(chunks.iter().map(|c| c.size).sum::<u64>(), duration_secs)
-    } else {
-        Bitrate::overall(data.len() as u64, duration_secs)
-    };
 
-    let mkv_stream =
-        full.then_some(MkvFullStream { seg_start, seg_end, video_track: track.track_number });
+    let single = groups.len() == 1;
+    let mut tracks = Vec::with_capacity(groups.len());
+    for (g, chunks) in groups.into_iter().zip(outs) {
+        let track = g.info;
+        let fps = match (track.default_duration_ns, duration_secs, chunks.len()) {
+            (Some(dd), _, _) if dd > 0 => Some(1_000_000_000.0 / dd as f64),
+            // Frame-count / duration fallback is only valid when we indexed every
+            // block; a bounded head window would divide a partial count by the full
+            // runtime and report a nonsensically low fps.
+            (_, Some(d), n) if d > 0.0 && n > 0 && !stopped_early => Some(n as f64 / d),
+            _ => None,
+        };
 
-    // Matroska interleaves the Profile-7 BL and EL in one track, so it is
-    // always single-track (dual layer when an EL is present).
-    let tdemux = TrackDemux {
-        track_number: Some(track.track_number),
-        width: track.width,
-        height: track.height,
-        fps,
-        bit_depth: track.bit_depth,
-        chroma: track.chroma,
-        codec_profile: track.codec_profile,
-        color: track.color,
-        dv_config: track.dv_config,
-        mastering: track.mastering,
-        content_light: track.content_light,
-        bitrate,
-        chunks,
-        ..TrackDemux::new(track.codec, track.nal_format)
-    };
-    let mut demux = Demux::single("Matroska", duration_secs, tdemux);
-    demux.mkv_stream = mkv_stream;
-    Ok(demux)
+        // Per-stream video bitrate, preferring the mkvmerge statistics tag for
+        // this track — the source MediaInfo reports, and cheap to read. `BPS` is
+        // the exact per-stream rate (already over the track's own duration, which
+        // a whole-file duration only approximates); `NUMBER_OF_BYTES` gives the
+        // exact size when only that is present. A track may carry several `Tag`
+        // entries (e.g. a SOURCE_ID tag before the statistics tag), so take the
+        // first with a usable value. Failing a tag, sum the block index when it's
+        // complete (whole file walked; a bounded head sample would undercount),
+        // else fall back to the container's overall rate from the file length —
+        // but only when this is the file's only video track: an overall rate
+        // (audio + overhead included) attributed to one of several video tracks
+        // would be a wrong number, so a multi-track file reports `None` instead.
+        let vstat = track.track_uid.and_then(|uid| {
+            stat_tags
+                .iter()
+                .filter(|s| s.track_uid == Some(uid))
+                .find(|s| s.bps.is_some() || s.number_of_bytes.is_some())
+        });
+        let bitrate = if let Some(bps) = vstat.and_then(|s| s.bps) {
+            Some(Bitrate::video_stream_bps(bps))
+        } else if let Some(bytes) = vstat.and_then(|s| s.number_of_bytes) {
+            Bitrate::video_stream(bytes, duration_secs)
+        } else if full {
+            // No statistics tag: the streaming scan sums the exact block bytes
+            // (`sample::Scan::es_bytes`, applied in main.rs — the same value the
+            // old exhaustive index summed here), so leave the rate unset rather
+            // than report the head window or the file-length overall rate.
+            None
+        } else if !stopped_early {
+            Bitrate::video_stream(chunks.iter().map(|c| c.size).sum::<u64>(), duration_secs)
+        } else if single {
+            Bitrate::overall(data.len() as u64, duration_secs)
+        } else {
+            None
+        };
+
+        tracks.push(TrackDemux {
+            track_number: Some(track.track_number),
+            default_flag: Some(track.default_flag),
+            width: track.width,
+            height: track.height,
+            fps,
+            bit_depth: track.bit_depth,
+            chroma: track.chroma,
+            codec_profile: track.codec_profile,
+            color: track.color,
+            dv_config: track.dv_config,
+            dv_dual_track: g.dv_dual_track,
+            mastering: track.mastering,
+            content_light: track.content_light,
+            bitrate,
+            chunks,
+            ..TrackDemux::new(track.codec, track.nal_format)
+        });
+    }
+
+    Ok(Demux {
+        container: "Matroska",
+        duration_secs,
+        tracks,
+        ts_stream: None,
+        mkv_stream,
+        raw_stream: None,
+    })
+}
+
+/// One reported (logical) video track: its TrackEntry plus the set of Matroska
+/// track numbers whose blocks feed it — the track's own number, plus a folded
+/// enhancement layer's in the atypical dual-track DV case.
+struct TrackGroup {
+    info: TrackInfo,
+    members: Vec<u64>,
+    dv_dual_track: bool,
+}
+
+/// Fold dependent Dolby Vision enhancement-layer TrackEntries into their base
+/// layer. A track whose dvcC/dvvC says `bl_present == 0` carries only the EL
+/// residual + RPU of some other track's picture — it is not an independent
+/// video track, so surfacing it alone would report garbage (and its RPU
+/// belongs with the BL it enhances). The BL is the first remaining track that
+/// carries a DV config, else the widest; the EL donates its config when the BL
+/// has none (mirroring MP4's dual-track handling). Ordinary MKV muxes
+/// interleave BL+EL in one track and never hit the fold; with no base layer to
+/// fold into, EL-flagged tracks are kept as-is rather than dropped.
+fn group_tracks(infos: Vec<TrackInfo>) -> Vec<TrackGroup> {
+    let (els, base): (Vec<TrackInfo>, Vec<TrackInfo>) = infos
+        .into_iter()
+        .partition(|t| t.dv_config.as_ref().is_some_and(|c| !c.bl_present));
+
+    let mut groups: Vec<TrackGroup> = base
+        .into_iter()
+        .map(|t| TrackGroup { members: vec![t.track_number], dv_dual_track: false, info: t })
+        .collect();
+
+    if groups.is_empty() {
+        return els
+            .into_iter()
+            .map(|t| TrackGroup { members: vec![t.track_number], dv_dual_track: false, info: t })
+            .collect();
+    }
+    if !els.is_empty() {
+        let bl = groups
+            .iter()
+            .position(|g| g.info.dv_config.is_some())
+            .unwrap_or_else(|| {
+                groups
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, g)| g.info.width as u64 * g.info.height as u64)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
+        let bl = &mut groups[bl];
+        for el in els {
+            bl.members.push(el.track_number);
+            if bl.info.dv_config.is_none() {
+                bl.info.dv_config = el.dv_config;
+            }
+        }
+        bl.dv_dual_track = true;
+    }
+    groups
+}
+
+/// The (track number -> group index) block-routing table for a group set.
+fn group_routes(groups: &[TrackGroup]) -> Vec<(u64, usize)> {
+    groups
+        .iter()
+        .enumerate()
+        .flat_map(|(i, g)| g.members.iter().map(move |&m| (m, i)))
+        .collect()
 }
 
 /// Everything `sample::scan` needs to drive the exhaustive `--full` cluster
@@ -443,13 +544,21 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
 pub struct MkvFullStream {
     seg_start: usize,
     seg_end: usize,
-    video_track: u64,
+    /// Matroska track numbers per reported track, in `Demux::tracks` order —
+    /// one number each ordinarily, two when a dual-track DV EL was folded.
+    groups: Vec<Vec<u64>>,
 }
 
 impl MkvFullStream {
     #[cfg(test)]
     pub(crate) fn new(seg_start: usize, seg_end: usize, video_track: u64) -> Self {
-        MkvFullStream { seg_start, seg_end, video_track }
+        MkvFullStream { seg_start, seg_end, groups: vec![vec![video_track]] }
+    }
+
+    /// How many reported tracks the walk routes into — the caller sizes its
+    /// per-track chunk lists to this (parallel to `Demux::tracks`).
+    pub fn track_count(&self) -> usize {
+        self.groups.len()
     }
 
     /// A fresh walker over the whole Segment. It starts at the Segment's first
@@ -460,7 +569,12 @@ impl MkvFullStream {
         BlockStreamer {
             p: self.seg_start,
             seg_end: self.seg_end,
-            video_track: self.video_track,
+            routes: self
+                .groups
+                .iter()
+                .enumerate()
+                .flat_map(|(i, g)| g.iter().map(move |&m| (m, i)))
+                .collect(),
             finished: false,
         }
     }
@@ -471,27 +585,29 @@ impl MkvFullStream {
 /// to one cluster (the walk only pauses at cluster boundaries).
 pub const STREAM_SPAN_BYTES: u64 = 64 << 20; // 64 MiB
 
-/// Resumable walker over the Segment's clusters: appends the video track's
+/// Resumable walker over the Segment's clusters: appends each video track's
 /// block byte ranges (absolute file offsets, unlike TS's buffer-relative
-/// chunks) window by window, reusing `parse_cluster` unbounded. The `frontier`
-/// is warmed per element and per known cluster extent, so on a remote volume
-/// the block headers *and* payloads the window (and its subsequent extraction)
+/// chunks) window by window, reusing `parse_cluster` unbounded — one walk over
+/// the clusters no matter how many tracks it routes into. The `frontier` is
+/// warmed per element and per known cluster extent, so on a remote volume the
+/// block headers *and* payloads the window (and its subsequent extraction)
 /// touch arrive in linear pipelined reads.
 pub struct BlockStreamer {
     p: usize,
     seg_end: usize,
-    video_track: u64,
+    routes: Vec<(u64, usize)>,
     finished: bool,
 }
 
 impl BlockStreamer {
     /// Append the video blocks of the clusters between the current position
-    /// and ~`target_span` file bytes ahead (or the Segment's end). Returns
+    /// and ~`target_span` file bytes ahead (or the Segment's end), routed per
+    /// track into `outs` (parallel to `MkvFullStream::track_count`). Returns
     /// `true` while more input remains.
     pub fn next_window(
         &mut self,
         data: &[u8],
-        chunks: &mut Vec<Chunk>,
+        outs: &mut [Vec<Chunk>],
         target_span: u64,
         frontier: &Frontier,
     ) -> bool {
@@ -511,13 +627,13 @@ impl BlockStreamer {
                         // MB); warm its exact extent — headers and payloads —
                         // before walking its blocks.
                         frontier.ensure_to(end as u64);
-                        parse_cluster(data, p2, end, false, Some(self.video_track), chunks, None);
+                        parse_cluster(data, p2, end, false, &self.routes, outs, None);
                         self.p = end;
                     }
                     None => {
                         // Unknown-size cluster: parse until the next level-1 element.
                         self.p =
-                            parse_cluster(data, p2, self.seg_end, true, Some(self.video_track), chunks, None);
+                            parse_cluster(data, p2, self.seg_end, true, &self.routes, outs, None);
                     }
                 },
                 _ => match size {
@@ -755,6 +871,8 @@ struct TrackInfo {
     track_number: u64,
     /// TrackUID, used to match this track's `Tags` statistics entries.
     track_uid: Option<u64>,
+    /// FlagDefault (0x88); the EBML default is true when the element is absent.
+    default_flag: bool,
     codec: Codec,
     nal_format: NalFormat,
     bit_depth: Option<u8>,
@@ -769,21 +887,25 @@ struct TrackInfo {
     default_duration_ns: Option<u64>,
 }
 
-fn parse_tracks(data: &[u8], start: usize, end: usize) -> Option<TrackInfo> {
+/// Every video TrackEntry we can handle, in TrackNumber order (the report
+/// order for a multi-track file).
+fn parse_tracks(data: &[u8], start: usize, end: usize) -> Vec<TrackInfo> {
+    let mut out = Vec::new();
     let mut p = start;
     while p < end {
-        let (id, p1) = read_id(data, p)?;
-        let (size, p2) = read_size(data, p1)?;
+        let Some((id, p1)) = read_id(data, p) else { break };
+        let Some((size, p2)) = read_size(data, p1) else { break };
         let s = size.unwrap_or(0) as usize;
         let tend = (p2 + s).min(end);
         if id == ID_TRACKENTRY {
             if let Some(t) = parse_track_entry(data, p2, tend) {
-                return Some(t);
+                out.push(t);
             }
         }
         p = tend;
     }
-    None
+    out.sort_by_key(|t| t.track_number);
+    out
 }
 
 /// Parse one TrackEntry; returns it only if it is a video track we can handle.
@@ -791,6 +913,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     let mut track_number: u64 = 0;
     let mut track_uid: Option<u64> = None;
     let mut track_type: u64 = 0;
+    let mut default_flag = true; // EBML default when FlagDefault is absent
     let mut codec_id: &[u8] = &[];
     let mut codec_private: &[u8] = &[];
     let mut default_duration_ns: Option<u64> = None;
@@ -811,6 +934,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
             ID_TRACK_NUMBER => track_number = read_uint(data, p2, s),
             ID_TRACK_UID => track_uid = Some(read_uint(data, p2, s)),
             ID_TRACK_TYPE => track_type = read_uint(data, p2, s),
+            ID_FLAG_DEFAULT => default_flag = read_uint(data, p2, s) != 0,
             ID_CODEC_ID => codec_id = &data[p2..cend],
             ID_CODEC_PRIVATE => codec_private = &data[p2..cend],
             ID_DEFAULT_DURATION => {
@@ -863,6 +987,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     Some(TrackInfo {
         track_number,
         track_uid,
+        default_flag,
         codec: cc.codec,
         nal_format: cc.nal_format,
         bit_depth: cc.bit_depth,
@@ -1087,16 +1212,18 @@ fn parse_block_addition_mapping(data: &[u8], start: usize, end: usize) -> Option
     }
 }
 
-/// Walk a cluster's children, recording video-block byte ranges. For an
-/// unknown-size cluster, stops at (and returns) the next level-1 element; for a
-/// known-size cluster, returns `end`.
+/// Walk a cluster's children, recording video-block byte ranges routed per
+/// reported track (`routes` maps a Matroska track number to its index in
+/// `outs`; non-video blocks match no route and are skipped). For an
+/// unknown-size cluster, stops at (and returns) the next level-1 element; for
+/// a known-size cluster, returns `end`.
 fn parse_cluster(
     data: &[u8],
     start: usize,
     end: usize,
     unknown: bool,
-    video_track: Option<u64>,
-    chunks: &mut Vec<Chunk>,
+    routes: &[(u64, usize)],
+    outs: &mut [Vec<Chunk>],
     head_limit: Option<u64>,
 ) -> usize {
     let mut p = start;
@@ -1109,7 +1236,7 @@ fn parse_cluster(
         let s = size.unwrap_or(0) as usize;
         let cend = (p2 + s).min(end);
         match id {
-            ID_SIMPLEBLOCK => record_block(data, p2, cend, video_track, chunks),
+            ID_SIMPLEBLOCK => record_block(data, p2, cend, routes, outs),
             ID_BLOCKGROUP => {
                 // The primary frame rides in a Block child; a BlockAddition would
                 // carry the dual-track EL residual, which is decode-only and never needed.
@@ -1120,7 +1247,7 @@ fn parse_cluster(
                     let cs = csz.unwrap_or(0) as usize;
                     let bend = (q2 + cs).min(cend);
                     if cid == ID_BLOCK {
-                        record_block(data, q2, bend, video_track, chunks);
+                        record_block(data, q2, bend, routes, outs);
                     }
                     q = bend;
                 }
@@ -1131,41 +1258,36 @@ fn parse_cluster(
         // Stop walking block headers once the head byte-window is covered, so a
         // large cluster on a network filesystem isn't faulted in past what we
         // sample. The demux loop then breaks out entirely.
-        if head_reached(chunks, head_limit) {
+        if head_reached(outs, head_limit) {
             return p;
         }
     }
     end
 }
 
-/// Whether the default fast path has indexed enough: the recorded blocks span the
-/// head byte-window, or a degenerate run of tiny blocks hit the safety cap.
-/// Always `false` when unbounded (`--full`, `head_limit == None`).
-fn head_reached(chunks: &[Chunk], head_limit: Option<u64>) -> bool {
+/// Whether the default fast path has indexed enough: the recorded blocks span
+/// the head byte-window (across all tracks — blocks arrive in file order, so
+/// the span is first-to-last over every track's list), or a degenerate run of
+/// tiny blocks hit the safety cap. Always `false` when unbounded (`--full`,
+/// `head_limit == None`).
+fn head_reached(outs: &[Vec<Chunk>], head_limit: Option<u64>) -> bool {
     let Some(limit) = head_limit else { return false };
-    if chunks.len() >= HEAD_BLOCK_CAP {
+    if outs.iter().map(|c| c.len()).sum::<usize>() >= HEAD_BLOCK_CAP {
         return true;
     }
-    match (chunks.first(), chunks.last()) {
-        (Some(f), Some(l)) => (l.offset + l.size).saturating_sub(f.offset) >= limit,
+    let first = outs.iter().filter_map(|c| c.first()).map(|c| c.offset).min();
+    let last = outs.iter().filter_map(|c| c.last()).map(|c| c.offset + c.size).max();
+    match (first, last) {
+        (Some(f), Some(l)) => l.saturating_sub(f) >= limit,
         _ => false,
     }
 }
 
-/// Record the frame-data byte range of a (Simple)Block for the video track.
+/// Record the frame-data byte range of a (Simple)Block into its track's list.
 /// Handles the common unlaced case; laced blocks (rare for video) are skipped.
-fn record_block(
-    data: &[u8],
-    start: usize,
-    end: usize,
-    video_track: Option<u64>,
-    chunks: &mut Vec<Chunk>,
-) {
-    let Some(vt) = video_track else { return };
+fn record_block(data: &[u8], start: usize, end: usize, routes: &[(u64, usize)], outs: &mut [Vec<Chunk>]) {
     let Some((tnum, p1)) = read_vint_num(data, start) else { return };
-    if tnum != vt {
-        return;
-    }
+    let Some(&(_, out)) = routes.iter().find(|(t, _)| *t == tnum) else { return };
     // int16 relative timecode + 1 flags byte.
     if p1 + 3 > end {
         return;
@@ -1179,7 +1301,7 @@ fn record_block(
     if frame_start >= end {
         return;
     }
-    chunks.push(Chunk {
+    outs[out].push(Chunk {
         offset: frame_start as u64,
         size: (end - frame_start) as u64,
     });
@@ -1239,28 +1361,39 @@ mod tests {
     fn simpleblock_frame_range_unlaced() {
         // track number 0x81 (=1), timecode 0x0000, flags 0x00, then 3 frame bytes.
         let block = [0x81, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC];
-        let mut chunks = Vec::new();
-        record_block(&block, 0, block.len(), Some(1), &mut chunks);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].offset, 4);
-        assert_eq!(chunks[0].size, 3);
+        let mut outs = [Vec::new()];
+        record_block(&block, 0, block.len(), &[(1, 0)], &mut outs);
+        assert_eq!(outs[0].len(), 1);
+        assert_eq!(outs[0][0].offset, 4);
+        assert_eq!(outs[0][0].size, 3);
     }
 
     #[test]
-    fn simpleblock_wrong_track_skipped() {
+    fn simpleblock_unrouted_track_skipped() {
         let block = [0x82, 0x00, 0x00, 0x00, 0xAA];
-        let mut chunks = Vec::new();
-        record_block(&block, 0, block.len(), Some(1), &mut chunks);
-        assert!(chunks.is_empty());
+        let mut outs = [Vec::new()];
+        record_block(&block, 0, block.len(), &[(1, 0)], &mut outs);
+        assert!(outs[0].is_empty());
+    }
+
+    #[test]
+    fn simpleblock_routes_by_track_number() {
+        // Track 2's block lands in its own list, not track 1's.
+        let block = [0x82, 0x00, 0x00, 0x00, 0xAA, 0xBB];
+        let mut outs = [Vec::new(), Vec::new()];
+        record_block(&block, 0, block.len(), &[(1, 0), (2, 1)], &mut outs);
+        assert!(outs[0].is_empty());
+        assert_eq!(outs[1].len(), 1);
+        assert_eq!((outs[1][0].offset, outs[1][0].size), (4, 2));
     }
 
     #[test]
     fn laced_block_skipped() {
         // flags 0x06 -> lacing bits set.
         let block = [0x81, 0x00, 0x00, 0x06, 0xAA, 0xBB];
-        let mut chunks = Vec::new();
-        record_block(&block, 0, block.len(), Some(1), &mut chunks);
-        assert!(chunks.is_empty());
+        let mut outs = [Vec::new()];
+        record_block(&block, 0, block.len(), &[(1, 0)], &mut outs);
+        assert!(outs[0].is_empty());
     }
 
     /// Encode an EBML element with a 1-byte size (payloads here stay < 127).
@@ -1299,9 +1432,10 @@ mod tests {
         let seg_start = data.len() - seg.len();
         let plan = MkvFullStream::new(seg_start, data.len(), 1);
 
-        let mut all: Vec<Chunk> = Vec::new();
+        let mut outs = [Vec::new()];
         let mut st = plan.streamer();
-        assert!(!st.next_window(&data, &mut all, u64::MAX, &Frontier::off()));
+        assert!(!st.next_window(&data, &mut outs, u64::MAX, &Frontier::off()));
+        let all = std::mem::take(&mut outs[0]);
         assert_eq!(all.iter().map(|c| c.size).collect::<Vec<_>>(), [3, 2, 1]);
         // Chunk offsets are absolute file ranges.
         assert_eq!(&data[all[0].offset as usize..][..3], &[1, 2, 3]);
@@ -1310,13 +1444,13 @@ mod tests {
         // Tiny windows: one cluster per window, identical chunks, monotonic
         // position ending at the Segment's end.
         let mut st = plan.streamer();
-        let (mut got, mut chunks) = (Vec::new(), Vec::new());
+        let (mut got, mut outs) = (Vec::new(), [Vec::new()]);
         let mut positions = Vec::new();
         loop {
-            chunks.clear();
-            let more = st.next_window(&data, &mut chunks, 1, &Frontier::off());
+            outs[0].clear();
+            let more = st.next_window(&data, &mut outs, 1, &Frontier::off());
             positions.push(st.position());
-            got.extend_from_slice(&chunks);
+            got.extend_from_slice(&outs[0]);
             if !more {
                 break;
             }
@@ -1325,6 +1459,137 @@ mod tests {
         assert!(got.iter().zip(&all).all(|(a, b)| (a.offset, a.size) == (b.offset, b.size)));
         assert!(positions.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(*positions.last().unwrap(), data.len());
+    }
+
+    /// `el` with a 2-byte size encoding, for payloads past the 1-byte limit.
+    fn el_wide(id: &[u8], payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 0x3FFF);
+        let mut v = id.to_vec();
+        v.push(0x40 | (payload.len() >> 8) as u8);
+        v.push((payload.len() & 0xFF) as u8);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// A minimal video TrackEntry: HEVC CodecID, given number/UID/default flag
+    /// and pixel dimensions (CodecPrivate omitted — classification falls back
+    /// to the codec defaults, which is all these tests need).
+    fn track_entry(num: u8, uid: u8, default: bool, w: u16, h: u16) -> Vec<u8> {
+        let mut b = el(&[0xD7], &[num]); // TrackNumber
+        b.extend(el(&[0x73, 0xC5], &[uid])); // TrackUID
+        b.extend(el(&[0x83], &[1])); // TrackType = video
+        b.extend(el(&[0x88], &[default as u8])); // FlagDefault
+        b.extend(el(&[0x86], b"V_MPEGH/ISO/HEVC")); // CodecID
+        let mut video = el(&[0xB0], &w.to_be_bytes());
+        video.extend(el(&[0xBA], &h.to_be_bytes()));
+        b.extend(el(&[0xE0], &video));
+        el(&[0xAE], &b)
+    }
+
+    /// A statistics `Tag` (Targets>TagTrackUID + BPS SimpleTag) for one track.
+    fn bps_tag(uid: u8, bps: &str) -> Vec<u8> {
+        let mut body = el(&[0x63, 0xC0], &el(&[0x63, 0xC5], &[uid]));
+        let mut simple = el(&[0x45, 0xA3], b"BPS");
+        simple.extend(el(&[0x44, 0x87], bps.as_bytes()));
+        body.extend(el(&[0x67, 0xC8], &simple));
+        el(&[0x73, 0x73], &body)
+    }
+
+    #[test]
+    fn two_track_mkv_reports_both_tracks() {
+        // Segment { Tracks{1 default, 2 non-default}, Tags{BPS per UID},
+        // Cluster{ blocks 1,2,1 } }: both tracks parsed, blocks routed per
+        // track number, statistics resolved per UID, no dual-track claim.
+        let mut tracks = track_entry(1, 0x11, true, 3840, 2160);
+        tracks.extend(track_entry(2, 0x22, false, 1920, 1080));
+        let mut seg = el_wide(&ID_TRACKS.to_be_bytes(), &tracks);
+        let mut tags = bps_tag(0x11, "5000000");
+        tags.extend(bps_tag(0x22, "1000000"));
+        seg.extend(el_wide(&ID_TAGS.to_be_bytes(), &tags));
+        seg.extend(cluster(&[sb(1, &[1, 2, 3]), sb(2, &[9, 9]), sb(1, &[4, 5])]));
+        let data = el_wide(&ID_SEGMENT.to_be_bytes(), &seg);
+
+        let d = demux(&data, false).expect("two-track demux");
+        assert_eq!(d.tracks.len(), 2);
+        let (t1, t2) = (&d.tracks[0], &d.tracks[1]);
+        assert_eq!((t1.track_number, t2.track_number), (Some(1), Some(2)));
+        assert_eq!((t1.default_flag, t2.default_flag), (Some(true), Some(false)));
+        assert_eq!((t1.width, t1.height), (3840, 2160));
+        assert_eq!((t2.width, t2.height), (1920, 1080));
+        // Blocks routed by track number, in file order per track.
+        assert_eq!(t1.chunks.iter().map(|c| c.size).collect::<Vec<_>>(), [3, 2]);
+        assert_eq!(t2.chunks.iter().map(|c| c.size).collect::<Vec<_>>(), [2]);
+        assert_eq!(&data[t2.chunks[0].offset as usize..][..2], &[9, 9]);
+        // Statistics resolved per TrackUID.
+        assert_eq!(t1.bitrate.unwrap().bits_per_sec, 5_000_000.0);
+        assert_eq!(t2.bitrate.unwrap().bits_per_sec, 1_000_000.0);
+        // Two independent tracks are not a DV base/enhancement pair.
+        assert!(!t1.dv_dual_track && !t2.dv_dual_track);
+    }
+
+    #[test]
+    fn el_flagged_track_folds_into_its_base_layer() {
+        // A TrackEntry whose dvcC says bl_present == 0 is a dependent DV
+        // enhancement layer: folded into the base track's group, donating its
+        // config — never surfaced as an independent track.
+        let info = |num: u64, w: u32, dv: Option<DvConfig>| TrackInfo {
+            track_number: num,
+            track_uid: None,
+            default_flag: true,
+            codec: Codec::Hevc,
+            nal_format: NalFormat::LengthPrefixed(4),
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+            width: w,
+            height: w / 2,
+            color: ColorInfo::default(),
+            mastering: None,
+            content_light: None,
+            dv_config: dv,
+            default_duration_ns: None,
+        };
+        let el_cfg = DvConfig {
+            profile: 7,
+            level: Some(6),
+            bl_present: false,
+            el_present: true,
+            rpu_present: true,
+            bl_compatibility_id: Some(6),
+        };
+        let groups = group_tracks(vec![info(1, 3840, None), info(2, 1920, Some(el_cfg.clone()))]);
+        assert_eq!(groups.len(), 1, "the EL is not an independent track");
+        assert_eq!(groups[0].members, [1, 2], "EL blocks route into the BL group");
+        assert!(groups[0].dv_dual_track);
+        assert_eq!(groups[0].info.dv_config.as_ref().unwrap().profile, 7, "EL donates its dvcC");
+
+        // Both-BL configs (or none) stay independent.
+        let bl_cfg = DvConfig { bl_present: true, ..el_cfg };
+        let groups = group_tracks(vec![info(1, 3840, Some(bl_cfg.clone())), info(2, 1920, Some(bl_cfg))]);
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|g| !g.dv_dual_track));
+    }
+
+    #[test]
+    fn block_streamer_routes_two_tracks() {
+        // The --full walk fans one cluster pass out into per-track chunk lists.
+        let mut seg = cluster(&[sb(1, &[1, 2, 3]), sb(2, &[9, 9])]);
+        seg.extend(cluster(&[sb(2, &[8]), sb(1, &[4])]));
+        let data = el(&ID_SEGMENT.to_be_bytes(), &seg);
+        let seg_start = data.len() - seg.len();
+
+        let plan = MkvFullStream {
+            seg_start,
+            seg_end: data.len(),
+            groups: vec![vec![1], vec![2]],
+        };
+        assert_eq!(plan.track_count(), 2);
+        let mut outs = [Vec::new(), Vec::new()];
+        let mut st = plan.streamer();
+        assert!(!st.next_window(&data, &mut outs, u64::MAX, &Frontier::off()));
+        assert_eq!(outs[0].iter().map(|c| c.size).collect::<Vec<_>>(), [3, 1]);
+        assert_eq!(outs[1].iter().map(|c| c.size).collect::<Vec<_>>(), [2, 1]);
+        assert_eq!(&data[outs[1][0].offset as usize..][..2], &[9, 9]);
     }
 
     #[test]
