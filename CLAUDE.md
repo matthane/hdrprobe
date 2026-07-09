@@ -306,9 +306,10 @@ never parse bytes native-endian.
   program then PID — `parse_psi` walks the whole PAT, so a multi-program capture reports one
   track per service with `program` set; the JSON is `video_tracks[]`, the text renders one
   track-rule group per entry with the group's *body* indented by `render.rs::TRACK_INDENT`
-  (carried on `Colorizer::indent`: section rules shift right but keep their right edge flush
-  with the full-width track rule, kv rows deepen past the base gutter, and the reflow value
-  column follows the shift — colored and plain alike, so which sections belong to which track
+  (carried on `Colorizer::indent`: section rules shift right, lead with a `└─` branch marking
+  them children of the track rule — colour-only, plain mode has no rule glyphs — and keep
+  their right edge flush with the full-width track rule; kv rows deepen past the base gutter,
+  and the reflow value column follows the shift — so which sections belong to which track
   reads at a glance), and `-q` prints one line per track tagged `[k/N]` when N > 1 —
   single-track output is byte-identical everywhere, including its geometry: only the
   multi-track arm ever sets a nonzero indent). A second video track/PID is a DV

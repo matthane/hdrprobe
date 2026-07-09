@@ -1194,19 +1194,23 @@ impl Colorizer {
     }
     /// Section header: an uppercase ruled line when coloured, the bare name
     /// when plain. Inside a track group (`indent` > 0) the rule shifts right
-    /// and its fill shortens so the right edge stays flush with the
-    /// full-width track rule; the plain name indents the same columns.
+    /// and leads with a `└─` branch instead of `──` — an L hanging off the
+    /// track rule above, marking the section as that track's child — while
+    /// its fill shortens so the right edge stays flush with the full-width
+    /// track rule. The plain name indents the same columns (plain mode has
+    /// no rule glyphs, so the branch is colour-only styling).
     fn section(&self, name: &str) -> String {
         let margin = " ".repeat(self.indent);
         if self.on {
             let up = name.to_uppercase();
-            // margin + "── " + name + " " + fill = rule_width() columns.
+            let lead = if self.indent > 0 { "└─" } else { "──" };
+            // margin + lead + " " + name + " " + fill = rule_width() columns.
             let fill = "─".repeat(
                 self.rule_width()
                     .saturating_sub(self.indent + 4)
                     .saturating_sub(up.chars().count()),
             );
-            format!("{}{} {} {}", margin, self.faint("──"), self.bright(&up), self.faint(&fill))
+            format!("{}{} {} {}", margin, self.faint(lead), self.bright(&up), self.faint(&fill))
         } else {
             format!("{margin}{name}")
         }
@@ -1581,9 +1585,11 @@ mod tests {
         assert_eq!(parse_cells(&rule).len(), RULE_W);
     }
 
-    /// A track-body section rule shifts right by the group indent but its
+    /// A track-body section rule shifts right by the group indent, leads
+    /// with the `└─` branch marking it a child of the track rule, and its
     /// fill shortens to match, so the right edge stays flush with the
     /// full-width track rule above it — probed width and fallback alike.
+    /// Base-geometry rules keep the plain `──` lead.
     #[test]
     fn indented_section_rule_stays_flush_right() {
         for wrap in [Some(100), None] {
@@ -1593,7 +1599,11 @@ mod tests {
             let cells = parse_cells(&rule);
             assert_eq!(cells.len(), wrap.unwrap_or(RULE_W), "right edge not flush");
             let visible: String = cells.iter().map(|c| c.ch).collect();
-            assert!(visible.starts_with("  ── HDR "), "rule not indented: {visible:?}");
+            assert!(visible.starts_with("  └─ HDR "), "rule not a branch: {visible:?}");
         }
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0 };
+        let rule = c.section("General");
+        let visible: String = parse_cells(&rule).iter().map(|c| c.ch).collect();
+        assert!(visible.starts_with("── GENERAL "), "base rule grew a branch: {visible:?}");
     }
 }
