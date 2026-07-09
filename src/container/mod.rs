@@ -318,7 +318,7 @@ fn starts_with_ebml(data: &[u8]) -> bool {
 /// and carries the same record layout. `rec` starts at the `dv_version_major`
 /// byte.
 pub(crate) fn parse_dovi_config(rec: &[u8]) -> Option<DvConfig> {
-    parse_dovi_record(rec, false)
+    parse_dovi_record(rec, false).map(|(cfg, _)| cfg)
 }
 
 /// Parse the MPEG-2 TS `DOVI_video_stream_descriptor` body (tag `0xB0`). It
@@ -327,12 +327,14 @@ pub(crate) fn parse_dovi_config(rec: &[u8]) -> Option<DvConfig> {
 /// `dependency_pid`(13) + reserved(3) block before `dv_bl_signal_compatibility_id`
 /// when `bl_present_flag == 0` (the secondary EL/RPU PID of a dual-PID stream).
 /// The ISOBMFF `dvcC`/`dvvC` record has no such field. `rec` starts at
-/// `dv_version_major`.
-pub(crate) fn parse_dovi_ts_descriptor(rec: &[u8]) -> Option<DvConfig> {
+/// `dv_version_major`. The second value is that `dependency_pid` — the base
+/// layer's PID, present only in the EL/RPU-PID form — which the TS backend uses
+/// to fold the EL into the right track group.
+pub(crate) fn parse_dovi_ts_descriptor(rec: &[u8]) -> Option<(DvConfig, Option<u16>)> {
     parse_dovi_record(rec, true)
 }
 
-fn parse_dovi_record(rec: &[u8], ts_descriptor: bool) -> Option<DvConfig> {
+fn parse_dovi_record(rec: &[u8], ts_descriptor: bool) -> Option<(DvConfig, Option<u16>)> {
     // Minimum is the 4-byte compact form: major, minor, and a 16-bit bitfield of
     // profile(7)+level(6)+rpu(1)+el(1)+bl(1). The full form adds the compat nibble.
     if rec.len() < 4 {
@@ -346,24 +348,32 @@ fn parse_dovi_record(rec: &[u8], ts_descriptor: bool) -> Option<DvConfig> {
     let el_present = r.read_bit()? == 1;
     let bl_present = r.read_bit()? == 1;
     // TS descriptor only: when the BL is absent (secondary EL/RPU PID), a
-    // 16-bit dependency_pid(13)+reserved(3) block precedes the compat nibble.
-    // Skip it so the nibble is read from the right offset; if the descriptor is
-    // truncated the skip is a no-op and the compat id simply reads as None.
-    if ts_descriptor && !bl_present {
-        let _ = r.skip_bits(16);
-    }
+    // dependency_pid(13)+reserved(3) block precedes the compat nibble. Read it
+    // — it names the BL PID this EL enhances — so the nibble is read from the
+    // right offset; if the descriptor is truncated the read yields None and
+    // the compat id simply reads as None too.
+    let dependency_pid = if ts_descriptor && !bl_present {
+        let pid = r.read_bits(13).map(|v| v as u16);
+        let _ = r.skip_bits(3);
+        pid
+    } else {
+        None
+    };
     // `dv_bl_signal_compatibility_id` was added to the record in a later revision;
     // the compact 4-byte form (older Profile-4 TS descriptors) omits it. Read it
     // when present, else leave it unknown rather than guessing 0.
     let bl_compatibility_id = r.read_bits(4).map(|v| v as u8);
-    Some(DvConfig {
-        profile,
-        level: Some(level),
-        bl_present,
-        el_present,
-        rpu_present,
-        bl_compatibility_id,
-    })
+    Some((
+        DvConfig {
+            profile,
+            level: Some(level),
+            bl_present,
+            el_present,
+            rpu_present,
+            bl_compatibility_id,
+        },
+        dependency_pid,
+    ))
 }
 
 pub(crate) struct HvccInfo {

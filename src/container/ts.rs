@@ -90,57 +90,60 @@ pub fn detect_layout(data: &[u8]) -> Option<Layout> {
 
 pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) -> Result<Demux> {
     let layout = detect_layout(data).context("not a recognized TS/M2TS stream")?;
-    let (pcr_pid, streams) = parse_psi(data, layout).context("no PMT / program map found")?;
-
-    // Video PIDs: standard HEVC/AVC streams plus any PID tagged as Dolby Vision
-    // (a Profile-7 enhancement layer rides its own PID with a DV descriptor).
-    let video_pids: Vec<u16> = streams
-        .iter()
-        .filter(|e| e.stream_type == STREAM_TYPE_HEVC || e.stream_type == STREAM_TYPE_AVC || e.has_dovi)
-        .map(|e| e.pid)
-        .collect();
-    if video_pids.is_empty() {
+    let programs = parse_psi(data, layout).context("no PMT / program map found")?;
+    let groups = group_video_pids(&programs);
+    if groups.is_empty() {
         bail!("no HEVC/AVC/Dolby Vision video PID in the program map");
     }
-    let dv_config = streams.iter().find_map(|e| e.dv_config.clone());
-
-    // Codec of the base layer: the PMT stream_type is authoritative (0x1B AVC,
-    // 0x24 HEVC). A DV-only PID (EL, PES-private 0x06) carries no video type, so
-    // fall back to the DV profile — only profile 9 is AVC. HEVC wins a tie (an
-    // AVC EL alongside an HEVC BL is not a real configuration, but be explicit).
-    let has_type = |t: u8| streams.iter().any(|e| video_pids.contains(&e.pid) && e.stream_type == t);
-    let codec = if has_type(STREAM_TYPE_HEVC) {
-        Codec::Hevc
-    } else if has_type(STREAM_TYPE_AVC) || dv_config.as_ref().map(|c| c.profile) == Some(9) {
-        Codec::Avc
-    } else {
-        Codec::Hevc
-    };
 
     // Metadata always comes from the bounded head pass — even under `--full`,
     // which streams the whole elementary stream through `sample::scan` in
-    // bounded windows (`TsFullStream`) instead of materializing it here.
-    let (buf, chunks) = head_reassemble(data, layout, &video_pids);
+    // bounded windows (`TsFullStream`) instead of materializing it here. One
+    // walk reassembles every group's PIDs, routed into per-group buffers. The
+    // packet budget is sized to `HEAD_SCAN_BYTES` for one video stream; with N
+    // independent streams interleaved that budget covers ~1/N of each stream's
+    // ES and a later stream's first IDR/SPS would fall outside, so it scales
+    // with the group count (capped). Only multi-video files pay: the prefetch
+    // head warm stays exactly `HEAD_SCAN_BYTES`, and the scaled overflow on
+    // those rare files is a bounded cold read.
+    let group_pids: Vec<Vec<u16>> = groups.iter().map(|g| g.pids()).collect();
+    let budget = (HEAD_SCAN_BYTES / 192) as usize * groups.len().min(HEAD_BUDGET_MAX_SCALE);
+    let outs = head_reassemble(data, layout, &group_pids, budget);
 
-    let mut best = best_sps(&buf, &chunks, &codec);
-    let mut sps_chunk = best.as_ref().map(|c| c.chunk);
-    if full && best.is_none() {
-        // The head window held no SPS at all (first IDR beyond
-        // `HEAD_SCAN_BYTES` — atypical captures): under `--full` keep looking
-        // through the whole stream rather than losing the resolution the old
-        // whole-stream pass would have found. A rescue hit's chunk index is
-        // window-relative, meaningless against the head chunks — and unneeded:
-        // the `--full` scan covers every AU, so nothing must be pinned.
-        best = sps_rescue(data, layout, &video_pids, &codec, progress, frontier);
-        sps_chunk = None;
+    // Per-group codec + widest SPS from the group's own buffer.
+    let codecs: Vec<Codec> = groups.iter().map(|g| group_codec(&g.streams)).collect();
+    let mut bests: Vec<Option<SpsCommon>> =
+        outs.iter().zip(&codecs).map(|(o, c)| best_sps(&o.buf, &o.chunks, c)).collect();
+    let mut sps_chunks: Vec<Option<usize>> =
+        bests.iter().map(|b| b.as_ref().map(|c| c.chunk)).collect();
+    if full && bests.iter().any(|b| b.is_none()) {
+        // A group's head window held no SPS at all (first IDR beyond the
+        // budget — atypical captures): under `--full` keep looking through the
+        // whole stream rather than losing the resolution the old whole-stream
+        // pass would have found — one walk fills every missing group. A rescue
+        // hit's chunk index is window-relative, meaningless against the head
+        // chunks — and unneeded: the `--full` scan covers every AU, so nothing
+        // must be pinned.
+        let targets: Vec<(usize, Vec<u16>, Codec)> = bests
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.is_none())
+            .map(|(i, _)| (i, group_pids[i].clone(), codecs[i].clone()))
+            .collect();
+        for (i, rescued) in sps_rescue(data, layout, &targets, progress, frontier) {
+            bests[i] = rescued;
+            sps_chunks[i] = None;
+        }
     }
-    let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_fields(best);
 
-    // Duration from the transport clock (head+tail PCR delta). Prefer the PMT's
-    // declared PCR PID, falling back to the video PID(s) — most streams carry the
-    // PCR on the video PID anyway.
-    let duration_secs = std::iter::once(pcr_pid)
-        .chain(video_pids.iter().copied())
+    // Duration from the transport clock (head+tail PCR delta), file-level: a
+    // multi-program capture shares one mux timeline. Prefer the PMTs' declared
+    // PCR PIDs, falling back to the video PID(s) — most streams carry the PCR
+    // on the video PID anyway.
+    let duration_secs = programs
+        .iter()
+        .map(|p| p.pcr_pid)
+        .chain(group_pids.iter().flatten().copied())
         .filter(|&pid| pid != PID_NONE)
         .find_map(|pid| pcr_duration(data, layout, pid));
 
@@ -150,46 +153,209 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         "MPEG-2 TS"
     };
 
-    // `--full`: the exact video-stream byte total is only known after the
-    // sampler's streaming walk, so leave the rate unset here — main.rs fills it
-    // from `sample::Scan::es_bytes` (the same value the old whole-stream
-    // reassembly produced, including `None` when no video bytes complete). The
-    // default bounded path reports the file-length overall rate as before.
-    let bitrate = if full { None } else { Bitrate::overall(data.len() as u64, duration_secs) };
+    let ts_stream = full.then(|| TsFullStream { layout, groups: group_pids.clone() });
+    let multi_program = programs.len() > 1;
+    let single = groups.len() == 1;
 
-    let ts_stream = full.then(|| TsFullStream { layout, video_pids: video_pids.clone() });
+    let mut tracks = Vec::with_capacity(groups.len());
+    for (((g, out), best), codec) in
+        groups.iter().zip(outs).zip(bests.into_iter().zip(sps_chunks)).zip(codecs)
+    {
+        let (best, sps_chunk) = best;
+        let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_fields(best);
 
-    let track = TrackDemux {
-        width,
-        height,
-        fps,
-        bit_depth,
-        chroma,
-        codec_profile,
-        color,
-        dv_config,
-        // A Profile-7 EL rides its own PID, so more than one video PID means the
-        // base and enhancement layers are on separate streams (dual track).
-        dv_dual_track: video_pids.len() > 1,
-        bitrate,
-        chunks,
-        sps_chunk,
-        reassembled: Some(buf),
-        ..TrackDemux::new(codec, NalFormat::AnnexB)
-    };
-    let mut demux = Demux::single(container, duration_secs, track);
-    demux.ts_stream = ts_stream;
-    Ok(demux)
+        // `--full`: the exact video-stream byte total is only known after the
+        // sampler's streaming walk, so leave the rate unset here — main.rs
+        // fills it from `sample::Scan` (the same value the old whole-stream
+        // reassembly produced, including `None` when no video bytes complete).
+        // The default bounded path reports the file-length overall rate as
+        // before — but only when this is the file's only video track: an
+        // overall rate (audio + overhead included) attributed to one of
+        // several tracks would be a wrong number, so multi-track reports
+        // `None` instead.
+        let bitrate = if full || !single {
+            None
+        } else {
+            Bitrate::overall(data.len() as u64, duration_secs)
+        };
+
+        tracks.push(TrackDemux {
+            track_number: Some(g.primary_pid() as u64),
+            program: multi_program.then_some(g.program_number),
+            width,
+            height,
+            fps,
+            bit_depth,
+            chroma,
+            codec_profile,
+            color,
+            dv_config: g.streams.iter().find_map(|e| e.dv_config.clone()),
+            dv_dual_track: g.dv_dual_track,
+            bitrate,
+            chunks: out.chunks,
+            sps_chunk,
+            reassembled: Some(out.buf),
+            ..TrackDemux::new(codec, NalFormat::AnnexB)
+        });
+    }
+
+    Ok(Demux {
+        container,
+        duration_secs,
+        tracks,
+        ts_stream,
+        mkv_stream: None,
+        raw_stream: None,
+    })
+}
+
+/// Cap on the head packet-budget scaling for multi-video files. 3× covers the
+/// realistic worst case (a whole-mux capture's per-service video share) without
+/// letting a pathological PMT force an unbounded head read.
+const HEAD_BUDGET_MAX_SCALE: usize = 3;
+
+/// Codec of a group's base layer: the PMT stream_type is authoritative (0x1B
+/// AVC, 0x24 HEVC). A DV-only PID (EL, PES-private 0x06) carries no video
+/// type, so fall back to the DV profile — only profile 9 is AVC. HEVC wins a
+/// tie (an AVC EL alongside an HEVC BL is not a real configuration, but be
+/// explicit).
+fn group_codec(streams: &[Es]) -> Codec {
+    let has = |t: u8| streams.iter().any(|e| e.stream_type == t);
+    if has(STREAM_TYPE_HEVC) {
+        Codec::Hevc
+    } else if has(STREAM_TYPE_AVC)
+        || streams.iter().find_map(|e| e.dv_config.as_ref()).map(|c| c.profile) == Some(9)
+    {
+        Codec::Avc
+    } else {
+        Codec::Hevc
+    }
 }
 
 // --- PSI (PAT / PMT) --------------------------------------------------------
 
 /// One elementary stream from the PMT.
+#[derive(Debug, Clone)]
 struct Es {
     pid: u16,
     stream_type: u8,
     has_dovi: bool,
     dv_config: Option<DvConfig>,
+    /// The 0xB0 descriptor's `dependency_pid` — the base-layer PID this
+    /// EL/RPU-only stream enhances. Present only on the EL form
+    /// (`bl_present == 0`); names the group the EL folds into.
+    dependency_pid: Option<u16>,
+}
+
+/// One program from the PAT/PMT walk.
+struct Program {
+    program_number: u16,
+    pcr_pid: u16,
+    streams: Vec<Es>,
+}
+
+/// One reported (logical) video track: the PIDs whose PES payloads reassemble
+/// into its elementary stream — the base layer's, plus a folded DV
+/// enhancement layer's in the dual-PID Profile 7 case.
+struct PidGroup {
+    program_number: u16,
+    /// Video-ish streams feeding this track, base layer first.
+    streams: Vec<Es>,
+    dv_dual_track: bool,
+}
+
+impl PidGroup {
+    fn pids(&self) -> Vec<u16> {
+        self.streams.iter().map(|e| e.pid).collect()
+    }
+
+    /// The track's identity PID: the base layer's (the first video-typed
+    /// stream, else the first stream).
+    fn primary_pid(&self) -> u16 {
+        self.streams
+            .iter()
+            .find(|e| is_video_type(e.stream_type))
+            .unwrap_or(&self.streams[0])
+            .pid
+    }
+}
+
+fn is_video_type(t: u8) -> bool {
+    t == STREAM_TYPE_HEVC || t == STREAM_TYPE_AVC
+}
+
+/// A Dolby Vision enhancement-layer stream: its 0xB0 descriptor says the PID
+/// carries no base layer, or it is DV-flagged with no video stream type at all
+/// (the bare EL/RPU PID shape, PES-private 0x06 with only a DOVI registration
+/// descriptor).
+fn is_el_stream(e: &Es) -> bool {
+    e.dv_config.as_ref().is_some_and(|c| !c.bl_present)
+        || (e.has_dovi && !is_video_type(e.stream_type))
+}
+
+/// Group each program's video PIDs into reported tracks.
+///
+/// Within a program: an EL stream folds into its base layer's group — by the
+/// descriptor's `dependency_pid` when it names one of the program's video
+/// PIDs, else the program's first video-typed PID — setting `dv_dual_track`;
+/// every other video PID is its own independent track. A program whose video
+/// PIDs carry **no DV descriptor at all** keeps the historical rule: more
+/// than one video PID means a descriptor-less BDMV Profile-7 BL+EL pair (an
+/// untouched Blu-ray M2TS signals DV via the playlist, not the PMT), so they
+/// form one dual-track group rather than independent tracks. Groups come back
+/// in program order, then PID order.
+fn group_video_pids(programs: &[Program]) -> Vec<PidGroup> {
+    let mut groups: Vec<PidGroup> = Vec::new();
+    for prog in programs {
+        let vids: Vec<&Es> = prog
+            .streams
+            .iter()
+            .filter(|e| is_video_type(e.stream_type) || e.has_dovi)
+            .collect();
+        if vids.is_empty() {
+            continue;
+        }
+        let any_dv_desc = vids.iter().any(|e| e.has_dovi);
+        if !any_dv_desc && vids.len() > 1 {
+            // Descriptor-less multi-PID program: the BDMV P7 shape.
+            groups.push(PidGroup {
+                program_number: prog.program_number,
+                streams: vids.into_iter().cloned().collect(),
+                dv_dual_track: true,
+            });
+            continue;
+        }
+        let (els, base): (Vec<&Es>, Vec<&Es>) = vids.into_iter().partition(|e| is_el_stream(e));
+        if base.is_empty() {
+            // Only EL/RPU-shaped PIDs (a bare DV PID cut): report what's there.
+            groups.push(PidGroup {
+                program_number: prog.program_number,
+                streams: els.into_iter().cloned().collect(),
+                dv_dual_track: false,
+            });
+            continue;
+        }
+        let first = groups.len();
+        for b in &base {
+            groups.push(PidGroup {
+                program_number: prog.program_number,
+                streams: vec![(*b).clone()],
+                dv_dual_track: false,
+            });
+        }
+        for el in els {
+            // Fold by dependency_pid when it names a base PID in this program,
+            // else into the program's first base group.
+            let target = el
+                .dependency_pid
+                .and_then(|dep| base.iter().position(|b| b.pid == dep))
+                .unwrap_or(0);
+            let g = &mut groups[first + target];
+            g.streams.push(el.clone());
+            g.dv_dual_track = true;
+        }
+    }
+    groups
 }
 
 /// Payload of a single TS packet at unit offset `p` (`data[p] == 0x47`):
@@ -212,18 +378,21 @@ fn packet_payload(data: &[u8], off: usize) -> Option<(u16, bool, &[u8])> {
     Some((pid, pusi, &data[start..end]))
 }
 
-/// Walk the head of the stream to resolve the PMT PID (from the PAT) and then
-/// the PCR PID and elementary streams (from the PMT).
-fn parse_psi(data: &[u8], layout: Layout) -> Option<(u16, Vec<Es>)> {
-    let mut pmt_pid: Option<u16> = None;
+/// Walk the head of the stream to resolve every program's PMT PID (from the
+/// PAT) and then each program's PCR PID and elementary streams (from its PMT).
+/// Programs come back in PAT order; one whose PMT never shows in the scanned
+/// head is dropped. A single-program stream — every BDMV, most remuxes — is
+/// one entry; a whole-mux broadcast capture yields one per service.
+fn parse_psi(data: &[u8], layout: Layout) -> Option<Vec<Program>> {
+    let mut progs: Option<Vec<(u16, u16)>> = None; // (program_number, map_pid)
     let mut p = layout.first;
     let mut scanned = 0;
     while p + TS_UNIT <= data.len() && scanned < 20_000 {
         if data[p] == SYNC {
             if let Some((pid, pusi, payload)) = packet_payload(data, p) {
                 if pid == PID_PAT && pusi {
-                    if let Some(mp) = parse_pat(payload) {
-                        pmt_pid = Some(mp);
+                    if let Some(list) = parse_pat(payload) {
+                        progs = Some(list);
                         break;
                     }
                 }
@@ -232,16 +401,26 @@ fn parse_psi(data: &[u8], layout: Layout) -> Option<(u16, Vec<Es>)> {
         p += layout.stride;
         scanned += 1;
     }
-    let pmt_pid = pmt_pid?;
+    let progs = progs?;
 
+    let mut programs: Vec<Option<Program>> = (0..progs.len()).map(|_| None).collect();
+    let mut missing = progs.len();
     let mut p = layout.first;
     let mut scanned = 0;
-    while p + TS_UNIT <= data.len() && scanned < 40_000 {
+    while p + TS_UNIT <= data.len() && scanned < 40_000 && missing > 0 {
         if data[p] == SYNC {
             if let Some((pid, pusi, payload)) = packet_payload(data, p) {
-                if pid == pmt_pid && pusi {
-                    if let Some(parsed) = parse_pmt(payload) {
-                        return Some(parsed);
+                if pusi {
+                    if let Some(i) = progs
+                        .iter()
+                        .position(|&(_, map)| map == pid)
+                        .filter(|&i| programs[i].is_none())
+                    {
+                        if let Some((pcr_pid, streams)) = parse_pmt(payload) {
+                            programs[i] =
+                                Some(Program { program_number: progs[i].0, pcr_pid, streams });
+                            missing -= 1;
+                        }
                     }
                 }
             }
@@ -249,11 +428,13 @@ fn parse_psi(data: &[u8], layout: Layout) -> Option<(u16, Vec<Es>)> {
         p += layout.stride;
         scanned += 1;
     }
-    None
+    let programs: Vec<Program> = programs.into_iter().flatten().collect();
+    (!programs.is_empty()).then_some(programs)
 }
 
-/// PAT: return the first program's `program_map_PID`.
-fn parse_pat(payload: &[u8]) -> Option<u16> {
+/// PAT: every program's `(program_number, program_map_PID)`, in table order
+/// (program 0 is the network PID, not a program).
+fn parse_pat(payload: &[u8]) -> Option<Vec<(u16, u16)>> {
     let ptr = *payload.first()? as usize;
     let s = payload.get(1 + ptr..)?;
     if *s.first()? != 0x00 {
@@ -261,16 +442,17 @@ fn parse_pat(payload: &[u8]) -> Option<u16> {
     }
     let section_length = (((s.get(1)? & 0x0F) as usize) << 8) | *s.get(2)? as usize;
     let prog_end = (3 + section_length).saturating_sub(4).min(s.len()); // exclude CRC
+    let mut out = Vec::new();
     let mut i = 8;
     while i + 4 <= prog_end {
         let prog_num = ((s[i] as u16) << 8) | s[i + 1] as u16;
         let map_pid = (((s[i + 2] & 0x1F) as u16) << 8) | s[i + 3] as u16;
         if prog_num != 0 {
-            return Some(map_pid);
+            out.push((prog_num, map_pid));
         }
         i += 4;
     }
-    None
+    (!out.is_empty()).then_some(out)
 }
 
 /// PMT: return the PCR PID and the list of elementary streams with DV descriptor
@@ -293,8 +475,8 @@ fn parse_pmt(payload: &[u8]) -> Option<(u16, Vec<Es>)> {
         let pid = (((s[i + 1] & 0x1F) as u16) << 8) | s[i + 2] as u16;
         let es_info_len = (((s[i + 3] & 0x0F) as usize) << 8) | s[i + 4] as usize;
         let desc = s.get(i + 5..(i + 5 + es_info_len).min(s.len())).unwrap_or(&[]);
-        let (has_dovi, dv_config) = scan_descriptors(desc);
-        streams.push(Es { pid, stream_type, has_dovi, dv_config });
+        let (has_dovi, dv_config, dependency_pid) = scan_descriptors(desc);
+        streams.push(Es { pid, stream_type, has_dovi, dv_config, dependency_pid });
         i += 5 + es_info_len;
     }
     Some((pcr_pid, streams))
@@ -302,10 +484,12 @@ fn parse_pmt(payload: &[u8]) -> Option<(u16, Vec<Es>)> {
 
 /// Scan ES-info descriptors for Dolby Vision signalling: a `DOVI` registration
 /// descriptor (tag 0x05) and/or the DV video-stream descriptor (tag 0xB0, whose
-/// body is a `dvcC`-shaped config record).
-fn scan_descriptors(d: &[u8]) -> (bool, Option<DvConfig>) {
+/// body is a `dvcC`-shaped config record — the EL form of which names its base
+/// layer's PID via `dependency_pid`).
+fn scan_descriptors(d: &[u8]) -> (bool, Option<DvConfig>, Option<u16>) {
     let mut has_dovi = false;
     let mut cfg = None;
+    let mut dep = None;
     let mut i = 0;
     while i + 2 <= d.len() {
         let tag = d[i];
@@ -319,21 +503,42 @@ fn scan_descriptors(d: &[u8]) -> (bool, Option<DvConfig>) {
             }
             0xB0 => {
                 has_dovi = true;
-                cfg = super::parse_dovi_ts_descriptor(body).or(cfg);
+                if let Some((c, d)) = super::parse_dovi_ts_descriptor(body) {
+                    cfg = Some(c);
+                    dep = d.or(dep);
+                }
             }
             _ => {}
         }
         i += 2 + len;
     }
-    (has_dovi, cfg)
+    (has_dovi, cfg, dep)
 }
 
 // --- PES reassembly ---------------------------------------------------------
 
 struct PidState {
     pid: u16,
+    /// Index of the track group (and so the `EsOut`) this PID's completed
+    /// access units are emitted into.
+    group: usize,
     acc: Vec<u8>,
     started: bool,
+}
+
+/// One track group's reassembled elementary stream: an Annex-B buffer plus the
+/// access-unit ranges indexing into it.
+#[derive(Debug, Default)]
+pub struct EsOut {
+    pub buf: Vec<u8>,
+    pub chunks: Vec<Chunk>,
+}
+
+impl EsOut {
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.chunks.clear();
+    }
 }
 
 /// Resumable walker over the target PIDs' scattered PES payloads: reassembles
@@ -359,12 +564,22 @@ pub struct EsStreamer {
 }
 
 impl EsStreamer {
-    fn new(layout: Layout, pids: &[u16], packet_budget: usize) -> Self {
+    /// `groups` lists each track group's PIDs; a PID's completed AUs are
+    /// emitted into `outs[group]` in `next_window`.
+    fn new(layout: Layout, groups: &[Vec<u16>], packet_budget: usize) -> Self {
         EsStreamer {
             layout,
-            states: pids
+            states: groups
                 .iter()
-                .map(|&pid| PidState { pid, acc: Vec::new(), started: false })
+                .enumerate()
+                .flat_map(|(group, pids)| {
+                    pids.iter().map(move |&pid| PidState {
+                        pid,
+                        group,
+                        acc: Vec::new(),
+                        started: false,
+                    })
+                })
                 .collect(),
             cursor: layout.first,
             packets_left: packet_budget,
@@ -372,22 +587,18 @@ impl EsStreamer {
         }
     }
 
-    /// Append completed access units to `buf`/`chunks` (chunk offsets are
-    /// relative to `buf`) until at least `target_bytes` accumulate or the walk
-    /// ends (end of data, packet budget exhausted, or unrecoverable sync loss).
-    /// A window may overshoot `target_bytes` by one AU — the whole accumulator
-    /// is appended when a new PES start completes it. Returns `true` while more
-    /// input remains.
-    pub fn next_window(
-        &mut self,
-        data: &[u8],
-        buf: &mut Vec<u8>,
-        chunks: &mut Vec<Chunk>,
-        target_bytes: usize,
-    ) -> bool {
+    /// Append completed access units to each group's `EsOut` (chunk offsets
+    /// are relative to that group's `buf`) until at least `target_bytes`
+    /// accumulate across the window (all groups together) or the walk ends
+    /// (end of data, packet budget exhausted, or unrecoverable sync loss). A
+    /// window may overshoot `target_bytes` by one AU — the whole accumulator
+    /// is appended when a new PES start completes it. Returns `true` while
+    /// more input remains.
+    pub fn next_window(&mut self, data: &[u8], outs: &mut [EsOut], target_bytes: usize) -> bool {
         if self.finished {
             return false;
         }
+        let mut appended = 0usize;
         while self.cursor + TS_UNIT <= data.len() && self.packets_left > 0 {
             if data[self.cursor] != SYNC {
                 // Re-locking the phase reads no packet, so it costs no budget.
@@ -401,12 +612,13 @@ impl EsStreamer {
             }
             if let Some((pid, pusi, payload)) = packet_payload(data, self.cursor) {
                 if let Some(si) = self.states.iter().position(|s| s.pid == pid) {
-                    process(&mut self.states[si], pusi, payload, buf, chunks);
+                    let group = self.states[si].group;
+                    appended += process(&mut self.states[si], pusi, payload, &mut outs[group]);
                 }
             }
             self.cursor += self.layout.stride;
             self.packets_left -= 1;
-            if buf.len() >= target_bytes {
+            if appended >= target_bytes {
                 return true;
             }
         }
@@ -423,17 +635,18 @@ impl EsStreamer {
 }
 
 /// One-shot head reassembly for the default (non-`--full`) metadata pass: a
-/// single window bounded only by a packet budget sized to `HEAD_SCAN_BYTES`
-/// (the prefetch-warmed region — divide by the larger stride, 192, so the byte
-/// span stays within it for both TS and M2TS). The budget is the sole bound:
-/// the default just grabs title-stable static metadata, and the read must not
-/// be cut short before the first IDR/SPS, typically ~one 4K GOP in.
-fn head_reassemble(data: &[u8], layout: Layout, pids: &[u16]) -> (Vec<u8>, Vec<Chunk>) {
-    let mut buf = Vec::new();
-    let mut chunks = Vec::new();
-    let mut st = EsStreamer::new(layout, pids, (HEAD_SCAN_BYTES / 192) as usize);
-    st.next_window(data, &mut buf, &mut chunks, usize::MAX);
-    (buf, chunks)
+/// single window bounded only by `packet_budget` (sized by the caller to
+/// `HEAD_SCAN_BYTES` — the prefetch-warmed region, divided by the larger
+/// stride, 192, so the byte span stays within it for both TS and M2TS — and
+/// scaled, capped, by the independent-group count). The budget is the sole
+/// bound: the default just grabs title-stable static metadata, and the read
+/// must not be cut short before each stream's first IDR/SPS, typically ~one
+/// 4K GOP in.
+fn head_reassemble(data: &[u8], layout: Layout, groups: &[Vec<u16>], packet_budget: usize) -> Vec<EsOut> {
+    let mut outs: Vec<EsOut> = groups.iter().map(|_| EsOut::default()).collect();
+    let mut st = EsStreamer::new(layout, groups, packet_budget);
+    st.next_window(data, &mut outs, usize::MAX);
+    outs
 }
 
 /// Completed-AU bytes per streamed window of the `--full` elementary-stream
@@ -451,32 +664,43 @@ pub const STREAM_WINDOW_BYTES: usize = 64 << 20; // 64 MiB
 #[derive(Debug, Clone)]
 pub struct TsFullStream {
     layout: Layout,
-    video_pids: Vec<u16>,
+    /// PIDs per track group, in `Demux::tracks` order — a P7 BL+EL pair shares
+    /// one group; independent video PIDs (per program) get their own.
+    groups: Vec<Vec<u16>>,
 }
 
 impl TsFullStream {
     #[cfg(test)]
     pub(crate) fn new(layout: Layout, video_pids: Vec<u16>) -> Self {
-        TsFullStream { layout, video_pids }
+        TsFullStream { layout, groups: vec![video_pids] }
+    }
+
+    /// How many track groups the walk routes into — the caller sizes its
+    /// per-group `EsOut` list to this (parallel to `Demux::tracks`).
+    pub fn track_count(&self) -> usize {
+        self.groups.len()
     }
 
     /// A fresh unbounded streamer over the whole stream. It starts at the head,
     /// re-reading the window the metadata pass already parsed (<= 24 MiB, cheap)
     /// so every AU is scanned exactly once — by the streamer.
     pub fn streamer(&self) -> EsStreamer {
-        EsStreamer::new(self.layout, &self.video_pids, usize::MAX)
+        EsStreamer::new(self.layout, &self.groups, usize::MAX)
     }
 }
 
 /// Feed one packet's payload into a PID's reassembler, emitting a completed
-/// access unit (into `buf`/`chunks`) when a new PES starts.
-fn process(st: &mut PidState, pusi: bool, payload: &[u8], buf: &mut Vec<u8>, chunks: &mut Vec<Chunk>) {
+/// access unit (into its group's `EsOut`) when a new PES starts. Returns the
+/// bytes appended, the window loop's pacing measure.
+fn process(st: &mut PidState, pusi: bool, payload: &[u8], out: &mut EsOut) -> usize {
+    let mut appended = 0;
     if pusi {
         // A new PES begins: finalize the previous access unit.
         if st.started && !st.acc.is_empty() {
-            let offset = buf.len() as u64;
-            buf.extend_from_slice(&st.acc);
-            chunks.push(Chunk { offset, size: st.acc.len() as u64 });
+            let offset = out.buf.len() as u64;
+            out.buf.extend_from_slice(&st.acc);
+            out.chunks.push(Chunk { offset, size: st.acc.len() as u64 });
+            appended = st.acc.len();
         }
         st.acc.clear();
         match pes_es_offset(payload) {
@@ -489,6 +713,7 @@ fn process(st: &mut PidState, pusi: bool, payload: &[u8], buf: &mut Vec<u8>, chu
     } else if st.started {
         st.acc.extend_from_slice(payload);
     }
+    appended
 }
 
 /// Offset of the elementary-stream bytes within a PES packet payload (after the
@@ -680,37 +905,40 @@ fn sps_fields(
 fn sps_rescue(
     data: &[u8],
     layout: Layout,
-    pids: &[u16],
-    codec: &Codec,
+    targets: &[(usize, Vec<u16>, Codec)],
     progress: &Progress,
     frontier: &Frontier,
-) -> Option<SpsCommon> {
-    let mut st = EsStreamer::new(layout, pids, usize::MAX);
-    let mut buf = Vec::new();
-    let mut chunks = Vec::new();
-    let mut best: Option<SpsCommon> = None;
+) -> Vec<(usize, Option<SpsCommon>)> {
+    // One walk serves every SPS-less group: their PIDs stream side by side
+    // (each target is one group here, so its BL+EL stay merged as in the head
+    // pass) and each keeps its own widest-so-far.
+    let groups: Vec<Vec<u16>> = targets.iter().map(|(_, pids, _)| pids.clone()).collect();
+    let mut st = EsStreamer::new(layout, &groups, usize::MAX);
+    let mut outs: Vec<EsOut> = groups.iter().map(|_| EsOut::default()).collect();
+    let mut bests: Vec<Option<SpsCommon>> = groups.iter().map(|_| None).collect();
     progress.begin(Phase::Index, data.len() as u64);
     // One window consumes more *file* bytes than its ES target (packet
     // overhead, other PIDs), so the frontier warms the upcoming window's file
     // span, adapted from the last window's observed density.
     let mut warm_span = STREAM_WINDOW_BYTES as u64 * 2;
     loop {
-        buf.clear();
-        chunks.clear();
         let pos0 = st.position() as u64;
         frontier.ensure_to(pos0.saturating_add(warm_span));
-        let more = st.next_window(data, &mut buf, &mut chunks, STREAM_WINDOW_BYTES);
+        let more = st.next_window(data, &mut outs, STREAM_WINDOW_BYTES);
         let used = st.position() as u64 - pos0;
         if used > 0 {
             warm_span = used + used / 4;
         }
-        if let Some(w) = best_sps(&buf, &chunks, codec) {
-            if best.as_ref().is_none_or(|b| w.width > b.width) {
-                best = Some(w);
+        for ((out, best), (_, _, codec)) in outs.iter_mut().zip(&mut bests).zip(targets) {
+            if let Some(w) = best_sps(&out.buf, &out.chunks, codec) {
+                if best.as_ref().is_none_or(|b| w.width > b.width) {
+                    *best = Some(w);
+                }
             }
+            out.clear();
         }
-        if !more || best.as_ref().is_some_and(|b| b.width >= 3840) {
-            return best;
+        if !more || bests.iter().all(|b| b.as_ref().is_some_and(|b| b.width >= 3840)) {
+            return targets.iter().map(|(i, _, _)| *i).zip(bests).collect();
         }
         progress.update(st.position() as u64);
     }
@@ -825,7 +1053,7 @@ mod tests {
         ];
         let mut payload = vec![0x00]; // pointer_field
         payload.extend_from_slice(&s);
-        assert_eq!(parse_pat(&payload), Some(0x0100));
+        assert_eq!(parse_pat(&payload), Some(vec![(1, 0x0100)]));
     }
 
     #[test]
@@ -859,6 +1087,8 @@ mod tests {
         assert_eq!(cfg.level, Some(6));
         assert!(cfg.rpu_present && cfg.el_present && !cfg.bl_present);
         assert_eq!(cfg.bl_compatibility_id, Some(6));
+        // The EL descriptor's dependency_pid names the base layer's PID.
+        assert_eq!(streams[1].dependency_pid, Some(0x1011));
     }
 
     #[test]
@@ -967,40 +1197,55 @@ mod tests {
         let layout = Layout { first: 0, stride: TS_UNIT };
         let pids = [0x100u16, 0x200];
 
-        let mut one_buf = Vec::new();
-        let mut one_chunks = Vec::new();
-        let mut st = EsStreamer::new(layout, &pids, usize::MAX);
-        assert!(!st.next_window(&d, &mut one_buf, &mut one_chunks, usize::MAX));
-        assert_eq!(one_buf, [1, 2, 3, 4, 5, 9, 9, 8, 6]);
-        assert_eq!(one_chunks.iter().map(|c| c.size).collect::<Vec<_>>(), [5, 3, 1]);
+        let one_group = vec![pids.to_vec()];
+        let mut one = vec![EsOut::default()];
+        let mut st = EsStreamer::new(layout, &one_group, usize::MAX);
+        assert!(!st.next_window(&d, &mut one, usize::MAX));
+        assert_eq!(one[0].buf, [1, 2, 3, 4, 5, 9, 9, 8, 6]);
+        assert_eq!(one[0].chunks.iter().map(|c| c.size).collect::<Vec<_>>(), [5, 3, 1]);
 
         // Tiny windows: identical bytes, AU sequence, and byte total. The pause
         // after the first emission leaves pid 0x200's AU half-accumulated, so a
         // partial AU straddling a window boundary is carried and emitted intact.
-        let mut st = EsStreamer::new(layout, &pids, usize::MAX);
-        let (mut buf, mut chunks) = (Vec::new(), Vec::new());
+        let mut st = EsStreamer::new(layout, &one_group, usize::MAX);
+        let mut outs = vec![EsOut::default()];
         let mut all = Vec::new();
         let mut sizes = Vec::new();
         let mut total = 0u64;
         let mut positions = Vec::new();
         loop {
-            buf.clear();
-            chunks.clear();
-            let more = st.next_window(&d, &mut buf, &mut chunks, 1);
+            outs[0].clear();
+            let more = st.next_window(&d, &mut outs, 1);
             positions.push(st.position());
-            all.extend_from_slice(&buf);
-            sizes.extend(chunks.iter().map(|c| c.size));
-            total += buf.len() as u64;
+            all.extend_from_slice(&outs[0].buf);
+            sizes.extend(outs[0].chunks.iter().map(|c| c.size));
+            total += outs[0].buf.len() as u64;
             if !more {
                 break;
             }
         }
-        assert_eq!(all, one_buf);
+        assert_eq!(all, one[0].buf);
         assert_eq!(sizes, [5, 3, 1]);
-        assert_eq!(total, one_buf.len() as u64);
+        assert_eq!(total, one[0].buf.len() as u64);
         // The progress cursor is monotonic and ends at the walk's end.
         assert!(positions.windows(2).all(|w| w[0] <= w[1]));
         assert_eq!(*positions.last().unwrap(), d.len());
+    }
+
+    #[test]
+    fn streamer_routes_per_group() {
+        // The same dual-PID stream split into two independent groups: each
+        // PID's completed AUs land in its own buffer, partials never flush.
+        let d = dual_pid_stream();
+        let layout = Layout { first: 0, stride: TS_UNIT };
+        let groups = vec![vec![0x100u16], vec![0x200u16]];
+        let mut outs = vec![EsOut::default(), EsOut::default()];
+        let mut st = EsStreamer::new(layout, &groups, usize::MAX);
+        assert!(!st.next_window(&d, &mut outs, usize::MAX));
+        assert_eq!(outs[0].buf, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(outs[0].chunks.iter().map(|c| c.size).collect::<Vec<_>>(), [5, 1]);
+        assert_eq!(outs[1].buf, [9, 9, 8]);
+        assert_eq!(outs[1].chunks.iter().map(|c| c.size).collect::<Vec<_>>(), [3]);
     }
 
     #[test]
@@ -1037,28 +1282,174 @@ mod tests {
 
         let full = demux(&d, true, &Progress::off(), &Frontier::off()).expect("full demux");
         let plan = full.ts_stream.as_ref().expect("full exposes the streaming plan");
-        assert_eq!(plan.video_pids, [0x1011, 0x1015]);
+        // BL + its dependent EL stay one group: one logical track.
+        assert_eq!(plan.groups, [[0x1011, 0x1015]]);
+        assert_eq!(full.tracks.len(), 1);
         let (ft, dt) = (&full.tracks[0], &default.tracks[0]);
+        assert!(ft.dv_dual_track, "descriptor-flagged EL PID means dual track");
+        assert_eq!(ft.track_number, Some(0x1011), "identity is the BL PID");
+        assert_eq!(ft.program, None, "single-program mux omits the program");
         assert!(ft.bitrate.is_none(), "the streaming scan supplies the full-path rate");
         // The metadata pass is the same bounded head reassembly either way.
         assert_eq!(ft.reassembled, dt.reassembled);
         assert_eq!(ft.chunks.len(), 1);
     }
 
+    /// An `Es` for grouping tests.
+    fn es(pid: u16, stream_type: u8, dv: Option<(bool, Option<u16>)>) -> Es {
+        let (has_dovi, dv_config, dependency_pid) = match dv {
+            Some((bl_present, dep)) => (
+                true,
+                Some(DvConfig {
+                    profile: 7,
+                    level: Some(6),
+                    bl_present,
+                    el_present: true,
+                    rpu_present: true,
+                    bl_compatibility_id: Some(6),
+                }),
+                dep,
+            ),
+            None => (false, None, None),
+        };
+        Es { pid, stream_type, has_dovi, dv_config, dependency_pid }
+    }
+
+    fn prog(n: u16, streams: Vec<Es>) -> Program {
+        Program { program_number: n, pcr_pid: PID_NONE, streams }
+    }
+
+    #[test]
+    fn grouping_folds_el_by_dependency_pid() {
+        // Two independent BLs + an EL whose dependency_pid names the *second*
+        // BL: the EL folds there, not into the first.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![
+                es(0x100, STREAM_TYPE_HEVC, None),
+                es(0x200, STREAM_TYPE_HEVC, None),
+                es(0x300, 0x06, Some((false, Some(0x200)))),
+            ],
+        )]);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].pids(), [0x100]);
+        assert!(!g[0].dv_dual_track);
+        assert_eq!(g[1].pids(), [0x200, 0x300]);
+        assert!(g[1].dv_dual_track);
+        assert_eq!(g[1].primary_pid(), 0x200);
+    }
+
+    #[test]
+    fn grouping_independent_video_pid_is_not_misread_as_el() {
+        // A single-layer DV PID (bl_present=1) plus an unrelated second video
+        // PID: two independent tracks — the old ">1 video PID means dual
+        // track" rule must not fire when descriptors say otherwise.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![
+                es(0x100, STREAM_TYPE_HEVC, Some((true, None))),
+                es(0x200, STREAM_TYPE_HEVC, None),
+            ],
+        )]);
+        assert_eq!(g.len(), 2);
+        assert!(g.iter().all(|g| !g.dv_dual_track));
+    }
+
+    #[test]
+    fn grouping_descriptorless_multi_pid_keeps_bdmv_rule() {
+        // No DV descriptor anywhere (an untouched BDMV carries none): more
+        // than one video PID is the Blu-ray P7 BL+EL pair — one dual group.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![es(0x1011, STREAM_TYPE_HEVC, None), es(0x1015, STREAM_TYPE_HEVC, None)],
+        )]);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].pids(), [0x1011, 0x1015]);
+        assert!(g[0].dv_dual_track);
+        assert_eq!(g[0].primary_pid(), 0x1011);
+    }
+
+    #[test]
+    fn grouping_spans_programs() {
+        // A whole-mux capture: one video PID per program → one track per
+        // program, in program order; a bare EL-only program reports as-is.
+        let g = group_video_pids(&[
+            prog(1, vec![es(0x100, STREAM_TYPE_HEVC, None)]),
+            prog(2, vec![es(0x200, STREAM_TYPE_AVC, None)]),
+            prog(3, vec![es(0x300, 0x06, Some((false, None)))]),
+        ]);
+        assert_eq!(g.len(), 3);
+        assert_eq!(
+            g.iter().map(|g| (g.program_number, g.primary_pid())).collect::<Vec<_>>(),
+            [(1, 0x100), (2, 0x200), (3, 0x300)]
+        );
+        assert!(g.iter().all(|g| !g.dv_dual_track));
+        assert!(matches!(group_codec(&g[1].streams), Codec::Avc));
+    }
+
+    #[test]
+    fn multi_program_demux_reports_one_track_per_program() {
+        // PAT with two programs → two PMTs → interleaved video packets on two
+        // PIDs: two tracks, each with its own program number, reassembly
+        // buffer, and no cross-pollution.
+        let pat: [u8; 20] = [
+            0x00, 0xB0, 0x11, 0x00, 0x01, 0xC1, 0x00, 0x00, // header (len 0x11)
+            0x00, 0x01, 0xE1, 0x00, // program 1 -> PMT 0x0100
+            0x00, 0x02, 0xE2, 0x00, // program 2 -> PMT 0x0200
+            0x00, 0x00, 0x00, 0x00, // CRC
+        ];
+        let pmt = |video_pid: u16| -> Vec<u8> {
+            vec![
+                0x02, 0xB0, 0x12, 0x00, 0x01, 0xC1, 0x00, 0x00, // table header
+                0xFF, 0xFF, 0xF0, 0x00, // PCR PID 0x1FFF (none), no prog info
+                0x24, 0xE0 | (video_pid >> 8) as u8, (video_pid & 0xFF) as u8, 0xF0, 0x00,
+                0x00, 0x00, 0x00, 0x00, // CRC
+            ]
+        };
+        let with_ptr = |s: &[u8]| {
+            let mut v = vec![0x00];
+            v.extend_from_slice(s);
+            v
+        };
+        let mut d = Vec::new();
+        d.extend(ts_packet(PID_PAT, true, &with_ptr(&pat)));
+        d.extend(ts_packet(0x0100, true, &with_ptr(&pmt(0x1011))));
+        d.extend(ts_packet(0x0200, true, &with_ptr(&pmt(0x1211))));
+        d.extend(ts_packet(0x1011, true, &pes_start(&[0x11, 0x22])));
+        d.extend(ts_packet(0x1211, true, &pes_start(&[0x33])));
+        d.extend(ts_packet(0x1011, true, &pes_start(&[0x44]))); // completes [0x11,0x22]
+        d.extend(ts_packet(0x1211, true, &pes_start(&[0x55]))); // completes [0x33]
+
+        let dm = demux(&d, false, &Progress::off(), &Frontier::off()).expect("demux");
+        assert_eq!(dm.tracks.len(), 2);
+        let (t1, t2) = (&dm.tracks[0], &dm.tracks[1]);
+        assert_eq!((t1.track_number, t1.program), (Some(0x1011), Some(1)));
+        assert_eq!((t2.track_number, t2.program), (Some(0x1211), Some(2)));
+        assert_eq!(t1.reassembled.as_deref(), Some(&[0x11u8, 0x22][..]));
+        assert_eq!(t2.reassembled.as_deref(), Some(&[0x33u8][..]));
+        assert_eq!(t1.chunks.len(), 1);
+        assert_eq!(t2.chunks.len(), 1);
+        // Multi-track: no overall bitrate attributed to either track.
+        assert!(t1.bitrate.is_none() && t2.bitrate.is_none());
+    }
+
     #[test]
     fn reassembly_emits_au_on_next_pes() {
         // A PES spanning two packets is emitted only when the next PES starts.
-        let mut st = PidState { pid: 0x100, acc: Vec::new(), started: false };
-        let mut buf = Vec::new();
-        let mut chunks = Vec::new();
+        let mut st = PidState { pid: 0x100, group: 0, acc: Vec::new(), started: false };
+        let mut out = EsOut::default();
         let pes1 = [0x00, 0x00, 0x01, 0xE0, 0, 0, 0x80, 0, 0, 0xAA, 0xBB, 0xCC];
-        process(&mut st, true, &pes1, &mut buf, &mut chunks);
-        process(&mut st, false, &[0xDD], &mut buf, &mut chunks);
-        assert!(chunks.is_empty()); // AU not yet complete
+        process(&mut st, true, &pes1, &mut out);
+        process(&mut st, false, &[0xDD], &mut out);
+        assert!(out.chunks.is_empty()); // AU not yet complete
         let pes2 = [0x00, 0x00, 0x01, 0xE0, 0, 0, 0x80, 0, 0, 0x11];
-        process(&mut st, true, &pes2, &mut buf, &mut chunks);
-        assert_eq!(chunks.len(), 1);
-        let c = chunks[0];
-        assert_eq!(&buf[c.offset as usize..(c.offset + c.size) as usize], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        let appended = process(&mut st, true, &pes2, &mut out);
+        assert_eq!(out.chunks.len(), 1);
+        assert_eq!(appended, 4);
+        let c = out.chunks[0];
+        assert_eq!(
+            &out.buf[c.offset as usize..(c.offset + c.size) as usize],
+            &[0xAA, 0xBB, 0xCC, 0xDD]
+        );
     }
 }

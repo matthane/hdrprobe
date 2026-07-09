@@ -193,8 +193,9 @@ fn scan_ts_full(
     frontier: &Frontier,
 ) -> Scan {
     let mut st = plan.streamer();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunks: Vec<Chunk> = Vec::new();
+    // Windows arrive routed per track group; until the per-track aggregation
+    // lands, only the first group's are extracted (main consumes tracks[0]).
+    let mut outs: Vec<ts::EsOut> = (0..plan.track_count()).map(|_| ts::EsOut::default()).collect();
     let mut dv = DvAggregate::default();
     // Windows arrive sequentially and each window's completed AUs are in
     // stream order, so folds are adjacent frames — cadence pairs are real.
@@ -211,20 +212,21 @@ fn scan_ts_full(
     // span, adapted from the last window's observed density.
     let mut warm_span = ts::STREAM_WINDOW_BYTES as u64 * 2;
     loop {
-        buf.clear();
-        chunks.clear();
+        for o in outs.iter_mut() {
+            o.clear();
+        }
         let pos0 = st.position() as u64;
         frontier.ensure_to(pos0.saturating_add(warm_span));
-        let more = st.next_window(data, &mut buf, &mut chunks, ts::STREAM_WINDOW_BYTES);
+        let more = st.next_window(data, &mut outs, ts::STREAM_WINDOW_BYTES);
         let used = st.position() as u64 - pos0;
         if used > 0 {
             warm_span = used + used / 4;
         }
-        es_bytes += buf.len() as u64;
+        es_bytes += outs[0].buf.len() as u64;
         if !opts.no_rpu {
             scan_chunks(
-                &buf,
-                &chunks,
+                &outs[0].buf,
+                &outs[0].chunks,
                 demux.tracks[0].nal_format,
                 &demux.tracks[0].codec,
                 &mut dv,
