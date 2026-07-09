@@ -305,8 +305,13 @@ never parse bytes native-endian.
   `TrackDemux` per *reported* track (report order: MKV by TrackNumber, MP4 by trak order, TS by
   program then PID — `parse_psi` walks the whole PAT, so a multi-program capture reports one
   track per service with `program` set; the JSON is `video_tracks[]`, the text renders one
-  track-rule group per entry, and `-q` prints one line per track tagged `[k/N]` when N > 1 —
-  single-track output is byte-identical everywhere). A second video track/PID is a DV
+  track-rule group per entry with the group's *body* indented by `render.rs::TRACK_INDENT`
+  (carried on `Colorizer::indent`: section rules shift right but keep their right edge flush
+  with the full-width track rule, kv rows deepen past the base gutter, and the reflow value
+  column follows the shift — colored and plain alike, so which sections belong to which track
+  reads at a glance), and `-q` prints one line per track tagged `[k/N]` when N > 1 —
+  single-track output is byte-identical everywhere, including its geometry: only the
+  multi-track arm ever sets a nonzero indent). A second video track/PID is a DV
   enhancement layer **only when its own config says so**: an MP4 trak / MKV TrackEntry whose
   dvcC has `bl_present == 0`, or a TS PID whose 0xB0 descriptor says `bl_present == 0` (its
   `dependency_pid` names the BL PID it folds into) or that is DV-flagged with no video
@@ -553,8 +558,10 @@ never parse bytes native-endian.
 - **Value-line reflow is terminal-only and byte-neutral everywhere else.** kv rows longer than
   the terminal wrap at their part separators (trailing ` ·`/`,`/` +`, or the unstyled double
   space before a warning chip — never mid-part, never inside a chip) with continuations
-  indented to the value column (`render.rs::wrap_line`, ANSI-aware: a break inside a styled
-  span closes it at the line end and re-opens it on the continuation). The width is
+  indented to the row's own value column — `VALUE_COL` plus the track-group indent, so a
+  multi-track body's wraps stay aligned under its shifted values (`render.rs::wrap_line`,
+  ANSI-aware: a break inside a styled span closes it at the line end and re-opens it on the
+  continuation). The width is
   `RenderOpts::wrap_width`, probed once per run by `main::terminal_width` (the stdout console
   window: Win32 `GetConsoleScreenBufferInfo` / unix `TIOCGWINSZ`) and `None` for pipes,
   redirects, `--output`, JSON/NDJSON, and quiet — so every machine-consumed stream, the corpus

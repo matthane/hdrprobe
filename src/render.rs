@@ -66,8 +66,16 @@ const LABEL_W: usize = 16;
 
 /// Visible column where values start: the 2-space gutter, the padded label,
 /// and the 2-space gap. Continuation lines of a reflowed row indent to here
-/// so wrapped values stay one aligned block under their first line.
+/// so wrapped values stay one aligned block under their first line. A
+/// track-group body shifts the whole geometry right by `Colorizer::indent`.
 const VALUE_COL: usize = 2 + LABEL_W + 2;
+
+/// Extra left margin for everything inside a multi-track track group: its
+/// section rules indent by this much (right edges stay flush with the
+/// full-width track rule) and its kv rows by this much on top of the 2-space
+/// gutter, so which HDR/DV sections belong to which track reads at a glance.
+/// Single-track reports never use it — their layout is byte-pinned.
+const TRACK_INDENT: usize = 2;
 
 /// Below this terminal width reflow stops helping — values would wrap into a
 /// sliver next to the label column — so narrower terminals get the unwrapped
@@ -90,7 +98,7 @@ const RULE_W: usize = 64;
 /// run, and only for colored text output (never quiet/JSON/pipes), so
 /// machine consumers and logs never see it.
 pub fn render_banner(theme: Theme) -> String {
-    let c = Colorizer { on: true, palette: theme.palette(), wrap: None };
+    let c = Colorizer { on: true, palette: theme.palette(), wrap: None, indent: 0 };
     let mut s = String::new();
     let _ = writeln!(s, "{}", c.bright("█ █ █▀▄ █▀█ █▀█ █▀█ █▀█ █▄▄ █▀▀"));
     let _ = writeln!(
@@ -105,7 +113,7 @@ pub fn render_banner(theme: Theme) -> String {
 
 pub fn render(r: &Report, o: &RenderOpts) -> String {
     let mut s = String::new();
-    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width };
+    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width, indent: 0 };
     let mut notes = Footnotes::default();
 
     // Each section carries one bright headline for quick glancing (General's
@@ -161,15 +169,20 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             }
             s.push('\n');
         }
+        // Everything belonging to a track renders through an indented
+        // Colorizer: its section rules shift right (right edges flush) and
+        // its rows deepen, so the full-width track rules read as the outer
+        // level at a glance. The footnote foot keeps the base geometry.
+        let ct = Colorizer { indent: TRACK_INDENT, ..c };
         for (i, t) in r.video_tracks.iter().enumerate() {
             // The track rule is structure, not a section: it always prints so
             // the per-track groups stay attributable under any --sections set.
             let _ = writeln!(s, "{}", c.section(&track_title(i, t, r)));
             if o.show_general {
-                track_general_rows(&mut s, &c, t, false);
+                track_general_rows(&mut s, &ct, t, false);
             }
             s.push('\n');
-            track_sections(&mut s, &c, t, false, o, &mut notes);
+            track_sections(&mut s, &ct, t, false, o, &mut notes);
         }
     }
 
@@ -585,7 +598,7 @@ fn report_header(file: &str, size_bytes: u64, o: &RenderOpts, c: &Colorizer) -> 
 /// — never before the first or after the last — so a single-file run and
 /// every machine path (quiet, JSON, NDJSON) are unchanged.
 pub fn render_divider(o: &RenderOpts) -> String {
-    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width };
+    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width, indent: 0 };
     format!("{}\n\n", c.bright(&"━".repeat(c.rule_width())))
 }
 
@@ -634,10 +647,13 @@ fn kv_styled(s: &mut String, c: &Colorizer, label: &str, value: &str) {
     // Char count, not byte length: a footnote marker on the label (†, ‡) is
     // multi-byte but single-column, and byte-based padding would misalign it.
     let pad = " ".repeat(LABEL_W.saturating_sub(label.chars().count()));
-    let line = format!("  {}{}  {}", c.label(label), pad, value);
+    let line = format!("{}{}{}  {}", " ".repeat(2 + c.indent), c.label(label), pad, value);
+    // The value column (and with it the whole reflow geometry) shifts with
+    // the track-group indent, so the bow-out floor shifts the same amount.
+    let value_col = VALUE_COL + c.indent;
     match c.wrap {
-        Some(w) if w >= MIN_WRAP_WIDTH => {
-            for l in wrap_line(&line, w) {
+        Some(w) if w >= MIN_WRAP_WIDTH + c.indent => {
+            for l in wrap_line(&line, w, value_col) {
                 let _ = writeln!(s, "{l}");
             }
         }
@@ -686,11 +702,11 @@ fn parse_cells(line: &str) -> Vec<Cell<'_>> {
 
 /// Re-serialize cells to a styled string, grouping runs of one style into
 /// `\x1b[..m…\x1b[0m` spans (the same open+reset shape `Colorizer::wrap`
-/// emits). `indent` prepends the value-column margin for continuation lines.
-fn render_cells(cells: &[Cell<'_>], indent: bool) -> String {
+/// emits). `indent` prepends the `value_col` margin for continuation lines.
+fn render_cells(cells: &[Cell<'_>], indent: bool, value_col: usize) -> String {
     let mut out = String::new();
     if indent {
-        out.push_str(&" ".repeat(VALUE_COL));
+        out.push_str(&" ".repeat(value_col));
     }
     let mut i = 0;
     while i < cells.len() {
@@ -720,10 +736,10 @@ fn render_cells(cells: &[Cell<'_>], indent: bool) -> String {
 /// Never inside a part, and never before the value column, so the label is
 /// untouchable. Single spaces are not candidates, which also keeps warning
 /// chips (styled spaces inside inverse video) whole.
-fn break_candidates(cells: &[Cell<'_>]) -> Vec<(usize, usize)> {
+fn break_candidates(cells: &[Cell<'_>], value_col: usize) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
     let n = cells.len();
-    for i in VALUE_COL..n {
+    for i in value_col..n {
         let next_space = i + 1 < n && cells[i + 1].ch == ' ';
         let sep = match cells[i].ch {
             '·' | ',' => next_space,
@@ -754,36 +770,37 @@ fn break_candidates(cells: &[Cell<'_>]) -> Vec<(usize, usize)> {
 }
 
 /// Greedy reflow of one rendered kv line to `width` visible columns:
-/// continuation lines indent to the value column and re-open the style
-/// active at the break. Char count is the width measure — every glyph this
-/// report emits is single-column (the same assumption the label padding
-/// makes). A line that already fits is returned byte-identical; a part too
-/// long for any break overflows to the next separator (the terminal's hard
-/// wrap takes it from there) rather than breaking mid-part.
-fn wrap_line(line: &str, width: usize) -> Vec<String> {
+/// continuation lines indent to `value_col` (the row's own value column —
+/// shifted right inside a track group) and re-open the style active at the
+/// break. Char count is the width measure — every glyph this report emits is
+/// single-column (the same assumption the label padding makes). A line that
+/// already fits is returned byte-identical; a part too long for any break
+/// overflows to the next separator (the terminal's hard wrap takes it from
+/// there) rather than breaking mid-part.
+fn wrap_line(line: &str, width: usize, value_col: usize) -> Vec<String> {
     let cells = parse_cells(line);
     if cells.len() <= width {
         return vec![line.to_string()];
     }
-    let candidates = break_candidates(&cells);
+    let candidates = break_candidates(&cells, value_col);
     let mut out = Vec::new();
     let mut start = 0usize;
     loop {
         let indent = !out.is_empty();
-        let budget = if indent { width - VALUE_COL } else { width };
+        let budget = if indent { width - value_col } else { width };
         if cells.len() - start <= budget {
-            out.push(render_cells(&cells[start..], indent));
+            out.push(render_cells(&cells[start..], indent, value_col));
             break;
         }
         let fit = candidates.iter().rev().find(|(end, _)| *end > start && end - start <= budget);
         let chosen = fit.or_else(|| candidates.iter().find(|(end, _)| *end > start));
         match chosen {
             Some(&(end, resume)) => {
-                out.push(render_cells(&cells[start..end], indent));
+                out.push(render_cells(&cells[start..end], indent, value_col));
                 start = resume;
             }
             None => {
-                out.push(render_cells(&cells[start..], indent));
+                out.push(render_cells(&cells[start..], indent, value_col));
                 break;
             }
         }
@@ -1106,6 +1123,11 @@ struct Colorizer {
     /// already threads the Colorizer; the banner and report header — the
     /// decoration paths with nothing to size — pass `None`.
     wrap: Option<usize>,
+    /// Left margin added to kv rows and section rules — `TRACK_INDENT` for a
+    /// multi-track track body, 0 everywhere else. Carried here (like `wrap`)
+    /// so the shared row/section builders shift without signature churn; the
+    /// value column and reflow geometry follow it.
+    indent: usize,
 }
 
 impl Colorizer {
@@ -1171,16 +1193,22 @@ impl Colorizer {
         self.wrap.unwrap_or(RULE_W)
     }
     /// Section header: an uppercase ruled line when coloured, the bare name
-    /// when plain.
+    /// when plain. Inside a track group (`indent` > 0) the rule shifts right
+    /// and its fill shortens so the right edge stays flush with the
+    /// full-width track rule; the plain name indents the same columns.
     fn section(&self, name: &str) -> String {
+        let margin = " ".repeat(self.indent);
         if self.on {
             let up = name.to_uppercase();
-            // "── " + name + " " + fill = rule_width() columns.
-            let fill =
-                "─".repeat(self.rule_width().saturating_sub(4).saturating_sub(up.chars().count()));
-            format!("{} {} {}", self.faint("──"), self.bright(&up), self.faint(&fill))
+            // margin + "── " + name + " " + fill = rule_width() columns.
+            let fill = "─".repeat(
+                self.rule_width()
+                    .saturating_sub(self.indent + 4)
+                    .saturating_sub(up.chars().count()),
+            );
+            format!("{}{} {} {}", margin, self.faint("──"), self.bright(&up), self.faint(&fill))
         } else {
-            name.to_string()
+            format!("{margin}{name}")
         }
     }
 }
@@ -1297,7 +1325,7 @@ mod tests {
     /// single-file report keeps its exact historical header shape.
     #[test]
     fn header_counter_multi_file_only() {
-        let c = Colorizer { on: false, palette: Theme::Paper.palette(), wrap: None };
+        let c = Colorizer { on: false, palette: Theme::Paper.palette(), wrap: None, indent: 0 };
         let single = report_header("m/movie.mkv", 1024, &opts(false, 1, 1), &c);
         assert_eq!(single, "movie.mkv  (1.00 KiB)\n");
         let multi = report_header("m/movie.mkv", 1024, &opts(false, 2, 7), &c);
@@ -1309,7 +1337,7 @@ mod tests {
     #[test]
     fn wrap_line_noop_when_it_fits() {
         let line = "  Video             HEVC (Main 10) · 3840×2160 · 23.976 fps";
-        assert_eq!(wrap_line(line, 80), vec![line.to_string()]);
+        assert_eq!(wrap_line(line, 80, VALUE_COL), vec![line.to_string()]);
     }
 
     /// An overlong plain value breaks after a ` · ` separator (the trailing
@@ -1318,7 +1346,7 @@ mod tests {
     #[test]
     fn wrap_line_breaks_at_separators_with_hanging_indent() {
         let line = "  Video             HEVC (Multiview Main 10, High tier @ L5) · 3840×2160 · 24.000 fps · 10-bit 4:2:0 · Stereoscopic 3D (2 views)";
-        let wrapped = wrap_line(line, 64);
+        let wrapped = wrap_line(line, 64, VALUE_COL);
         assert_eq!(
             wrapped,
             vec![
@@ -1337,10 +1365,10 @@ mod tests {
     /// across the wrap and never drops mid-value.
     #[test]
     fn wrap_line_reopens_style_across_the_break() {
-        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None };
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0 };
         let value = c.bright("HEVC (Multiview Main 10, High tier @ L5) · 3840×2160 · 24.000 fps");
         let line = format!("  {}{}  {}", c.label("Video"), " ".repeat(LABEL_W - 5), value);
-        let wrapped = wrap_line(&line, 64);
+        let wrapped = wrap_line(&line, 64, VALUE_COL);
         assert_eq!(wrapped.len(), 2);
         let bright = format!("\x1b[{}m", Theme::Green.palette().bright);
         // Every line's styling is self-contained: opens re-emitted, reset last.
@@ -1359,7 +1387,7 @@ mod tests {
     /// (its interior spaces are styled, so they are not candidates).
     #[test]
     fn wrap_line_moves_warning_chips_whole() {
-        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None };
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0 };
         let line = format!(
             "  {}{}  {}{}  {}",
             c.label("Mastering"),
@@ -1368,7 +1396,7 @@ mod tests {
             c.value(" · max 4000  min 0.0001 cd/m²"),
             c.warn("FEL brightness expansion")
         );
-        let wrapped = wrap_line(&line, 60);
+        let wrapped = wrap_line(&line, 60, VALUE_COL);
         assert_eq!(wrapped.len(), 2);
         let cells = parse_cells(&wrapped[1]);
         let chip: String = cells.iter().map(|c| c.ch).collect();
@@ -1475,9 +1503,10 @@ mod tests {
             test_track("HEVC", 1920, Some(false)),
         ]);
         let s = render(&two, &opts(false, 1, 1));
-        // Plain mode uses bare section names, so the track titles appear bare.
-        assert!(s.contains("Track 1 · Default"), "default-flagged track is tagged:\n{s}");
-        assert!(s.contains("Track 2"));
+        // Plain mode uses bare section names, so the track titles appear bare
+        // — at column 0, like the file-level General.
+        assert!(s.contains("\nTrack 1 · Default\n"), "default-flagged track is tagged:\n{s}");
+        assert!(s.contains("\nTrack 2\n"));
         assert!(!s.contains("Track 2 · Default"));
         assert_eq!(s.matches("Format").count(), 2, "each track repeats its sections");
         // File-level facts print once, in the General section.
@@ -1485,6 +1514,15 @@ mod tests {
         assert_eq!(s.matches("Duration").count(), 1);
         // Video rows are per track.
         assert!(s.contains("3840×2160") && s.contains("1920×1080"));
+        // Everything inside a track group indents by TRACK_INDENT: section
+        // names shift off column 0 and rows deepen past the 2-space gutter,
+        // so group membership reads at a glance. File-level rows keep the
+        // base gutter, and the single-track layout is untouched.
+        assert!(s.contains("\n  HDR\n"), "track section names indent:\n{s}");
+        assert!(!s.contains("\nHDR\n"));
+        assert!(s.contains("\n    Video "), "track rows deepen:\n{s}");
+        assert!(s.contains("\n  Container "), "file-level rows keep the base gutter:\n{s}");
+        assert!(single.contains("\nHDR\n") && single.contains("\n  Video "));
     }
 
     /// A multi-program track title carries the program instead of a default tag.
@@ -1533,13 +1571,29 @@ mod tests {
             let mut o = opts(false, 2, 7);
             o.wrap_width = Some(w);
             assert_eq!(render_divider(&o), format!("{}\n\n", "━".repeat(w)));
-            let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: Some(w) };
+            let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: Some(w), indent: 0 };
             let rule = c.section("General");
             assert_eq!(parse_cells(&rule).len(), w, "section rule not {w} columns");
         }
         // No probe: the section rule keeps the RULE_W fallback.
-        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None };
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0 };
         let rule = c.section("General");
         assert_eq!(parse_cells(&rule).len(), RULE_W);
+    }
+
+    /// A track-body section rule shifts right by the group indent but its
+    /// fill shortens to match, so the right edge stays flush with the
+    /// full-width track rule above it — probed width and fallback alike.
+    #[test]
+    fn indented_section_rule_stays_flush_right() {
+        for wrap in [Some(100), None] {
+            let c =
+                Colorizer { on: true, palette: Theme::Green.palette(), wrap, indent: TRACK_INDENT };
+            let rule = c.section("HDR");
+            let cells = parse_cells(&rule);
+            assert_eq!(cells.len(), wrap.unwrap_or(RULE_W), "right edge not flush");
+            let visible: String = cells.iter().map(|c| c.ch).collect();
+            assert!(visible.starts_with("  ── HDR "), "rule not indented: {visible:?}");
+        }
     }
 }
