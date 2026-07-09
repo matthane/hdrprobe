@@ -49,6 +49,13 @@ file and reads only the bytes it needs, so it stays fast regardless of file size
 
 ## What it reports
 
+Everything below is reported per video track. Most files carry a single video track and read
+exactly as shown above; when a file carries several (a remux with more than one cut of a title,
+or a broadcast capture with one video stream per service), each track gets its own labelled
+group in the report, and quiet mode prints one summary line per track. A Dolby Vision
+dual-layer pair (base layer plus enhancement layer) is one logical track, not two, whatever
+the container layout.
+
 ### General video info
 
 - Container, codec, and codec profile
@@ -142,9 +149,9 @@ hdrprobe reads both video files and standalone metadata sidecar files:
 
 | Input | Type | Codecs | Notes |
 |---|---|---|---|
-| MP4 / MOV | Video | HEVC, AVC, AV1 | Single or dual track; an enhancement layer may ride its own track |
-| MKV / WebM | Video | HEVC, AVC, AV1 | Single track; an enhancement layer may be interleaved into it |
-| MPEG-TS / M2TS | Video | HEVC, AVC | Single or dual track; an enhancement layer may ride its own track |
+| MP4 / MOV | Video | HEVC, AVC, AV1 | One or more video tracks; an enhancement layer may ride its own track |
+| MKV / WebM | Video | HEVC, AVC, AV1 | One or more video tracks; an enhancement layer is typically interleaved into its base track |
+| MPEG-TS / M2TS | Video | HEVC, AVC | One or more programs, each with its own video stream; an enhancement layer may ride its own PID |
 | Raw HEVC (Annex-B) | Video | HEVC | Elementary stream; profile inferred from the RPU |
 | Raw AV1 (IVF or low-overhead OBU) | Video | AV1 | Elementary stream; the RPU rides an in-band metadata OBU |
 | Dolby Vision RPU (`.bin`, `.rpu`) | Sidecar | – | Raw RPU stream (for example from `dovi_tool extract-rpu`), aggregated across every frame |
@@ -198,7 +205,7 @@ cargo build --release
 hdrprobe movie.mkv                     # default report
 hdrprobe *.mp4                         # several files
 hdrprobe --sections dv movie.mp4       # just the Dolby Vision block
-hdrprobe --json movie.mp4 | jq .dolby_vision.profile
+hdrprobe --json movie.mp4 | jq '.video_tracks[].dolby_vision.profile'
 hdrprobe --full movie.mkv              # exhaustive per-frame scan and census
 hdrprobe --no-rpu disc.m2ts            # container-level DV config only
 hdrprobe RPU.bin                       # inspect a raw Dolby Vision RPU sidecar
