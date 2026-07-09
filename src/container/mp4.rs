@@ -360,85 +360,119 @@ struct VideoTrack {
     media_timescale: u32,
 }
 
-/// Fold one or more video tracks into a single `Demux`. For the common
-/// single-track case this is a straight pass-through. For a Profile 7 dual-track
-/// pair, the widest track is the base layer (its dimensions/colour describe the
-/// picture), the DV config comes from whichever track carries a dvcC/dvvC box (the
-/// EL), and both tracks' samples are concatenated so the RPU — which rides the EL —
-/// is scanned alongside the base layer.
+/// Assemble the parsed video `trak`s into reported tracks. A trak whose
+/// dvcC/dvvC says `bl_present == 0` carries only the Dolby Vision
+/// enhancement-layer residual + RPU of another trak's picture — it is not an
+/// independent video track, so it folds into the base layer (the widest
+/// independent trak): its samples are concatenated so the RPU riding the EL is
+/// scanned alongside the BL, its DV config / static HDR fill the BL's gaps,
+/// and the pair reports as one logical track with `dv_dual_track` set. Every
+/// other trak — including a second independent video track with no dvcC, or
+/// with a `bl_present == 1` dvcC — is its own reported track, in trak order.
 fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str) -> Demux {
-    let primary = tracks
+    let is_el = |t: &VideoTrack| t.sd.dv_config.as_ref().is_some_and(|c| !c.bl_present);
+    let (els, base): (Vec<VideoTrack>, Vec<VideoTrack>) = tracks.into_iter().partition(is_el);
+    // Degenerate mux with only EL-flagged traks: report what's there rather
+    // than dropping everything (no BL exists to fold into).
+    let (els, base) = if base.is_empty() { (Vec::new(), els) } else { (els, base) };
+
+    // The fold target for any ELs: the widest independent trak is the base
+    // layer whose picture the residual enhances.
+    let fold = base
         .iter()
         .enumerate()
         .max_by_key(|(_, t)| t.sd.width as u64 * t.sd.height as u64)
         .map(|(i, _)| i)
         .unwrap_or(0);
-    let p = &tracks[primary];
 
-    // DV config / static HDR from whichever track supplies them.
-    let dv_config = tracks.iter().find_map(|t| t.sd.dv_config.clone());
-    let mastering = tracks.iter().find_map(|t| t.sd.mastering.clone());
-    let content_light = tracks.iter().find_map(|t| t.sd.content_light);
-    // Colour: prefer any track whose signalling actually resolved (a bare BL may
-    // omit its colr box / carry only an SPS the base parse can't reach).
-    let color = tracks
-        .iter()
-        .find(|t| t.sd.color.transfer.is_some())
-        .map(|t| t.sd.color.clone())
-        .unwrap_or_else(|| p.sd.color.clone());
+    let mut duration_secs: Option<f64> = None;
+    let mut out = Vec::with_capacity(base.len());
+    for (i, t) in base.into_iter().enumerate() {
+        let group_els: &[VideoTrack] = if i == fold { &els } else { &[] };
 
-    // Concatenate chunks from the base layer and any EL track sharing its NAL
-    // length prefix size (mixing sizes would misread the length fields).
-    let nal_len = p.sd.nal_len;
-    let mut chunks = p.chunks.clone();
-    for (i, t) in tracks.iter().enumerate() {
-        if i != primary && t.sd.nal_len == nal_len {
-            chunks.extend_from_slice(&t.chunks);
+        // DV config / static HDR from the trak itself, gaps filled from its
+        // folded EL (a real dual-track pair carries the dvcC on the EL trak).
+        let dv_config =
+            t.sd.dv_config.clone().or_else(|| group_els.iter().find_map(|e| e.sd.dv_config.clone()));
+        let mastering =
+            t.sd.mastering.clone().or_else(|| group_els.iter().find_map(|e| e.sd.mastering.clone()));
+        let content_light =
+            t.sd.content_light.or_else(|| group_els.iter().find_map(|e| e.sd.content_light));
+        let stereo = t.sd.stereo.clone().or_else(|| group_els.iter().find_map(|e| e.sd.stereo.clone()));
+        // Colour: prefer signalling that actually resolved (a bare BL may omit
+        // its colr box / carry only an SPS the base parse can't reach).
+        let color = if t.sd.color.transfer.is_some() {
+            t.sd.color.clone()
+        } else {
+            group_els
+                .iter()
+                .find(|e| e.sd.color.transfer.is_some())
+                .map(|e| e.sd.color.clone())
+                .unwrap_or_else(|| t.sd.color.clone())
+        };
+        // Last resort for colour: recover the VUI colour from an in-band SPS in
+        // this track's own samples (the `hev1` case), as TS does.
+        let color = if color.transfer.is_none() {
+            color_from_stream(data, &t.chunks, t.sd.nal_len).unwrap_or(color)
+        } else {
+            color
+        };
+
+        // Concatenate the folded EL's samples after the base layer's, when it
+        // shares the NAL length prefix size (mixing sizes would misread the
+        // length fields).
+        let nal_len = t.sd.nal_len;
+        let dv_dual_track = !group_els.is_empty();
+        let mut chunks = t.chunks;
+        for e in group_els {
+            if e.sd.nal_len == nal_len {
+                chunks.extend_from_slice(&e.chunks);
+            }
         }
+
+        // The stsz table (or the fragment trun index) gives every sample's
+        // encoded size, so the chunks are the exact video-stream byte count —
+        // no sample data was read. Divide by the track's own duration.
+        let stream_bytes = chunks.iter().map(|c| c.size).sum::<u64>();
+        let bitrate = crate::model::Bitrate::video_stream(
+            stream_bytes,
+            t.stream_duration_secs.or(t.duration_secs),
+        );
+
+        // File duration: the longest track's presentation length.
+        duration_secs = match (duration_secs, t.duration_secs) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+
+        out.push(TrackDemux {
+            track_number: Some(t.track_id as u64),
+            width: t.sd.width,
+            height: t.sd.height,
+            fps: t.fps,
+            bit_depth: t.sd.bit_depth,
+            chroma: t.sd.chroma.clone(),
+            codec_profile: t.sd.codec_profile.clone(),
+            stereo,
+            color,
+            dv_config,
+            dv_dual_track,
+            mastering,
+            content_light,
+            bitrate,
+            chunks,
+            ..TrackDemux::new(t.sd.codec.clone(), NalFormat::LengthPrefixed(nal_len))
+        });
     }
 
-    // Last resort for colour: some dual-track BLs carry no colr box and an hvcC
-    // whose stored SPS the base parse can't reach. Recover the VUI colour from an
-    // in-band SPS in the base-layer samples (the `hev1` case), as TS does.
-    let color = if color.transfer.is_none() {
-        color_from_stream(data, &p.chunks, p.sd.nal_len).unwrap_or(color)
-    } else {
-        color
-    };
-
-    // The stsz table (or the fragment trun index) gives every sample's encoded
-    // size, so the concatenated chunks are the exact video-stream byte count —
-    // no sample data was read. Divide by the track's own duration when known.
-    let stream_bytes = chunks.iter().map(|c| c.size).sum::<u64>();
-    let bitrate = crate::model::Bitrate::video_stream(
-        stream_bytes,
-        p.stream_duration_secs.or(p.duration_secs),
-    );
-
-    // More than one video track means a Profile-7 base/enhancement pair muxed as
-    // separate `trak`s (dual track); a single track holds an interleaved or
-    // single-layer stream. (`el_present` decides whether this is surfaced.)
-    let dv_dual_track = tracks.len() > 1;
-
-    let track = TrackDemux {
-        track_number: Some(p.track_id as u64),
-        width: p.sd.width,
-        height: p.sd.height,
-        fps: p.fps,
-        bit_depth: p.sd.bit_depth,
-        chroma: p.sd.chroma.clone(),
-        codec_profile: p.sd.codec_profile.clone(),
-        stereo: tracks.iter().find_map(|t| t.sd.stereo.clone()),
-        color,
-        dv_config,
-        dv_dual_track,
-        mastering,
-        content_light,
-        bitrate,
-        chunks,
-        ..TrackDemux::new(p.sd.codec.clone(), NalFormat::LengthPrefixed(nal_len))
-    };
-    Demux::single(container, p.duration_secs, track)
+    Demux {
+        container,
+        duration_secs,
+        tracks: out,
+        ts_stream: None,
+        mkv_stream: None,
+        raw_stream: None,
+    }
 }
 
 fn parse_video_track(
@@ -1018,6 +1052,12 @@ mod tests {
         }
     }
 
+    /// The dvcC a real dual-track Profile 7 EL trak carries: the trak holds
+    /// only the enhancement layer, so `bl_present` is 0.
+    fn dv7_el() -> DvConfig {
+        DvConfig { bl_present: false, ..dv7() }
+    }
+
     fn track(w: u32, h: u32, nal_len: u8, dv: Option<DvConfig>, chunks: usize) -> VideoTrack {
         VideoTrack {
             sd: SampleDesc {
@@ -1054,15 +1094,17 @@ mod tests {
 
     #[test]
     fn dual_track_takes_bl_dims_el_dvconfig_and_merges_chunks() {
-        // BL (4K, no dvcC) listed first; EL (1080p, dvcC) second — as in a real
-        // Profile 7 dual-track MP4.
+        // BL (4K, no dvcC) listed first; EL (1080p, dvcC with bl_present=0)
+        // second — as in a real Profile 7 dual-track MP4.
         let bl = track(3840, 2160, 4, None, 3);
-        let el = track(1920, 1080, 4, Some(dv7()), 2);
+        let el = track(1920, 1080, 4, Some(dv7_el()), 2);
         let d = assemble_tracks(&[], vec![bl, el], "MP4 (ISOBMFF)");
+        assert_eq!(d.tracks.len(), 1, "BL + EL fold into one logical track");
         let t = &d.tracks[0];
         assert_eq!((t.width, t.height), (3840, 2160), "dims from the base layer");
         assert_eq!(t.dv_config.as_ref().unwrap().profile, 7, "DV config from the EL");
         assert_eq!(t.chunks.len(), 5, "BL + EL samples both scanned for the RPU");
+        assert!(t.dv_dual_track);
     }
 
     #[test]
@@ -1070,12 +1112,43 @@ mod tests {
         // A different length-prefix size would misread the EL's NAL lengths, so it
         // must not be blindly appended; the DV config is still recovered.
         let bl = track(3840, 2160, 4, None, 3);
-        let el = track(1920, 1080, 2, Some(dv7()), 2);
+        let el = track(1920, 1080, 2, Some(dv7_el()), 2);
         let d = assemble_tracks(&[], vec![bl, el], "MP4 (ISOBMFF)");
         let t = &d.tracks[0];
         assert_eq!(t.chunks.len(), 3, "mismatched-nal-len EL chunks skipped");
         assert!(t.dv_config.is_some());
         assert!(matches!(t.nal_format, NalFormat::LengthPrefixed(4)));
+    }
+
+    #[test]
+    fn independent_second_trak_is_not_misread_as_an_el() {
+        // Two independent video traks (say a color and a black-and-white cut):
+        // no dvcC anywhere, so neither is an enhancement layer — two reported
+        // tracks in trak order, no chunk pollution, no dual-track claim.
+        let a = track(3840, 2160, 4, None, 3);
+        let mut b = track(1920, 1080, 4, None, 2);
+        b.track_id = 2;
+        let d = assemble_tracks(&[], vec![a, b], "MP4 (ISOBMFF)");
+        assert_eq!(d.tracks.len(), 2);
+        assert_eq!(d.tracks[0].track_number, Some(1));
+        assert_eq!(d.tracks[1].track_number, Some(2));
+        assert_eq!(d.tracks[0].chunks.len(), 3, "no cross-track concatenation");
+        assert_eq!(d.tracks[1].chunks.len(), 2);
+        assert!(d.tracks.iter().all(|t| !t.dv_dual_track));
+    }
+
+    #[test]
+    fn two_bl_present_dv_traks_stay_independent() {
+        // Both traks carry a bl_present=1 dvcC (e.g. two single-layer DV cuts
+        // muxed together): each is a self-contained DV track, not a BL+EL pair.
+        let a = track(3840, 2160, 4, Some(dv7()), 3);
+        let mut b = track(3840, 2160, 4, Some(dv7()), 2);
+        b.track_id = 2;
+        let d = assemble_tracks(&[], vec![a, b], "MP4 (ISOBMFF)");
+        assert_eq!(d.tracks.len(), 2);
+        assert!(d.tracks.iter().all(|t| t.dv_config.is_some() && !t.dv_dual_track));
+        assert_eq!(d.tracks[0].chunks.len(), 3);
+        assert_eq!(d.tracks[1].chunks.len(), 2);
     }
 
     #[test]
