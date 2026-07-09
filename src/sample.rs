@@ -103,7 +103,8 @@ pub fn scan(
         return scan_raw_full(data, plan, demux, opts, progress, frontier);
     }
 
-    if opts.no_rpu || demux.chunks.is_empty() {
+    let track = &demux.tracks[0];
+    if opts.no_rpu || track.chunks.is_empty() {
         return Scan {
             dv: DvAggregate::default(),
             sei: SeiFindings::default(),
@@ -114,16 +115,16 @@ pub fn scan(
         };
     }
 
-    let indices = select_indices(demux.chunks.len(), opts.samples, opts.full, demux.sps_chunk);
+    let indices = select_indices(track.chunks.len(), opts.samples, opts.full, track.sps_chunk);
 
     // Chunks index into the reassembled elementary stream when the container
     // provides one (TS/M2TS), else directly into the mmap. The frontier only
     // means anything against the file, so a heap-buffer source gets the no-op.
-    let source: &[u8] = demux.reassembled.as_deref().unwrap_or(data);
+    let source: &[u8] = track.reassembled.as_deref().unwrap_or(data);
     let off = Frontier::off();
-    let frontier = if demux.reassembled.is_none() { frontier } else { &off };
+    let frontier = if track.reassembled.is_none() { frontier } else { &off };
 
-    let selected: Vec<Chunk> = indices.iter().map(|&i| demux.chunks[i]).collect();
+    let selected: Vec<Chunk> = indices.iter().map(|&i| track.chunks[i]).collect();
     progress.begin(Phase::Scan, selected.iter().map(|c| c.size).sum());
     let mut dv = DvAggregate::default();
     // Under `--full` the selection is every AU in decode order, so consecutive
@@ -134,7 +135,7 @@ pub fn scan(
         dv.track_consecutive();
     }
     let mut sei = SeiFindings::default();
-    scan_chunks(source, &selected, demux.nal_format, &demux.codec, &mut dv, &mut sei, progress, frontier);
+    scan_chunks(source, &selected, track.nal_format, &track.codec, &mut dv, &mut sei, progress, frontier);
 
     Scan { dv, sei, es_bytes: None, frame_count: None, fps: None, duration_secs: None }
 }
@@ -224,8 +225,8 @@ fn scan_ts_full(
             scan_chunks(
                 &buf,
                 &chunks,
-                demux.nal_format,
-                &demux.codec,
+                demux.tracks[0].nal_format,
+                &demux.tracks[0].codec,
                 &mut dv,
                 &mut sei,
                 &Progress::off(),
@@ -286,8 +287,8 @@ fn scan_mkv_full(
             scan_chunks(
                 data,
                 &chunks,
-                demux.nal_format,
-                &demux.codec,
+                demux.tracks[0].nal_format,
+                &demux.tracks[0].codec,
                 &mut dv,
                 &mut sei,
                 &Progress::off(),
@@ -379,7 +380,7 @@ fn scan_raw_full(
     // exhaustive walk fed `build_demux`, now known only after this walk. The
     // rate is the walk's own measurement (IVF) or the sequence header's
     // constant rate already on the demux (OBU); raw HEVC stays duration-less.
-    let duration_secs = match (frame_count, fps.or(demux.fps)) {
+    let duration_secs = match (frame_count, fps.or(demux.tracks[0].fps)) {
         (Some(n), Some(f)) if f > 0.0 => Some(n as f64 / f),
         _ => None,
     };
@@ -398,7 +399,8 @@ fn flush_raw_batch(
     frontier: &Frontier,
 ) {
     if !no_rpu && !pending.is_empty() {
-        scan_chunks(data, pending, demux.nal_format, &demux.codec, dv, sei, &Progress::off(), frontier);
+        let track = &demux.tracks[0];
+        scan_chunks(data, pending, track.nal_format, &track.codec, dv, sei, &Progress::off(), frontier);
     }
     pending.clear();
 }
@@ -515,7 +517,7 @@ pub(crate) fn select_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ColorInfo;
+    use crate::container::TrackDemux;
 
     #[test]
     fn ts_full_scan_streams_and_counts_es_bytes() {
@@ -532,31 +534,14 @@ mod tests {
         data.extend(ts_packet(0x200, false, &[0xCD]));
 
         let layout = ts::detect_layout(&data).expect("layout");
-        let demux = Demux {
-            container: "MPEG-2 TS",
-            codec: Codec::Hevc,
-            nal_format: NalFormat::AnnexB,
-            width: 0,
-            height: 0,
-            fps: None,
-            duration_secs: None,
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-            stereo: None,
-            color: ColorInfo::default(),
-            dv_config: None,
+        let track = TrackDemux {
             dv_dual_track: true,
-            mastering: None,
-            content_light: None,
-            bitrate: None,
-            chunks: Vec::new(), // head window empty: the plan must still walk
-            sps_chunk: None,
+            // head window empty: the plan must still walk
             reassembled: Some(Vec::new()),
-            ts_stream: Some(ts::TsFullStream::new(layout, vec![0x100, 0x200])),
-            mkv_stream: None,
-            raw_stream: None,
+            ..TrackDemux::new(Codec::Hevc, NalFormat::AnnexB)
         };
+        let mut demux = Demux::single("MPEG-2 TS", None, track);
+        demux.ts_stream = Some(ts::TsFullStream::new(layout, vec![0x100, 0x200]));
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
         assert_eq!(scan(&demux, &data, &opts, &Progress::off(), &Frontier::off()).es_bytes, Some(9));
@@ -626,35 +611,15 @@ mod tests {
         let data = ebml(&[0x18, 0x53, 0x80, 0x67], &seg);
         let seg_start = data.len() - seg.len();
 
-        let demux = Demux {
-            container: "Matroska",
-            codec: Codec::Hevc,
-            nal_format: NalFormat::AnnexB,
+        // head window ignored: the plan walks
+        let track = TrackDemux {
             width: 3840,
             height: 2160,
-            fps: None,
-            duration_secs: None,
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-            stereo: None,
-            color: ColorInfo::default(),
-            dv_config: None,
-            dv_dual_track: false,
-            mastering: None,
-            content_light: None,
-            bitrate: None,
-            chunks: Vec::new(), // head window ignored: the plan walks
-            sps_chunk: None,
-            reassembled: None,
-            ts_stream: None,
-            mkv_stream: Some(crate::container::mkv::MkvFullStream::new(
-                seg_start,
-                data.len(),
-                1,
-            )),
-            raw_stream: None,
+            ..TrackDemux::new(Codec::Hevc, NalFormat::AnnexB)
         };
+        let mut demux = Demux::single("Matroska", None, track);
+        demux.mkv_stream =
+            Some(crate::container::mkv::MkvFullStream::new(seg_start, data.len(), 1));
         let total = (cll.len() + filler.len()) as u64;
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
@@ -679,31 +644,10 @@ mod tests {
             Codec::Hevc => NalFormat::AnnexB,
             _ => NalFormat::LengthPrefixed(0),
         };
-        Demux {
-            container: "raw",
-            codec,
-            nal_format,
-            width: 0,
-            height: 0,
-            fps,
-            duration_secs: None,
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-            stereo: None,
-            color: ColorInfo::default(),
-            dv_config: None,
-            dv_dual_track: false,
-            mastering: None,
-            content_light: None,
-            bitrate: None,
-            chunks: Vec::new(),
-            sps_chunk: None,
-            reassembled: None,
-            ts_stream: None,
-            mkv_stream: None,
-            raw_stream: Some(plan),
-        }
+        let track = TrackDemux { fps, ..TrackDemux::new(codec, nal_format) };
+        let mut demux = Demux::single("raw", None, track);
+        demux.raw_stream = Some(plan);
+        demux
     }
 
     #[test]
@@ -780,7 +724,7 @@ mod tests {
 
         let demux = crate::container::av1::demux(&data, true, &Progress::off(), &Frontier::off())
             .expect("valid IVF");
-        assert_eq!(demux.fps, None, "under --full the fused scan owns the rate");
+        assert_eq!(demux.tracks[0].fps, None, "under --full the fused scan owns the rate");
         assert_eq!(demux.duration_secs, None);
         assert!(demux.raw_stream.is_some());
 

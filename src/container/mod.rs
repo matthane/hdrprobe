@@ -64,15 +64,81 @@ pub struct DvConfig {
     pub bl_compatibility_id: Option<u8>,
 }
 
+/// File-level demux result: container identity, timing, and the `--full`
+/// streaming plans, plus one `TrackDemux` per reported video track.
 #[derive(Debug)]
 pub struct Demux {
     pub container: &'static str,
+    pub duration_secs: Option<f64>,
+    /// Report-ordered video tracks, always at least one. MKV orders by
+    /// TrackNumber, MP4 by `trak` order, TS by program then PID; the
+    /// single-stream backends (raw HEVC/AV1) produce exactly one.
+    pub tracks: Vec<TrackDemux>,
+    /// TS/M2TS under `--full` only: the plan `sample::scan` uses to stream the
+    /// whole video elementary stream in bounded windows (`ts::EsStreamer`)
+    /// instead of demux materializing it — the old whole-stream `reassembled`
+    /// buffer was the video track's full size (tens of GB for a UHD BD M2TS).
+    /// When `Some`, the sampler ignores the tracks' `chunks`/`reassembled`
+    /// (they hold only the head metadata window). Every other backend, and the
+    /// TS default path, leaves it `None`.
+    pub ts_stream: Option<ts::TsFullStream>,
+    /// MKV under `--full` only: the plan `sample::scan` uses to walk every
+    /// cluster in bounded windows (`mkv::BlockStreamer`), extracting each
+    /// window's blocks as they are discovered — index and scan fused into one
+    /// pass over the file. When `Some`, the sampler ignores the tracks'
+    /// `chunks` (the head metadata window). Every other backend, and the MKV
+    /// default path, leaves it `None`.
+    pub mkv_stream: Option<mkv::MkvFullStream>,
+    /// Raw elementary streams (Annex-B HEVC, AV1 OBU/IVF) under `--full` only:
+    /// demux keeps its bounded head walk for metadata and `sample::scan` walks
+    /// the whole stream itself, splitting and extracting in one fused pass —
+    /// the mirror of `ts_stream`/`mkv_stream`, so the file is read once at any
+    /// size instead of an index pass plus a scan pass. When `Some`, the
+    /// sampler ignores the track's `chunks` (the head metadata window). Every
+    /// other backend, and the raw default paths, leave it `None`.
+    pub raw_stream: Option<RawFullStream>,
+}
+
+impl Demux {
+    /// One-track constructor for the single-stream backends.
+    pub fn single(container: &'static str, duration_secs: Option<f64>, track: TrackDemux) -> Demux {
+        Demux {
+            container,
+            duration_secs,
+            tracks: vec![track],
+            ts_stream: None,
+            mkv_stream: None,
+            raw_stream: None,
+        }
+    }
+}
+
+/// One reported video track (or logical track: a DV Profile-7 BL+EL pair folds
+/// into a single entry — the EL residual is decode-only and never a track of
+/// its own in the report).
+#[derive(Debug)]
+pub struct TrackDemux {
+    // The three identity fields are written by the backends now but consumed
+    // only by the schema-2.0 report assembly; the allows come off with that
+    // change (they exist so the intermediate refactor commits stay
+    // warning-free).
+    /// Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID,
+    /// TS primary (BL) PID. `None` where no such id exists (raw streams).
+    #[allow(dead_code)]
+    pub track_number: Option<u64>,
+    /// TS `program_number` of the program this track belongs to; `None` for
+    /// every other container.
+    #[allow(dead_code)]
+    pub program: Option<u16>,
+    /// MKV FlagDefault (element 0x88, EBML default true). `None` where the
+    /// container has no such flag (MP4/TS/raw).
+    #[allow(dead_code)]
+    pub default_flag: Option<bool>,
     pub codec: Codec,
     pub nal_format: NalFormat,
     pub width: u32,
     pub height: u32,
     pub fps: Option<f64>,
-    pub duration_secs: Option<f64>,
     pub bit_depth: Option<u8>,
     pub chroma: Option<String>,
     pub codec_profile: Option<String>,
@@ -110,29 +176,36 @@ pub struct Demux {
     /// payloads). When `Some`, `chunks` index into this buffer instead of the
     /// mmap; when `None`, chunks index into the file directly.
     pub reassembled: Option<Vec<u8>>,
-    /// TS/M2TS under `--full` only: the plan `sample::scan` uses to stream the
-    /// whole video elementary stream in bounded windows (`ts::EsStreamer`)
-    /// instead of demux materializing it — the old whole-stream `reassembled`
-    /// buffer was the video track's full size (tens of GB for a UHD BD M2TS).
-    /// When `Some`, the sampler ignores `chunks`/`reassembled` (they hold only
-    /// the head metadata window). Every other backend, and the TS default
-    /// path, leaves it `None`.
-    pub ts_stream: Option<ts::TsFullStream>,
-    /// MKV under `--full` only: the plan `sample::scan` uses to walk every
-    /// cluster in bounded windows (`mkv::BlockStreamer`), extracting each
-    /// window's blocks as they are discovered — index and scan fused into one
-    /// pass over the file. When `Some`, the sampler ignores `chunks` (the head
-    /// metadata window). Every other backend, and the MKV default path, leaves
-    /// it `None`.
-    pub mkv_stream: Option<mkv::MkvFullStream>,
-    /// Raw elementary streams (Annex-B HEVC, AV1 OBU/IVF) under `--full` only:
-    /// demux keeps its bounded head walk for metadata and `sample::scan` walks
-    /// the whole stream itself, splitting and extracting in one fused pass —
-    /// the mirror of `ts_stream`/`mkv_stream`, so the file is read once at any
-    /// size instead of an index pass plus a scan pass. When `Some`, the
-    /// sampler ignores `chunks` (the head metadata window). Every other
-    /// backend, and the raw default paths, leave it `None`.
-    pub raw_stream: Option<RawFullStream>,
+}
+
+impl TrackDemux {
+    /// Zeroed/`None` track with only the codec identity filled — the
+    /// single-track backends set what they parsed and leave the rest.
+    pub fn new(codec: Codec, nal_format: NalFormat) -> TrackDemux {
+        TrackDemux {
+            track_number: None,
+            program: None,
+            default_flag: None,
+            codec,
+            nal_format,
+            width: 0,
+            height: 0,
+            fps: None,
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+            stereo: None,
+            color: ColorInfo::default(),
+            dv_config: None,
+            dv_dual_track: false,
+            mastering: None,
+            content_light: None,
+            bitrate: None,
+            chunks: Vec::new(),
+            sps_chunk: None,
+            reassembled: None,
+        }
+    }
 }
 
 /// Which raw-stream walk `sample::scan` must drive under `--full`. The walkers

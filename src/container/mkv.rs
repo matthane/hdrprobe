@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
+use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
 use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
 use crate::prefetch::Frontier;
 
@@ -411,33 +411,27 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     let mkv_stream =
         full.then_some(MkvFullStream { seg_start, seg_end, video_track: track.track_number });
 
-    Ok(Demux {
-        container: "Matroska",
-        codec: track.codec,
-        nal_format: track.nal_format,
+    // Matroska interleaves the Profile-7 BL and EL in one track, so it is
+    // always single-track (dual layer when an EL is present).
+    let tdemux = TrackDemux {
+        track_number: Some(track.track_number),
         width: track.width,
         height: track.height,
         fps,
-        duration_secs,
         bit_depth: track.bit_depth,
         chroma: track.chroma,
         codec_profile: track.codec_profile,
-        stereo: None,
         color: track.color,
         dv_config: track.dv_config,
-        // Matroska interleaves the Profile-7 BL and EL in one track, so it is
-        // always single-track (dual layer when an EL is present).
-        dv_dual_track: false,
         mastering: track.mastering,
         content_light: track.content_light,
         bitrate,
         chunks,
-        sps_chunk: None,
-        reassembled: None,
-        ts_stream: None,
-        mkv_stream,
-        raw_stream: None,
-    })
+        ..TrackDemux::new(track.codec, track.nal_format)
+    };
+    let mut demux = Demux::single("Matroska", duration_secs, tdemux);
+    demux.mkv_stream = mkv_stream;
+    Ok(demux)
 }
 
 /// Everything `sample::scan` needs to drive the exhaustive `--full` cluster

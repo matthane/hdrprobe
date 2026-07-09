@@ -7,7 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
+use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
 use crate::model::{ColorInfo, ContentLight, MasteringDisplay};
 
 struct BoxHdr {
@@ -420,14 +420,11 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
     // single-layer stream. (`el_present` decides whether this is surfaced.)
     let dv_dual_track = tracks.len() > 1;
 
-    Demux {
-        container,
-        codec: p.sd.codec.clone(),
-        nal_format: NalFormat::LengthPrefixed(nal_len),
+    let track = TrackDemux {
+        track_number: Some(p.track_id as u64),
         width: p.sd.width,
         height: p.sd.height,
         fps: p.fps,
-        duration_secs: p.duration_secs,
         bit_depth: p.sd.bit_depth,
         chroma: p.sd.chroma.clone(),
         codec_profile: p.sd.codec_profile.clone(),
@@ -439,12 +436,9 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         content_light,
         bitrate,
         chunks,
-        sps_chunk: None,
-        reassembled: None,
-        ts_stream: None,
-        mkv_stream: None,
-        raw_stream: None,
-    }
+        ..TrackDemux::new(p.sd.codec.clone(), NalFormat::LengthPrefixed(nal_len))
+    };
+    Demux::single(container, p.duration_secs, track)
 }
 
 fn parse_video_track(
@@ -1052,9 +1046,10 @@ mod tests {
     #[test]
     fn single_track_passes_through() {
         let d = assemble_tracks(&[], vec![track(3840, 2160, 4, Some(dv7()), 5)], "MP4 (ISOBMFF)");
-        assert_eq!((d.width, d.height), (3840, 2160));
-        assert_eq!(d.dv_config.unwrap().profile, 7);
-        assert_eq!(d.chunks.len(), 5);
+        let t = &d.tracks[0];
+        assert_eq!((t.width, t.height), (3840, 2160));
+        assert_eq!(t.dv_config.as_ref().unwrap().profile, 7);
+        assert_eq!(t.chunks.len(), 5);
     }
 
     #[test]
@@ -1064,9 +1059,10 @@ mod tests {
         let bl = track(3840, 2160, 4, None, 3);
         let el = track(1920, 1080, 4, Some(dv7()), 2);
         let d = assemble_tracks(&[], vec![bl, el], "MP4 (ISOBMFF)");
-        assert_eq!((d.width, d.height), (3840, 2160), "dims from the base layer");
-        assert_eq!(d.dv_config.as_ref().unwrap().profile, 7, "DV config from the EL");
-        assert_eq!(d.chunks.len(), 5, "BL + EL samples both scanned for the RPU");
+        let t = &d.tracks[0];
+        assert_eq!((t.width, t.height), (3840, 2160), "dims from the base layer");
+        assert_eq!(t.dv_config.as_ref().unwrap().profile, 7, "DV config from the EL");
+        assert_eq!(t.chunks.len(), 5, "BL + EL samples both scanned for the RPU");
     }
 
     #[test]
@@ -1076,9 +1072,10 @@ mod tests {
         let bl = track(3840, 2160, 4, None, 3);
         let el = track(1920, 1080, 2, Some(dv7()), 2);
         let d = assemble_tracks(&[], vec![bl, el], "MP4 (ISOBMFF)");
-        assert_eq!(d.chunks.len(), 3, "mismatched-nal-len EL chunks skipped");
-        assert!(d.dv_config.is_some());
-        assert!(matches!(d.nal_format, NalFormat::LengthPrefixed(4)));
+        let t = &d.tracks[0];
+        assert_eq!(t.chunks.len(), 3, "mismatched-nal-len EL chunks skipped");
+        assert!(t.dv_config.is_some());
+        assert!(matches!(t.nal_format, NalFormat::LengthPrefixed(4)));
     }
 
     #[test]

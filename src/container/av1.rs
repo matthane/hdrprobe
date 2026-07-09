@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 
 use crate::av1::obu::{obus, OBU_SEQUENCE_HEADER, OBU_TEMPORAL_DELIMITER};
 use crate::av1::seq::{parse_sequence_header, SeqInfo};
-use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream};
+use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream, TrackDemux};
 use crate::model::ColorInfo;
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
@@ -339,32 +339,22 @@ fn build_demux(
         ),
         None => (None, None, ColorInfo::default(), None),
     };
-    Demux {
-        container: label,
-        codec: Codec::Av1,
-        nal_format: NalFormat::LengthPrefixed(0), // unused for AV1 (OBU-walked)
+    // AV1 Dolby Vision (Profile 10) is single-layer, single-track.
+    let track = TrackDemux {
         width,
         height,
         fps,
-        duration_secs,
         bit_depth,
         chroma,
         codec_profile,
-        stereo: None,
         color,
-        dv_config: None,
-        // AV1 Dolby Vision (Profile 10) is single-layer, single-track.
-        dv_dual_track: false,
-        mastering: None,
-        content_light: None,
-        bitrate: None,
         chunks,
-        sps_chunk: None,
-        reassembled: None,
-        ts_stream: None,
-        mkv_stream: None,
-        raw_stream,
-    }
+        // NalFormat::LengthPrefixed(0) is unused for AV1 (OBU-walked).
+        ..TrackDemux::new(Codec::Av1, NalFormat::LengthPrefixed(0))
+    };
+    let mut demux = Demux::single(label, duration_secs, track);
+    demux.raw_stream = raw_stream;
+    demux
 }
 
 #[cfg(test)]

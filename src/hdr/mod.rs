@@ -4,11 +4,11 @@
 
 pub mod sei;
 
-use crate::container::Demux;
+use crate::container::TrackDemux;
 use crate::hdr::sei::SeiFindings;
 use crate::model::{DolbyVision, Hdr, MasteringDisplay};
 
-pub fn assemble(demux: &Demux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> Hdr {
+pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings) -> Hdr {
     let hdr10plus = sei.hdr10plus.is_some();
     // The HLG alt-transfer SEI (147) overrides the VUI transfer for the purpose
     // of format classification (VUI often signals BT.2020, SEI says HLG/PQ).

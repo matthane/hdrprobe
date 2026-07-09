@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream};
+use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream, TrackDemux};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::{parse_sps, SpsInfo};
 use crate::model::ColorInfo;
@@ -69,33 +69,23 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
     let sps_chunk = sps_offset
         .and_then(|off| chunks.iter().position(|c| c.offset <= off && off < c.offset + c.size));
 
-    Ok(Demux {
-        container: "raw HEVC (Annex-B)",
-        codec: Codec::Hevc,
-        nal_format: NalFormat::AnnexB,
+    // A raw elementary stream is a single track; a Profile-7 EL, if present,
+    // is interleaved in it (single track, dual layer).
+    let track = TrackDemux {
         width,
         height,
         fps,
-        duration_secs: None,
         bit_depth,
         chroma,
         codec_profile,
-        stereo: None,
         color,
-        dv_config: None,
-        // A raw elementary stream is a single track; a Profile-7 EL, if present,
-        // is interleaved in it (single track, dual layer).
-        dv_dual_track: false,
-        mastering: None,
-        content_light: None,
-        bitrate: None,
         chunks,
         sps_chunk,
-        reassembled: None,
-        ts_stream: None,
-        mkv_stream: None,
-        raw_stream: full.then_some(RawFullStream::HevcAnnexB),
-    })
+        ..TrackDemux::new(Codec::Hevc, NalFormat::AnnexB)
+    };
+    let mut demux = Demux::single("raw HEVC (Annex-B)", None, track);
+    demux.raw_stream = full.then_some(RawFullStream::HevcAnnexB);
+    Ok(demux)
 }
 
 /// Head scan: NAL-split the head window only, so demux cost is O(window)
@@ -321,12 +311,13 @@ mod tests {
         d.extend_from_slice(&[0, 0, 0, 1, 0x02, 0x01, 0xAA]);
 
         let dm = demux(&d, true, &Progress::off(), &Frontier::off()).unwrap();
-        assert_eq!((dm.width, dm.height), (3840, 2160), "rescued SPS fills the metadata");
+        let t = &dm.tracks[0];
+        assert_eq!((t.width, t.height), (3840, 2160), "rescued SPS fills the metadata");
         assert!(matches!(dm.raw_stream, Some(RawFullStream::HevcAnnexB)));
 
         // Default path: head window only, no rescue, no fused plan.
         let dm = demux(&d, false, &Progress::off(), &Frontier::off()).unwrap();
-        assert_eq!(dm.width, 0);
+        assert_eq!(dm.tracks[0].width, 0);
         assert!(dm.raw_stream.is_none());
     }
 

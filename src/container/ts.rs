@@ -27,7 +27,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::avc::nal as avc_nal;
-use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat};
+use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::{parse_sps, SpsInfo};
 use crate::model::{Bitrate, ColorInfo};
@@ -159,33 +159,27 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
 
     let ts_stream = full.then(|| TsFullStream { layout, video_pids: video_pids.clone() });
 
-    Ok(Demux {
-        container,
-        codec,
-        nal_format: NalFormat::AnnexB,
+    let track = TrackDemux {
         width,
         height,
         fps,
-        duration_secs,
         bit_depth,
         chroma,
         codec_profile,
-        stereo: None,
         color,
         dv_config,
         // A Profile-7 EL rides its own PID, so more than one video PID means the
         // base and enhancement layers are on separate streams (dual track).
         dv_dual_track: video_pids.len() > 1,
-        mastering: None,
-        content_light: None,
         bitrate,
         chunks,
         sps_chunk,
         reassembled: Some(buf),
-        ts_stream,
-        mkv_stream: None,
-        raw_stream: None,
-    })
+        ..TrackDemux::new(codec, NalFormat::AnnexB)
+    };
+    let mut demux = Demux::single(container, duration_secs, track);
+    demux.ts_stream = ts_stream;
+    Ok(demux)
 }
 
 // --- PSI (PAT / PMT) --------------------------------------------------------
@@ -1044,10 +1038,11 @@ mod tests {
         let full = demux(&d, true, &Progress::off(), &Frontier::off()).expect("full demux");
         let plan = full.ts_stream.as_ref().expect("full exposes the streaming plan");
         assert_eq!(plan.video_pids, [0x1011, 0x1015]);
-        assert!(full.bitrate.is_none(), "the streaming scan supplies the full-path rate");
+        let (ft, dt) = (&full.tracks[0], &default.tracks[0]);
+        assert!(ft.bitrate.is_none(), "the streaming scan supplies the full-path rate");
         // The metadata pass is the same bounded head reassembly either way.
-        assert_eq!(full.reassembled, default.reassembled);
-        assert_eq!(full.chunks.len(), 1);
+        assert_eq!(ft.reassembled, dt.reassembled);
+        assert_eq!(ft.chunks.len(), 1);
     }
 
     #[test]
