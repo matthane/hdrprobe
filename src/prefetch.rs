@@ -346,16 +346,17 @@ pub fn warm_sample_chunks(
     samples: usize,
     warmed_head: usize,
 ) {
-    // TS/M2TS chunks index into the reassembled buffer, not the file — its
-    // file-side working set (head + tail windows) is warmed by `warm_metadata`.
-    let track = &demux.tracks[0];
-    if !remote || track.reassembled.is_some() || track.chunks.is_empty() {
+    if !remote {
         return;
     }
     let mut ranges: Vec<(u64, usize)> = Vec::new();
     let mut total = 0usize;
-    for i in crate::sample::select_indices(track.chunks.len(), samples, false, track.sps_chunk) {
-        let c = track.chunks[i];
+    // `select_track_chunks` is the sampler's own file-ordered selection —
+    // sharing the function is what keeps the warm aligned with what the scan
+    // faults. It already excludes reassembled-buffer tracks (TS/M2TS, whose
+    // chunk offsets are not file positions — their file-side working set,
+    // head + tail windows, is warmed by `warm_metadata`).
+    for (_, c) in crate::sample::select_track_chunks(demux, samples, false) {
         let len = (c.size as usize).min(CHUNK_WARM_RANGE_CAP);
         // Already streamed by the metadata head warm (MKV/AV1 head chunks).
         if c.offset.saturating_add(len as u64) <= warmed_head as u64 {

@@ -510,7 +510,8 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     }
 
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
-    let scan = sample::scan(&demux, &mmap, &opts, progress, &frontier);
+    let mut scan_tracks = sample::scan(&demux, &mmap, &opts, progress, &frontier).tracks;
+    let scan = scan_tracks.swap_remove(0);
 
     let track = &demux.tracks[0];
     let is_av1 = matches!(track.codec, container::Codec::Av1);

@@ -24,7 +24,22 @@ pub struct Options {
     pub no_rpu: bool,
 }
 
+/// Per-file scan result: one `TrackScan` per `Demux::tracks` entry, parallel
+/// and in the same order.
 pub struct Scan {
+    pub tracks: Vec<TrackScan>,
+}
+
+impl Scan {
+    /// One default `TrackScan` per demux track (the `--no-rpu` / empty shape).
+    fn empty(demux: &Demux) -> Scan {
+        Scan { tracks: demux.tracks.iter().map(|_| TrackScan::default()).collect() }
+    }
+}
+
+/// What the scan learned about one video track.
+#[derive(Default)]
+pub struct TrackScan {
     pub dv: DvAggregate,
     pub sei: SeiFindings,
     /// Exact completed-AU byte total of a `--full` TS/M2TS streaming walk —
@@ -43,7 +58,7 @@ pub struct Scan {
     /// Whole-stream average fps measured by the `--full` raw IVF fused walk —
     /// the value the demux-time exhaustive walk used to compute before that
     /// walk moved here. `None` on every other path (raw OBU's rate comes from
-    /// the sequence header, already on `Demux::fps`).
+    /// the sequence header, already on the track's `fps`).
     pub fps: Option<f64>,
     /// Duration (frame count ÷ fps) recovered by the `--full` raw AV1 fused
     /// walks — raw AV1 has no duration box, so it exists only once the whole
@@ -103,41 +118,134 @@ pub fn scan(
         return scan_raw_full(data, plan, demux, opts, progress, frontier);
     }
 
-    let track = &demux.tracks[0];
-    if opts.no_rpu || track.chunks.is_empty() {
-        return Scan {
-            dv: DvAggregate::default(),
-            sei: SeiFindings::default(),
-            es_bytes: None,
-            frame_count: None,
-            fps: None,
-            duration_secs: None,
-        };
+    if opts.no_rpu || demux.tracks.iter().all(|t| t.chunks.is_empty()) {
+        return Scan::empty(demux);
     }
 
-    let indices = select_indices(track.chunks.len(), opts.samples, opts.full, track.sps_chunk);
+    // Single track — the overwhelming majority — keeps the exact historical
+    // call sequence: one selection, one scan_chunks pass.
+    if demux.tracks.len() == 1 {
+        let track = &demux.tracks[0];
+        let indices = select_indices(track.chunks.len(), opts.samples, opts.full, track.sps_chunk);
 
-    // Chunks index into the reassembled elementary stream when the container
-    // provides one (TS/M2TS), else directly into the mmap. The frontier only
-    // means anything against the file, so a heap-buffer source gets the no-op.
-    let source: &[u8] = track.reassembled.as_deref().unwrap_or(data);
-    let off = Frontier::off();
-    let frontier = if track.reassembled.is_none() { frontier } else { &off };
+        // Chunks index into the reassembled elementary stream when the container
+        // provides one (TS/M2TS), else directly into the mmap. The frontier only
+        // means anything against the file, so a heap-buffer source gets the no-op.
+        let source: &[u8] = track.reassembled.as_deref().unwrap_or(data);
+        let off = Frontier::off();
+        let frontier = if track.reassembled.is_none() { frontier } else { &off };
 
-    let selected: Vec<Chunk> = indices.iter().map(|&i| track.chunks[i]).collect();
-    progress.begin(Phase::Scan, selected.iter().map(|c| c.size).sum());
-    let mut dv = DvAggregate::default();
-    // Under `--full` the selection is every AU in decode order, so consecutive
-    // folds are adjacent frames and the cadence verdict has real pairs to
-    // compare. The sampled default folds scattered AUs — a pair spanning a
-    // sampling gap would read as a change — so it stays untracked (no verdict).
+        let selected: Vec<Chunk> = indices.iter().map(|&i| track.chunks[i]).collect();
+        progress.begin(Phase::Scan, selected.iter().map(|c| c.size).sum());
+        let mut ts = TrackScan::default();
+        // Under `--full` the selection is every AU in decode order, so consecutive
+        // folds are adjacent frames and the cadence verdict has real pairs to
+        // compare. The sampled default folds scattered AUs — a pair spanning a
+        // sampling gap would read as a change — so it stays untracked (no verdict).
+        if opts.full {
+            ts.dv.track_consecutive();
+        }
+        scan_chunks(source, &selected, track.nal_format, &track.codec, &mut ts.dv, &mut ts.sei, progress, frontier);
+        return Scan { tracks: vec![ts] };
+    }
+
+    // Multiple tracks. Mmap-backed containers (MKV, MP4) scan one merged
+    // file-ordered pass so the remote frontier stays linear and the file
+    // crosses the wire once; TS tracks each index their own reassembled
+    // buffer, so they scan per track against it (no file I/O is at stake —
+    // the buffers are already in memory — and the default path's progress
+    // sink is Off by construction).
+    let mut tracks: Vec<TrackScan> = demux.tracks.iter().map(|_| TrackScan::default()).collect();
     if opts.full {
-        dv.track_consecutive();
+        for ts in tracks.iter_mut() {
+            ts.dv.track_consecutive();
+        }
     }
-    let mut sei = SeiFindings::default();
-    scan_chunks(source, &selected, track.nal_format, &track.codec, &mut dv, &mut sei, progress, frontier);
+    if demux.tracks.iter().any(|t| t.reassembled.is_some()) {
+        progress.begin(Phase::Scan, 0);
+        for (track, ts) in demux.tracks.iter().zip(tracks.iter_mut()) {
+            let indices =
+                select_indices(track.chunks.len(), opts.samples, opts.full, track.sps_chunk);
+            let source: &[u8] = track.reassembled.as_deref().unwrap_or(data);
+            let selected: Vec<Chunk> = indices.iter().map(|&i| track.chunks[i]).collect();
+            scan_chunks(
+                source,
+                &selected,
+                track.nal_format,
+                &track.codec,
+                &mut ts.dv,
+                &mut ts.sei,
+                &Progress::off(),
+                &Frontier::off(),
+            );
+        }
+    } else {
+        let items = select_track_chunks(demux, opts.samples, opts.full);
+        progress.begin(Phase::Scan, items.iter().map(|(_, c)| c.size).sum());
+        scan_chunks_routed(data, &items, demux, &mut tracks, progress, frontier);
+    }
+    Scan { tracks }
+}
 
-    Scan { dv, sei, es_bytes: None, frame_count: None, fps: None, duration_secs: None }
+/// The default path's per-track sampled selection, merged into file order —
+/// each track's own `select_indices` (with its own SPS pin), then a stable
+/// merge by chunk offset so the pass over the file stays linear. `pub(crate)`
+/// because `prefetch::warm_sample_chunks` replays it with identical inputs:
+/// sharing the function is what keeps the warm and the sampler from drifting.
+/// Tracks whose chunks index a reassembled buffer (TS) are excluded — their
+/// offsets are not file positions.
+pub(crate) fn select_track_chunks(demux: &Demux, samples: usize, full: bool) -> Vec<(usize, Chunk)> {
+    let mut items: Vec<(usize, Chunk)> = Vec::new();
+    for (ti, track) in demux.tracks.iter().enumerate() {
+        if track.reassembled.is_some() {
+            continue;
+        }
+        for i in select_indices(track.chunks.len(), samples, full, track.sps_chunk) {
+            items.push((ti, track.chunks[i]));
+        }
+    }
+    // Each track's selection is already file-ordered; the stable sort is a
+    // merge by offset that preserves per-track index order.
+    items.sort_by_key(|(_, c)| c.offset);
+    items
+}
+
+/// The multi-track sibling of `scan_chunks`: one merged, file-ordered pass in
+/// the same `AGG_BATCH` rayon batches, routing each access unit's results into
+/// its track's aggregates during the sequential per-batch fold. Within a track
+/// the items keep that track's index order (stable merge), so the first-wins /
+/// L5-order / cadence semantics are per-track exactly as the single-track pass
+/// — never a parallel reduce of partial aggregates.
+fn scan_chunks_routed(
+    data: &[u8],
+    items: &[(usize, Chunk)],
+    demux: &Demux,
+    tracks: &mut [TrackScan],
+    progress: &Progress,
+    frontier: &Frontier,
+) {
+    let mut done: u64 = 0;
+    for batch in items.chunks(AGG_BATCH) {
+        if let Some((_, last)) = batch.last() {
+            frontier.ensure_to(last.offset + last.size);
+        }
+        let outs: Vec<(usize, ChunkScan)> = batch
+            .par_iter()
+            .map(|&(ti, c)| {
+                let t = &demux.tracks[ti];
+                (ti, extract_chunk(data, c, t.nal_format, &t.codec))
+            })
+            .collect();
+        for (ti, out) in &outs {
+            let ts = &mut tracks[*ti];
+            for rpu in &out.rpus {
+                ts.dv.add(rpu);
+            }
+            ts.sei.merge(&out.sei);
+        }
+        done += batch.iter().map(|(_, c)| c.size).sum::<u64>();
+        progress.update(done);
+    }
 }
 
 /// Extract RPUs + SEI from `chunks` in parallel batches, aggregating each
@@ -193,15 +301,16 @@ fn scan_ts_full(
     frontier: &Frontier,
 ) -> Scan {
     let mut st = plan.streamer();
-    // Windows arrive routed per track group; until the per-track aggregation
-    // lands, only the first group's are extracted (main consumes tracks[0]).
+    // Windows arrive routed per track group, each scanned into its own
+    // aggregates; the scratch buffers are reused across windows.
     let mut outs: Vec<ts::EsOut> = (0..plan.track_count()).map(|_| ts::EsOut::default()).collect();
-    let mut dv = DvAggregate::default();
-    // Windows arrive sequentially and each window's completed AUs are in
-    // stream order, so folds are adjacent frames — cadence pairs are real.
-    dv.track_consecutive();
-    let mut sei = SeiFindings::default();
-    let mut es_bytes: u64 = 0;
+    let mut tracks: Vec<TrackScan> = demux.tracks.iter().map(|_| TrackScan::default()).collect();
+    for ts in tracks.iter_mut() {
+        // Windows arrive sequentially and each group's completed AUs are in
+        // stream order, so folds are adjacent frames — cadence pairs are real.
+        ts.dv.track_consecutive();
+        ts.es_bytes = Some(0);
+    }
     // Progress by the streamer's file cursor against the whole mmap — the walk
     // reads every packet, so file position is the honest denominator. The
     // per-window `scan_chunks` gets no-op sinks; the window loop owns the
@@ -222,30 +331,25 @@ fn scan_ts_full(
         if used > 0 {
             warm_span = used + used / 4;
         }
-        es_bytes += outs[0].buf.len() as u64;
-        if !opts.no_rpu {
-            scan_chunks(
-                &outs[0].buf,
-                &outs[0].chunks,
-                demux.tracks[0].nal_format,
-                &demux.tracks[0].codec,
-                &mut dv,
-                &mut sei,
-                &Progress::off(),
-                &Frontier::off(),
-            );
+        for ((out, ts), track) in outs.iter().zip(tracks.iter_mut()).zip(&demux.tracks) {
+            *ts.es_bytes.get_or_insert(0) += out.buf.len() as u64;
+            if !opts.no_rpu {
+                scan_chunks(
+                    &out.buf,
+                    &out.chunks,
+                    track.nal_format,
+                    &track.codec,
+                    &mut ts.dv,
+                    &mut ts.sei,
+                    &Progress::off(),
+                    &Frontier::off(),
+                );
+            }
         }
         if !more {
             // The cursor stops short of EOF by a partial packet; pin 100%.
             progress.update(data.len() as u64);
-            return Scan {
-                dv,
-                sei,
-                es_bytes: Some(es_bytes),
-                frame_count: None,
-                fps: None,
-                duration_secs: None,
-            };
+            return Scan { tracks };
         }
         progress.update(st.position() as u64);
     }
@@ -269,16 +373,17 @@ fn scan_mkv_full(
     frontier: &Frontier,
 ) -> Scan {
     let mut st = plan.streamer();
-    // Blocks arrive routed per track; until the per-track aggregation lands,
-    // only the first track's are extracted (main consumes tracks[0]).
+    // Blocks arrive routed per track, each window's batches extracted into
+    // their track's aggregates — still one walk over the clusters.
     let mut outs: Vec<Vec<Chunk>> = vec![Vec::new(); plan.track_count()];
-    let mut dv = DvAggregate::default();
-    // Cluster windows arrive sequentially with blocks in stream order, so
-    // folds are adjacent frames — cadence pairs are real.
-    dv.track_consecutive();
-    let mut sei = SeiFindings::default();
-    let mut es_bytes: u64 = 0;
-    let mut frame_count: u64 = 0;
+    let mut tracks: Vec<TrackScan> = demux.tracks.iter().map(|_| TrackScan::default()).collect();
+    for ts in tracks.iter_mut() {
+        // Cluster windows arrive sequentially with blocks in stream order, so
+        // folds are adjacent frames — cadence pairs are real.
+        ts.dv.track_consecutive();
+        ts.es_bytes = Some(0);
+        ts.frame_count = Some(0);
+    }
     // One phase, one bar: position over the whole mmap, like the TS walk.
     progress.begin(Phase::Scan, data.len() as u64);
     loop {
@@ -287,31 +392,25 @@ fn scan_mkv_full(
         }
         let more =
             st.next_window(data, &mut outs, crate::container::mkv::STREAM_SPAN_BYTES, frontier);
-        let chunks = &outs[0];
-        es_bytes += chunks.iter().map(|c| c.size).sum::<u64>();
-        frame_count += chunks.len() as u64;
-        if !opts.no_rpu {
-            scan_chunks(
-                data,
-                chunks,
-                demux.tracks[0].nal_format,
-                &demux.tracks[0].codec,
-                &mut dv,
-                &mut sei,
-                &Progress::off(),
-                frontier,
-            );
+        for ((chunks, ts), track) in outs.iter().zip(tracks.iter_mut()).zip(&demux.tracks) {
+            *ts.es_bytes.get_or_insert(0) += chunks.iter().map(|c| c.size).sum::<u64>();
+            *ts.frame_count.get_or_insert(0) += chunks.len() as u64;
+            if !opts.no_rpu {
+                scan_chunks(
+                    data,
+                    chunks,
+                    track.nal_format,
+                    &track.codec,
+                    &mut ts.dv,
+                    &mut ts.sei,
+                    &Progress::off(),
+                    frontier,
+                );
+            }
         }
         if !more {
             progress.update(data.len() as u64);
-            return Scan {
-                dv,
-                sei,
-                es_bytes: Some(es_bytes),
-                frame_count: Some(frame_count),
-                fps: None,
-                duration_secs: None,
-            };
+            return Scan { tracks };
         }
         progress.update(st.position() as u64);
     }
@@ -335,6 +434,7 @@ fn scan_raw_full(
     frontier: &Frontier,
 ) -> Scan {
     progress.begin(Phase::Scan, data.len() as u64);
+    // Raw elementary streams are single-track by definition.
     let mut dv = DvAggregate::default();
     // The fused walk emits completed AUs in stream order, batch after batch,
     // so folds are adjacent frames — cadence pairs are real.
@@ -391,7 +491,7 @@ fn scan_raw_full(
         (Some(n), Some(f)) if f > 0.0 => Some(n as f64 / f),
         _ => None,
     };
-    Scan { dv, sei, es_bytes: None, frame_count, fps, duration_secs }
+    Scan { tracks: vec![TrackScan { dv, sei, es_bytes: None, frame_count, fps, duration_secs }] }
 }
 
 /// Extract one accumulated batch of the raw fused walk's access units (unless
@@ -526,6 +626,76 @@ mod tests {
     use super::*;
     use crate::container::TrackDemux;
 
+    /// Scan a single-track demux and unwrap its one `TrackScan`.
+    fn scan1(demux: &Demux, data: &[u8], opts: &Options) -> TrackScan {
+        let mut s = scan(demux, data, opts, &Progress::off(), &Frontier::off());
+        assert_eq!(s.tracks.len(), demux.tracks.len());
+        s.tracks.swap_remove(0)
+    }
+
+    #[test]
+    fn multi_track_scan_keeps_per_track_findings_isolated() {
+        // Two mmap-backed tracks whose AUs carry different CLL SEIs,
+        // interleaved in file order: each track's aggregates must see only its
+        // own values — no cross-track leakage through the merged routed pass.
+        let cll_a = sei_cll_nal(1000, 400);
+        let cll_b = sei_cll_nal(300, 60);
+        let mut data = cll_a.clone();
+        data.extend_from_slice(&cll_b);
+        let t = |offset: u64, size: u64| TrackDemux {
+            chunks: vec![Chunk { offset, size }],
+            ..TrackDemux::new(Codec::Hevc, NalFormat::AnnexB)
+        };
+        let demux = Demux {
+            container: "Matroska",
+            duration_secs: None,
+            tracks: vec![t(0, cll_a.len() as u64), t(cll_a.len() as u64, cll_b.len() as u64)],
+            ts_stream: None,
+            mkv_stream: None,
+            raw_stream: None,
+        };
+        let opts = Options { samples: 16, full: false, no_rpu: false };
+        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        assert_eq!(s.tracks.len(), 2);
+        let a = s.tracks[0].sei.content_light.expect("track 1 CLL");
+        let b = s.tracks[1].sei.content_light.expect("track 2 CLL");
+        assert_eq!((a.max_cll, a.max_fall), (1000, 400));
+        assert_eq!((b.max_cll, b.max_fall), (300, 60));
+    }
+
+    #[test]
+    fn select_track_chunks_merges_in_file_order_with_pins() {
+        // Interleaved chunk offsets across two tracks merge by offset, keeping
+        // each track's own index order and its SPS pin; a reassembled-buffer
+        // track contributes nothing (its offsets are not file positions).
+        let mk = |offsets: &[u64], sps: Option<usize>| TrackDemux {
+            chunks: offsets.iter().map(|&o| Chunk { offset: o, size: 1 }).collect(),
+            sps_chunk: sps,
+            ..TrackDemux::new(Codec::Hevc, NalFormat::AnnexB)
+        };
+        let mut ts_track = mk(&[5], None);
+        ts_track.reassembled = Some(Vec::new());
+        let demux = Demux {
+            container: "Matroska",
+            duration_secs: None,
+            tracks: vec![mk(&[0, 20, 40, 60], Some(3)), mk(&[10, 30, 50], None), ts_track],
+            ts_stream: None,
+            mkv_stream: None,
+            raw_stream: None,
+        };
+        // A tiny budget still includes each track's head run and pin.
+        let items = select_track_chunks(&demux, 2, false);
+        assert!(items.windows(2).all(|w| w[0].1.offset <= w[1].1.offset), "file-ordered");
+        assert!(items.iter().all(|&(ti, _)| ti < 2), "reassembled track excluded");
+        assert!(
+            items.iter().any(|&(ti, c)| ti == 0 && c.offset == 60),
+            "track 0's SPS pin (index 3) survives the merge"
+        );
+        // Full selection covers every chunk of both mmap tracks.
+        let items = select_track_chunks(&demux, 2, true);
+        assert_eq!(items.len(), 7);
+    }
+
     #[test]
     fn ts_full_scan_streams_and_counts_es_bytes() {
         // Dual-PID stream mirroring ts.rs's streamer tests: three completed AUs
@@ -551,11 +721,11 @@ mod tests {
         demux.ts_stream = Some(ts::TsFullStream::new(layout, vec![0x100, 0x200]));
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
-        assert_eq!(scan(&demux, &data, &opts, &Progress::off(), &Frontier::off()).es_bytes, Some(9));
+        assert_eq!(scan1(&demux, &data, &opts).es_bytes, Some(9));
         // --no-rpu still walks the stream: the exact byte count is what the
         // full-path bitrate is computed from.
         let opts = Options { samples: 16, full: true, no_rpu: true };
-        assert_eq!(scan(&demux, &data, &opts, &Progress::off(), &Frontier::off()).es_bytes, Some(9));
+        assert_eq!(scan1(&demux, &data, &opts).es_bytes, Some(9));
     }
 
     /// One 188-byte TS packet carrying exactly `payload`, adaptation-stuffed.
@@ -630,7 +800,7 @@ mod tests {
         let total = (cll.len() + filler.len()) as u64;
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
-        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        let s = scan1(&demux, &data, &opts);
         assert_eq!(s.es_bytes, Some(total));
         assert_eq!(s.frame_count, Some(2));
         let cl = s.sei.content_light.expect("CLL extracted from the streamed block");
@@ -638,7 +808,7 @@ mod tests {
 
         // --no-rpu: the walk still yields the exact totals, extraction skipped.
         let opts = Options { samples: 16, full: true, no_rpu: true };
-        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        let s = scan1(&demux, &data, &opts);
         assert_eq!(s.es_bytes, Some(total));
         assert_eq!(s.frame_count, Some(2));
         assert!(s.sei.content_light.is_none());
@@ -670,7 +840,7 @@ mod tests {
         let demux = raw_demux(Codec::Hevc, None, RawFullStream::HevcAnnexB);
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
-        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        let s = scan1(&demux, &data, &opts);
         let cl = s.sei.content_light.expect("CLL from the fused walk");
         assert_eq!((cl.max_cll, cl.max_fall), (777, 88));
         // Raw HEVC has no duration source; nothing else comes back.
@@ -680,7 +850,7 @@ mod tests {
 
         // --no-rpu: the walk is count-only, extraction skipped.
         let opts = Options { samples: 16, full: true, no_rpu: true };
-        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        let s = scan1(&demux, &data, &opts);
         assert!(s.sei.content_light.is_none());
     }
 
@@ -697,7 +867,7 @@ mod tests {
         let demux = raw_demux(Codec::Av1, Some(24.0), RawFullStream::Av1Obu);
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
-        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        let s = scan1(&demux, &data, &opts);
         assert_eq!(s.frame_count, Some(3));
         assert_eq!(s.duration_secs, Some(3.0 / 24.0));
         assert_eq!(s.fps, None, "OBU rate is the sequence header's, not the walk's");
@@ -705,7 +875,7 @@ mod tests {
         assert_eq!((cl.max_cll, cl.max_fall), (1000, 400));
 
         let opts = Options { samples: 16, full: true, no_rpu: true };
-        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        let s = scan1(&demux, &data, &opts);
         assert_eq!(s.frame_count, Some(3), "--no-rpu still walks for the totals");
         assert_eq!(s.duration_secs, Some(3.0 / 24.0));
         assert!(s.sei.content_light.is_none());
@@ -736,7 +906,7 @@ mod tests {
         assert!(demux.raw_stream.is_some());
 
         let opts = Options { samples: 16, full: true, no_rpu: false };
-        let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
+        let s = scan1(&demux, &data, &opts);
         assert_eq!(s.frame_count, Some(3));
         assert_eq!(s.fps, Some(24.0));
         assert_eq!(s.duration_secs, Some(0.125));
