@@ -171,13 +171,11 @@ Version history:
   `stereo`, `color`) and the old top-level `hdr`, `dolby_vision`, `hdr10plus` objects are now
   fields of a `video_tracks` entry, which also gains `track_number`, `program`, and `default`.
   The old `general.container`, `general.format_version`, and `general.duration_secs` moved to
-  the top level; `general` itself is gone. No field changed type, unit, or meaning. Ships in
+  the top level; `general` itself is gone. No field changed type, unit, or meaning. Also adds
+  `video_tracks[].dolby_vision.metadata_cadence`: the shot-based vs frame-by-frame authoring
+  verdict with its evidence counts, present for `--full` video scans and DV sidecars. Ships in
   hdrprobe 0.4.0. A step-by-step consumer migration guide is in
   [MIGRATION-2.0.md](MIGRATION-2.0.md).
-- **1.3**: added `dolby_vision.metadata_cadence` (additive): the shot-based vs frame-by-frame
-  authoring verdict with its evidence counts, present for `--full` video scans and DV sidecars.
-  Never shipped in a release on its own; it ships folded into 2.0 (as
-  `video_tracks[].dolby_vision.metadata_cadence`).
 - **1.2**: added `dolby_vision.mastering_primaries_mismatch` (additive). `trim_targets` now
   also includes target displays defined by the title's global L10 metadata even when no read
   trim referenced them, folded into the L8 set (a semantic broadening of `levels: [8]`, no new

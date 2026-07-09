@@ -49,7 +49,7 @@ Nothing changed type, unit, or meaning: fields just live at a new path.
 - A typical jq migration: `.dolby_vision.cm_version` becomes
   `.video_tracks[].dolby_vision.cm_version` (or `.video_tracks[0]...` if you assume
   single-track).
-- Also new in 2.0: `dolby_vision.metadata_cadence` (from the never-released 1.3) rides
-  along, present for `--full` video scans and DV sidecars.
+- Also new in 2.0: `video_tracks[].dolby_vision.metadata_cadence`, the shot-based vs
+  frame-by-frame authoring verdict, present for `--full` video scans and DV sidecars.
 
 Full field-by-field reference: [SCHEMA.md](SCHEMA.md).
