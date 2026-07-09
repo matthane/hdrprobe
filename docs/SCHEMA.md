@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 1.3**
+**Schema version: 2.0**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -48,12 +48,13 @@ process results as they stream, without holding a whole scan in memory.
 Shell, with `jq`:
 
 ```sh
-# One file: a single object
-hdrprobe --json movie.mkv | jq -r '.dolby_vision.profile'
+# One file: a single object; per-track facts live in the video_tracks array
+hdrprobe --json movie.mkv | jq -r '.video_tracks[].dolby_vision.profile'
 
 # Library scan: one object per line, filter as a stream
 hdrprobe --format ndjson -r ./library |
-  jq -r 'select(.dolby_vision) | [.file, .dolby_vision.profile] | @tsv'
+  jq -r '. as $r | .video_tracks[] | select(.dolby_vision)
+         | [$r.file, .dolby_vision.profile] | @tsv'
 ```
 
 Python, as a subprocess:
@@ -131,10 +132,11 @@ as a `"<major>.<minor>"` string. The current version is the one stated at the to
 document.
 
 The name is deliberately explicit about whose version it is, because the output contains two
-other, unrelated version fields: `general.format_version` is the version an *input* sidecar
+other, unrelated version fields: `format_version` is the version an *input* sidecar
 declares for itself (e.g. a Dolby Vision CM XML's own schema version), and
-`dolby_vision.cm_version` is Dolby's content-mapping version. `hdrprobe_schema_version`
-describes hdrprobe's output shape and nothing about the inspected file.
+`video_tracks[].dolby_vision.cm_version` is Dolby's content-mapping version.
+`hdrprobe_schema_version` describes hdrprobe's output shape and nothing about the inspected
+file.
 
 It is versioned independently of the hdrprobe release version, so an unchanged value across
 releases means exactly what a consumer wants it to mean: the output contract did not change
@@ -161,8 +163,20 @@ build until the schema version, that test, and this document are updated togethe
 
 Version history:
 
+- **2.0**: breaking restructure for multi-video-track reporting. The per-track sections moved
+  into the always-present `video_tracks` array (one entry per video track — one for ordinary
+  files, one per independent track for a multi-track MKV/MP4 or multi-program TS, and one for
+  sidecars, so consumers always iterate the array): the old `general` object's track-level
+  fields (`codec`, `codec_profile`, `width`, `height`, `fps`, `bitrate`, `bit_depth`, `chroma`,
+  `stereo`, `color`) and the old top-level `hdr`, `dolby_vision`, `hdr10plus` objects are now
+  fields of a `video_tracks` entry, which also gains `track_number`, `program`, and `default`.
+  The old `general.container`, `general.format_version`, and `general.duration_secs` moved to
+  the top level; `general` itself is gone. No field changed type, unit, or meaning. Ships in
+  hdrprobe 0.4.0.
 - **1.3**: added `dolby_vision.metadata_cadence` (additive): the shot-based vs frame-by-frame
   authoring verdict with its evidence counts, present for `--full` video scans and DV sidecars.
+  Never shipped in a release on its own; it ships folded into 2.0 (as
+  `video_tracks[].dolby_vision.metadata_cadence`).
 - **1.2**: added `dolby_vision.mastering_primaries_mismatch` (additive). `trim_targets` now
   also includes target displays defined by the title's global L10 metadata even when no read
   trim referenced them, folded into the L8 set (a semantic broadening of `levels: [8]`, no new
@@ -194,32 +208,48 @@ Version history:
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `hdrprobe_schema_version` | string | always | Version of hdrprobe's own output schema, `"<major>.<minor>"`; see Schema versioning above. Not related to the inspected file's metadata (contrast `general.format_version` and `dolby_vision.cm_version`) |
+| `hdrprobe_schema_version` | string | always | Version of hdrprobe's own output schema, `"<major>.<minor>"`; see Schema versioning above. Not related to the inspected file's metadata (contrast `format_version` and `video_tracks[].dolby_vision.cm_version`) |
 | `file` | string | always | The input path as given on the command line (or as found during a directory scan) |
 | `size_bytes` | integer | always | File size in bytes |
-| `general` | `General` | always | Container, codec, picture, and colour signalling |
-| `hdr` | `Hdr` | video inputs only | Static HDR classification and mastering info; absent for metadata sidecars, which have no base layer |
-| `dolby_vision` | `DolbyVision` | when DV metadata was found | Present when at least one RPU parsed, when the container carries a DV configuration (including under `--no-rpu`), or for a DV sidecar |
-| `hdr10plus` | `Hdr10Plus` | when HDR10+ metadata was found | Present when ST.2094-40 metadata was parsed from the stream, or for an HDR10+ JSON sidecar. Like `dolby_vision`, the object's existence is the presence signal |
+| `container` | string | always | Container or sidecar kind; see the value table below |
+| `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
+| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a multi-program TS shares one mux timeline). Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; all sidecars) |
+| `video_tracks` | array of `VideoTrack` | always, at least one entry | One entry per video track; see "Multiple video tracks" below |
 | `elapsed_ms` | float | always | Wall-clock parse time in milliseconds |
 
-## Object: `General`
+### Multiple video tracks
+
+`video_tracks` always exists and always holds at least one entry, so consumers iterate it
+unconditionally — a single-track file (the overwhelming majority) simply has one entry, and a
+metadata sidecar has one entry too (with `codec: ""`). More than one entry means the container
+carries genuinely **independent** video tracks: an MKV or MP4 with several video tracks (e.g. a
+remux carrying a color and a black-and-white cut of the same title), or a multi-program
+TS capture with one video stream per service. A Dolby Vision Profile-7 base+enhancement-layer
+pair is **one logical track** and never produces two entries, whatever the mux shape (MP4
+dual-`trak`, TS dual-PID, or an atypical dual-track MKV): the pair reports as a single entry
+with `dolby_vision.structure` = `"Dual track, dual layer"`. Track order follows the container:
+MKV by TrackNumber, MP4 by `trak` order, TS by program then PID.
+
+## Object: `VideoTrack`
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `container` | string | always | Container or sidecar kind; see the value table below |
+| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID. Absent where no such id exists (raw elementary streams, sidecars) |
+| `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
+| `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
 | `codec` | string | always | `"HEVC"`, `"AVC"`, or `"AV1"`. The empty string `""` for metadata sidecars, which carry no video |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
-| `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
 | `fps` | float | optional | Frame rate. From container timing (MP4/MKV), the SPS VUI (TS, raw HEVC), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>`. Absent when the input carries no rate signal; never guessed |
-| `duration_secs` | float | optional | Duration in seconds. Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; all sidecars) |
-| `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists |
+| `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists. The `"overall"` (file-length) fallback rate appears only when this is the file's sole video track — an overall rate attributed to one of several tracks would be a wrong number |
 | `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
 | `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"` (a reserved signalling value renders `"?"`) |
 | `stereo` | string | optional | Stereoscopic view structure from MP4 `vexu`/`stri` (MV-HEVC, DV Profile 20): `"Stereoscopic 3D (2 views)"`, `"Monoscopic (1 view)"`, or `"Multiview 3D (2+ views)"`. Absent for ordinary monoscopic video |
 | `color` | `ColorInfo` | always | Colour signalling; may be `{}` when nothing was signalled |
+| `hdr` | `Hdr` | video inputs only | Static HDR classification and mastering info; absent for metadata sidecars, which have no base layer |
+| `dolby_vision` | `DolbyVision` | when DV metadata was found | Present when at least one RPU parsed, when the container carries a DV configuration (including under `--no-rpu`), or for a DV sidecar |
+| `hdr10plus` | `Hdr10Plus` | when HDR10+ metadata was found | Present when ST.2094-40 metadata was parsed from the stream, or for an HDR10+ JSON sidecar. Like `dolby_vision`, the object's existence is the presence signal |
 
 ### `container` values
 
@@ -236,7 +266,7 @@ Video inputs:
 | `"raw AV1 (IVF)"` | AV1 in an IVF wrapper |
 | `"raw AV1 (OBU)"` | AV1 low-overhead OBU stream |
 
-Metadata sidecars (no `hdr` section, empty `codec`):
+Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
 
 | Value | Source |
 |---|---|
@@ -470,12 +500,15 @@ signal, mirroring `dolby_vision`.
 
 ## How input kind and flags affect presence
 
-**Video vs sidecar.** A video input always has `general` picture fields as available, an `hdr`
-section, and codec identification. A metadata sidecar (raw RPU, DV XML, HDR10+ JSON) has no
-picture data: `codec` is `""`, `hdr` is absent, and `width`/`height`/`duration_secs`/`bitrate`/
-`bit_depth`/`chroma`/`stereo` are absent. A DV XML additionally provides `fps` (from
-`<EditRate>`) and `format_version`; a raw RPU bin provides neither. An HDR10+ JSON sidecar has
-no `dolby_vision` section; DV sidecars have no `hdr10plus` section.
+The per-track presence notes below all describe fields of a `video_tracks` entry.
+
+**Video vs sidecar.** A video input's track entries carry picture fields as available, an
+`hdr` section, and codec identification. A metadata sidecar (raw RPU, DV XML, HDR10+ JSON) has
+no picture data: its single track entry has `codec` `""`, no `hdr`, and no `width`/`height`/
+`bitrate`/`bit_depth`/`chroma`/`stereo` (and the report-level `duration_secs` is absent). A DV
+XML additionally provides `fps` (from `<EditRate>`) and the report-level `format_version`; a
+raw RPU bin provides neither. An HDR10+ JSON sidecar has no `dolby_vision` section; DV
+sidecars have no `hdr10plus` section.
 
 **Default (sampled) run.** `dolby_vision.sampled` is `true`; `l5_active_areas` and
 `trim_targets` are unions over the sampled RPUs and may be incomplete (though the L10-defined

@@ -118,21 +118,14 @@ impl Demux {
 /// its own in the report).
 #[derive(Debug)]
 pub struct TrackDemux {
-    // The three identity fields are written by the backends now but consumed
-    // only by the schema-2.0 report assembly; the allows come off with that
-    // change (they exist so the intermediate refactor commits stay
-    // warning-free).
     /// Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID,
     /// TS primary (BL) PID. `None` where no such id exists (raw streams).
-    #[allow(dead_code)]
     pub track_number: Option<u64>,
     /// TS `program_number` of the program this track belongs to; `None` for
     /// every other container.
-    #[allow(dead_code)]
     pub program: Option<u16>,
     /// MKV FlagDefault (element 0x88, EBML default true). `None` where the
     /// container has no such flag (MP4/TS/raw).
-    #[allow(dead_code)]
     pub default_flag: Option<bool>,
     pub codec: Codec,
     pub nal_format: NalFormat,

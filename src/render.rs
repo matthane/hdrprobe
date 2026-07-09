@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::model::{BitrateScope, ColorInfo, DolbyVision, General, Report};
+use crate::model::{BitrateScope, ColorInfo, DolbyVision, Report, VideoTrack};
 
 pub struct RenderOpts {
     pub color: bool,
@@ -110,64 +110,142 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
 
     // Each section carries one bright headline for quick glancing (General's
     // Video, HDR's Format, DV's and HDR10+'s Profile) — video inputs only. A
-    // metadata sidecar (no codec) surfaces too few lines for a single bold
-    // value to read as anything but odd, so its report stays headline-free.
-    let sidecar = r.general.codec.is_empty();
+    // metadata sidecar (no codec, always single-track) surfaces too few lines
+    // for a single bold value to read as anything but odd, so its report stays
+    // headline-free.
+    let multi = r.video_tracks.len() > 1;
+    let sidecar = !multi && r.video_tracks[0].codec.is_empty();
 
     s.push_str(&report_header(&r.file, r.size_bytes, o, &c));
     s.push('\n');
 
-    if o.show_general {
-        let _ = writeln!(s, "{}", c.section("General"));
-        kv(&mut s, &c, "Container", &r.general.container);
-        // Sidecar schema version (a DV XML's root `version` attribute); video
-        // inputs never carry one, so the line only appears for sidecars.
-        if let Some(v) = &r.general.format_version {
-            kv(&mut s, &c, "Schema version", v);
-        }
-        if let Some(d) = r.general.duration_secs {
-            kv(&mut s, &c, "Duration", &human_duration(d));
-        }
-        // Video files show fps in the Video line; a metadata-only sidecar (no
-        // codec) has no Video line, so it surfaces its frame rate on its own.
-        if sidecar {
-            if let Some(fps) = r.general.fps {
-                kv(&mut s, &c, "Frame rate", &format!("{:.3} fps", fps));
+    if !multi {
+        // Single track — the overwhelming majority — keeps the historical
+        // layout exactly: one General section interleaving the file-level and
+        // track-level rows, then the track's HDR/DV/HDR10+ sections.
+        let t = &r.video_tracks[0];
+        if o.show_general {
+            let _ = writeln!(s, "{}", c.section("General"));
+            kv(&mut s, &c, "Container", &r.container);
+            // Sidecar schema version (a DV XML's root `version` attribute); video
+            // inputs never carry one, so the line only appears for sidecars.
+            if let Some(v) = &r.format_version {
+                kv(&mut s, &c, "Schema version", v);
             }
+            if let Some(d) = r.duration_secs {
+                kv(&mut s, &c, "Duration", &human_duration(d));
+            }
+            // Video files show fps in the Video line; a metadata-only sidecar (no
+            // codec) has no Video line, so it surfaces its frame rate on its own.
+            if sidecar {
+                if let Some(fps) = t.fps {
+                    kv(&mut s, &c, "Frame rate", &format!("{:.3} fps", fps));
+                }
+            }
+            track_general_rows(&mut s, &c, t, sidecar);
+            s.push('\n');
         }
-        if let Some(br) = &r.general.bitrate {
-            let scope = match br.scope {
-                BitrateScope::VideoStream => "video stream",
-                BitrateScope::Overall => "overall",
-            };
-            kv_styled(
-                &mut s,
-                &c,
-                "Bitrate",
-                &format!("{}{}", c.value(&human_bitrate(br.bits_per_sec)), c.tag(scope)),
-            );
+        track_sections(&mut s, &c, t, sidecar, o, &mut notes);
+    } else {
+        // Multi-track: the General section keeps only the file-level facts,
+        // then each track renders under its own rule — the same Bitrate/Video/
+        // Color rows followed by its HDR/DV/HDR10+ sections.
+        if o.show_general {
+            let _ = writeln!(s, "{}", c.section("General"));
+            kv(&mut s, &c, "Container", &r.container);
+            if let Some(v) = &r.format_version {
+                kv(&mut s, &c, "Schema version", v);
+            }
+            if let Some(d) = r.duration_secs {
+                kv(&mut s, &c, "Duration", &human_duration(d));
+            }
+            s.push('\n');
         }
-        let video = video_line(r);
-        if !video.is_empty() && !sidecar {
-            kv_styled(&mut s, &c, "Video", &c.bright(&video));
+        for (i, t) in r.video_tracks.iter().enumerate() {
+            // The track rule is structure, not a section: it always prints so
+            // the per-track groups stay attributable under any --sections set.
+            let _ = writeln!(s, "{}", c.section(&track_title(i, t, r)));
+            if o.show_general {
+                track_general_rows(&mut s, &c, t, false);
+            }
+            s.push('\n');
+            track_sections(&mut s, &c, t, false, o, &mut notes);
         }
-        let color = color_line(r);
-        if !color.is_empty() {
-            kv(&mut s, &c, "Color", &color);
-        }
-        s.push('\n');
     }
 
+    // Footnotes collected from marked labels render once at the report's
+    // foot, so per-line caveats never clutter the values they qualify (two
+    // sampled tracks share one mark — `Footnotes` dedupes identical texts).
+    // The elapsed time is JSON-only (`elapsed_ms`); the text report doesn't
+    // show it.
+    for (mark, text) in notes.lines() {
+        let _ = writeln!(s, "{}", c.faint(&format!("{mark} {text}")));
+    }
+
+    s
+}
+
+/// The rule title of one track in a multi-track report: 1-based position,
+/// plus the identity that distinguishes it — the TS program for a
+/// multi-program mux, and a "Default" tag when the container flags exactly
+/// this track as default (all-default is Matroska's default value and would
+/// be noise).
+fn track_title(i: usize, t: &VideoTrack, r: &Report) -> String {
+    let mut title = format!("Track {}", i + 1);
+    if let Some(p) = t.program {
+        let _ = write!(title, " · Program {p}");
+    }
+    if t.default == Some(true) && r.video_tracks.iter().any(|o| o.default == Some(false)) {
+        title.push_str(" · Default");
+    }
+    title
+}
+
+/// The track-level rows of the General section (Bitrate, Video, Color) —
+/// shared verbatim between the single-track layout (inside the combined
+/// General section) and each multi-track track group.
+fn track_general_rows(s: &mut String, c: &Colorizer, t: &VideoTrack, sidecar: bool) {
+    if let Some(br) = &t.bitrate {
+        let scope = match br.scope {
+            BitrateScope::VideoStream => "video stream",
+            BitrateScope::Overall => "overall",
+        };
+        kv_styled(
+            s,
+            c,
+            "Bitrate",
+            &format!("{}{}", c.value(&human_bitrate(br.bits_per_sec)), c.tag(scope)),
+        );
+    }
+    let video = video_line(t);
+    if !video.is_empty() && !sidecar {
+        kv_styled(s, c, "Video", &c.bright(&video));
+    }
+    let color = color_line(t);
+    if !color.is_empty() {
+        kv(s, c, "Color", &color);
+    }
+}
+
+/// One track's HDR / Dolby Vision / HDR10+ sections.
+fn track_sections(
+    s: &mut String,
+    c: &Colorizer,
+    t: &VideoTrack,
+    sidecar: bool,
+    o: &RenderOpts,
+    notes: &mut Footnotes,
+) {
     if o.show_hdr {
-        if let Some(hdr) = &r.hdr {
+        if let Some(hdr) = &t.hdr {
             let _ = writeln!(s, "{}", c.section("HDR"));
-            kv_styled(&mut s, &c, "Format", &c.bright(&hdr.format));
+            kv_styled(s, c, "Format", &c.bright(&hdr.format));
             if let Some(m) = &hdr.mastering {
                 // Gamut first, luminance after: "DCI-P3 D65 · max 1000  min 0.0001 cd/m²".
                 let prim = m.primaries.as_ref().map(|p| format!("{p} · ")).unwrap_or_default();
                 kv(
-                    &mut s,
-                    &c,
+                    s,
+                    c,
                     "Mastering",
                     &format!("{}max {}  min {} cd/m²", prim, fmt_num(m.max_luminance), fmt_num(m.min_luminance)),
                 );
@@ -175,14 +253,14 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             if let Some(cl) = &hdr.content_light {
                 let flag = if cl.zeroed { format!("  {}", c.warn("zeroed")) } else { String::new() };
                 let light = c.value(&format!("MaxCLL {} · MaxFALL {}", cl.max_cll, cl.max_fall));
-                kv_styled(&mut s, &c, "Content light", &format!("{}{}", light, flag));
+                kv_styled(s, c, "Content light", &format!("{}{}", light, flag));
             }
             s.push('\n');
         }
     }
 
     if o.show_dv {
-        if let Some(dv) = &r.dolby_vision {
+        if let Some(dv) = &t.dolby_vision {
             let _ = writeln!(s, "{}", c.section("Dolby Vision"));
 
             if let Some(census) = &dv.census {
@@ -190,8 +268,8 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 // types). This line is census-gated, and the census only exists
                 // on a full scan (sidecars are always full; video needs --full),
                 // so an RPU count here is never a sample — no "[full scan]" tag.
-                kv(&mut s, &c, "RPU count", &dv.rpu_count.to_string());
-                kv(&mut s, &c, "Scene cuts", &census.scene_cuts.to_string());
+                kv(s, c, "RPU count", &dv.rpu_count.to_string());
+                kv(s, c, "Scene cuts", &census.scene_cuts.to_string());
             }
             // Shot-based vs frame-by-frame authoring, decided from adjacent
             // frames' DM payloads — only exhaustive stream-order reads (a
@@ -199,10 +277,10 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             // lines it never reflects a sample. The text keeps the verdict;
             // the JSON carries the pair counts behind it.
             if let Some(cad) = &dv.metadata_cadence {
-                kv(&mut s, &c, "Metadata cadence", &cad.cadence);
+                kv(s, c, "Metadata cadence", &cad.cadence);
             }
             if let Some(structure) = &dv.structure {
-                kv(&mut s, &c, "Structure", structure);
+                kv(s, c, "Structure", structure);
             }
 
             // The BL/EL/RPU carriage booleans are serialized in the JSON report
@@ -218,7 +296,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             // `profile_compat_assumed` (that flag fires only on these inputs,
             // so its old "[compat assumed]" tag no longer renders anywhere).
             if !sidecar {
-                kv_styled(&mut s, &c, "Profile", &c.bright(&dv_profile_display(dv, &r.general)));
+                kv_styled(s, c, "Profile", &c.bright(&dv_profile_display(dv, t)));
             }
 
             // The DV level only defines the codec bit-rate envelope; it says
@@ -230,7 +308,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 // Profile line. `cm_version` is stored as "CM v2.9"/"CM v4.0";
                 // drop the redundant "CM " since the label spells it out.
                 let ver = cm.strip_prefix("CM ").unwrap_or(cm);
-                kv(&mut s, &c, "Content mapping", ver);
+                kv(s, c, "Content mapping", ver);
             }
 
             // The reconstructed ("VDR") signal depth from the RPU header —
@@ -241,7 +319,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             // for FEL sidecars too: unlike the profile, these are values the
             // metadata itself carries.
             if let Some(bits) = dv.reconstructed_bit_depth {
-                kv(&mut s, &c, "Reconstruction", &format!("{bits}-bit (10-bit BL + FEL residual)"));
+                kv(s, c, "Reconstruction", &format!("{bits}-bit (10-bit BL + FEL residual)"));
             }
             // The DV grade's mastering display comes from the DM data header
             // (source_min/max_pq), not a metadata level — so it renders with the
@@ -284,7 +362,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     fmt_num(md.max_luminance),
                     fmt_num(md.min_luminance)
                 ));
-                kv_styled(&mut s, &c, "Mastering", &format!("{}{}{}{}", prim, lum, mismatch, expansion));
+                kv_styled(s, c, "Mastering", &format!("{}{}{}{}", prim, lum, mismatch, expansion));
             }
             if !dv.trim_targets.is_empty() {
                 // The target set is a union over the RPUs actually read, and the
@@ -306,7 +384,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     })
                     .collect::<Vec<_>>()
                     .join(&c.value(", "));
-                kv_styled(&mut s, &c, &format!("Trim targets{mark}"), &list);
+                kv_styled(s, c, &format!("Trim targets{mark}"), &list);
             }
             if !dv.l5_active_areas.is_empty() {
                 // The set of distinct active areas is shown inline (joined by
@@ -334,7 +412,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 } else {
                     String::new()
                 };
-                kv_styled(&mut s, &c, &format!("L5 offsets{mark}"), &format!("{}{}", c.value(&offsets), variable));
+                kv_styled(s, c, &format!("L5 offsets{mark}"), &format!("{}{}", c.value(&offsets), variable));
                 let areas = dv
                     .l5_active_areas
                     .iter()
@@ -343,7 +421,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     .collect::<Vec<_>>()
                     .join(" + ");
                 if !areas.is_empty() {
-                    kv(&mut s, &c, &format!("L5 active area{mark}"), &areas);
+                    kv(s, c, &format!("L5 active area{mark}"), &areas);
                 }
             }
             // L6's CLL fields exist to feed HDR10 signaling (CTA-861.3), which
@@ -363,7 +441,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             if let Some(l6) = dv.l6.as_ref().filter(|_| hdr10_base) {
                 let flag = if l6.zeroed { format!("  {}", c.warn("zeroed")) } else { String::new() };
                 let light = c.value(&format!("MaxCLL {} · MaxFALL {}", l6.max_cll, l6.max_fall));
-                kv_styled(&mut s, &c, "L6 content light", &format!("{}{}", light, flag));
+                kv_styled(s, c, "L6 content light", &format!("{}{}", light, flag));
             }
             // L9 folds into the Mastering line above when recognized; a
             // standalone line remains only when it couldn't ride there (no
@@ -372,7 +450,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                 dv.mastering_display.as_ref().is_some_and(|m| m.primaries.is_some());
             if !l9_on_mastering {
                 if let Some(l9) = &dv.l9_mastering {
-                    kv(&mut s, &c, "L9 mastering", l9);
+                    kv(s, c, "L9 mastering", l9);
                 }
             }
             if let Some(l11) = &dv.l11_content {
@@ -384,7 +462,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     Some(true) => " · reference mode",
                     _ => "",
                 };
-                kv(&mut s, &c, "L11 APO", &format!("{}{}{}", l11, wp, rm));
+                kv(s, c, "L11 APO", &format!("{}{}{}", l11, wp, rm));
             }
             if let Some(census) = &dv.census {
                 let levels = census
@@ -400,7 +478,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
                     .collect::<Vec<_>>()
                     .join(", ");
                 if !levels.is_empty() {
-                    kv(&mut s, &c, "Levels present", &levels);
+                    kv(s, c, "Levels present", &levels);
                 }
             }
             s.push('\n');
@@ -409,32 +487,22 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
 
     // The section exists only when HDR10+ metadata was found, like Dolby Vision.
     if o.show_hdr10plus {
-        if let Some(hp) = &r.hdr10plus {
+        if let Some(hp) = &t.hdr10plus {
             let _ = writeln!(s, "{}", c.section("HDR10+"));
             // The section's bright headline, mirroring the DV Profile line
             // (and like it, plain for an HDR10+ JSON sidecar).
             if let Some(p) = hp.profile {
                 let styled = if sidecar { c.value(&p.to_string()) } else { c.bright(&p.to_string()) };
-                kv_styled(&mut s, &c, "Profile", &styled);
+                kv_styled(s, c, "Profile", &styled);
             }
-            kv(&mut s, &c, "Application", &format!("v{}", hp.application_version));
-            kv(&mut s, &c, "Windows", &hp.num_windows.to_string());
+            kv(s, c, "Application", &format!("v{}", hp.application_version));
+            kv(s, c, "Windows", &hp.num_windows.to_string());
             if let Some(n) = hp.target_max_luminance {
-                kv(&mut s, &c, "Target", &format!("{} nits", n));
+                kv(s, c, "Target", &format!("{} nits", n));
             }
             s.push('\n');
         }
     }
-
-    // Footnotes collected from marked labels render once at the report's
-    // foot, so per-line caveats never clutter the values they qualify. The
-    // elapsed time is JSON-only (`elapsed_ms`); the text report doesn't
-    // show it.
-    for (mark, text) in notes.lines() {
-        let _ = writeln!(s, "{}", c.faint(&format!("{mark} {text}")));
-    }
-
-    s
 }
 
 /// The one caveat most reports carry: the default pipeline reads a spread of
@@ -521,23 +589,38 @@ pub fn render_divider(o: &RenderOpts) -> String {
     format!("{}\n\n", c.bright(&"━".repeat(c.rule_width())))
 }
 
-/// One-line summary for `--quiet`.
+/// One-line summary for `--quiet` — one line *per video track*: a
+/// single-track file keeps the exact historical shape, a multi-track file
+/// tags each line `[k/N]` so per-track facts stay unambiguous and
+/// grep/awk-friendly.
 pub fn render_quiet(r: &Report) -> String {
-    let mut parts = Vec::new();
-    if let Some(dv) = &r.dolby_vision {
-        parts.push(format!("DV {}", dv_profile_display(dv, &r.general)));
-    }
-    if let Some(hdr) = &r.hdr {
-        parts.push(hdr.format.clone());
-    } else if r.hdr10plus.is_some() {
-        parts.push("HDR10+".to_string());
-    } else if r.dolby_vision.is_none() {
-        parts.push("SDR".to_string());
-    }
-    if let (Some(w), Some(h)) = (r.general.width, r.general.height) {
-        parts.push(format!("{}×{}", w, h));
-    }
-    format!("{}  {}", r.file, parts.join(" · "))
+    let n = r.video_tracks.len();
+    r.video_tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut parts = Vec::new();
+            if let Some(dv) = &t.dolby_vision {
+                parts.push(format!("DV {}", dv_profile_display(dv, t)));
+            }
+            if let Some(hdr) = &t.hdr {
+                parts.push(hdr.format.clone());
+            } else if t.hdr10plus.is_some() {
+                parts.push("HDR10+".to_string());
+            } else if t.dolby_vision.is_none() {
+                parts.push("SDR".to_string());
+            }
+            if let (Some(w), Some(h)) = (t.width, t.height) {
+                parts.push(format!("{}×{}", w, h));
+            }
+            if n == 1 {
+                format!("{}  {}", r.file, parts.join(" · "))
+            } else {
+                format!("{} [{}/{}]  {}", r.file, i + 1, n, parts.join(" · "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn kv(s: &mut String, c: &Colorizer, label: &str, value: &str) {
@@ -708,8 +791,7 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn video_line(r: &Report) -> String {
-    let g = &r.general;
+fn video_line(g: &VideoTrack) -> String {
     let mut parts = Vec::new();
     let codec = match &g.codec_profile {
         Some(p) => format!("{} ({})", g.codec, p),
@@ -744,14 +826,14 @@ fn video_line(r: &Report) -> String {
     parts.join(" · ")
 }
 
-fn color_line(r: &Report) -> String {
+fn color_line(t: &VideoTrack) -> String {
     // The profile-defined colour inferences inside apply only to video inputs: a
     // metadata-only sidecar (no codec — the same signal that suppresses the Video
     // line) has no base layer whose colour they could describe.
     build_color_line(
-        &r.general.color,
-        r.dolby_vision.as_ref().map(|dv| dv.profile.as_str()),
-        !r.general.codec.is_empty(),
+        &t.color,
+        t.dolby_vision.as_ref().map(|dv| dv.profile.as_str()),
+        !t.codec.is_empty(),
     )
 }
 
@@ -825,10 +907,10 @@ fn build_color_line(cc: &ColorInfo, dv_profile: Option<&str>, has_video: bool) -
 /// `bl_compatibility_id` / `compatibility` keep exactly what the mux declares
 /// (the bare number / null), so machine consumers get the raw facts and draw
 /// their own inferences.
-fn dv_profile_display(dv: &DolbyVision, general: &General) -> String {
+fn dv_profile_display(dv: &DolbyVision, track: &VideoTrack) -> String {
     // A bare label implies no compat id was declared anywhere — a declared or
     // XML-supplied id would already have rendered the minor digit.
-    if !general.codec.is_empty() {
+    if !track.codec.is_empty() {
         // Profile 5 admits *only* compat 0 (IPT-PQ-c2, no cross-compatible
         // base — Dolby's P&L spec), so a bare "5" (a raw ES with no dvcC)
         // completes definitionally, no base-layer signal needed — the same
@@ -837,7 +919,7 @@ fn dv_profile_display(dv: &DolbyVision, general: &General) -> String {
             return "5.0".to_string();
         }
         if dv.profile == "10" {
-            if let Some(id) = infer_p10_compat(&general.color) {
+            if let Some(id) = infer_p10_compat(&track.color) {
                 return format!("10.{id}");
             }
         }
@@ -1305,24 +1387,27 @@ mod tests {
             hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
             file: "movie.mp4".to_string(),
             size_bytes: 0,
-            general: General {
-                container: "MP4 (ISOBMFF)".to_string(),
+            container: "MP4 (ISOBMFF)".to_string(),
+            format_version: None,
+            duration_secs: None,
+            video_tracks: vec![VideoTrack {
+                track_number: None,
+                program: None,
+                default: None,
                 codec: "HEVC".to_string(),
                 codec_profile: Some("Multiview Main 10, High tier @ L5".to_string()),
-                format_version: None,
                 width: Some(3840),
                 height: Some(2160),
                 fps: Some(24.0),
-                duration_secs: None,
                 bitrate: None,
                 bit_depth: Some(10),
                 chroma: Some("4:2:0".to_string()),
                 stereo: Some("Stereoscopic 3D (2 views)".to_string()),
                 color: ColorInfo::default(),
-            },
-            hdr: None,
-            dolby_vision: None,
-            hdr10plus: None,
+                hdr: None,
+                dolby_vision: None,
+                hdr10plus: None,
+            }],
             elapsed_ms: 0.0,
         };
         let plain = render(&r, &opts(false, 1, 1));
@@ -1335,6 +1420,93 @@ mod tests {
         // Below the useful floor, reflow bows out entirely.
         o.wrap_width = Some(30);
         assert_eq!(render(&r, &o), plain);
+    }
+
+    /// A bare video track for report-shape tests.
+    fn test_track(codec: &str, w: u32, default: Option<bool>) -> VideoTrack {
+        VideoTrack {
+            track_number: None,
+            program: None,
+            default,
+            codec: codec.to_string(),
+            codec_profile: None,
+            width: Some(w),
+            height: Some(w * 9 / 16),
+            fps: None,
+            bitrate: None,
+            bit_depth: None,
+            chroma: None,
+            stereo: None,
+            color: ColorInfo::default(),
+            hdr: Some(crate::model::Hdr {
+                format: "SDR".to_string(),
+                mastering: None,
+                content_light: None,
+            }),
+            dolby_vision: None,
+            hdr10plus: None,
+        }
+    }
+
+    fn test_report(tracks: Vec<VideoTrack>) -> Report {
+        Report {
+            hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
+            file: "show.mkv".to_string(),
+            size_bytes: 0,
+            container: "Matroska".to_string(),
+            format_version: None,
+            duration_secs: Some(60.0),
+            video_tracks: tracks,
+            elapsed_ms: 0.0,
+        }
+    }
+
+    /// Multi-track reports render one rule-titled group per track with the
+    /// sections repeated inside; single-track reports keep the historical
+    /// layout with no track rule at all.
+    #[test]
+    fn multi_track_report_renders_per_track_groups() {
+        let single = render(&test_report(vec![test_track("HEVC", 3840, None)]), &opts(false, 1, 1));
+        assert!(!single.contains("Track 1"), "single-track output must not grow a track rule");
+        assert_eq!(single.matches("HDR").count(), 1);
+
+        let two = test_report(vec![
+            test_track("HEVC", 3840, Some(true)),
+            test_track("HEVC", 1920, Some(false)),
+        ]);
+        let s = render(&two, &opts(false, 1, 1));
+        // Plain mode uses bare section names, so the track titles appear bare.
+        assert!(s.contains("Track 1 · Default"), "default-flagged track is tagged:\n{s}");
+        assert!(s.contains("Track 2"));
+        assert!(!s.contains("Track 2 · Default"));
+        assert_eq!(s.matches("Format").count(), 2, "each track repeats its sections");
+        // File-level facts print once, in the General section.
+        assert_eq!(s.matches("Container").count(), 1);
+        assert_eq!(s.matches("Duration").count(), 1);
+        // Video rows are per track.
+        assert!(s.contains("3840×2160") && s.contains("1920×1080"));
+    }
+
+    /// A multi-program track title carries the program instead of a default tag.
+    #[test]
+    fn track_title_carries_program_number() {
+        let mut t = test_track("HEVC", 1920, None);
+        t.program = Some(28);
+        let r = test_report(vec![test_track("HEVC", 3840, None), t]);
+        let s = render(&r, &opts(false, 1, 1));
+        assert!(s.contains("Track 2 · Program 28"), "{s}");
+    }
+
+    /// Quiet output: one line per track, tagged only when there are several.
+    #[test]
+    fn quiet_lines_per_track() {
+        let one = render_quiet(&test_report(vec![test_track("HEVC", 3840, None)]));
+        assert_eq!(one, "show.mkv  SDR · 3840×2160");
+        let two = render_quiet(&test_report(vec![
+            test_track("HEVC", 3840, None),
+            test_track("HEVC", 1920, None),
+        ]));
+        assert_eq!(two, "show.mkv [1/2]  SDR · 3840×2160\nshow.mkv [2/2]  SDR · 1920×1080");
     }
 
     /// The between-reports divider is a full-width heavy rule (`━`, distinct

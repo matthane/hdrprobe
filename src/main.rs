@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use memmap2::Mmap;
 
-use crate::model::{General, Hdr10Plus, Report};
+use crate::model::{Hdr10Plus, Report};
 use crate::render::{RenderOpts, Theme};
 
 #[derive(Parser, Debug)]
@@ -510,87 +510,98 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     }
 
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
-    let mut scan_tracks = sample::scan(&demux, &mmap, &opts, progress, &frontier).tracks;
-    let scan = scan_tracks.swap_remove(0);
+    let scan = sample::scan(&demux, &mmap, &opts, progress, &frontier);
 
-    let track = &demux.tracks[0];
-    let is_av1 = matches!(track.codec, container::Codec::Av1);
-    let mut dv = scan
-        .dv
-        .finalize(track.width, track.height, track.dv_config.as_ref(), cli.full, is_av1, track.dv_dual_track)
-        .or_else(|| track.dv_config.as_ref().map(|c| dv::levels::container_only(c, track.dv_dual_track)));
+    // Raw AV1 `--full`: duration (frames ÷ fps) exists only after the fused
+    // walk counted the frames, so it lands here instead of demux.
+    let duration_secs =
+        demux.duration_secs.or_else(|| scan.tracks.iter().find_map(|t| t.duration_secs));
 
-    // The two grade-vs-base-layer verdicts (FEL brightness expansion, mastering
-    // primaries mismatch) are only decidable here on the video path: both need
-    // the base layer's own declared mastering display (container MDCV or
-    // ST.2086 SEI), which a metadata sidecar doesn't have.
-    if let Some(dv) = dv.as_mut() {
-        let bl_mastering = track.mastering.as_ref().or(scan.sei.mastering.as_ref());
-        dv::levels::flag_fel_brightness_expansion(dv, bl_mastering.map(|m| m.max_luminance));
-        dv::levels::flag_mastering_primaries_mismatch(
-            dv,
-            bl_mastering.and_then(|m| m.primaries.as_deref()),
-        );
-    }
+    let mut video_tracks = Vec::with_capacity(demux.tracks.len());
+    for (track, scan) in demux.tracks.iter().zip(scan.tracks) {
+        let is_av1 = matches!(track.codec, container::Codec::Av1);
+        let mut dv = scan
+            .dv
+            .finalize(track.width, track.height, track.dv_config.as_ref(), cli.full, is_av1, track.dv_dual_track)
+            .or_else(|| track.dv_config.as_ref().map(|c| dv::levels::container_only(c, track.dv_dual_track)));
 
-    let hdr10plus = scan.sei.hdr10plus.map(|info| Hdr10Plus {
-        application_version: info.application_version,
-        num_windows: info.num_windows,
-        profile: (info.profile != 0).then_some(info.profile as char),
-        target_max_luminance: (info.target_max_luminance > 0).then_some(info.target_max_luminance),
-    });
-
-    let hdr = Some(hdr::assemble(track, dv.as_ref(), &scan.sei));
-
-    // Reflect the HLG/PQ alt-transfer SEI override in the displayed colour line.
-    let mut color = track.color.clone();
-    if let Some(pt) = scan.sei.preferred_transfer {
-        if let Some(t) = container::cicp_transfer(pt as u16) {
-            color.transfer = Some(t.to_string());
+        // The two grade-vs-base-layer verdicts (FEL brightness expansion,
+        // mastering primaries mismatch) are only decidable here on the video
+        // path: both need the base layer's own declared mastering display
+        // (container MDCV or ST.2086 SEI), which a metadata sidecar doesn't
+        // have. Gated on *this track's own* mastering/SEI — an independent
+        // sibling track can never lend the DV track its display, or vice versa.
+        if let Some(dv) = dv.as_mut() {
+            let bl_mastering = track.mastering.as_ref().or(scan.sei.mastering.as_ref());
+            dv::levels::flag_fel_brightness_expansion(dv, bl_mastering.map(|m| m.max_luminance));
+            dv::levels::flag_mastering_primaries_mismatch(
+                dv,
+                bl_mastering.and_then(|m| m.primaries.as_deref()),
+            );
         }
-    }
 
-    let general = General {
-        container: demux.container.to_string(),
-        codec: track.codec.label(),
-        codec_profile: track.codec_profile.clone(),
-        format_version: None,
-        width: if track.width > 0 { Some(track.width) } else { None },
-        height: if track.height > 0 { Some(track.height) } else { None },
-        // The `--full` streaming walks recover what their demux's bounded pass
-        // no longer can: raw IVF's whole-stream average rate (`scan.fps`), and
-        // for MKV without a DefaultDuration the exact frame count feeding the
-        // count ÷ duration fallback the demux's complete index used to compute
-        // — same inputs, same values.
-        fps: track.fps.or(scan.fps).or_else(|| match (scan.frame_count, demux.duration_secs) {
-            (Some(n), Some(d)) if n > 0 && d > 0.0 => Some(n as f64 / d),
-            _ => None,
-        }),
-        // Raw AV1 `--full`: duration (frames ÷ fps) exists only after the
-        // fused walk counted the frames, so it lands here instead of demux.
-        duration_secs: demux.duration_secs.or(scan.duration_secs),
-        // A container-known rate wins (MKV statistics tags); the `--full`
-        // streaming walks (TS ES bytes, MKV block bytes) fill the gap with the
-        // exact sum their demux could no longer compute — the same value the
-        // old whole-stream paths produced (`Some(0)` es_bytes ⇒ `None`, as
-        // before).
-        bitrate: track.bitrate.or_else(|| {
-            scan.es_bytes.and_then(|bytes| model::Bitrate::video_stream(bytes, demux.duration_secs))
-        }),
-        bit_depth: track.bit_depth,
-        chroma: track.chroma.clone(),
-        stereo: track.stereo.clone(),
-        color,
-    };
+        let hdr10plus = scan.sei.hdr10plus.map(|info| Hdr10Plus {
+            application_version: info.application_version,
+            num_windows: info.num_windows,
+            profile: (info.profile != 0).then_some(info.profile as char),
+            target_max_luminance: (info.target_max_luminance > 0)
+                .then_some(info.target_max_luminance),
+        });
+
+        let hdr = Some(hdr::assemble(track, dv.as_ref(), &scan.sei));
+
+        // Reflect the HLG/PQ alt-transfer SEI override in the displayed colour line.
+        let mut color = track.color.clone();
+        if let Some(pt) = scan.sei.preferred_transfer {
+            if let Some(t) = container::cicp_transfer(pt as u16) {
+                color.transfer = Some(t.to_string());
+            }
+        }
+
+        video_tracks.push(model::VideoTrack {
+            track_number: track.track_number,
+            program: track.program,
+            default: track.default_flag,
+            codec: track.codec.label(),
+            codec_profile: track.codec_profile.clone(),
+            width: if track.width > 0 { Some(track.width) } else { None },
+            height: if track.height > 0 { Some(track.height) } else { None },
+            // The `--full` streaming walks recover what their demux's bounded
+            // pass no longer can: raw IVF's whole-stream average rate
+            // (`scan.fps`), and for MKV without a DefaultDuration the exact
+            // frame count feeding the count ÷ duration fallback the demux's
+            // complete index used to compute — same inputs, same values.
+            fps: track.fps.or(scan.fps).or_else(|| match (scan.frame_count, duration_secs) {
+                (Some(n), Some(d)) if n > 0 && d > 0.0 => Some(n as f64 / d),
+                _ => None,
+            }),
+            // A container-known rate wins (MKV statistics tags); the `--full`
+            // streaming walks (TS ES bytes, MKV block bytes) fill the gap with
+            // the exact per-track sum their demux could no longer compute —
+            // the same value the old whole-stream paths produced (`Some(0)`
+            // es_bytes ⇒ `None`, as before).
+            bitrate: track.bitrate.or_else(|| {
+                scan.es_bytes
+                    .and_then(|bytes| model::Bitrate::video_stream(bytes, duration_secs))
+            }),
+            bit_depth: track.bit_depth,
+            chroma: track.chroma.clone(),
+            stereo: track.stereo.clone(),
+            color,
+            hdr,
+            dolby_vision: dv,
+            hdr10plus,
+        });
+    }
 
     Ok(Report {
         hdrprobe_schema_version: model::SCHEMA_VERSION,
         file: path.display().to_string(),
         size_bytes: size,
-        general,
-        hdr,
-        dolby_vision: dv,
-        hdr10plus,
+        container: demux.container.to_string(),
+        format_version: None,
+        duration_secs,
+        video_tracks,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
 }

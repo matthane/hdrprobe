@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 147 unit tests
+cargo test                     # 164 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -87,8 +87,10 @@ never parse bytes native-endian.
   accepts), *not* from libdovi: `CmXmlParser` never parses `<EditRate>`, folds the mastering
   display into a lossy PQ code, and reduces the version to a coarse enum, so reading the XML gives
   exact values. All sit in the file head, so it's cheap; keep them off the libdovi path. The
-  version renders as the General section's `Schema version` line (`model::General::format_version`),
-  present only when an input declares one — today only DV XML sidecars. The XML's Level-0 primaries (tagged `[L0]`) are the
+  version renders as the General section's `Schema version` line (`model::Report::format_version`),
+  present only when an input declares one — today only DV XML sidecars. A sidecar's `Report`
+  carries one `video_tracks` entry (empty `codec`) so JSON consumers iterate the array for
+  every input kind. The XML's Level-0 primaries (tagged `[L0]`) are the
   mastering-gamut fallback for a CM v2.9 XML, which has no L9; a recognized L9 wins when present,
   so CM v4.0 output is unchanged.
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
@@ -298,16 +300,33 @@ never parse bytes native-endian.
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),
   `sniff_demux` re-probes by magic bytes and is adopted only if a sniffed backend actually
   succeeds; otherwise the original, more specific error is surfaced.
-- **Layer/track structure is observed, not assumed per-container.** The report's `Structure` line
-  (`Single track, dual layer` vs `Dual track, dual layer`) is rendered only for dual-layer content
-  (an EL is present, i.e. Profile 4 or 7) and is driven by `Demux::dv_dual_track`, which each backend
-  sets from what it actually saw: MP4 from its video-`trak` count (`tracks.len() > 1`), TS/M2TS from
-  its video-PID count (a P7 EL rides its own PID, so >1 video PID), MKV/raw-HEVC/AV1 always `false`
-  (BL+EL interleaved in one track, or single-layer). So in practice MKV is always single-track; TS/M2TS
-  is dual for Profile 7 (BL and EL on separate PIDs) but single-track for legacy Profile 4, whose EL is
-  interleaved into one PID (the corpus `dv4_hevc.ts` reads `Single track, dual layer`); MP4 is either —
-  but the label follows the bytes, so an atypical mux is reported correctly rather than by rule.
-  `levels::{finalize,container_only}` gate it behind `el_present` via `structure_str`.
+- **Every independent video track is reported; a DV BL+EL pair is one logical track — and the
+  classification is per-stream signalling, never a track count.** `Demux::tracks` holds one
+  `TrackDemux` per *reported* track (report order: MKV by TrackNumber, MP4 by trak order, TS by
+  program then PID — `parse_psi` walks the whole PAT, so a multi-program capture reports one
+  track per service with `program` set; the JSON is `video_tracks[]`, the text renders one
+  track-rule group per entry, and `-q` prints one line per track tagged `[k/N]` when N > 1 —
+  single-track output is byte-identical everywhere). A second video track/PID is a DV
+  enhancement layer **only when its own config says so**: an MP4 trak / MKV TrackEntry whose
+  dvcC has `bl_present == 0`, or a TS PID whose 0xB0 descriptor says `bl_present == 0` (its
+  `dependency_pid` names the BL PID it folds into) or that is DV-flagged with no video
+  stream_type (the bare EL/RPU PID shape). Such an EL folds into its base layer's track — chunks
+  concatenated so the RPU is scanned, dvcC donated, per-track `dv_dual_track` set, rendering the
+  `Structure` line's `Dual track, dual layer` (still gated behind `el_present` via
+  `structure_str` in `levels::{finalize,container_only}`); anything else is an independent
+  track and never pollutes a sibling's scan or inherits its verdicts. One deliberate exception:
+  a TS **program with no DV descriptor anywhere** and >1 video PID keeps the historical BDMV
+  rule — an untouched Blu-ray P7 M2TS signals DV via the playlist, not the PMT, so its BL+EL
+  PID pair is one dual-track group. Legacy Profile 4 interleaves its EL in one PID/track and
+  stays `Single track, dual layer` (corpus `dv4_hevc.ts`). Latency: single-track files keep the
+  identical I/O and call sequence; a multi-video TS scales its head packet budget by group
+  count (capped, `ts::HEAD_BUDGET_MAX_SCALE`) while the prefetch head warm stays
+  `HEAD_SCAN_BYTES` — the overflow on those rare files is a bounded cold read. Under `--full`
+  every walk stays single-pass: the MKV/TS streamers fan blocks/AUs into per-track lists in one
+  walk, and `sample.rs` aggregates per track (`Scan::tracks` parallels `Demux::tracks`;
+  mmap-backed multi-track files scan one merged file-ordered pass over `select_track_chunks`,
+  the same selection `prefetch::warm_sample_chunks` replays) — never one pass per track, never
+  a parallel reduce.
 - **Profile number authority.** libdovi's `dovi_profile` can't express AV1 P10 (returns 5/8),
   so `levels::finalize` takes the profile number from the container dvcC when present, else 10
   for AV1. Don't trust the RPU's profile field for the number.

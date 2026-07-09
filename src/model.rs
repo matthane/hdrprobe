@@ -16,49 +16,58 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "1.3";
+pub const SCHEMA_VERSION: &str = "2.0";
 
 #[derive(Debug, Serialize)]
 pub struct Report {
     /// hdrprobe's own output-schema version (`SCHEMA_VERSION`). The name spells
-    /// out whose schema it is: `general.format_version` is the *input's* declared
+    /// out whose schema it is: `format_version` is the *input's* declared
     /// version (e.g. a DV CM XML's), and `dolby_vision.cm_version` is Dolby's
     /// content-mapping version — this field is neither.
     pub hdrprobe_schema_version: &'static str,
     pub file: String,
     pub size_bytes: u64,
-    pub general: General,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hdr: Option<Hdr>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dolby_vision: Option<DolbyVision>,
-    /// Present only when HDR10+ metadata was found, mirroring `dolby_vision`:
-    /// the object's existence *is* the presence signal.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hdr10plus: Option<Hdr10Plus>,
-    /// Wall-clock parse time in milliseconds.
-    pub elapsed_ms: f64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct General {
     pub container: String,
-    pub codec: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codec_profile: Option<String>,
     /// Sidecar schema version, e.g. "4.0.2" from a DV CM XML's root
     /// `<DolbyLabsMDF version=…>` attribute. `None` for video inputs and
     /// sidecars that don't declare one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
+    /// One entry per video track, always at least one. A single-track file —
+    /// the overwhelming majority — has exactly one; an MKV/MP4 carrying
+    /// independent video tracks (e.g. a color and a black-and-white cut) or a
+    /// multi-program TS has one per track. A Dolby Vision Profile-7 BL+EL pair
+    /// is one *logical* track, never two entries. Metadata sidecars carry one
+    /// entry too (empty `codec`), so consumers always iterate the array.
+    pub video_tracks: Vec<VideoTrack>,
+    /// Wall-clock parse time in milliseconds.
+    pub elapsed_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VideoTrack {
+    /// Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID,
+    /// TS the base layer's PID. Absent where no such id exists (raw elementary
+    /// streams, sidecars).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track_number: Option<u64>,
+    /// TS `program_number`, present only for a multi-program mux.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program: Option<u16>,
+    /// MKV FlagDefault (absent for containers without such a flag).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
+    pub codec: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fps: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_secs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate: Option<Bitrate>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +80,14 @@ pub struct General {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stereo: Option<String>,
     pub color: ColorInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdr: Option<Hdr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dolby_vision: Option<DolbyVision>,
+    /// Present only when HDR10+ metadata was found, mirroring `dolby_vision`:
+    /// the object's existence *is* the presence signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdr10plus: Option<Hdr10Plus>,
 }
 
 /// Average bitrate. `scope` says whether it's the exact video-stream rate (from a
@@ -389,25 +406,33 @@ mod tests {
             hdrprobe_schema_version: SCHEMA_VERSION,
             file: "movie.mkv".to_string(),
             size_bytes: 1,
-            general: General {
-                container: "Matroska".to_string(),
-                codec: "HEVC".to_string(),
-                codec_profile: Some("Main 10, High tier @ L5.1".to_string()),
-                format_version: Some("4.0.2".to_string()),
-                width: Some(3840),
-                height: Some(2160),
-                fps: Some(23.976),
-                duration_secs: Some(30.0),
-                bitrate: Some(Bitrate::video_stream_bps(1.0)),
-                bit_depth: Some(10),
-                chroma: Some("4:2:0".to_string()),
-                stereo: Some("Stereoscopic 3D (2 views)".to_string()),
-                color: ColorInfo {
-                    primaries: Some("BT.2020".to_string()),
-                    transfer: Some("PQ (SMPTE ST 2084)".to_string()),
-                    matrix: Some("BT.2020 NCL".to_string()),
-                    range: Some("limited".to_string()),
-                },
+            container: "Matroska".to_string(),
+            format_version: Some("4.0.2".to_string()),
+            duration_secs: Some(30.0),
+            video_tracks: vec![maximal_track()],
+            elapsed_ms: 5.0,
+        }
+    }
+
+    fn maximal_track() -> VideoTrack {
+        VideoTrack {
+            track_number: Some(1),
+            program: Some(28),
+            default: Some(true),
+            codec: "HEVC".to_string(),
+            codec_profile: Some("Main 10, High tier @ L5.1".to_string()),
+            width: Some(3840),
+            height: Some(2160),
+            fps: Some(23.976),
+            bitrate: Some(Bitrate::video_stream_bps(1.0)),
+            bit_depth: Some(10),
+            chroma: Some("4:2:0".to_string()),
+            stereo: Some("Stereoscopic 3D (2 views)".to_string()),
+            color: ColorInfo {
+                primaries: Some("BT.2020".to_string()),
+                transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+                matrix: Some("BT.2020 NCL".to_string()),
+                range: Some("limited".to_string()),
             },
             hdr: Some(Hdr {
                 format: "Dolby Vision / HDR10 (fallback)".to_string(),
@@ -486,7 +511,6 @@ mod tests {
                 profile: Some('B'),
                 target_max_luminance: Some(400),
             }),
-            elapsed_ms: 5.0,
         }
     }
 
@@ -523,83 +547,86 @@ mod tests {
             "hdrprobe_schema_version",
             "file",
             "size_bytes",
+            "container",
+            "format_version",
+            "duration_secs",
             "elapsed_ms",
-            "general.container",
-            "general.codec",
-            "general.codec_profile",
-            "general.format_version",
-            "general.width",
-            "general.height",
-            "general.fps",
-            "general.duration_secs",
-            "general.bitrate.bits_per_sec",
-            "general.bitrate.scope",
-            "general.bit_depth",
-            "general.chroma",
-            "general.stereo",
-            "general.color.primaries",
-            "general.color.transfer",
-            "general.color.matrix",
-            "general.color.range",
-            "hdr.format",
-            "hdr.mastering.max_luminance",
-            "hdr.mastering.min_luminance",
-            "hdr.mastering.primaries",
-            "hdr.mastering.primaries_level",
-            "hdr.content_light.max_cll",
-            "hdr.content_light.max_fall",
-            "hdr.content_light.zeroed",
-            "dolby_vision.profile",
-            "dolby_vision.profile_compat_assumed",
-            "dolby_vision.structure",
-            "dolby_vision.level",
-            "dolby_vision.bl_present",
-            "dolby_vision.el_present",
-            "dolby_vision.rpu_present",
-            "dolby_vision.el_type",
-            "dolby_vision.reconstructed_bit_depth",
-            "dolby_vision.bl_compatibility_id",
-            "dolby_vision.compatibility",
-            "dolby_vision.cm_version",
-            "dolby_vision.l5_active_areas[].width",
-            "dolby_vision.l5_active_areas[].height",
-            "dolby_vision.l5_active_areas[].left",
-            "dolby_vision.l5_active_areas[].right",
-            "dolby_vision.l5_active_areas[].top",
-            "dolby_vision.l5_active_areas[].bottom",
-            "dolby_vision.l5_assumed_canvas[]",
-            "dolby_vision.mastering_display.max_luminance",
-            "dolby_vision.mastering_display.min_luminance",
-            "dolby_vision.mastering_display.primaries",
-            "dolby_vision.mastering_display.primaries_level",
-            "dolby_vision.fel_brightness_expansion.bl_max_nits",
-            "dolby_vision.fel_brightness_expansion.rpu_max_nits",
-            "dolby_vision.mastering_primaries_mismatch.bl_primaries",
-            "dolby_vision.mastering_primaries_mismatch.rpu_primaries",
-            "dolby_vision.l6.max_cll",
-            "dolby_vision.l6.max_fall",
-            "dolby_vision.l6.max_mastering",
-            "dolby_vision.l6.min_mastering",
-            "dolby_vision.l6.zeroed",
-            "dolby_vision.l9_mastering",
-            "dolby_vision.l11_content",
-            "dolby_vision.l11_white_point",
-            "dolby_vision.l11_reference_mode",
-            "dolby_vision.trim_targets[].nits",
-            "dolby_vision.trim_targets[].levels[]",
-            "dolby_vision.rpu_count",
-            "dolby_vision.sampled",
-            "dolby_vision.metadata_cadence.cadence",
-            "dolby_vision.metadata_cadence.frame_pairs",
-            "dolby_vision.metadata_cadence.changed_pairs",
-            "dolby_vision.census.scene_cuts",
-            "dolby_vision.census.dm_version_index",
-            "dolby_vision.census.level_presence[].level",
-            "dolby_vision.census.level_presence[].rpus_with",
-            "hdr10plus.application_version",
-            "hdr10plus.num_windows",
-            "hdr10plus.profile",
-            "hdr10plus.target_max_luminance",
+            "video_tracks[].track_number",
+            "video_tracks[].program",
+            "video_tracks[].default",
+            "video_tracks[].codec",
+            "video_tracks[].codec_profile",
+            "video_tracks[].width",
+            "video_tracks[].height",
+            "video_tracks[].fps",
+            "video_tracks[].bitrate.bits_per_sec",
+            "video_tracks[].bitrate.scope",
+            "video_tracks[].bit_depth",
+            "video_tracks[].chroma",
+            "video_tracks[].stereo",
+            "video_tracks[].color.primaries",
+            "video_tracks[].color.transfer",
+            "video_tracks[].color.matrix",
+            "video_tracks[].color.range",
+            "video_tracks[].hdr.format",
+            "video_tracks[].hdr.mastering.max_luminance",
+            "video_tracks[].hdr.mastering.min_luminance",
+            "video_tracks[].hdr.mastering.primaries",
+            "video_tracks[].hdr.mastering.primaries_level",
+            "video_tracks[].hdr.content_light.max_cll",
+            "video_tracks[].hdr.content_light.max_fall",
+            "video_tracks[].hdr.content_light.zeroed",
+            "video_tracks[].dolby_vision.profile",
+            "video_tracks[].dolby_vision.profile_compat_assumed",
+            "video_tracks[].dolby_vision.structure",
+            "video_tracks[].dolby_vision.level",
+            "video_tracks[].dolby_vision.bl_present",
+            "video_tracks[].dolby_vision.el_present",
+            "video_tracks[].dolby_vision.rpu_present",
+            "video_tracks[].dolby_vision.el_type",
+            "video_tracks[].dolby_vision.reconstructed_bit_depth",
+            "video_tracks[].dolby_vision.bl_compatibility_id",
+            "video_tracks[].dolby_vision.compatibility",
+            "video_tracks[].dolby_vision.cm_version",
+            "video_tracks[].dolby_vision.l5_active_areas[].width",
+            "video_tracks[].dolby_vision.l5_active_areas[].height",
+            "video_tracks[].dolby_vision.l5_active_areas[].left",
+            "video_tracks[].dolby_vision.l5_active_areas[].right",
+            "video_tracks[].dolby_vision.l5_active_areas[].top",
+            "video_tracks[].dolby_vision.l5_active_areas[].bottom",
+            "video_tracks[].dolby_vision.l5_assumed_canvas[]",
+            "video_tracks[].dolby_vision.mastering_display.max_luminance",
+            "video_tracks[].dolby_vision.mastering_display.min_luminance",
+            "video_tracks[].dolby_vision.mastering_display.primaries",
+            "video_tracks[].dolby_vision.mastering_display.primaries_level",
+            "video_tracks[].dolby_vision.fel_brightness_expansion.bl_max_nits",
+            "video_tracks[].dolby_vision.fel_brightness_expansion.rpu_max_nits",
+            "video_tracks[].dolby_vision.mastering_primaries_mismatch.bl_primaries",
+            "video_tracks[].dolby_vision.mastering_primaries_mismatch.rpu_primaries",
+            "video_tracks[].dolby_vision.l6.max_cll",
+            "video_tracks[].dolby_vision.l6.max_fall",
+            "video_tracks[].dolby_vision.l6.max_mastering",
+            "video_tracks[].dolby_vision.l6.min_mastering",
+            "video_tracks[].dolby_vision.l6.zeroed",
+            "video_tracks[].dolby_vision.l9_mastering",
+            "video_tracks[].dolby_vision.l11_content",
+            "video_tracks[].dolby_vision.l11_white_point",
+            "video_tracks[].dolby_vision.l11_reference_mode",
+            "video_tracks[].dolby_vision.trim_targets[].nits",
+            "video_tracks[].dolby_vision.trim_targets[].levels[]",
+            "video_tracks[].dolby_vision.rpu_count",
+            "video_tracks[].dolby_vision.sampled",
+            "video_tracks[].dolby_vision.metadata_cadence.cadence",
+            "video_tracks[].dolby_vision.metadata_cadence.frame_pairs",
+            "video_tracks[].dolby_vision.metadata_cadence.changed_pairs",
+            "video_tracks[].dolby_vision.census.scene_cuts",
+            "video_tracks[].dolby_vision.census.dm_version_index",
+            "video_tracks[].dolby_vision.census.level_presence[].level",
+            "video_tracks[].dolby_vision.census.level_presence[].rpus_with",
+            "video_tracks[].hdr10plus.application_version",
+            "video_tracks[].hdr10plus.num_windows",
+            "video_tracks[].hdr10plus.profile",
+            "video_tracks[].hdr10plus.target_max_luminance",
         ];
         expected.sort_unstable();
         assert_eq!(paths, expected, "JSON schema surface changed; see docs/SCHEMA.md");
@@ -607,11 +634,11 @@ mod tests {
 
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "1.3");
+        assert_eq!(SCHEMA_VERSION, "2.0");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "1.3");
+        assert_eq!(v["hdrprobe_schema_version"], "2.0");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
-        assert_eq!(v["hdr10plus"]["profile"], "B");
+        assert_eq!(v["video_tracks"][0]["hdr10plus"]["profile"], "B");
     }
 }

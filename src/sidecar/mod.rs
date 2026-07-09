@@ -23,7 +23,7 @@ use anyhow::{bail, Result};
 use crate::dv::levels::DvAggregate;
 use crate::dv::rpu::parse_hevc_rpu;
 use crate::hevc::nal::{self, NalRef};
-use crate::model::{ColorInfo, General, Hdr10Plus, Report};
+use crate::model::{ColorInfo, Hdr10Plus, Report};
 
 /// A parsed sidecar's payload — exactly one of the metadata sections. The DV
 /// section is boxed (it dwarfs the HDR10+ one) to keep the enum small.
@@ -219,24 +219,30 @@ fn build_report(
         hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
         file: path.display().to_string(),
         size_bytes: size,
-        general: General {
-            container: container.to_string(),
+        container: container.to_string(),
+        format_version,
+        duration_secs: None,
+        // One `video_tracks` entry for uniformity — consumers always iterate
+        // the array (`.video_tracks[0].dolby_vision` works for every input
+        // kind); the empty `codec` marks the metadata-only shape as before.
+        video_tracks: vec![crate::model::VideoTrack {
+            track_number: None,
+            program: None,
+            default: None,
             codec: String::new(),
             codec_profile: None,
-            format_version,
             width: None,
             height: None,
             fps,
-            duration_secs: None,
             bitrate: None,
             bit_depth: None,
             chroma: None,
             stereo: None,
             color: ColorInfo::default(),
-        },
-        hdr: None,
-        dolby_vision,
-        hdr10plus,
+            hdr: None,
+            dolby_vision,
+            hdr10plus,
+        }],
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     }
 }
