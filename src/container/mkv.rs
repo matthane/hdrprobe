@@ -970,16 +970,18 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
 
     let cc = classify_codec(codec_id, codec_private);
 
-    // No container Colour element? Recover colour from the SPS in CodecPrivate,
-    // with the codec's own record parser (same fallback MP4 applies to a
-    // missing `colr` box).
+    // No container Colour element? Recover colour from the parameter set in
+    // CodecPrivate — the SPS in hvcC/avcC, the sequence header in av1C — with
+    // the codec's own record parser (same fallback MP4 applies to a missing
+    // `colr` box).
     if color.transfer.is_none() {
-        let sps_color = match cc.codec {
+        let stream_color = match cc.codec {
             Codec::Hevc => super::color_from_hvcc(codec_private),
             Codec::Avc => super::color_from_avcc(codec_private),
+            Codec::Av1 => super::color_from_av1c(codec_private),
             _ => None,
         };
-        if let Some(c) = sps_color {
+        if let Some(c) = stream_color {
             color = c;
         }
     }

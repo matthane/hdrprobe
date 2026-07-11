@@ -20,6 +20,12 @@ pub struct SeqInfo {
     pub bit_depth: u8,
     pub chroma: &'static str,
     pub color: ColorInfo,
+    /// Whether `color_config()` carried an explicit `color_description` (CICP
+    /// triplet). When false, `color`'s CICP fields are the spec's "unspecified"
+    /// defaults — the stream declares nothing, which callers recovering colour
+    /// from an embedded sequence header must not mistake for a signal (the
+    /// HEVC analogue is the SPS VUI's `colour_description_present_flag`).
+    pub color_description_present: bool,
     /// Constant frame rate from the sequence header's `timing_info()`, when the
     /// stream carries it with `equal_picture_interval` set. AV1 encoders usually
     /// omit `timing_info` entirely, so this is `None` far more often than for
@@ -171,7 +177,8 @@ pub fn parse_sequence_header(p: &[u8]) -> Option<SeqInfo> {
     r.skip_bits(1)?; // enable_cdef
     r.skip_bits(1)?; // enable_restoration
 
-    let (bit_depth, chroma, color) = parse_color_config(&mut r, seq_profile)?;
+    let (bit_depth, chroma, color, color_description_present) =
+        parse_color_config(&mut r, seq_profile)?;
 
     Some(SeqInfo {
         seq_profile,
@@ -182,6 +189,7 @@ pub fn parse_sequence_header(p: &[u8]) -> Option<SeqInfo> {
         bit_depth,
         chroma,
         color,
+        color_description_present,
         fps,
     })
 }
@@ -200,8 +208,12 @@ pub fn av1_chroma_str(mono_chrome: bool, ss_x: u8, ss_y: u8) -> &'static str {
     }
 }
 
-/// color_config() (AV1 spec §5.5.2). Returns (bit_depth, chroma, ColorInfo).
-fn parse_color_config(r: &mut BitReader, seq_profile: u8) -> Option<(u8, &'static str, ColorInfo)> {
+/// color_config() (AV1 spec §5.5.2). Returns (bit_depth, chroma, ColorInfo,
+/// color_description_present).
+fn parse_color_config(
+    r: &mut BitReader,
+    seq_profile: u8,
+) -> Option<(u8, &'static str, ColorInfo, bool)> {
     let high_bitdepth = r.read_bit()? == 1;
     let bit_depth = if seq_profile == 2 && high_bitdepth {
         let twelve_bit = r.read_bit()? == 1;
@@ -259,7 +271,7 @@ fn parse_color_config(r: &mut BitReader, seq_profile: u8) -> Option<(u8, &'stati
         range: Some(if range_full { "full" } else { "limited" }.to_string()),
     };
 
-    Some((bit_depth, chroma, color))
+    Some((bit_depth, chroma, color, color_description_present))
 }
 
 /// AV1 uvlc() — unsigned variable-length code.

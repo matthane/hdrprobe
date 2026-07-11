@@ -585,6 +585,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut content_light = None;
     let mut hvcc_bytes: Option<&[u8]> = None;
     let mut avcc_bytes: Option<&[u8]> = None;
+    let mut av1c_bytes: Option<&[u8]> = None;
     // A layered-HEVC config box (`lhvC`) beside the base `hvcC` marks MV-HEVC — the
     // multiview form of DV Profile 20 (for 3D / dual-view); its absence is the 2D
     // single-view form. Free to detect: the box is already a sample-entry child.
@@ -613,6 +614,9 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                 }
             }
             b"av1C" => {
+                if c.end >= c.payload {
+                    av1c_bytes = Some(&data[c.payload..c.end]);
+                }
                 if let Some((bd, ch, prof)) = parse_av1c(data, c) {
                     bit_depth = Some(bd);
                     chroma = Some(ch.to_string());
@@ -641,7 +645,8 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         }
     }
 
-    // No `colr` box? Recover colour from the SPS in `hvcC` / `avcC`.
+    // No `colr` box? Recover colour from the parameter set in the codec config
+    // box — the SPS in `hvcC`/`avcC`, the sequence header in `av1C`.
     if color.transfer.is_none() {
         if let Some(h) = hvcc_bytes {
             if let Some(c) = super::color_from_hvcc(h) {
@@ -649,6 +654,10 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             }
         } else if let Some(a) = avcc_bytes {
             if let Some(c) = super::color_from_avcc(a) {
+                color = c;
+            }
+        } else if let Some(v) = av1c_bytes {
+            if let Some(c) = super::color_from_av1c(v) {
                 color = c;
             }
         }

@@ -488,6 +488,24 @@ pub(crate) fn color_from_avcc(avcc: &[u8]) -> Option<ColorInfo> {
     info.color.as_ref().map(color_from_vui)
 }
 
+/// Recover colour info from the sequence-header OBU embedded in an `av1C`
+/// record's `configOBUs`, for AV1 files whose container carries no explicit
+/// colour box/element (mkvmerge leaves AV1 colour in-stream, so an HDR AV1
+/// remux commonly has no MKV `Colour` element at all). The record's fixed
+/// header is 4 bytes; the OBUs follow, each with a size field except possibly
+/// the last — exactly the framing `av1::obu::obus` walks. Mirrors the
+/// HEVC/AVC fallbacks above: adopted only when the stream carries an explicit
+/// `color_description` (the analogue of the SPS VUI's
+/// `colour_description_present_flag`), so a CICP-unspecified stream never
+/// overwrites container colour with defaults.
+pub(crate) fn color_from_av1c(av1c: &[u8]) -> Option<ColorInfo> {
+    let config_obus = av1c.get(4..)?;
+    let seq = crate::av1::obu::obus(config_obus)
+        .find(|o| o.obu_type == crate::av1::obu::OBU_SEQUENCE_HEADER)?;
+    let info = crate::av1::seq::parse_sequence_header(seq.payload)?;
+    info.color_description_present.then_some(info.color)
+}
+
 pub(crate) fn cicp_primaries(v: u16) -> Option<&'static str> {
     Some(match v {
         1 => "BT.709",
@@ -613,5 +631,33 @@ mod tests {
         assert_eq!(c.primaries.as_deref(), Some("BT.709"));
         assert_eq!(c.transfer.as_deref(), Some("BT.709"));
         assert_eq!(c.range.as_deref(), Some("limited"));
+    }
+
+    #[test]
+    fn color_from_av1c_reads_the_embedded_sequence_header() {
+        // The `av1C` head of a real DV Profile 10 MKV's CodecPrivate: the 4-byte
+        // record header, then the sequence-header OBU whose color_config carries
+        // CICP 9/16/9 limited (BT.2020 / PQ). mkvmerge wrote no MKV Colour
+        // element for that file — this OBU is the only colour signal it has, and
+        // missing it misclassified the DV base (no "HDR10 (fallback)").
+        let av1c = [
+            0x81, 0x0c, 0x4e, 0x00, // marker+version, Main profile L5.0, 10-bit 4:2:0
+            0x0a, 0x0f, // OBU header: sequence header, 15-byte payload
+            0x00, 0x00, 0x00, 0x62, 0xeb, 0xbf, 0xf2, 0x39, 0xd5, 0xf3, 0xa1, 0x22, 0x01, 0x2a,
+            0x80,
+        ];
+        let c = color_from_av1c(&av1c).expect("colour description");
+        assert_eq!(c.primaries.as_deref(), Some("BT.2020"));
+        assert_eq!(c.transfer.as_deref(), Some("PQ (SMPTE ST 2084)"));
+        assert_eq!(c.matrix.as_deref(), Some("BT.2020 NCL"));
+        assert_eq!(c.range.as_deref(), Some("limited"));
+
+        // The same header with color_description_present cleared (the bits that
+        // follow shift up: range=limited, chroma position dropped): the stream
+        // declares nothing, so the fallback must yield None — never the CICP
+        // "unspecified" defaults overwriting container colour.
+        let mut unspecified = av1c;
+        unspecified[16] = 0x81;
+        assert!(color_from_av1c(&unspecified).is_none());
     }
 }
