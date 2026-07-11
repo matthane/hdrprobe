@@ -973,8 +973,11 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     // No container Colour element? Recover colour from the parameter set in
     // CodecPrivate — the SPS in hvcC/avcC, the sequence header in av1C — with
     // the codec's own record parser (same fallback MP4 applies to a missing
-    // `colr` box).
-    if color.transfer.is_none() {
+    // `colr` box). A Colour element that resolved but left Range unset (or
+    // "unspecified") gets just the range from the same parameter set, keeping
+    // the container's authority over primaries/transfer/matrix — the MP4
+    // nclc-colr treatment.
+    if color.transfer.is_none() || color.range.is_none() {
         let stream_color = match cc.codec {
             Codec::Hevc => super::color_from_hvcc(codec_private),
             Codec::Avc => super::color_from_avcc(codec_private),
@@ -982,7 +985,11 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
             _ => None,
         };
         if let Some(c) = stream_color {
-            color = c;
+            if color.transfer.is_none() {
+                color = c;
+            } else if color.range.is_none() {
+                color.range = c.range;
+            }
         }
     }
 

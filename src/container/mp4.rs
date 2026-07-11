@@ -646,19 +646,26 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     }
 
     // No `colr` box? Recover colour from the parameter set in the codec config
-    // box — the SPS in `hvcC`/`avcC`, the sequence header in `av1C`.
-    if color.transfer.is_none() {
-        if let Some(h) = hvcc_bytes {
-            if let Some(c) = super::color_from_hvcc(h) {
-                color = c;
-            }
+    // box — the SPS in `hvcC`/`avcC`, the sequence header in `av1C`. A resolved
+    // QuickTime `nclc` colr leaves only the range unset (the form has no range
+    // field — iPhone HLG/DV MOVs are the common case): the colr keeps authority
+    // over primaries/transfer/matrix and just the VUI's video_full_range_flag
+    // fills in, the same stream-sourced range MediaInfo reports for these files.
+    if color.transfer.is_none() || color.range.is_none() {
+        let cfg_color = if let Some(h) = hvcc_bytes {
+            super::color_from_hvcc(h)
         } else if let Some(a) = avcc_bytes {
-            if let Some(c) = super::color_from_avcc(a) {
-                color = c;
-            }
+            super::color_from_avcc(a)
         } else if let Some(v) = av1c_bytes {
-            if let Some(c) = super::color_from_av1c(v) {
+            super::color_from_av1c(v)
+        } else {
+            None
+        };
+        if let Some(c) = cfg_color {
+            if color.transfer.is_none() {
                 color = c;
+            } else if color.range.is_none() {
+                color.range = c.range;
             }
         }
     }
@@ -754,7 +761,10 @@ fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<ColorInfo> {
         let primaries = read_u16(data, p + 4);
         let transfer = read_u16(data, p + 6);
         let matrix = read_u16(data, p + 8);
-        let range = if kind == b"nclx" {
+        // Only the ISO `nclx` form carries a range flag (one byte after the
+        // matrix); the QuickTime `nclc` form ends at the matrix, so its range
+        // stays None for the caller to recover from the SPS VUI.
+        let range = if kind == b"nclx" && b.end >= p + 11 {
             let full = (data[p + 10] & 0x80) != 0;
             Some(if full { "full".to_string() } else { "limited".to_string() })
         } else {
@@ -1238,6 +1248,84 @@ mod tests {
         assert_eq!(chunks.len(), 2, "only the two real sample sizes are indexed");
         assert_eq!(chunks[0].size, 10);
         assert_eq!(chunks[1].size, 20);
+    }
+
+    /// One size-prefixed ISOBMFF box.
+    fn boxed(typ: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(&typ);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// A minimal `hvcC` built from a real iPhone HLG/DV MOV recording: the
+    /// record header verbatim (Main 10, 4:2:0, 10-bit, 4-byte NAL lengths) plus
+    /// its SPS, whose VUI signals full range with BT.2020/HLG colour.
+    fn iphone_hvcc_box() -> Vec<u8> {
+        let mut rec = vec![
+            0x01, 0x22, 0x20, 0x00, 0x00, 0x00, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0xf0,
+            0x00, 0xfc, 0xfd, 0xfa, 0xfa, 0x00, 0x00, 0x0b,
+        ];
+        rec.extend_from_slice(&[0x01, 0xa1, 0x00, 0x01, 0x00, 38]); // one array: 1 SPS, 38 bytes
+        rec.extend_from_slice(&[
+            0x42, 0x01, 0x04, 0x22, 0x20, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x99, 0x00, 0x00, 0xa0, 0x01, 0xe0, 0x20, 0x02, 0x1c, 0x4d, 0x88,
+            0x15, 0xee, 0x45, 0x95, 0x4d, 0xc2, 0x44, 0x82, 0x40, 0x20,
+        ]);
+        boxed(*b"hvcC", &rec)
+    }
+
+    /// An stsd holding one `hvc1` VisualSampleEntry with the given child boxes.
+    fn stsd_with(children: &[Vec<u8>]) -> Vec<u8> {
+        let mut entry_payload = vec![0u8; 78]; // fixed VisualSampleEntry fields
+        entry_payload[24..26].copy_from_slice(&3840u16.to_be_bytes()); // width (entry offset 32)
+        entry_payload[26..28].copy_from_slice(&2160u16.to_be_bytes()); // height (entry offset 34)
+        for c in children {
+            entry_payload.extend_from_slice(c);
+        }
+        let entry = boxed(*b"hvc1", &entry_payload);
+        let mut stsd_payload = vec![0, 0, 0, 0, 0, 0, 0, 1]; // ver/flags + entry_count
+        stsd_payload.extend_from_slice(&entry);
+        boxed(*b"stsd", &stsd_payload)
+    }
+
+    #[test]
+    fn nclc_colr_fills_its_missing_range_from_the_vui() {
+        // iPhone MOVs write the QuickTime `nclc` colr form, which has no range
+        // field; the range lives only in the SPS VUI (video_full_range_flag=1 —
+        // the same stream-sourced "Full" MediaInfo reports). The colr keeps
+        // authority over primaries/transfer/matrix; only the range fills in.
+        let colr = boxed(*b"colr", b"nclc\x00\x09\x00\x12\x00\x09");
+        let data = stsd_with(&[iphone_hvcc_box(), colr]);
+        let top = iter_boxes(&data, 0, data.len());
+        let sd = parse_stsd(&data, &top[0]).unwrap();
+        assert_eq!(sd.color.primaries.as_deref(), Some("BT.2020"));
+        assert_eq!(sd.color.transfer.as_deref(), Some("HLG (ARIB STD-B67)"));
+        assert_eq!(sd.color.matrix.as_deref(), Some("BT.2020 NCL"));
+        assert_eq!(sd.color.range.as_deref(), Some("full"), "range from the SPS VUI");
+    }
+
+    #[test]
+    fn colr_range_flag_is_nclx_only_and_bounds_safe() {
+        let parse = |payload: &[u8]| {
+            let data = boxed(*b"colr", payload);
+            let top = iter_boxes(&data, 0, data.len());
+            parse_colr(&data, &top[0])
+        };
+        // ISO nclx: the byte after the matrix carries the full-range flag.
+        let c = parse(b"nclx\x00\x09\x00\x12\x00\x09\x80").unwrap();
+        assert_eq!(c.range.as_deref(), Some("full"));
+        let c = parse(b"nclx\x00\x09\x00\x12\x00\x09\x00").unwrap();
+        assert_eq!(c.range.as_deref(), Some("limited"));
+        // nclx truncated before the flag byte (the box ends at the matrix):
+        // the colour still parses, the range stays unknown — the read must
+        // never reach past the box end.
+        let c = parse(b"nclx\x00\x09\x00\x12\x00\x09").unwrap();
+        assert_eq!(c.primaries.as_deref(), Some("BT.2020"));
+        assert!(c.range.is_none());
+        // QuickTime nclc carries no range field at all.
+        let c = parse(b"nclc\x00\x09\x00\x12\x00\x09").unwrap();
+        assert!(c.range.is_none());
     }
 
     #[test]
