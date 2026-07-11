@@ -46,8 +46,8 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
         }
     } else if let Some(dv) = dv {
         // No independently viewable base — infer it from the DV BL compatibility id
-        // (1=HDR10, 2=SDR, 4=HLG). Profiles 5 and 20 (compat 0) have no directly
-        // viewable base, so we show no base tag.
+        // (1=HDR10, 2=SDR, 4=HLG, 6=HDR10 per UHD Blu-ray). Profiles 5 and 20
+        // (compat 0) have no directly viewable base, so we show no base tag.
         //
         // Profile 4 is defined with an SDR (BT.709/BT.1886) base layer, so its base
         // is SDR even when the container omits the compatibility id (older P4 TS
@@ -55,8 +55,11 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
         if dv.profile.starts_with('4') {
             Some("SDR (fallback)")
         } else {
+            // Compat 6 is the UHD Blu-ray base signal: the same CTA-861.3 HDR10
+            // base as compat 1 with disc constraints on top — the L6 gating
+            // below already treats the two as one HDR10 family.
             match dv.bl_compatibility_id {
-                Some(1) => Some("HDR10 (fallback)"),
+                Some(1) | Some(6) => Some("HDR10 (fallback)"),
                 Some(2) => Some("SDR (fallback)"),
                 Some(4) => Some("HLG (fallback)"),
                 _ => None,
