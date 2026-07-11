@@ -166,7 +166,9 @@ Version history:
 - **2.1**: added `dolby_vision.unconverted_dual_layer_rpu` (additive): true when the RPU
   carries the dual-layer composer payload but the carriage has no enhancement layer, the
   signature of a custom transcode that injected a Profile 7 RPU without converting it.
-  Renders as the `Unconverted RPU` chip on the text report's Profile line. Unreleased.
+  Renders as the `Unconverted RPU` chip on the text report's Profile line. Also adds VP9
+  support (additive value-set growth, no new fields): `"VP9"` joins the `codec` set with its
+  own `codec_profile` format, and `"raw VP9 (IVF)"` joins the `container` set. Unreleased.
 - **2.0**: breaking restructure for multi-video-track reporting. The per-track sections moved
   into the always-present `video_tracks` array (one entry per video track — one for ordinary
   files, one per independent track for a multi-track MKV/MP4 or multi-program TS, and one for
@@ -241,7 +243,7 @@ MKV by TrackNumber, MP4 by `trak` order, TS by program then PID.
 | `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID. Absent where no such id exists (raw elementary streams, sidecars) |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, or `"AV1"`. The empty string `""` for metadata sidecars, which carry no video |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, or `"VP9"`. The empty string `""` for metadata sidecars, which carry no video |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
@@ -253,7 +255,7 @@ MKV by TrackNumber, MP4 by `trak` order, TS by program then PID.
 | `color` | `ColorInfo` | always | Colour signalling; may be `{}` when nothing was signalled |
 | `hdr` | `Hdr` | video inputs only | Static HDR classification and mastering info; absent for metadata sidecars, which have no base layer |
 | `dolby_vision` | `DolbyVision` | when DV metadata was found | Present when at least one RPU parsed, when the container carries a DV configuration (including under `--no-rpu`), or for a DV sidecar |
-| `hdr10plus` | `Hdr10Plus` | when HDR10+ metadata was found | Present when ST.2094-40 metadata was parsed from the stream, or for an HDR10+ JSON sidecar. Like `dolby_vision`, the object's existence is the presence signal |
+| `hdr10plus` | `Hdr10Plus` | when HDR10+ metadata was found | Present when ST.2094-40 metadata was parsed from the input — an HEVC SEI, an AV1 metadata OBU, or the Matroska BlockAdditions carriage (VP9 in WebM) — or for an HDR10+ JSON sidecar. Like `dolby_vision`, the object's existence is the presence signal |
 
 ### `container` values
 
@@ -269,6 +271,7 @@ Video inputs:
 | `"raw HEVC (Annex-B)"` | HEVC elementary stream |
 | `"raw AV1 (IVF)"` | AV1 in an IVF wrapper |
 | `"raw AV1 (OBU)"` | AV1 low-overhead OBU stream |
+| `"raw VP9 (IVF)"` | VP9 in an IVF wrapper (`VP90` FourCC) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
 
@@ -286,6 +289,7 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 | MV-HEVC | The HEVC label prefixed with `Multiview ` | `"Multiview Main 10, High tier @ L5"` |
 | AVC | `<profile> @ L<level>` | `"High @ L4.2"`, `"Constrained High @ L4"`, `"Baseline @ L3.1"` |
 | AV1 | `<profile> profile, <tier> tier @ L<level>` (level omitted when unset) | `"Main profile, Main tier @ L5.1"`, `"Main profile, Main tier"` |
+| VP9 | `Profile <n> @ L<level>` (level omitted when the mux states none — only WebM CodecPrivate and MP4 `vpcC` carry one) | `"Profile 2 @ L4.0"`, `"Profile 2"` |
 
 ## Object: `Bitrate`
 

@@ -14,6 +14,7 @@ mod render;
 mod sample;
 mod shell;
 mod sidecar;
+mod vp9;
 
 use std::fs::File;
 use std::io::{IsTerminal as _, Write as _};

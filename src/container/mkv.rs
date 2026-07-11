@@ -85,6 +85,16 @@ const ID_BLOCK_ADD_ID_EXTRA: u32 = 0x41ED;
 const ID_SIMPLEBLOCK: u32 = 0xA3;
 const ID_BLOCKGROUP: u32 = 0xA0;
 const ID_BLOCK: u32 = 0xA1;
+const ID_BLOCK_ADDITIONS: u32 = 0x75A1;
+const ID_BLOCK_MORE: u32 = 0xA6;
+const ID_BLOCK_ADDITIONAL: u32 = 0xA5;
+const ID_BLOCK_ADD_ID: u32 = 0xEE;
+
+/// The Matroska-registered `BlockAddID` for ITU-T T.35 metadata — the HDR10+
+/// carriage for VP9 (and AV1) in WebM: one raw T.35 message per BlockGroup,
+/// starting at the country code. Real muxes (google/video-file) write the ID
+/// with no TrackEntry BlockAdditionMapping, so the ID itself is the signal.
+const BLOCK_ADD_ID_ITU_T35: u64 = 4;
 
 // BlockAddIDType FourCCs identifying the DV config record carried in the track.
 const DVCC: u32 = 0x6476_6343; // 'dvcC'
@@ -290,6 +300,9 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     let mut groups: Vec<TrackGroup> = Vec::new();
     let mut routes: Vec<(u64, usize)> = Vec::new();
     let mut outs: Vec<Vec<Chunk>> = Vec::new();
+    // Per-group ITU-T T.35 BlockAdditional ranges (HDR10+ on VP9), parallel to
+    // `outs`; empty for the overwhelming majority of tracks.
+    let mut t35_outs: Vec<Vec<Chunk>> = Vec::new();
     // Per-track statistics from the `Tags` element (mkvmerge writes it at the
     // front, inside the warmed head window). Collected regardless of element
     // order and resolved against each video track's UID after the walk.
@@ -319,6 +332,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
                     groups = group_tracks(parse_tracks(data, p2, end));
                     routes = group_routes(&groups);
                     outs = vec![Vec::new(); groups.len()];
+                    t35_outs = vec![Vec::new(); groups.len()];
                 }
                 p = end;
             }
@@ -343,12 +357,12 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
                 match size {
                     Some(s) => {
                         let end = (p2 + s as usize).min(seg_end);
-                        parse_cluster(data, p2, end, false, &routes, &mut outs, head_limit);
+                        parse_cluster(data, p2, end, false, &routes, &mut outs, &mut t35_outs, head_limit);
                         p = end;
                     }
                     None => {
                         // Unknown-size cluster: parse until the next level-1 element.
-                        p = parse_cluster(data, p2, seg_end, true, &routes, &mut outs, head_limit);
+                        p = parse_cluster(data, p2, seg_end, true, &routes, &mut outs, &mut t35_outs, head_limit);
                     }
                 }
                 // Static DV metadata (dvcC + first RPU) and HDR SEI sit in the
@@ -391,7 +405,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
 
     let single = groups.len() == 1;
     let mut tracks = Vec::with_capacity(groups.len());
-    for (g, chunks) in groups.into_iter().zip(outs) {
+    for ((g, chunks), t35_chunks) in groups.into_iter().zip(outs).zip(t35_outs) {
         let track = g.info;
         let fps = match (track.default_duration_ns, duration_secs, chunks.len()) {
             (Some(dd), _, _) if dd > 0 => Some(1_000_000_000.0 / dd as f64),
@@ -438,7 +452,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
             None
         };
 
-        tracks.push(TrackDemux {
+        let mut td = TrackDemux {
             track_number: Some(track.track_number),
             default_flag: Some(track.default_flag),
             width: track.width,
@@ -454,8 +468,20 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
             content_light: track.content_light,
             bitrate,
             chunks,
+            t35_chunks,
             ..TrackDemux::new(track.codec, track.nal_format)
-        });
+        };
+        // A VP9 track's CodecPrivate is optional (mkvmerge wrote none before
+        // ~v30) and never carries colour, so profile/depth/chroma and the
+        // stream's matrix/range come from the first keyframe's uncompressed
+        // header — the VP9 analogue of the CodecPrivate fallback above, with
+        // the same container authority (fills only what the Colour element
+        // left unset). The first cluster's blocks sit inside the warmed head
+        // window, so this costs no extra I/O.
+        if td.codec == Codec::Vp9 {
+            fill_vp9_stream_fields(&mut td, data);
+        }
+        tracks.push(td);
     }
 
     Ok(Demux {
@@ -602,12 +628,14 @@ pub struct BlockStreamer {
 impl BlockStreamer {
     /// Append the video blocks of the clusters between the current position
     /// and ~`target_span` file bytes ahead (or the Segment's end), routed per
-    /// track into `outs` (parallel to `MkvFullStream::track_count`). Returns
-    /// `true` while more input remains.
+    /// track into `outs`, with any ITU-T T.35 BlockAdditional ranges routed
+    /// into `t35_outs` (both parallel to `MkvFullStream::track_count`).
+    /// Returns `true` while more input remains.
     pub fn next_window(
         &mut self,
         data: &[u8],
         outs: &mut [Vec<Chunk>],
+        t35_outs: &mut [Vec<Chunk>],
         target_span: u64,
         frontier: &Frontier,
     ) -> bool {
@@ -627,13 +655,14 @@ impl BlockStreamer {
                         // MB); warm its exact extent — headers and payloads —
                         // before walking its blocks.
                         frontier.ensure_to(end as u64);
-                        parse_cluster(data, p2, end, false, &self.routes, outs, None);
+                        parse_cluster(data, p2, end, false, &self.routes, outs, t35_outs, None);
                         self.p = end;
                     }
                     None => {
                         // Unknown-size cluster: parse until the next level-1 element.
-                        self.p =
-                            parse_cluster(data, p2, self.seg_end, true, &self.routes, outs, None);
+                        self.p = parse_cluster(
+                            data, p2, self.seg_end, true, &self.routes, outs, t35_outs, None,
+                        );
                     }
                 },
                 _ => match size {
@@ -1058,6 +1087,21 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             cfg.codec_profile = Some(a.profile_str);
         }
         cfg
+    } else if codec_id.starts_with(b"V_VP9") {
+        // CodecPrivate is the WebM VP9 feature list (profile/level/depth/
+        // chroma) — optional, and colour-less by definition; whatever it
+        // leaves unset is recovered from the first keyframe's uncompressed
+        // header by `fill_vp9_stream_fields` after the blocks are indexed.
+        // The nal_format is a placeholder: VP9 blocks are raw frames, never
+        // NAL streams, and the sampler's VP9 arm ignores it.
+        let p = crate::vp9::parse_webm_codec_private(codec_private);
+        CodecConfig {
+            codec: Codec::Vp9,
+            nal_format: NalFormat::LengthPrefixed(4),
+            bit_depth: p.bit_depth,
+            chroma: p.chroma.map(str::to_string),
+            codec_profile: p.profile.map(|pr| crate::vp9::profile_label(pr, p.level)),
+        }
     } else if codec_id.starts_with(b"V_AV1") {
         // CodecPrivate is an AV1CodecConfigurationRecord (same layout as `av1C`),
         // which carries profile/tier/level and bit depth.
@@ -1080,6 +1124,48 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             chroma: None,
             codec_profile: None,
         }
+    }
+}
+
+/// Fill a VP9 track's config/colour gaps from the first keyframe's
+/// uncompressed header (the only in-band signal VP9 has): profile, bit depth,
+/// chroma, and — only when the container's Colour element signalled no colour
+/// at all — the header's matrix, plus the range on its own (the nclc-colr
+/// treatment: a Colour element that resolved but left Range unset gets just
+/// the range from the stream, keeping the container's authority over
+/// primaries/transfer/matrix). Tries the head blocks in order until a
+/// keyframe header parses; inter frames carry no colour config.
+fn fill_vp9_stream_fields(track: &mut TrackDemux, data: &[u8]) {
+    let missing_cfg = track.bit_depth.is_none()
+        || track.chroma.is_none()
+        || track.codec_profile.is_none();
+    let missing_color = track.color.transfer.is_none() || track.color.range.is_none();
+    if !missing_cfg && !missing_color {
+        return;
+    }
+    let f = track.chunks.iter().take(32).find_map(|c| {
+        let s = c.offset as usize;
+        let e = ((c.offset + c.size) as usize).min(data.len());
+        (s < e).then(|| crate::vp9::parse_frame_header(&data[s..e])).flatten()
+    });
+    let Some(f) = f else { return };
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(f.bit_depth);
+    }
+    if track.chroma.is_none() {
+        track.chroma = Some(f.chroma.to_string());
+    }
+    if track.codec_profile.is_none() {
+        track.codec_profile = Some(crate::vp9::profile_label(f.profile, None));
+    }
+    let signalled_nothing = track.color.primaries.is_none()
+        && track.color.transfer.is_none()
+        && track.color.matrix.is_none();
+    if signalled_nothing {
+        track.color.matrix = f.color.matrix.clone();
+    }
+    if track.color.range.is_none() {
+        track.color.range = f.color.range.clone();
     }
 }
 
@@ -1232,6 +1318,7 @@ fn parse_block_addition_mapping(data: &[u8], start: usize, end: usize) -> Option
 /// `outs`; non-video blocks match no route and are skipped). For an
 /// unknown-size cluster, stops at (and returns) the next level-1 element; for
 /// a known-size cluster, returns `end`.
+#[allow(clippy::too_many_arguments)] // one walk, two parallel routed sinks
 fn parse_cluster(
     data: &[u8],
     start: usize,
@@ -1239,6 +1326,7 @@ fn parse_cluster(
     unknown: bool,
     routes: &[(u64, usize)],
     outs: &mut [Vec<Chunk>],
+    t35_outs: &mut [Vec<Chunk>],
     head_limit: Option<u64>,
 ) -> usize {
     let mut p = start;
@@ -1251,20 +1339,34 @@ fn parse_cluster(
         let s = size.unwrap_or(0) as usize;
         let cend = (p2 + s).min(end);
         match id {
-            ID_SIMPLEBLOCK => record_block(data, p2, cend, routes, outs),
+            ID_SIMPLEBLOCK => {
+                record_block(data, p2, cend, routes, outs);
+            }
             ID_BLOCKGROUP => {
-                // The primary frame rides in a Block child; a BlockAddition would
-                // carry the dual-track EL residual, which is decode-only and never needed.
+                // The primary frame rides in a Block child. Of the BlockAdditions,
+                // only the registered ITU-T T.35 ID (HDR10+ on VP9/AV1) is
+                // recorded; any other addition — notably the dual-track DV EL
+                // residual — is decode-only and never needed. Children can come
+                // in any order, so the addition is attributed after the walk.
+                let mut route = None;
+                let mut t35 = None;
                 let mut q = p2;
                 while q < cend {
                     let Some((cid, q1)) = read_id(data, q) else { break };
                     let Some((csz, q2)) = read_size(data, q1) else { break };
                     let cs = csz.unwrap_or(0) as usize;
                     let bend = (q2 + cs).min(cend);
-                    if cid == ID_BLOCK {
-                        record_block(data, q2, bend, routes, outs);
+                    match cid {
+                        ID_BLOCK => route = record_block(data, q2, bend, routes, outs),
+                        ID_BLOCK_ADDITIONS => {
+                            t35 = parse_block_additions(data, q2, bend).or(t35)
+                        }
+                        _ => {}
                     }
                     q = bend;
+                }
+                if let (Some(r), Some(c)) = (route, t35) {
+                    t35_outs[r].push(c);
                 }
             }
             _ => {}
@@ -1298,28 +1400,76 @@ fn head_reached(outs: &[Vec<Chunk>], head_limit: Option<u64>) -> bool {
     }
 }
 
-/// Record the frame-data byte range of a (Simple)Block into its track's list.
+/// Record the frame-data byte range of a (Simple)Block into its track's list,
+/// returning the routed track index so a BlockGroup's additions can follow it.
 /// Handles the common unlaced case; laced blocks (rare for video) are skipped.
-fn record_block(data: &[u8], start: usize, end: usize, routes: &[(u64, usize)], outs: &mut [Vec<Chunk>]) {
-    let Some((tnum, p1)) = read_vint_num(data, start) else { return };
-    let Some(&(_, out)) = routes.iter().find(|(t, _)| *t == tnum) else { return };
+fn record_block(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    routes: &[(u64, usize)],
+    outs: &mut [Vec<Chunk>],
+) -> Option<usize> {
+    let (tnum, p1) = read_vint_num(data, start)?;
+    let &(_, out) = routes.iter().find(|(t, _)| *t == tnum)?;
     // int16 relative timecode + 1 flags byte.
     if p1 + 3 > end {
-        return;
+        return None;
     }
     let flags = data[p1 + 2];
     let lacing = (flags >> 1) & 0x03;
     if lacing != 0 {
-        return;
+        return None;
     }
     let frame_start = p1 + 3;
     if frame_start >= end {
-        return;
+        return None;
     }
     outs[out].push(Chunk {
         offset: frame_start as u64,
         size: (end - frame_start) as u64,
     });
+    Some(out)
+}
+
+/// The ITU-T T.35 `BlockAdditional` payload range of a BlockGroup's
+/// BlockAdditions, if one is carried: the BlockMore whose explicit
+/// `BlockAddID` is the registered T.35 value (4). A BlockMore without an ID
+/// defaults to 1 (the DV EL residual slot) and is skipped.
+fn parse_block_additions(data: &[u8], start: usize, end: usize) -> Option<Chunk> {
+    let mut p = start;
+    while p < end {
+        let (id, p1) = read_id(data, p)?;
+        let (size, p2) = read_size(data, p1)?;
+        let s = size.unwrap_or(0) as usize;
+        let cend = (p2 + s).min(end);
+        if id == ID_BLOCK_MORE {
+            let mut add_id = 1u64; // EBML default when the element is absent
+            let mut payload: Option<Chunk> = None;
+            let mut q = p2;
+            while q < cend {
+                let (cid, q1) = read_id(data, q)?;
+                let (csz, q2) = read_size(data, q1)?;
+                let cs = csz.unwrap_or(0) as usize;
+                let bend = (q2 + cs).min(cend);
+                match cid {
+                    ID_BLOCK_ADD_ID => add_id = read_uint(data, q2, cs),
+                    ID_BLOCK_ADDITIONAL if bend > q2 => {
+                        payload = Some(Chunk { offset: q2 as u64, size: (bend - q2) as u64 })
+                    }
+                    _ => {}
+                }
+                q = bend;
+            }
+            if add_id == BLOCK_ADD_ID_ITU_T35 {
+                if let Some(c) = payload {
+                    return Some(c);
+                }
+            }
+        }
+        p = cend;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1435,6 +1585,40 @@ mod tests {
         el(&ID_CLUSTER.to_be_bytes(), &body)
     }
 
+    /// A BlockGroup for `track`: an unlaced Block plus one BlockMore whose
+    /// explicit BlockAddID is `add_id` and whose BlockAdditional is `extra`.
+    fn bg_with_addition(track: u8, payload: &[u8], add_id: u8, extra: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x80 | track, 0x00, 0x00, 0x00];
+        b.extend_from_slice(payload);
+        let mut group = el(&[0xA1], &b);
+        let mut more = el(&[0xEE], &[add_id]);
+        more.extend(el(&[0xA5], extra));
+        group.extend(el(&[0x75, 0xA1], &el(&[0xA6], &more)));
+        el(&[0xA0], &group)
+    }
+
+    #[test]
+    fn blockgroup_t35_addition_is_recorded_and_gated_on_id_4() {
+        // Two BlockGroups on track 1: one whose BlockMore carries the
+        // registered ITU-T T.35 BlockAddID (4) — the HDR10+ carriage for VP9
+        // in WebM — and one carrying BlockAddID 1 (the DV EL residual slot),
+        // which must stay ignored. The T.35 payload range lands in the
+        // routed track's t35 list; the frame ranges land in `outs` as ever.
+        let t35 = [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04];
+        let mut body = bg_with_addition(1, &[0xAA, 0xBB], 4, &t35);
+        body.extend(bg_with_addition(1, &[0xCC], 1, &[0xDE, 0xAD]));
+        let data = el(&ID_CLUSTER.to_be_bytes(), &body);
+        let (mut outs, mut t35_outs) = ([Vec::new()], [Vec::new()]);
+        // The cluster payload starts 2 bytes in (4-byte id + 1-byte size... id
+        // is 4 bytes here), so parse from the element's payload offset.
+        let payload_start = 5;
+        parse_cluster(&data, payload_start, data.len(), false, &[(1, 0)], &mut outs, &mut t35_outs, None);
+        assert_eq!(outs[0].len(), 2, "both frames recorded");
+        assert_eq!(t35_outs[0].len(), 1, "only the BlockAddID-4 addition");
+        let c = t35_outs[0][0];
+        assert_eq!(&data[c.offset as usize..(c.offset + c.size) as usize], &t35);
+    }
+
     #[test]
     fn block_streamer_windows_match_one_shot() {
         // Segment { filler, Cluster{v,other,v}, filler, Cluster{v} }: the walk
@@ -1448,10 +1632,12 @@ mod tests {
         let plan = MkvFullStream::new(seg_start, data.len(), 1);
 
         let mut outs = [Vec::new()];
+        let mut t35 = [Vec::new()];
         let mut st = plan.streamer();
-        assert!(!st.next_window(&data, &mut outs, u64::MAX, &Frontier::off()));
+        assert!(!st.next_window(&data, &mut outs, &mut t35, u64::MAX, &Frontier::off()));
         let all = std::mem::take(&mut outs[0]);
         assert_eq!(all.iter().map(|c| c.size).collect::<Vec<_>>(), [3, 2, 1]);
+        assert!(t35[0].is_empty(), "SimpleBlocks carry no additions");
         // Chunk offsets are absolute file ranges.
         assert_eq!(&data[all[0].offset as usize..][..3], &[1, 2, 3]);
         assert_eq!(&data[all[2].offset as usize..][..1], &[6]);
@@ -1463,7 +1649,7 @@ mod tests {
         let mut positions = Vec::new();
         loop {
             outs[0].clear();
-            let more = st.next_window(&data, &mut outs, 1, &Frontier::off());
+            let more = st.next_window(&data, &mut outs, &mut t35, 1, &Frontier::off());
             positions.push(st.position());
             got.extend_from_slice(&outs[0]);
             if !more {
@@ -1600,8 +1786,9 @@ mod tests {
         };
         assert_eq!(plan.track_count(), 2);
         let mut outs = [Vec::new(), Vec::new()];
+        let mut t35 = [Vec::new(), Vec::new()];
         let mut st = plan.streamer();
-        assert!(!st.next_window(&data, &mut outs, u64::MAX, &Frontier::off()));
+        assert!(!st.next_window(&data, &mut outs, &mut t35, u64::MAX, &Frontier::off()));
         assert_eq!(outs[0].iter().map(|c| c.size).collect::<Vec<_>>(), [3, 1]);
         assert_eq!(outs[1].iter().map(|c| c.size).collect::<Vec<_>>(), [2, 1]);
         assert_eq!(&data[outs[1][0].offset as usize..][..2], &[9, 9]);

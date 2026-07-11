@@ -61,7 +61,9 @@ never parse bytes native-endian.
 - `main.rs` — clap CLI, per-file dispatch (sidecar files first, then the video pipeline), exit
   codes (0 ok / 1 usage / 2 unreadable).
 - `container/` — one hand-rolled demuxer per format: `mp4.rs`, `mkv.rs`, `ts.rs`, `annexb.rs`,
-  `av1.rs`; `mod.rs` holds `Demux`/`Chunk`/`DvConfig` and the shared dvcC/hvcC/CICP decoders.
+  `av1.rs` (which also owns the IVF wrapper's FourCC dispatch: `VP90` → the VP9 IVF demux,
+  `VP80` → an honest error, else AV1); `mod.rs` holds `Demux`/`Chunk`/`DvConfig` and the shared
+  dvcC/hvcC/CICP decoders.
 - `hevc/` — `nal.rs` (Annex-B + length-prefixed NAL split), `sps.rs` (dims + VUI colour + VUI
   timing/frame rate).
 - `avc/` — the H.264 analogue, for Dolby Vision **Profile 9** (`dvav.09`: 8-bit AVC, single-layer,
@@ -70,6 +72,16 @@ never parse bytes native-endian.
   timing). Reuses `hevc::sps::VuiColor` so the shared `container::color_from_vui` plumbing is
   unchanged.
 - `av1/` — `obu.rs` (OBU walker, T.35 routing), `seq.rs` (sequence header).
+- `vp9.rs` — the VP9 analogue: keyframe uncompressed-header parse (profile/depth/chroma +
+  matrix/range — the header names **no transfer or primaries**, so a bare VP9 stream can never
+  classify HDR; container colour keeps authority, the header only fills gaps), the WebM
+  CodecPrivate feature list (optional — mkvmerge wrote none before ~v30; `mkv.rs` falls back to
+  the first keyframe via `fill_vp9_stream_fields`), and `profile_label`. VP9 has no in-band
+  SEI/RPU: its HDR10+ rides MKV `BlockAdditions` with `BlockAddID == 4` (a raw ITU-T T.35
+  message, recorded per track as `TrackDemux::t35_chunks` — the DV-EL addition slot, ID 1,
+  stays ignored) and `sample.rs` merges those payloads through the same `sei::parse_hdr10plus`
+  gate the AV1 T.35 route uses. MP4 carries VP9 as `vp09` + `vpcC` (CICP + range directly in
+  the record — parsed in `mp4.rs`).
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
 - `hdr/` — `mod.rs` (format classification + `primaries_label`, the chromaticity→gamut matcher
   behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer). The AV1

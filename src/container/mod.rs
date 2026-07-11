@@ -22,6 +22,7 @@ pub enum Codec {
     Hevc,
     Avc,
     Av1,
+    Vp9,
     Other(String),
 }
 
@@ -31,6 +32,7 @@ impl Codec {
             Codec::Hevc => "HEVC".to_string(),
             Codec::Avc => "AVC".to_string(),
             Codec::Av1 => "AV1".to_string(),
+            Codec::Vp9 => "VP9".to_string(),
             Codec::Other(s) => s.clone(),
         }
     }
@@ -154,6 +156,14 @@ pub struct TrackDemux {
     /// usable duration.
     pub bitrate: Option<Bitrate>,
     pub chunks: Vec<Chunk>,
+    /// Container-carried ITU-T T.35 payload ranges (absolute file offsets):
+    /// MKV `BlockAdditional` payloads with `BlockAddID == 4` — the HDR10+
+    /// carriage for VP9 in WebM, whose bitstream has no SEI side channel. The
+    /// sampler parses these alongside the chunks (`SeiFindings` merge is
+    /// first-wins, so no index alignment with `chunks` is needed). Every other
+    /// backend leaves it empty; under `--full` MKV the streaming walk routes
+    /// the additions per window instead.
+    pub t35_chunks: Vec<Chunk>,
     /// Index into `chunks` of the access unit whose SPS filled the metadata
     /// fields — a random-access point. A TS capture (or a raw ES cut) often
     /// starts mid-GOP: the leading AUs then precede the first IDR, and the
@@ -195,6 +205,7 @@ impl TrackDemux {
             content_light: None,
             bitrate: None,
             chunks: Vec::new(),
+            t35_chunks: Vec::new(),
             sps_chunk: None,
             reassembled: None,
         }
@@ -209,10 +220,12 @@ impl TrackDemux {
 pub enum RawFullStream {
     HevcAnnexB,
     Av1Obu,
-    /// `data_start` is the first frame header's offset (past the IVF file
-    /// header); `ticks_per_sec` is the header's rate/scale time base, needed to
-    /// turn the walk's timestamp span into the stream's true average fps.
-    Av1Ivf { data_start: usize, ticks_per_sec: f64 },
+    /// IVF frame walk, shared by AV1 and VP9 (the wrapper is codec-agnostic;
+    /// extraction dispatches on the track's codec). `data_start` is the first
+    /// frame header's offset (past the IVF file header); `ticks_per_sec` is
+    /// the header's rate/scale time base, needed to turn the walk's timestamp
+    /// span into the stream's true average fps.
+    Ivf { data_start: usize, ticks_per_sec: f64 },
 }
 
 /// Detect the container type and demux it. `full` requests an exhaustive scan

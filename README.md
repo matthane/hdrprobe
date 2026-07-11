@@ -120,6 +120,9 @@ RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoi
 - Window count
 - Target display max luminance
 
+Detected wherever the format is carried: HEVC SEI messages, AV1 metadata OBUs, or the
+Matroska/WebM carriage used by VP9.
+
 ### Badges and footnotes
 
 Some lines carry a highlighted badge when the metadata shows something worth a second look:
@@ -150,11 +153,12 @@ hdrprobe reads both video files and standalone metadata sidecar files:
 
 | Input | Type | Codecs | Notes |
 |---|---|---|---|
-| MP4 / MOV | Video | HEVC, AVC, AV1 | One or more video tracks; an enhancement layer may ride its own track |
-| MKV / WebM | Video | HEVC, AVC, AV1 | One or more video tracks; an enhancement layer is typically interleaved into its base track |
+| MP4 / MOV | Video | HEVC, AVC, AV1, VP9 | One or more video tracks; an enhancement layer may ride its own track |
+| MKV / WebM | Video | HEVC, AVC, AV1, VP9 | One or more video tracks; an enhancement layer is typically interleaved into its base track |
 | MPEG-TS / M2TS | Video | HEVC, AVC | One or more programs, each with its own video stream; an enhancement layer may ride its own PID |
 | Raw HEVC (Annex-B) | Video | HEVC | Elementary stream; profile inferred from the RPU |
 | Raw AV1 (IVF or low-overhead OBU) | Video | AV1 | Elementary stream; the RPU rides an in-band metadata OBU |
+| Raw VP9 (IVF) | Video | VP9 | Elementary stream; a bare VP9 stream carries no HDR signalling of its own, so colour beyond matrix and range comes only from a container |
 | Dolby Vision RPU (`.bin`, `.rpu`) | Sidecar | – | Raw RPU stream (for example from `dovi_tool extract-rpu`), aggregated across every frame |
 | Dolby Vision CM XML (`.xml`) | Sidecar | – | Dolby CM metadata (DolbyLabsMDF), aggregated per shot |
 | HDR10+ JSON (`.json`) | Sidecar | – | hdr10plus_tool metadata; reports the file-level profile and the first scene from a bounded head read |
@@ -169,12 +173,13 @@ Sidecars carry no picture data, bypass the video pipeline entirely. Because none
 formats records a resolution, the L5 active-area dimensions for the Dolby Vision sidecars are
 computed against an assumed UHD (3840x2160) master and labelled as assumed in the report.
 
-A note on WebM: WebM is a subset of Matroska and is parsed by the same backend, but its codec
-whitelist does not include HEVC. The common Dolby Vision profiles (5, 7, and 8) are all HEVC,
-so they cannot appear in a spec-compliant WebM file. The only Dolby Vision profile that can is
-Profile 10, which is carried in AV1. Because AV1 stores its RPU in-band as a metadata OBU,
-hdrprobe detects it regardless of container, so a WebM carrying DV Profile 10 AV1 is reported
-correctly. In practice this combination is rare.
+A note on WebM: WebM is a subset of Matroska, parsed by the same backend, whose codec
+whitelist excludes HEVC and with it the common Dolby Vision profiles; the only one it can
+carry is AV1's Profile 10, which hdrprobe reports correctly (the RPU rides in-band). WebM's
+native HDR codec is instead VP9, typically 10-bit Profile 2 with the HDR signalling carried
+by the container, including the mastering display, content light levels, and, when present,
+per-frame HDR10+ metadata. hdrprobe reads all of it, from WebM and MKV alike, and reports
+the same sections an HEVC or AV1 HDR file gets.
 
 ## Install
 

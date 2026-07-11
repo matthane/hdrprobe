@@ -146,6 +146,9 @@ pub fn scan(
             ts.dv.track_consecutive();
         }
         scan_chunks(source, &selected, track.nal_format, &track.codec, &mut ts.dv, &mut ts.sei, progress, frontier);
+        // Container-carried T.35 (MKV BlockAdditions): file ranges inside the
+        // demux's head block window, already warmed — never buffer offsets.
+        merge_t35_chunks(data, &track.t35_chunks, &mut ts.sei);
         return Scan { tracks: vec![ts] };
     }
 
@@ -183,6 +186,9 @@ pub fn scan(
         let items = select_track_chunks(demux, opts.samples, opts.full);
         progress.begin(Phase::Scan, items.iter().map(|(_, c)| c.size).sum());
         scan_chunks_routed(data, &items, demux, &mut tracks, progress, frontier);
+    }
+    for (track, ts) in demux.tracks.iter().zip(tracks.iter_mut()) {
+        merge_t35_chunks(data, &track.t35_chunks, &mut ts.sei);
     }
     Scan { tracks }
 }
@@ -374,8 +380,10 @@ fn scan_mkv_full(
 ) -> Scan {
     let mut st = plan.streamer();
     // Blocks arrive routed per track, each window's batches extracted into
-    // their track's aggregates — still one walk over the clusters.
+    // their track's aggregates — still one walk over the clusters. T.35
+    // BlockAdditions (HDR10+ on VP9) ride a parallel routed list.
     let mut outs: Vec<Vec<Chunk>> = vec![Vec::new(); plan.track_count()];
+    let mut t35_outs: Vec<Vec<Chunk>> = vec![Vec::new(); plan.track_count()];
     let mut tracks: Vec<TrackScan> = demux.tracks.iter().map(|_| TrackScan::default()).collect();
     for ts in tracks.iter_mut() {
         // Cluster windows arrive sequentially with blocks in stream order, so
@@ -387,11 +395,16 @@ fn scan_mkv_full(
     // One phase, one bar: position over the whole mmap, like the TS walk.
     progress.begin(Phase::Scan, data.len() as u64);
     loop {
-        for o in outs.iter_mut() {
+        for o in outs.iter_mut().chain(t35_outs.iter_mut()) {
             o.clear();
         }
-        let more =
-            st.next_window(data, &mut outs, crate::container::mkv::STREAM_SPAN_BYTES, frontier);
+        let more = st.next_window(
+            data,
+            &mut outs,
+            &mut t35_outs,
+            crate::container::mkv::STREAM_SPAN_BYTES,
+            frontier,
+        );
         for ((chunks, ts), track) in outs.iter().zip(tracks.iter_mut()).zip(&demux.tracks) {
             *ts.es_bytes.get_or_insert(0) += chunks.iter().map(|c| c.size).sum::<u64>();
             *ts.frame_count.get_or_insert(0) += chunks.len() as u64;
@@ -406,6 +419,11 @@ fn scan_mkv_full(
                     &Progress::off(),
                     frontier,
                 );
+            }
+        }
+        if !opts.no_rpu {
+            for (chunks, ts) in t35_outs.iter().zip(tracks.iter_mut()) {
+                merge_t35_chunks(data, chunks, &mut ts.sei);
             }
         }
         if !more {
@@ -474,7 +492,7 @@ fn scan_raw_full(
             let count = av1::walk_obu_tus(data, tick, push_au!());
             (count, None)
         }
-        RawFullStream::Av1Ivf { data_start, ticks_per_sec } => {
+        RawFullStream::Ivf { data_start, ticks_per_sec } => {
             let walk = av1::walk_ivf_frames(data, *data_start, data.len(), tick, push_au!());
             let fps = av1::ivf_fps(walk.frames, walk.span, *ticks_per_sec);
             ((walk.frames > 0).then_some(walk.frames as u64), fps)
@@ -572,9 +590,32 @@ fn extract_chunk(data: &[u8], chunk: Chunk, fmt: NalFormat, codec: &Codec) -> Ch
             rpus = scan.rpus;
             sei_findings = scan.sei;
         }
+        // VP9 has no in-band SEI/RPU side channel: its static HDR rides the
+        // container's colour signalling and its HDR10+ rides MKV
+        // BlockAdditions (`TrackDemux::t35_chunks`, merged separately) — the
+        // frame bytes themselves carry nothing to extract.
+        Codec::Vp9 => {}
         Codec::Other(_) => {}
     }
     ChunkScan { rpus, sei: sei_findings }
+}
+
+/// Merge container-carried ITU-T T.35 payloads (MKV `BlockAdditional` ranges,
+/// the HDR10+ carriage for VP9 in WebM) into a track's findings, gated the
+/// same way as the AV1 T.35 OBU route: only the HDR10+ signature is parsed,
+/// anything else ignored. First-wins like `SeiFindings::merge`.
+fn merge_t35_chunks(data: &[u8], chunks: &[Chunk], sei: &mut SeiFindings) {
+    for c in chunks {
+        if sei.hdr10plus.is_some() {
+            return;
+        }
+        let start = c.offset as usize;
+        let end = (c.offset + c.size) as usize;
+        let Some(p) = data.get(start..end) else { continue };
+        if let Some(h) = sei::parse_hdr10plus(p) {
+            sei.hdr10plus = Some(h);
+        }
+    }
 }
 
 /// Choose access-unit indices to sample: a head run plus an even spread, plus

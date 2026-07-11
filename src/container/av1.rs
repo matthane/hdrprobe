@@ -1,8 +1,12 @@
-//! Raw AV1 elementary streams: IVF (`DKIF`) and low-overhead OBU (`.obu`).
+//! Raw AV1 elementary streams — IVF (`DKIF`) and low-overhead OBU (`.obu`) —
+//! plus the IVF wrapper's other codec: a `VP90` FourCC routes to a VP9 demux
+//! whose metadata comes from the first keyframe's uncompressed header
+//! (`crate::vp9`) instead of a sequence-header OBU.
 //!
 //! No container metadata — dimensions/bit-depth/colour come from the sequence
-//! header OBU, and the Dolby Vision profile (always **10** for AV1) is inferred
-//! from the presence of DV RPU metadata OBUs downstream. Demux-only.
+//! header OBU (AV1) or the frame header (VP9), and the Dolby Vision profile
+//! (always **10** for AV1) is inferred from the presence of DV RPU metadata
+//! OBUs downstream. Demux-only.
 
 use anyhow::{bail, Result};
 
@@ -49,7 +53,16 @@ pub fn is_obu_stream(data: &[u8]) -> bool {
 
 pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) -> Result<Demux> {
     if is_ivf(data) {
-        demux_ivf(data, full, progress, frontier)
+        // The IVF wrapper is codec-agnostic; the FourCC at bytes 8..12 names
+        // the payload. `VP90` gets the VP9 demux; `VP80` is an honest error
+        // (VP8 has no HDR story and no parser here) rather than the garbage a
+        // sequence-header search over VP8 frames would report; anything else
+        // — `AV01` or an unfilled field — keeps the historical AV1 path.
+        match data.get(8..12) {
+            Some(fc) if fc == b"VP90" => demux_ivf_vp9(data, full, frontier),
+            Some(fc) if fc == b"VP80" => bail!("VP8 in IVF is not supported"),
+            _ => demux_ivf(data, full, progress, frontier),
+        }
     } else if is_obu_stream(data) {
         demux_obu(data, "raw AV1 (OBU)", full, progress, frontier)
     } else {
@@ -57,27 +70,42 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
     }
 }
 
-/// IVF: 32-byte file header, then per-frame (4-byte LE size + 8-byte timestamp +
-/// frame bytes). Each IVF frame is one temporal unit → one chunk. Always a
-/// bounded head walk here — under `--full` the whole-file frame walk belongs to
-/// the sampler's fused pass (`RawFullStream::Av1Ivf`), which recomputes the
-/// exact fps and frame count the old demux-time exhaustive walk produced.
-fn demux_ivf(data: &[u8], full: bool, _progress: &Progress, frontier: &Frontier) -> Result<Demux> {
+/// The IVF fixed file header's fields, plus where the frame records start.
+struct IvfHeader {
+    data_start: usize,
+    width: u32,
+    height: u32,
+    /// The IVF "rate/scale" is a time base (ticks/second), not a frame rate —
+    /// the real fps is recovered from the per-frame presentation timestamps.
+    ticks_per_sec: f64,
+    /// The header's total frame count, so duration is exact even when the
+    /// frame walk is bounded to the head window. 0 = unfilled (some muxers).
+    frames: u32,
+}
+
+/// Parse the 32-byte IVF file header (`DKIF` already verified by `is_ivf`).
+fn parse_ivf_header(data: &[u8]) -> Result<IvfHeader> {
     if data.len() < 32 {
         bail!("truncated IVF header");
     }
     let header_len = u16::from_le_bytes([data[6], data[7]]) as usize;
-    let width = u16::from_le_bytes([data[12], data[13]]) as u32;
-    let height = u16::from_le_bytes([data[14], data[15]]) as u32;
-    // The IVF "rate/scale" is a time base (ticks/second), not a frame rate — the
-    // real fps is recovered from the per-frame presentation timestamps below.
-    let rate = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as f64;
-    let scale = u32::from_le_bytes([data[20], data[21], data[22], data[23]]).max(1) as f64;
-    // The IVF header records the total frame count, so duration is exact even when
-    // the frame walk is bounded to the head window. 0 = unfilled (some muxers).
-    let header_frames = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-    let ticks_per_sec = rate / scale;
-    let data_start = header_len.max(32);
+    Ok(IvfHeader {
+        data_start: header_len.max(32),
+        width: u16::from_le_bytes([data[12], data[13]]) as u32,
+        height: u16::from_le_bytes([data[14], data[15]]) as u32,
+        ticks_per_sec: u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as f64
+            / u32::from_le_bytes([data[20], data[21], data[22], data[23]]).max(1) as f64,
+        frames: u32::from_le_bytes([data[24], data[25], data[26], data[27]]),
+    })
+}
+
+/// IVF: 32-byte file header, then per-frame (4-byte LE size + 8-byte timestamp +
+/// frame bytes). Each IVF frame is one temporal unit → one chunk. Always a
+/// bounded head walk here — under `--full` the whole-file frame walk belongs to
+/// the sampler's fused pass (`RawFullStream::Ivf`), which recomputes the
+/// exact fps and frame count the old demux-time exhaustive walk produced.
+fn demux_ivf(data: &[u8], full: bool, _progress: &Progress, frontier: &Frontier) -> Result<Demux> {
+    let hdr = parse_ivf_header(data)?;
 
     // Small streams are walked whole (cheaper than bounding); big ones stop at
     // the head window so demux cost is O(head) regardless of file size. Under
@@ -88,27 +116,83 @@ fn demux_ivf(data: &[u8], full: bool, _progress: &Progress, frontier: &Frontier)
     let mut chunks = Vec::new();
     let walk = walk_ivf_frames(
         data,
-        data_start,
+        hdr.data_start,
         scan_limit,
         |pos| frontier.ensure(pos as u64),
         |c| chunks.push(c),
     );
 
-    let fps = if full { None } else { ivf_fps(walk.frames, walk.span, ticks_per_sec) };
+    let fps = if full { None } else { ivf_fps(walk.frames, walk.span, hdr.ticks_per_sec) };
 
     let seq = chunks.iter().find_map(|c| find_seq_header(&data[c.offset as usize..(c.offset + c.size) as usize]));
-    // Exact frame count: the whole-file chunk count when we walked it all, else the
-    // header's total (when the muxer filled it) so duration survives the bounded
-    // walk. Under `--full` the fused scan supplies the exact count instead.
-    let frame_count = if full {
+    let frame_count = ivf_frame_count(&hdr, &chunks, full, walked_all);
+    let raw_stream = full
+        .then_some(RawFullStream::Ivf { data_start: hdr.data_start, ticks_per_sec: hdr.ticks_per_sec });
+    Ok(build_demux("raw AV1 (IVF)", hdr.width, hdr.height, fps, frame_count, seq, chunks, raw_stream))
+}
+
+/// Exact frame count: the whole-file chunk count when we walked it all, else
+/// the header's total (when the muxer filled it) so duration survives the
+/// bounded walk. Under `--full` the fused scan supplies the exact count instead.
+fn ivf_frame_count(hdr: &IvfHeader, chunks: &[Chunk], full: bool, walked_all: bool) -> Option<u64> {
+    if full {
         None
     } else if walked_all {
         (!chunks.is_empty()).then_some(chunks.len() as u64)
     } else {
-        (header_frames > 0).then_some(header_frames as u64)
+        (hdr.frames > 0).then_some(hdr.frames as u64)
+    }
+}
+
+/// VP9 in IVF: the same frame walk as AV1's, with the stream's own metadata
+/// read from the first keyframe's uncompressed header instead of a sequence
+/// OBU — profile/depth/chroma, the header's matrix/range, and the coded size
+/// (preferred over the IVF header's, which some tools leave stale). VP9 has no
+/// in-band HDR carriage at all, so a raw VP9 report is honest about what a
+/// bare stream can say: colour is matrix/range-only, never a transfer.
+fn demux_ivf_vp9(data: &[u8], full: bool, frontier: &Frontier) -> Result<Demux> {
+    let hdr = parse_ivf_header(data)?;
+    let walked_all = !full && data.len() <= HEAD_SCAN_BYTES;
+    let scan_limit = if walked_all { data.len() } else { HEAD_SCAN_BYTES.min(data.len()) };
+    let mut chunks = Vec::new();
+    let walk = walk_ivf_frames(
+        data,
+        hdr.data_start,
+        scan_limit,
+        |pos| frontier.ensure(pos as u64),
+        |c| chunks.push(c),
+    );
+    let fps = if full { None } else { ivf_fps(walk.frames, walk.span, hdr.ticks_per_sec) };
+    let frame_count = ivf_frame_count(&hdr, &chunks, full, walked_all);
+
+    // First parsable keyframe header (frame 0 in any real stream; inter
+    // frames simply yield None until one parses).
+    let frame = chunks
+        .iter()
+        .take(32)
+        .find_map(|c| crate::vp9::parse_frame_header(&data[c.offset as usize..(c.offset + c.size) as usize]));
+
+    let duration_secs = match (frame_count, fps) {
+        (Some(n), Some(f)) if f > 0.0 => Some(n as f64 / f),
+        _ => None,
     };
-    let raw_stream = full.then_some(RawFullStream::Av1Ivf { data_start, ticks_per_sec });
-    Ok(build_demux("raw AV1 (IVF)", width, height, fps, frame_count, seq, chunks, raw_stream))
+    let (width, height) = frame.as_ref().map(|f| (f.width, f.height)).unwrap_or((hdr.width, hdr.height));
+    let track = TrackDemux {
+        width,
+        height,
+        fps,
+        bit_depth: frame.as_ref().map(|f| f.bit_depth),
+        chroma: frame.as_ref().map(|f| f.chroma.to_string()),
+        codec_profile: frame.as_ref().map(|f| crate::vp9::profile_label(f.profile, None)),
+        color: frame.map(|f| f.color).unwrap_or_default(),
+        chunks,
+        // NalFormat is unused for VP9 (raw frames, never NAL streams).
+        ..TrackDemux::new(Codec::Vp9, NalFormat::LengthPrefixed(0))
+    };
+    let mut demux = Demux::single("raw VP9 (IVF)", duration_secs, track);
+    demux.raw_stream = full
+        .then_some(RawFullStream::Ivf { data_start: hdr.data_start, ticks_per_sec: hdr.ticks_per_sec });
+    Ok(demux)
 }
 
 /// Stats from an IVF frame-header walk: the walked frame count and the
