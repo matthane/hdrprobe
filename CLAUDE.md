@@ -294,7 +294,20 @@ never parse bytes native-endian.
   only (never the L6 fallback, whose primaries *are* the L9 — self-comparison), both sides
   recognized (unmatched coordinates suppress the verdict, never guess). The classic trigger is
   re-encode drift (a BT.2020-claiming MDCV over a P3-D65 grade), so the badge is a provenance
-  observation, not an error claim.
+  observation, not an error claim. The third sibling is the **`Unconverted RPU` chip**
+  (`levels::finalize`, rendered on the Profile line, JSON
+  `dolby_vision.unconverted_dual_layer_rpu`): the RPU carries the dual-layer NLQ composer
+  payload (`el_type` is Some — that fingerprint exists only in P4/P7-authored RPUs) while the
+  carriage demonstrably has no EL. Hard gates on the no-EL side: an explicit dvcC/dvvC/
+  descriptor with `el_present == 0`, or AV1 with no config (DV-on-AV1 is single-layer by
+  construction — the same derivation `finalize` already uses for `el`). Never fire it for
+  config-less HEVC (a raw P7 BL+EL Annex-B stream carries its EL in-band) or metadata sidecars
+  (no carriage to compare; they reach `finalize` with `cfg == None`). The classic producer is a
+  custom transcode that injected a UHD-BD P7 RPU without dovi_tool `--mode 2` — also the root
+  cause of out-of-spec AV1 profile digits like `10.6`, since mkvmerge hardcodes AV1's profile
+  to 10 but derives the dvvC compat id from the RPU-guessed profile (6 exactly when the guess
+  is 7). The stray payload is inert for playback (a MEL residual contributes nothing), so this
+  too is a provenance observation, not an error claim.
 - **Extension dispatch falls back to content sniffing only on error.** `container::demux` picks a
   backend by extension and returns immediately on success — sniffing never runs on the happy path
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),

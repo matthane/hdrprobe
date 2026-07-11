@@ -16,7 +16,7 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "2.0";
+pub const SCHEMA_VERSION: &str = "2.1";
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -206,6 +206,20 @@ pub struct DolbyVision {
     pub rpu_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub el_type: Option<String>,
+    /// True when the RPU carries the dual-layer composer payload (the NLQ
+    /// block whose MEL/FEL fingerprint is `el_type`) but the carriage
+    /// demonstrably has no enhancement layer: an explicit dvcC/dvvC/descriptor
+    /// with `el_present == 0`, or AV1 with no config (AV1 DV carriage is
+    /// single-layer by construction). The classic producer is a custom
+    /// transcode that injected a UHD-BD Profile 7 RPU without converting it
+    /// (dovi_tool `--mode 2`); the stray payload is inert for playback but
+    /// misleads tools that fingerprint the RPU to guess a profile (mkvmerge
+    /// derives an AV1 dvvC's compat id that way, yielding out-of-spec "10.6").
+    /// A provenance observation, not an error claim. Never fires for a
+    /// metadata sidecar (no carriage to compare) or a config-less raw HEVC
+    /// stream (its EL may legitimately ride in-band).
+    #[serde(skip_serializing_if = "is_false")]
+    pub unconverted_dual_layer_rpu: bool,
     /// The composer's reconstructed signal bit depth, read verbatim from the
     /// RPU header's `vdr_bit_depth` field (never derived from the profile:
     /// Profile 7 signals 12, but Profile 4 signals 14). Present only for FEL
@@ -453,6 +467,7 @@ mod tests {
                 el_present: true,
                 rpu_present: true,
                 el_type: Some("FEL".to_string()),
+                unconverted_dual_layer_rpu: true,
                 reconstructed_bit_depth: Some(12),
                 bl_compatibility_id: Some(6),
                 compatibility: Some("HDR10-compatible".to_string()),
@@ -584,6 +599,7 @@ mod tests {
             "video_tracks[].dolby_vision.el_present",
             "video_tracks[].dolby_vision.rpu_present",
             "video_tracks[].dolby_vision.el_type",
+            "video_tracks[].dolby_vision.unconverted_dual_layer_rpu",
             "video_tracks[].dolby_vision.reconstructed_bit_depth",
             "video_tracks[].dolby_vision.bl_compatibility_id",
             "video_tracks[].dolby_vision.compatibility",
@@ -634,9 +650,9 @@ mod tests {
 
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "2.0");
+        assert_eq!(SCHEMA_VERSION, "2.1");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "2.0");
+        assert_eq!(v["hdrprobe_schema_version"], "2.1");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
         assert_eq!(v["video_tracks"][0]["hdr10plus"]["profile"], "B");

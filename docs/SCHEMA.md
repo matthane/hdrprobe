@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 2.0**
+**Schema version: 2.1**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -163,6 +163,10 @@ build until the schema version, that test, and this document are updated togethe
 
 Version history:
 
+- **2.1**: added `dolby_vision.unconverted_dual_layer_rpu` (additive): true when the RPU
+  carries the dual-layer composer payload but the carriage has no enhancement layer, the
+  signature of a custom transcode that injected a Profile 7 RPU without converting it.
+  Renders as the `Unconverted RPU` chip on the text report's Profile line. Unreleased.
 - **2.0**: breaking restructure for multi-video-track reporting. The per-track sections moved
   into the always-present `video_tracks` array (one entry per video track — one for ordinary
   files, one per independent track for a multi-track MKV/MP4 or multi-program TS, and one for
@@ -189,9 +193,10 @@ Version history:
   no value. No field in the schema is ever serialized as `null`.
 - **Empty arrays are omitted.** `l5_active_areas` and `trim_targets` are absent rather than `[]`
   when nothing was found.
-- **Default-false booleans may be omitted.** `profile_compat_assumed` appears only when `true`.
-  All other booleans (`bl_present`, `el_present`, `rpu_present`, `sampled`, `zeroed`,
-  `l11_reference_mode`) are serialized whenever their containing object is.
+- **Default-false booleans may be omitted.** `profile_compat_assumed` and
+  `unconverted_dual_layer_rpu` appear only when `true`. All other booleans (`bl_present`,
+  `el_present`, `rpu_present`, `sampled`, `zeroed`, `l11_reference_mode`) are serialized
+  whenever their containing object is.
 - **Numbers.** JSON has a single number type; the tables below note the underlying type.
   Integer-typed fields are always whole numbers. Float-typed fields (`fps`, `duration_secs`,
   `bits_per_sec`, `max_luminance`, `min_luminance`, `bl_max_nits`, `rpu_max_nits`, `elapsed_ms`)
@@ -363,6 +368,7 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 | `el_present` | boolean | always | Enhancement layer present |
 | `rpu_present` | boolean | always | RPU substream present |
 | `el_type` | string | optional | `"FEL"` or `"MEL"`; absent for single-layer profiles and under `--no-rpu` (the kind is read from the RPU) |
+| `unconverted_dual_layer_rpu` | boolean | only when `true` | The RPU carries the dual-layer composer payload (the NLQ block whose fingerprint is `el_type`) but the carriage has no enhancement layer: an explicit container config with `el_present` 0, or AV1 (whose DV carriage is single-layer by construction). The signature of a custom transcode that injected a UHD-BD Profile 7 RPU without converting it; the stray payload is inert for playback but misleads tools that guess a profile from the RPU (mkvmerge derives an AV1 `dvvC` compat id that way, producing out-of-spec profile strings like `"10.6"`). A provenance observation, not an error claim. Never set for metadata sidecars (no carriage to compare) or config-less raw HEVC (its EL may legitimately ride in-band). Renders as the `Unconverted RPU` chip on the Profile line |
 | `reconstructed_bit_depth` | integer | optional | The composer's reconstructed signal bit depth, read verbatim from the RPU header's `vdr_bit_depth` field: `12` for Profile 7 FEL, `14` for Profile 4 FEL (never assumed from the profile). Present only when `el_type` is `"FEL"`, the one case where a real residual reconstructs beyond the 10-bit base layer; MEL and single-layer RPUs signal a value too, but it describes composer arithmetic precision rather than content depth, so it is withheld. Absent under `--no-rpu` |
 | `bl_compatibility_id` | integer | optional | Raw `dv_bl_signal_compatibility_id` (0, 1, 2, 4, ...) from the container or a DV XML's declared profile; absent when neither carries it |
 | `compatibility` | string | optional | Human name for the id above: `"no cross-compatibility"`, `"HDR10-compatible"`, `"SDR-compatible"`, `"HLG-compatible"`. Absent for ids outside that set |

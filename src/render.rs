@@ -309,7 +309,20 @@ fn track_sections(
             // `profile_compat_assumed` (that flag fires only on these inputs,
             // so its old "[compat assumed]" tag no longer renders anywhere).
             if !sidecar {
-                kv_styled(s, c, "Profile", &c.bright(&dv_profile_display(dv, t)));
+                // A dual-layer-authored RPU riding an EL-less carriage: the
+                // usual product of a custom transcode that injected a UHD-BD
+                // P7 RPU without converting it — which is also what makes
+                // muxers that fingerprint the RPU write odd profile digits
+                // (mkvmerge's AV1 "10.6"), so the chip rides the line whose
+                // number it explains. The chip stays short; the JSON spells
+                // out `unconverted_dual_layer_rpu`.
+                let unconverted = if dv.unconverted_dual_layer_rpu {
+                    format!("  {}", c.warn("Unconverted RPU"))
+                } else {
+                    String::new()
+                };
+                let profile = c.bright(&dv_profile_display(dv, t));
+                kv_styled(s, c, "Profile", &format!("{profile}{unconverted}"));
             }
 
             // The DV level only defines the codec bit-rate envelope; it says

@@ -324,6 +324,25 @@ impl DvAggregate {
             None => (true, profile == 7, true),
         };
 
+        // A dual-layer-authored RPU in an EL-less carriage: the NLQ composer
+        // payload (whose MEL/FEL fingerprint is `el_type`) exists only when
+        // the RPU was authored for a dual-layer (P4/P7) encode, so its
+        // presence where the carriage demonstrably has no EL marks an
+        // unconverted RPU — the classic custom-transcode case of a UHD-BD P7
+        // RPU injected without dovi_tool `--mode 2`. Hard gates: the no-EL
+        // side must be *declared* (an explicit config with el_present == 0)
+        // or definitional (AV1, whose DV carriage is single-layer by
+        // construction — the same reasoning `el` derives from above). A
+        // config-less raw HEVC stream never fires (its EL may legitimately
+        // ride in-band), and a metadata sidecar has no carriage to compare
+        // (cfg None, not AV1). Provenance observation, not an error claim:
+        // the stray payload is inert for playback.
+        let no_el_carriage = match cfg {
+            Some(c) => !c.el_present,
+            None => is_av1,
+        };
+        let unconverted_dual_layer_rpu = self.el_type.is_some() && no_el_carriage;
+
         let structure = structure_str(el, dual_track);
 
         let l5_active_areas = self
@@ -388,6 +407,7 @@ impl DvAggregate {
             el_present: el,
             rpu_present: rpu,
             el_type,
+            unconverted_dual_layer_rpu,
             reconstructed_bit_depth,
             bl_compatibility_id: compat_id,
             compatibility,
@@ -478,6 +498,9 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         el_present: cfg.el_present,
         rpu_present: cfg.rpu_present,
         el_type: None,
+        // Requires the RPU's own composer payload as evidence, so the
+        // config-only path can never establish it.
+        unconverted_dual_layer_rpu: false,
         reconstructed_bit_depth: None,
         bl_compatibility_id: cfg.bl_compatibility_id,
         compatibility: cfg.bl_compatibility_id.and_then(compat_str),
@@ -904,6 +927,52 @@ mod tests {
         // No sequence-info block: the defaulted 0 must not read as "8-bit".
         let dv = finalize(rpu(Some(DoviELType::FEL), false, 0));
         assert_eq!(dv.reconstructed_bit_depth, None);
+    }
+
+    #[test]
+    fn unconverted_dual_layer_rpu_needs_nlq_and_an_el_less_carriage() {
+        let rpu = |el_type: Option<DoviELType>| {
+            let mut r = DoviRpu::default();
+            r.dovi_profile = 7;
+            r.el_type = el_type;
+            r
+        };
+        let cfg = |profile: u8, el_present: bool| DvConfig {
+            profile,
+            level: None,
+            bl_present: true,
+            el_present,
+            rpu_present: true,
+            bl_compatibility_id: Some(6),
+        };
+        let finalize = |r: DoviRpu, cfg: Option<&DvConfig>, is_av1: bool| {
+            let mut agg = DvAggregate::default();
+            agg.add(&r);
+            agg.finalize(3840, 2160, cfg, false, is_av1, false).unwrap()
+        };
+
+        // The motivating case: a UHD-BD P7 MEL RPU injected into an AV1 mux
+        // whose dvvC declares no EL (mkvmerge then writes profile 10 with the
+        // RPU-guessed compat 6, the out-of-spec "10.6").
+        let dv = finalize(rpu(Some(DoviELType::MEL)), Some(&cfg(10, false)), true);
+        assert!(dv.unconverted_dual_layer_rpu);
+        // The HEVC sibling: an unconverted FEL RPU under a single-layer dvcC.
+        let dv = finalize(rpu(Some(DoviELType::FEL)), Some(&cfg(8, false)), false);
+        assert!(dv.unconverted_dual_layer_rpu);
+        // A real dual-layer mux declares its EL: never flagged.
+        let dv = finalize(rpu(Some(DoviELType::FEL)), Some(&cfg(7, true)), false);
+        assert!(!dv.unconverted_dual_layer_rpu);
+        // A properly converted RPU carries no NLQ payload: nothing to flag.
+        let dv = finalize(rpu(None), Some(&cfg(8, false)), false);
+        assert!(!dv.unconverted_dual_layer_rpu);
+        // Config-less raw HEVC may carry its EL in-band (a P7 BL+EL Annex-B
+        // stream) — and a metadata-only RPU sidecar shares this state with no
+        // carriage to compare at all: never inferred for either.
+        let dv = finalize(rpu(Some(DoviELType::MEL)), None, false);
+        assert!(!dv.unconverted_dual_layer_rpu);
+        // Config-less raw AV1 is single-layer by construction: flagged.
+        let dv = finalize(rpu(Some(DoviELType::MEL)), None, true);
+        assert!(dv.unconverted_dual_layer_rpu);
     }
 
     #[test]

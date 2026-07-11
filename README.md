@@ -130,6 +130,7 @@ Some lines carry a highlighted badge when the metadata shows something worth a s
 | `zeroed` | Content light, L6 content light | MaxCLL / MaxFALL are signalled but both zero, a placeholder left in by the authoring tool (a common real-world defect) |
 | `MDP mismatch` | DV Mastering | The Dolby Vision grade's mastering gamut (L9) disagrees with the base layer's own signalled mastering display primaries, usually drift left behind by a re-encode |
 | `FEL brightness expansion` | DV Mastering | The Dolby Vision grade's mastering display is brighter than the one declared for the base layer (for example a 4000-nit grade over a 1000-nit HDR10 base): the base layer is a tone-mapped rendition of a brighter master, and the full-enhancement layer's residual is what restores those highlights, so stripping it (a Profile 7 to 8 conversion) would discard them |
+| `Unconverted RPU` | DV Profile | The RPU still carries the dual-layer composer metadata of its source (typically a UHD Blu-ray Profile 7 title), but this stream has no enhancement layer: the RPU was carried into a single-layer transcode without being converted first. Playback is unaffected, but tools that guess a profile from the RPU can be misled by the leftover metadata; the out-of-spec `10.6` some AV1 transcodes declare is exactly this. Converting the RPU (for example with `dovi_tool`) before the encode avoids it |
 
 These are observations about the metadata, not errors; the file still plays. They surface
 inconsistencies a normal player silently ignores but a remuxer or encoder may care about.
