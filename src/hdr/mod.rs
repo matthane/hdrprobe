@@ -132,6 +132,14 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
 /// 1/65536) while keeping apart the tightest real split, the DCI theatrical
 /// vs D65 white x (0.0013). Unrecognized coordinates yield `None` — the
 /// luminance still shows, the gamut tag is just omitted, never guessed.
+///
+/// Matching is order-insensitive: the three primaries are first canonicalized
+/// by their chromaticity role (blue has the smallest y, red the largest x of
+/// the rest — unambiguous for every recognized gamut), because real muxers
+/// store them rotated across the slots (google/video-file writes a WebM
+/// MasteringMetadata whose R element holds blue's coordinates; the *set* is
+/// still exactly Display P3, and MediaInfo labels it as such). Same single
+/// tolerance, same label value space — only the slot assignment moves.
 pub(crate) fn primaries_label(
     r: (f64, f64),
     g: (f64, f64),
@@ -140,6 +148,10 @@ pub(crate) fn primaries_label(
 ) -> Option<&'static str> {
     const D65: (f64, f64) = (0.3127, 0.3290);
     const DCI: (f64, f64) = (0.3140, 0.3510);
+    let mut tri3 = [r, g, b];
+    tri3.sort_by(|a, c| a.1.total_cmp(&c.1)); // blue first (min y)
+    let b = tri3[0];
+    let (r, g) = if tri3[1].0 >= tri3[2].0 { (tri3[1], tri3[2]) } else { (tri3[2], tri3[1]) };
     let near =
         |a: (f64, f64), t: (f64, f64)| (a.0 - t.0).abs() < 0.0005 && (a.1 - t.1).abs() < 0.0005;
     let tri = |tr, tg, tb| near(r, tr) && near(g, tg) && near(b, tb);
@@ -184,6 +196,24 @@ mod tests {
         assert_eq!(
             primaries_label((0.640, 0.330), (0.300, 0.600), (0.150, 0.060), d65),
             Some("BT.709")
+        );
+    }
+
+    #[test]
+    fn rotated_primary_slots_still_classify() {
+        // The corpus vp9_hdr10plus.webm's MasteringMetadata verbatim: Display
+        // P3 primaries stored rotated across the R/G/B elements (the R slot
+        // holds blue's coordinates, etc. — a google/video-file muxer quirk).
+        // The set is exactly P3 with a D65 white, so the role-canonicalized
+        // match must label it; MediaInfo reports "Display P3" for this file.
+        assert_eq!(
+            primaries_label(
+                (0.15, 0.06),
+                (0.68, 0.32),
+                (0.26496, 0.69),
+                (0.31268, 0.329)
+            ),
+            Some("DCI-P3 D65")
         );
     }
 
