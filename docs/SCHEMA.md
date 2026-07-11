@@ -171,7 +171,7 @@ Version history:
   own `codec_profile` format, and `"raw VP9 (IVF)"` joins the `container` set. Also adds
   ProRes support the same way: `"ProRes"` joins the `codec` set, with a `codec_profile`
   present only for MOV/MP4 carriage (the profile is signalled by the sample-entry FourCC,
-  which Matroska does not carry). Unreleased.
+  which Matroska does not carry). Ships in hdrprobe 0.5.0.
 - **2.0**: breaking restructure for multi-video-track reporting. The per-track sections moved
   into the always-present `video_tracks` array (one entry per video track — one for ordinary
   files, one per independent track for a multi-track MKV/MP4 or multi-program TS, and one for
