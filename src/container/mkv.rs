@@ -1183,6 +1183,12 @@ fn parse_mastering(data: &[u8], start: usize, end: usize) -> Option<MasteringDis
     if max_lum.is_none() && min_lum.is_none() {
         return None;
     }
+    // Quantize to ST.2086's 0.0001 cd/m² unit: the EBML floats are usually
+    // f32, whose promotion renders noise (0.005f32 → "0.004999999888…") where
+    // the SEI path's /10000 integers render "0.0050".
+    let quant = |v: f64| (v * 10000.0).round() / 10000.0;
+    let max_lum = max_lum.map(quant);
+    let min_lum = min_lum.map(quant);
     let primaries = if chroma.iter().all(Option::is_some) {
         let c = chroma.map(|v| v.unwrap_or(0.0));
         crate::hdr::primaries_label((c[0], c[1]), (c[2], c[3]), (c[4], c[5]), (c[6], c[7]))
