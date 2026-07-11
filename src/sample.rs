@@ -595,6 +595,11 @@ fn extract_chunk(data: &[u8], chunk: Chunk, fmt: NalFormat, codec: &Codec) -> Ch
         // BlockAdditions (`TrackDemux::t35_chunks`, merged separately) — the
         // frame bytes themselves carry nothing to extract.
         Codec::Vp9 => {}
+        // ProRes has no bitstream side channel at all: static HDR rides the
+        // container's colour/mastering signalling, dynamic HDR does not exist
+        // for ProRes carriage, and DV masters pair with CM XML sidecars (the
+        // sidecar path). Nothing to extract from the frame bytes.
+        Codec::ProRes => {}
         Codec::Other(_) => {}
     }
     ChunkScan { rpus, sei: sei_findings }

@@ -153,8 +153,8 @@ hdrprobe reads both video files and standalone metadata sidecar files:
 
 | Input | Type | Codecs | Notes |
 |---|---|---|---|
-| MP4 / MOV | Video | HEVC, AVC, AV1, VP9 | One or more video tracks; an enhancement layer may ride its own track |
-| MKV / WebM | Video | HEVC, AVC, AV1, VP9 | One or more video tracks; an enhancement layer is typically interleaved into its base track |
+| MP4 / MOV | Video | HEVC, AVC, AV1, VP9, ProRes | One or more video tracks; an enhancement layer may ride its own track |
+| MKV / WebM | Video | HEVC, AVC, AV1, VP9, ProRes | One or more video tracks; an enhancement layer is typically interleaved into its base track |
 | MPEG-TS / M2TS | Video | HEVC, AVC | One or more programs, each with its own video stream; an enhancement layer may ride its own PID |
 | Raw HEVC (Annex-B) | Video | HEVC | Elementary stream; profile inferred from the RPU |
 | Raw AV1 (IVF or low-overhead OBU) | Video | AV1 | Elementary stream; the RPU rides an in-band metadata OBU |

@@ -465,6 +465,16 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         });
     }
 
+    // A ProRes MOV without a `colr` box (ffmpeg writes none by default) signals
+    // colour only in the frame headers — recover it from the first sample, the
+    // ProRes analogue of the hvcC/avcC SPS colour fallback above. Runs after
+    // the fMP4 fragment index fill so the chunks exist on either layout.
+    for t in &mut out {
+        if t.codec == Codec::ProRes {
+            super::fill_prores_stream_fields(t, data);
+        }
+    }
+
     Demux {
         container,
         duration_secs,
@@ -567,6 +577,9 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         b"avc1" | b"avc3" | b"dva1" | b"dvav" => Codec::Avc,
         b"av01" | b"dav1" => Codec::Av1,
         b"vp09" => Codec::Vp9,
+        // The six ProRes video profiles. ProRes RAW (`aprn`/`aprh`) is a
+        // different codec family and stays on the generic fallback.
+        b"apco" | b"apcs" | b"apcn" | b"apch" | b"ap4h" | b"ap4x" => Codec::ProRes,
         other => Codec::Other(String::from_utf8_lossy(other).to_string()),
     };
 
@@ -579,6 +592,17 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut bit_depth = None;
     let mut chroma = None;
     let mut codec_profile = None;
+    // ProRes has no decoder-config child box: the sample-entry FourCC itself
+    // is the profile, and the family defines chroma/depth (10-bit 4:2:2, or
+    // 12-bit 4:4:4 for the 4444 pair). Colour still comes from the ordinary
+    // `colr`/`mdcv`/`clli` children below.
+    if codec == Codec::ProRes {
+        if let Some((prof, ch, bd)) = crate::prores::profile_from_fourcc(&format) {
+            codec_profile = Some(prof.to_string());
+            chroma = Some(ch.to_string());
+            bit_depth = Some(bd);
+        }
+    }
     let mut nal_len = 4u8;
     let mut color = ColorInfo::default();
     let mut dv_config = None;

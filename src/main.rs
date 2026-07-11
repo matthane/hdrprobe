@@ -10,6 +10,7 @@ mod hevc;
 mod model;
 mod prefetch;
 mod progress;
+mod prores;
 mod render;
 mod sample;
 mod shell;

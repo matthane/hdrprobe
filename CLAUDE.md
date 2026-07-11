@@ -82,6 +82,23 @@ never parse bytes native-endian.
   stays ignored) and `sample.rs` merges those payloads through the same `sei::parse_hdr10plus`
   gate the AV1 T.35 route uses. MP4 carries VP9 as `vp09` + `vpcC` (CICP + range directly in
   the record — parsed in `mp4.rs`).
+- `prores.rs` — the ProRes analogue, plainer still: the frame header (every frame is
+  intra-coded and carries one) gives chroma format and its own CICP colour bytes, which real
+  encodes routinely leave unspecified (the corpus MKV says 2/2/6 under real BT.2020/PQ
+  container signalling) — container colour keeps authority, the header only fills gaps, and
+  bit depth is the profile family's defined depth (4:2:2 → 10, 4444 → 12; the header has no
+  depth field). ProRes has **no bitstream side channel at all** — no SEI/RPU/T.35; static HDR
+  rides MKV `Colour` / MP4 `colr`+`mdcv`+`clli`, and DV masters pair with CM XML sidecars —
+  so the sampler's ProRes arm is a deliberate no-op. The profile is signalled **only** by the
+  MOV/MP4 sample-entry FourCC (`apco/apcs/apcn/apch/ap4h/ap4x` → `profile_from_fourcc`);
+  Matroska's `V_PRORES` carries no FourCC and a void CodecPrivate, and its blocks strip the
+  frame's 8-byte `size+'icpf'` atom header (`parse_frame_header` accepts both forms), so an
+  MKV mux reports no profile (MediaInfo/ffprobe agree — never guess). Both backends run the
+  shared `container::fill_prores_stream_fields` over the first frame: MKV for depth/chroma
+  (stated nowhere else), and both for the colour gap-fill — an ffmpeg-written ProRes MOV
+  carries no `colr` box at all, leaving the frame header's CICP as the only colour signal
+  (verified: without the fill such a PQ master classifies SDR). ProRes RAW (`aprn`/`aprh`)
+  is a different codec family and stays on the `Other` fallback.
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
 - `hdr/` — `mod.rs` (format classification + `primaries_label`, the chromaticity→gamut matcher
   behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer). The AV1

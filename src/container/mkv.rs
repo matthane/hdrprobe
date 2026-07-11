@@ -481,6 +481,13 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         if td.codec == Codec::Vp9 {
             fill_vp9_stream_fields(&mut td, data);
         }
+        // ProRes has the same shape with a plainer header: `V_PRORES` carries
+        // no CodecPrivate at all, so depth/chroma (and colour, only when the
+        // Colour element signalled nothing) come from the first block's frame
+        // header. Same head-window economics as the VP9 fill.
+        if td.codec == Codec::ProRes {
+            super::fill_prores_stream_fields(&mut td, data);
+        }
         tracks.push(td);
     }
 
@@ -1101,6 +1108,20 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth: p.bit_depth,
             chroma: p.chroma.map(str::to_string),
             codec_profile: p.profile.map(|pr| crate::vp9::profile_label(pr, p.level)),
+        }
+    } else if codec_id.starts_with(b"V_PRORES") {
+        // CodecPrivate is void per the Matroska codec spec, and the profile
+        // FourCC exists nowhere in an MKV mux (MediaInfo/ffprobe leave the
+        // profile blank too — never guess one). Depth/chroma come from the
+        // first block's frame header via `fill_prores_stream_fields` after the
+        // blocks are indexed. The nal_format is a placeholder: blocks are raw
+        // frames (the 8-byte size+'icpf' atom stripped), never NAL streams.
+        CodecConfig {
+            codec: Codec::ProRes,
+            nal_format: NalFormat::LengthPrefixed(4),
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
         }
     } else if codec_id.starts_with(b"V_AV1") {
         // CodecPrivate is an AV1CodecConfigurationRecord (same layout as `av1C`),

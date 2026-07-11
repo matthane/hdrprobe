@@ -23,6 +23,7 @@ pub enum Codec {
     Avc,
     Av1,
     Vp9,
+    ProRes,
     Other(String),
 }
 
@@ -33,6 +34,7 @@ impl Codec {
             Codec::Avc => "AVC".to_string(),
             Codec::Av1 => "AV1".to_string(),
             Codec::Vp9 => "VP9".to_string(),
+            Codec::ProRes => "ProRes".to_string(),
             Codec::Other(s) => s.clone(),
         }
     }
@@ -517,6 +519,45 @@ pub(crate) fn color_from_av1c(av1c: &[u8]) -> Option<ColorInfo> {
         .find(|o| o.obu_type == crate::av1::obu::OBU_SEQUENCE_HEADER)?;
     let info = crate::av1::seq::parse_sequence_header(seq.payload)?;
     info.color_description_present.then_some(info.color)
+}
+
+/// Fill a ProRes track's config/colour gaps from the first frame's header
+/// (every ProRes frame is intra-coded and carries one, so the first parseable
+/// chunk suffices; both carriage forms parse — the MOV/MP4 sample keeps the
+/// `icpf` atom, the Matroska block strips it). Depth/chroma fill only when the
+/// container stated none (MKV always; MOV/MP4 derive them from the sample-entry
+/// FourCC first). The header's CICP primaries/transfer/matrix fill only when
+/// the container signalled none of the three — all-or-nothing, so container
+/// authority is never mixed with header bytes (the corpus MKV's header says
+/// unspecified under real BT.2020/PQ container signalling, while an
+/// ffmpeg-written MOV carries no `colr` box and *only* the header CICP — both
+/// directions need this rule). The header has no range field, so range is
+/// never touched.
+pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
+    let missing_cfg = track.bit_depth.is_none() || track.chroma.is_none();
+    let signalled_nothing = track.color.primaries.is_none()
+        && track.color.transfer.is_none()
+        && track.color.matrix.is_none();
+    if !missing_cfg && !signalled_nothing {
+        return;
+    }
+    let f = track.chunks.iter().take(32).find_map(|c| {
+        let s = c.offset as usize;
+        let e = ((c.offset + c.size) as usize).min(data.len());
+        (s < e).then(|| crate::prores::parse_frame_header(&data[s..e])).flatten()
+    });
+    let Some(f) = f else { return };
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(f.bit_depth);
+    }
+    if track.chroma.is_none() {
+        track.chroma = Some(f.chroma.to_string());
+    }
+    if signalled_nothing {
+        track.color.primaries = f.color.primaries;
+        track.color.transfer = f.color.transfer;
+        track.color.matrix = f.color.matrix;
+    }
 }
 
 pub(crate) fn cicp_primaries(v: u16) -> Option<&'static str> {
