@@ -63,6 +63,15 @@ const MP4_HEAD_WARM: usize = 1 << 20; // 1 MiB
 /// generic `HEAD_WARM` fallback applies (see its coupling note).
 const MKV_HEAD_WARM: usize = 1 << 20; // 1 MiB
 
+/// A Blu-ray ISO's front UDF structures: the volume recognition sequence at
+/// sector 16, the front volume descriptor sequence, and the anchor descriptor
+/// at sector 256 (byte 512 KiB) all sit inside 1 MiB. Everything past that
+/// (the metadata partition, the playlists, and the located clip's TS
+/// head/tail windows) is warmed by exact extent from the locator (`bdiso`)
+/// and `warm_ts_windows`, so a bigger generic head would only stream bytes
+/// the walk never reads.
+const ISO_HEAD_WARM: usize = 1 << 20; // 1 MiB
+
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
 #[cfg(unix)]
@@ -209,9 +218,10 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     // the demux is actually blocked on.
     let mut ranges: Vec<(u64, usize)> = Vec::new();
 
-    let is_ts = looks_like_ts(path, data);
-    let is_mp4 = looks_like_mp4(path, data);
-    let is_mkv = looks_like_mkv(path, data);
+    let is_iso = looks_like_iso(path);
+    let is_ts = !is_iso && looks_like_ts(path, data);
+    let is_mp4 = !is_iso && looks_like_mp4(path, data);
+    let is_mkv = !is_iso && looks_like_mkv(path, data);
     let moov = if is_mp4 { crate::container::mp4::moov_extent(data) } else { None };
     let mkv_blocks = if is_mkv { crate::container::mkv::head_blocks_extent(data) } else { None };
 
@@ -224,7 +234,9 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     // extent below, and a generic head would stream bytes nothing parses. Raw
     // HEVC/AV1 head walks are covered by the generic head (the `<=` couplings
     // on `HEAD_WARM`).
-    let head = if is_ts {
+    let head = if is_iso {
+        ISO_HEAD_WARM
+    } else if is_ts {
         crate::container::ts::HEAD_SCAN_BYTES as usize
     } else if moov.is_some() {
         MP4_HEAD_WARM
@@ -296,9 +308,28 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
 /// ranges become ~pool-width parallel positioned reads instead of a serial
 /// chain, so one range's network latency hides another's. Positioned reads on a
 /// shared `&File` are safe: each carries its own offset, and nothing in the
-/// program relies on the file cursor.
-fn warm_ranges(file: &File, ranges: Vec<(u64, usize)>) {
+/// program relies on the file cursor. `pub(crate)` for the Blu-ray ISO
+/// locator, which discovers its exact extents (metadata partition, playlists)
+/// mid-walk, after `warm_metadata` has already run.
+pub(crate) fn warm_ranges(file: &File, ranges: Vec<(u64, usize)>) {
     warm_merged(file, &merge_ranges(ranges));
+}
+
+/// The located main-feature clip's TS head and tail windows, translated to its
+/// byte range inside the ISO: the ISO counterpart of `warm_metadata`'s TS
+/// branch (which warms the same windows at file offsets 0/EOF). Sized exactly
+/// to what `ts::demux` reads from the subslice; keep in sync with
+/// `ts::HEAD_SCAN_BYTES` / `ts::TAIL_SCAN_BYTES` like the TS branch above.
+pub fn warm_ts_windows(remote: bool, file: &File, base: u64, len: u64) {
+    if !remote {
+        return;
+    }
+    let head = crate::container::ts::HEAD_SCAN_BYTES.min(len);
+    let tail_start = len.saturating_sub(crate::container::ts::TAIL_SCAN_BYTES);
+    warm_ranges(
+        file,
+        vec![(base, head as usize), (base + tail_start, (len - tail_start) as usize)],
+    );
 }
 
 /// Warm already-merged `(start, end)` extents concurrently.
@@ -403,6 +434,11 @@ const FRONTIER_AHEAD: u64 = 32 << 20; // 32 MiB
 /// corpus `-q` gate cannot catch a breakage; only a real network path shows it.
 pub struct Frontier<'a> {
     file: Option<&'a File>,
+    /// File offset of walk position 0. Every walk that ticks the frontier
+    /// addresses its input slice; for a whole-file mmap that equals the file
+    /// (base 0), for a Blu-ray ISO's main-feature subslice the positions are
+    /// clip-relative and the reads must land at `base + pos` in the image.
+    base: u64,
     len: u64,
     warmed_to: std::cell::Cell<u64>,
 }
@@ -410,11 +446,17 @@ pub struct Frontier<'a> {
 impl Frontier<'_> {
     /// Disabled sink: every call is a no-op.
     pub fn off() -> Frontier<'static> {
-        Frontier { file: None, len: 0, warmed_to: std::cell::Cell::new(0) }
+        Frontier { file: None, base: 0, len: 0, warmed_to: std::cell::Cell::new(0) }
     }
 
     pub fn new(file: &File, len: u64) -> Frontier<'_> {
-        Frontier { file: Some(file), len, warmed_to: std::cell::Cell::new(0) }
+        Self::new_at(file, 0, len)
+    }
+
+    /// A frontier over a subslice of the file: positions stay slice-relative
+    /// (clamped to `len`, the slice length); only the reads are translated.
+    pub fn new_at(file: &File, base: u64, len: u64) -> Frontier<'_> {
+        Frontier { file: Some(file), base, len, warmed_to: std::cell::Cell::new(0) }
     }
 
     /// The walk is at `pos`: keep `[pos, pos + FRONTIER_AHEAD)` warm, reading
@@ -445,7 +487,7 @@ impl Frontier<'_> {
         if target <= from {
             return;
         }
-        warm(file, from, (target - from) as usize);
+        warm(file, self.base + from, (target - from) as usize);
         self.warmed_to.set(target);
     }
 }
@@ -494,6 +536,16 @@ fn looks_like_ts(path: &Path, data: &[u8]) -> bool {
         || crate::container::ts::detect_layout(data).is_some()
 }
 
+// Extension-only on purpose, unlike the other sniffs: the ISO pipeline itself
+// is gated on the `.iso` extension in `main.rs` (a UDF image under another
+// name takes the ordinary demux path), and a content sniff here would fault
+// the sector-16..64 recognition window in on every remote non-ISO file:
+// ~48 scattered cold round-trips ahead of the real head warm.
+fn looks_like_iso(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    ext == "iso"
+}
+
 fn looks_like_mkv(path: &Path, data: &[u8]) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     matches!(ext.as_str(), "mkv" | "webm" | "mka")
@@ -518,6 +570,25 @@ mod tests {
         f.ensure(100); // behind the frontier: nothing to re-read
         f.ensure_to(2048); // already covered
         assert_eq!(f.warmed_to.get(), before);
+
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn based_frontier_stays_in_slice_coordinates() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("hdrprobe_frontier_based_smoke");
+        std::fs::write(&path, vec![0xAAu8; 8192]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        // A 4096-byte slice starting at file offset 2048: positions and the
+        // EOF clamp are slice-relative; only the reads are base-translated.
+        let f = super::Frontier::new_at(&file, 2048, 4096);
+        f.ensure(0);
+        assert_eq!(f.warmed_to.get(), 4096, "clamped to the slice length, not the file");
+        f.ensure_to(4096);
+        assert_eq!(f.warmed_to.get(), 4096);
 
         drop(file);
         let _ = std::fs::remove_file(&path);

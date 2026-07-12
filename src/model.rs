@@ -16,7 +16,7 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "2.1";
+pub const SCHEMA_VERSION: &str = "2.2";
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -28,6 +28,11 @@ pub struct Report {
     pub file: String,
     pub size_bytes: u64,
     pub container: String,
+    /// Blu-ray ISO probes only: which BDMV playlist/clip was auto-selected as
+    /// the main feature. The report's duration, bitrate, and tracks describe
+    /// that clip; `size_bytes` stays the whole image's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bd_iso: Option<BdIso>,
     /// Sidecar schema version, e.g. "4.0.2" from a DV CM XML's root
     /// `<DolbyLabsMDF version=…>` attribute. `None` for video inputs and
     /// sidecars that don't declare one.
@@ -44,6 +49,24 @@ pub struct Report {
     pub video_tracks: Vec<VideoTrack>,
     /// Wall-clock parse time in milliseconds.
     pub elapsed_ms: f64,
+}
+
+/// The BDMV main feature a Blu-ray ISO probe selected (see `Report::bd_iso`).
+#[derive(Debug, Serialize)]
+pub struct BdIso {
+    /// Selected playlist file name, e.g. `"00800.mpls"`: the longest by
+    /// deduped edit duration.
+    pub playlist: String,
+    /// The playlist's own edit duration. Distinct from the report's
+    /// `duration_secs`, which is the probed clip's transport-clock duration.
+    pub playlist_duration_secs: f64,
+    /// Probed clip file name under `BDMV/STREAM`, e.g. `"00055.m2ts"`: the
+    /// playlist's largest clip.
+    pub clip: String,
+    /// 1-based position of the probed clip among the playlist's distinct
+    /// clips in playback order.
+    pub clip_index: usize,
+    pub clip_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -421,6 +444,13 @@ mod tests {
             file: "movie.mkv".to_string(),
             size_bytes: 1,
             container: "Matroska".to_string(),
+            bd_iso: Some(BdIso {
+                playlist: "00800.mpls".to_string(),
+                playlist_duration_secs: 8065.0,
+                clip: "00055.m2ts".to_string(),
+                clip_index: 1,
+                clip_count: 1,
+            }),
             format_version: Some("4.0.2".to_string()),
             duration_secs: Some(30.0),
             video_tracks: vec![maximal_track()],
@@ -563,6 +593,11 @@ mod tests {
             "file",
             "size_bytes",
             "container",
+            "bd_iso.playlist",
+            "bd_iso.playlist_duration_secs",
+            "bd_iso.clip",
+            "bd_iso.clip_index",
+            "bd_iso.clip_count",
             "format_version",
             "duration_secs",
             "elapsed_ms",
@@ -650,9 +685,9 @@ mod tests {
 
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "2.1");
+        assert_eq!(SCHEMA_VERSION, "2.2");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "2.1");
+        assert_eq!(v["hdrprobe_schema_version"], "2.2");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
         assert_eq!(v["video_tracks"][0]["hdr10plus"]["profile"], "B");

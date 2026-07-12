@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 181 unit tests
+cargo test                     # 208 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -58,8 +58,8 @@ the gates and builds without creating a release. The corpus `-q` check stays a m
 `cfg(windows)` branches — keep new platform-specific code behind `cfg` with a non-Windows path, and
 never parse bytes native-endian.
 
-- `main.rs` — clap CLI, per-file dispatch (sidecar files first, then the video pipeline), exit
-  codes (0 ok / 1 usage / 2 unreadable).
+- `main.rs` — clap CLI, per-file dispatch (sidecar files first, then the Blu-ray ISO branch,
+  then the video pipeline), exit codes (0 ok / 1 usage / 2 unreadable).
 - `container/` — one hand-rolled demuxer per format: `mp4.rs`, `mkv.rs`, `ts.rs`, `annexb.rs`,
   `av1.rs` (which also owns the IVF wrapper's FourCC dispatch: `VP90` → the VP9 IVF demux,
   `VP80` → an honest error, else AV1); `mod.rs` holds `Demux`/`Chunk`/`DvConfig` and the shared
@@ -122,6 +122,19 @@ never parse bytes native-endian.
   every input kind. The XML's Level-0 primaries (tagged `[L0]`) are the
   mastering-gamut fallback for a CM v2.9 XML, which has no L9; a recognized L9 wins when present,
   so CM v4.0 output is unchanged.
+- `bdiso/` — Blu-ray ISO (`.iso`) main-feature probing: `udf.rs` (read-only ECMA-167/UDF 2.50
+  walker over the ISO mmap, both plain type-1 partition maps and the 2.50 Metadata Partition,
+  bounds-checked with `mp4.rs` discipline; UDF is little-endian, explicit LE reads), `mpls.rs`
+  (playlist header + PlayItems only, big-endian; STN tables and angle blocks are skipped by the
+  item length field), `mod.rs` (`is_udf_iso` VRS gate, `locate_main_feature`, the `select_main`
+  heuristic: longest deduped-segment duration wins, ties by referenced clip bytes, identical
+  playlists collapse, missing-clip playlists drop; probe clip = the winner's largest clip,
+  extents coalesced to one contiguous range). `main.rs` owns the orchestration: the extension
+  gate, the clip subslice, the based Frontier, the `"Blu-ray ISO (BDMV)"` container label, and
+  `model::BdIso` (the `Main feature` line). The synthetic UDF image builder for tests lives in
+  `udf.rs::testimg` (in-memory, path-portable; type-1 images use short_ad file data and
+  extent-recorded directories, metadata images use long_ad data and inline directories, so
+  both descriptor forms stay exercised).
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
   The JSON output is an external contract documented field-by-field in `docs/SCHEMA.md` and
   versioned by `model::SCHEMA_VERSION` (the `hdrprobe_schema_version` field on every report,
@@ -337,6 +350,30 @@ never parse bytes native-endian.
   to 10 but derives the dvvC compat id from the RPU-guessed profile (6 exactly when the guess
   is 7). The stray payload is inert for playback (a MEL residual contributes nothing), so this
   too is a provenance observation, not an error claim.
+- **A Blu-ray ISO is probed as a clip subslice, never as offset fix-ups.** The ISO path
+  (`main.rs`, gated on the `.iso` extension *and* `bdiso::is_udf_iso`) resolves the main
+  feature to one contiguous byte range and hands `&mmap[clip_start..clip_start+clip_len]` to
+  `ts::demux` **and** `sample::scan`: the TS backend is fully slice-relative (packet phase
+  re-derived, head/tail windows addressed from the slice ends, chunks index the reassembled
+  heap buffer), so bitrate denominators, `--full` streaming positions, and progress totals are
+  all clip-correct by construction. Never pass the whole ISO mmap with offsets patched in.
+  The `--full` frontier is the one base-aware piece: `Frontier::new_at(file, clip_start,
+  clip_len)` keeps walk positions slice-relative and translates only the reads. Related
+  gates, all deliberate: the **AACS verdict** is "`ts::detect_layout` fails on the clip head
+  *and* an `AACS/` directory exists" (decrypted backups keep the directory, so presence alone
+  never rejects; encrypted clips can't sync-lock because AACS leaves only 16 clear bytes per
+  6144-byte unit); **selection dedupes segments before comparing durations** (a decoy looping
+  one segment 500 times collapses to one, so it can't out-rank the feature); a **fragmented
+  clip errors honestly** (UDF's ~1 GiB extent cap makes real features many exactly-adjacent
+  extents that coalesce; a genuine gap is not supported, never guessed). Prefetch:
+  `looks_like_iso` is extension-only on purpose (a content sniff would fault the sector-16..64
+  VRS window on every remote non-ISO file), `ISO_HEAD_WARM` (1 MiB) covers VRS + front VDS +
+  the anchor at byte 512 KiB, the locator warms the metadata-partition and playlist extents
+  exactly (`warm: Option<&File>`, remote only), and `prefetch::warm_ts_windows` replays the TS
+  head/tail warm at `clip_start`/clip EOF (keep it in sync with `ts::HEAD_SCAN_BYTES`/
+  `TAIL_SCAN_BYTES` like the byte-0 TS branch). The report keeps the ISO's `size_bytes` and
+  the clip's PCR `duration_secs`; the playlist's own edit duration renders on the
+  `Main feature` line, never on the Duration line.
 - **Extension dispatch falls back to content sniffing only on error.** `container::demux` picks a
   backend by extension and returns immediately on success — sniffing never runs on the happy path
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),

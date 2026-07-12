@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 2.1**
+**Schema version: 2.2**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -163,6 +163,10 @@ build until the schema version, that test, and this document are updated togethe
 
 Version history:
 
+- **2.2**: Blu-ray ISO support (additive). `"Blu-ray ISO (BDMV)"` joins the `container` set,
+  and the new optional `bd_iso` object on `Report` records which BDMV playlist and clip were
+  auto-selected as the main feature; the rest of the report describes that clip through the
+  ordinary TS/M2TS pipeline. Ships in hdrprobe 0.6.0.
 - **2.1**: added `dolby_vision.unconverted_dual_layer_rpu` (additive): true when the RPU
   carries the dual-layer composer payload but the carriage has no enhancement layer, the
   signature of a custom transcode that injected a Profile 7 RPU without converting it.
@@ -221,6 +225,7 @@ Version history:
 | `file` | string | always | The input path as given on the command line (or as found during a directory scan) |
 | `size_bytes` | integer | always | File size in bytes |
 | `container` | string | always | Container or sidecar kind; see the value table below |
+| `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes" below |
 | `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
 | `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a multi-program TS shares one mux timeline). Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; all sidecars) |
 | `video_tracks` | array of `VideoTrack` | always, at least one entry | One entry per video track; see "Multiple video tracks" below |
@@ -238,6 +243,30 @@ pair is **one logical track** and never produces two entries, whatever the mux s
 dual-`trak`, TS dual-PID, or an atypical dual-track MKV): the pair reports as a single entry
 with `dolby_vision.structure` = `"Dual track, dual layer"`. Track order follows the container:
 MKV by TrackNumber, MP4 by `trak` order, TS by program then PID.
+
+### Blu-ray ISO probes and `BdIso`
+
+A decrypted Blu-ray ISO (`.iso`, UDF image with a `BDMV` tree) is probed through its **main
+feature**: hdrprobe parses every playlist under `BDMV/PLAYLIST`, selects the one with the
+longest edit duration (duplicate and looped decoy segments are collapsed first; ties break on
+total referenced stream bytes), and runs the ordinary TS/M2TS pipeline over the selected
+playlist's largest clip. Everything in the report (`duration_secs`, per-track bitrate, codec,
+HDR and Dolby Vision facts) describes **that clip**, exactly as if the mounted
+`BDMV/STREAM/<clip>.m2ts` had been probed directly; `size_bytes` stays the whole image's size.
+`container` is `"Blu-ray ISO (BDMV)"` and `bd_iso` records the selection:
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `playlist` | string | always | Selected playlist file name, e.g. `"00800.mpls"` |
+| `playlist_duration_secs` | float | always | The playlist's own edit duration (sum of its distinct segments). Distinct from the top-level `duration_secs`, which is the probed clip's transport-clock duration |
+| `clip` | string | always | Probed clip file name under `BDMV/STREAM`, e.g. `"00055.m2ts"` |
+| `clip_index` | integer | always | 1-based position of the probed clip among the playlist's distinct clips in playback order |
+| `clip_count` | integer | always | Number of distinct clips in the selected playlist. `1` for the common single-clip feature; more for seamless-branching titles, where only the largest clip is probed |
+
+AACS-encrypted images are detected (the clip fails TS sync-lock and an `AACS` directory is
+present) and rejected with an error; hdrprobe never decrypts. DVD-Video ISOs and non-BDMV
+UDF images error distinctly. A fragmented (non-contiguous) main clip is not supported and
+errors rather than guessing.
 
 ## Object: `VideoTrack`
 
@@ -275,6 +304,7 @@ Video inputs:
 | `"raw AV1 (IVF)"` | AV1 in an IVF wrapper |
 | `"raw AV1 (OBU)"` | AV1 low-overhead OBU stream |
 | `"raw VP9 (IVF)"` | VP9 in an IVF wrapper (`VP90` FourCC) |
+| `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
 

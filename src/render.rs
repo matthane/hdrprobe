@@ -135,6 +135,12 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         if o.show_general {
             let _ = writeln!(s, "{}", c.section("General"));
             kv(&mut s, &c, "Container", &r.container);
+            // Blu-ray ISO probes: which playlist/clip the report describes,
+            // with the playlist's own edit duration (the Duration line below
+            // stays the probed clip's transport-clock duration).
+            if let Some(iso) = &r.bd_iso {
+                kv(&mut s, &c, "Main feature", &bd_iso_line(iso));
+            }
             // Sidecar schema version (a DV XML's root `version` attribute); video
             // inputs never carry one, so the line only appears for sidecars.
             if let Some(v) = &r.format_version {
@@ -161,6 +167,9 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         if o.show_general {
             let _ = writeln!(s, "{}", c.section("General"));
             kv(&mut s, &c, "Container", &r.container);
+            if let Some(iso) = &r.bd_iso {
+                kv(&mut s, &c, "Main feature", &bd_iso_line(iso));
+            }
             if let Some(v) = &r.format_version {
                 kv(&mut s, &c, "Schema version", v);
             }
@@ -1035,6 +1044,19 @@ fn human_bitrate(bps: f64) -> String {
     }
 }
 
+/// The Main feature line of a Blu-ray ISO report:
+/// `00800.mpls (2:14:05) · clip 1/1: 00055.m2ts`.
+fn bd_iso_line(iso: &crate::model::BdIso) -> String {
+    format!(
+        "{} ({}) · clip {}/{}: {}",
+        iso.playlist,
+        human_duration(iso.playlist_duration_secs),
+        iso.clip_index,
+        iso.clip_count,
+        iso.clip
+    )
+}
+
 fn human_duration(secs: f64) -> String {
     let total = secs.round() as u64;
     let h = total / 3600;
@@ -1433,6 +1455,7 @@ mod tests {
             file: "movie.mp4".to_string(),
             size_bytes: 0,
             container: "MP4 (ISOBMFF)".to_string(),
+            bd_iso: None,
             format_version: None,
             duration_secs: None,
             video_tracks: vec![VideoTrack {
@@ -1499,6 +1522,7 @@ mod tests {
             file: "show.mkv".to_string(),
             size_bytes: 0,
             container: "Matroska".to_string(),
+            bd_iso: None,
             format_version: None,
             duration_secs: Some(60.0),
             video_tracks: tracks,

@@ -2,6 +2,7 @@
 
 mod av1;
 mod avc;
+mod bdiso;
 mod bits;
 mod container;
 mod dv;
@@ -488,20 +489,57 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     let remote = prefetch::is_remote(&file);
     let warmed_head = prefetch::warm_metadata(remote, &file, path, &mmap);
 
+    // A Blu-ray ISO is probed through its BDMV main feature: locate the
+    // playlist-selected clip's contiguous byte range, then run the ordinary
+    // TS/M2TS pipeline over that *subslice*, so every slice-relative
+    // mechanism (head/tail windows, streaming positions, bitrate
+    // denominators, progress) is correct by construction. Extension-gated: a
+    // UDF image under another name takes the ordinary demux path below.
+    let is_iso = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("iso"));
+    let feature = if is_iso && bdiso::is_udf_iso(&mmap) {
+        let f = bdiso::locate_main_feature(&mmap, remote.then_some(&file))
+            .context("locating the BDMV main feature")?;
+        // The clip's TS head/tail windows, translated to its range in the
+        // image: the ISO counterpart of `warm_metadata`'s TS branch.
+        prefetch::warm_ts_windows(remote, &file, f.clip_start, f.clip_len);
+        Some(f)
+    } else {
+        None
+    };
+    let data: &[u8] = match &feature {
+        Some(f) => &mmap[f.clip_start as usize..(f.clip_start + f.clip_len) as usize],
+        None => &mmap,
+    };
+
     // `--full` on a genuinely remote volume: the whole-file walks tailgate a
     // bounded look-ahead warm (`prefetch::Frontier`), so the file crosses the
     // wire once, linearly, instead of thousands of scattered page-fault
     // round-trips. Off everywhere else — local `--full` and the default path
     // are unchanged. `warm_metadata` above still covers the tail extents (TS
-    // last-PCR, MKV `Tags`, `mfra`) a front-first stream reaches last.
+    // last-PCR, MKV `Tags`, `mfra`) a front-first stream reaches last. For an
+    // ISO the frontier is based at the clip: walk positions are subslice-
+    // relative and the reads must land at `clip_start + pos` in the image.
     let frontier = if cli.full && prefetch::is_remote_strict(&file, path) {
-        prefetch::Frontier::new(&file, size)
+        match &feature {
+            Some(f) => prefetch::Frontier::new_at(&file, f.clip_start, f.clip_len),
+            None => prefetch::Frontier::new(&file, size),
+        }
     } else {
         prefetch::Frontier::off()
     };
 
-    let demux =
-        container::demux(path, &mmap, cli.full, progress, &frontier).context("demux failed")?;
+    let demux = match &feature {
+        // The main feature is M2TS by construction (the locator's sync-lock
+        // gate); extension dispatch would misroute the `.iso` name.
+        Some(_) => container::ts::demux(data, cli.full, progress, &frontier)
+            .context("demuxing the BDMV main-feature clip")?,
+        None => {
+            container::demux(path, data, cli.full, progress, &frontier).context("demux failed")?
+        }
+    };
 
     // The sampled access units are scattered across the whole file (worst for
     // MP4, whose sample index spans a multi-GB mdat), so warm exactly the
@@ -512,7 +550,7 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     }
 
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
-    let scan = sample::scan(&demux, &mmap, &opts, progress, &frontier);
+    let scan = sample::scan(&demux, data, &opts, progress, &frontier);
 
     // Raw AV1 `--full`: duration (frames ÷ fps) exists only after the fused
     // walk counted the frames, so it lands here instead of demux.
@@ -596,11 +634,27 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         });
     }
 
+    // The ISO report describes the probed clip (duration, bitrate, tracks)
+    // under the ISO's own name and size; the `Main feature` line carries the
+    // selected playlist/clip and the playlist's edit duration.
+    let container = match &feature {
+        Some(_) => "Blu-ray ISO (BDMV)".to_string(),
+        None => demux.container.to_string(),
+    };
+    let bd_iso = feature.map(|f| model::BdIso {
+        playlist: f.playlist,
+        playlist_duration_secs: f.playlist_duration_secs,
+        clip: f.clip,
+        clip_index: f.clip_index,
+        clip_count: f.clip_count,
+    });
+
     Ok(Report {
         hdrprobe_schema_version: model::SCHEMA_VERSION,
         file: path.display().to_string(),
         size_bytes: size,
-        container: demux.container.to_string(),
+        container,
+        bd_iso,
         format_version: None,
         duration_secs,
         video_tracks,
@@ -608,8 +662,10 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     })
 }
 
-const VIDEO_EXTS: &[&str] =
-    &["mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts", "mts", "hevc", "h265", "265", "ivf", "obu"];
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts", "mts", "hevc", "h265", "265", "ivf", "obu",
+    "iso",
+];
 
 fn collect_paths(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();

@@ -156,6 +156,7 @@ hdrprobe reads both video files and standalone metadata sidecar files:
 | MP4 / MOV | Video | HEVC, AVC, AV1, VP9, ProRes | One or more video tracks; an enhancement layer may ride its own track |
 | MKV / WebM | Video | HEVC, AVC, AV1, VP9, ProRes | One or more video tracks; an enhancement layer is typically interleaved into its base track |
 | MPEG-TS / M2TS | Video | HEVC, AVC | One or more programs, each with its own video stream; an enhancement layer may ride its own PID |
+| Blu-ray ISO (`.iso`) | Video | HEVC, AVC | Decrypted disc image: hdrprobe reads the disc's playlists, picks the main feature automatically, and reports on it as if the stream file had been probed directly. Encrypted images are detected and rejected |
 | Raw HEVC (Annex-B) | Video | HEVC | Elementary stream; profile inferred from the RPU |
 | Raw AV1 (IVF or low-overhead OBU) | Video | AV1 | Elementary stream; the RPU rides an in-band metadata OBU |
 | Raw VP9 (IVF) | Video | VP9 | Elementary stream; a bare VP9 stream carries no HDR signalling of its own, so colour beyond matrix and range comes only from a container |

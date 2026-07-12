@@ -220,6 +220,7 @@ fn build_report(
         file: path.display().to_string(),
         size_bytes: size,
         container: container.to_string(),
+        bd_iso: None,
         format_version,
         duration_secs: None,
         // One `video_tracks` entry for uniformity — consumers always iterate
