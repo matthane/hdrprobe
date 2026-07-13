@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 208 unit tests
+cargo test                     # 213 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -271,7 +271,14 @@ never parse bytes native-endian.
   pair/change counts from independent computations), and the P7 FEL MKV matches its own CM XML
   exactly (6/713).
 - **DV facts and their sources.** BL **compatibility id** and DV **level** come from the
-  `dvcC`/`dvvC` box, *not* the RPU. The DV Mastering line's **luminance** is the DM header's
+  `dvcC`/`dvvC` box, *not* the RPU. When **no config declares a level** (authentic disc M2TS —
+  UHD-BD signals DV via the playlist, not the PMT — or a raw elementary stream), it is derived
+  from the coded stream's resolution and reported frame rate against the Dolby P&L table
+  (`levels::fill_derived_level`, a main.rs-only post-pass like the Mastering badges; JSON-only
+  via `dolby_vision.level_derived`, never text-rendered): the smallest level admitting the pixel
+  rate and width, a pixel-rate floor only (the bitrate/tier axis is not probed). A declared
+  level always wins, sidecars never derive (assumed canvas), and no fps means no level — never
+  a guess. The DV Mastering line's **luminance** is the DM header's
   `source_min_pq`/`source_max_pq` (present in every CM version); its **gamut** comes only from a
   level that actually carries one — RPU L9 (CM v4.0) or a DV XML's Level-0 `<MasteringDisplay>` —
   tagged `[L9]`/`[L0]` per `model::MasteringDisplay::primaries_level`. A CM v2.9 RPU carries **no
