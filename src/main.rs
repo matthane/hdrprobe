@@ -582,6 +582,16 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
             .finalize(track.width, track.height, track.dv_config.as_ref(), cli.full, is_av1, track.dv_dual_track)
             .or_else(|| track.dv_config.as_ref().map(|c| dv::levels::container_only(c, track.dv_dual_track)));
 
+        // The reported frame rate. The `--full` streaming walks recover what
+        // their demux's bounded pass no longer can: raw IVF's whole-stream
+        // average rate (`scan.fps`), and for MKV without a DefaultDuration
+        // the exact frame count feeding the count ÷ duration fallback the
+        // demux's complete index used to compute — same inputs, same values.
+        let fps = track.fps.or(scan.fps).or_else(|| match (scan.frame_count, duration_secs) {
+            (Some(n), Some(d)) if n > 0 && d > 0.0 => Some(n as f64 / d),
+            _ => None,
+        });
+
         // The two grade-vs-base-layer verdicts (FEL brightness expansion,
         // mastering primaries mismatch) are only decidable here on the video
         // path: both need the base layer's own declared mastering display
@@ -595,6 +605,11 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
                 dv,
                 bl_mastering.and_then(|m| m.primaries.as_deref()),
             );
+            // The level derivation is video-path-only for the same reason:
+            // it needs the track's real coded dimensions and the *reported*
+            // frame rate — a metadata sidecar has neither (assumed canvas,
+            // authoring-declared rate).
+            dv::levels::fill_derived_level(dv, track.width, track.height, fps);
         }
 
         let hdr10plus = scan.sei.hdr10plus.map(|info| Hdr10Plus {
@@ -623,15 +638,7 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
             codec_profile: track.codec_profile.clone(),
             width: if track.width > 0 { Some(track.width) } else { None },
             height: if track.height > 0 { Some(track.height) } else { None },
-            // The `--full` streaming walks recover what their demux's bounded
-            // pass no longer can: raw IVF's whole-stream average rate
-            // (`scan.fps`), and for MKV without a DefaultDuration the exact
-            // frame count feeding the count ÷ duration fallback the demux's
-            // complete index used to compute — same inputs, same values.
-            fps: track.fps.or(scan.fps).or_else(|| match (scan.frame_count, duration_secs) {
-                (Some(n), Some(d)) if n > 0 && d > 0.0 => Some(n as f64 / d),
-                _ => None,
-            }),
+            fps,
             // A container-known rate wins (MKV statistics tags); the `--full`
             // streaming walks (TS ES bytes, MKV block bytes) fill the gap with
             // the exact per-track sum their demux could no longer compute —

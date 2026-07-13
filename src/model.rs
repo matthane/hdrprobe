@@ -224,6 +224,15 @@ pub struct DolbyVision {
     pub structure: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
+    /// True when `level` was derived from the coded stream's resolution and
+    /// frame rate against the Dolby P&L level table rather than declared by a
+    /// container config. Authentic disc muxes carry no declaration at all (a
+    /// UHD-BD M2TS signals DV via the playlist STN table, not the PMT), so
+    /// without the derivation the field would simply be absent there. The
+    /// derived value is a pixel-rate floor: the level's bitrate/tier axis is
+    /// not probed, and a declared `dvcC`/`dvvC`/descriptor level always wins.
+    #[serde(skip_serializing_if = "is_false")]
+    pub level_derived: bool,
     pub bl_present: bool,
     pub el_present: bool,
     pub rpu_present: bool,
@@ -493,6 +502,7 @@ mod tests {
                 profile_compat_assumed: true,
                 structure: Some("Single track, dual layer".to_string()),
                 level: Some(6),
+                level_derived: true,
                 bl_present: true,
                 el_present: true,
                 rpu_present: true,
@@ -630,6 +640,7 @@ mod tests {
             "video_tracks[].dolby_vision.profile_compat_assumed",
             "video_tracks[].dolby_vision.structure",
             "video_tracks[].dolby_vision.level",
+            "video_tracks[].dolby_vision.level_derived",
             "video_tracks[].dolby_vision.bl_present",
             "video_tracks[].dolby_vision.el_present",
             "video_tracks[].dolby_vision.rpu_present",

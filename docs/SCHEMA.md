@@ -166,7 +166,11 @@ Version history:
 - **2.2**: Blu-ray ISO support (additive). `"Blu-ray ISO (BDMV)"` joins the `container` set,
   and the new optional `bd_iso` object on `Report` records which BDMV playlist and clip were
   auto-selected as the main feature; the rest of the report describes that clip through the
-  ordinary TS/M2TS pipeline. Ships in hdrprobe 0.6.0.
+  ordinary TS/M2TS pipeline. Also adds `dolby_vision.level_derived` (additive): when no
+  container config declares a DV level (authentic disc M2TS, raw elementary streams),
+  `level` is now derived from the coded stream's resolution and frame rate against the
+  Dolby level table and flagged with `level_derived: true`; a declared level always wins
+  and stays unflagged. Ships in hdrprobe 0.6.0.
 - **2.1**: added `dolby_vision.unconverted_dual_layer_rpu` (additive): true when the RPU
   carries the dual-layer composer payload but the carriage has no enhancement layer, the
   signature of a custom transcode that injected a Profile 7 RPU without converting it.
@@ -202,7 +206,7 @@ Version history:
   no value. No field in the schema is ever serialized as `null`.
 - **Empty arrays are omitted.** `l5_active_areas` and `trim_targets` are absent rather than `[]`
   when nothing was found.
-- **Default-false booleans may be omitted.** `profile_compat_assumed` and
+- **Default-false booleans may be omitted.** `profile_compat_assumed`, `level_derived`, and
   `unconverted_dual_layer_rpu` appear only when `true`. All other booleans (`bl_present`,
   `el_present`, `rpu_present`, `sampled`, `zeroed`, `l11_reference_mode`) are serialized
   whenever their containing object is.
@@ -401,7 +405,8 @@ or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimate
 | `profile` | string | always | `<major>.<minor>` from the container config, e.g. `"8.1"`, `"5.0"`, `"10.4"`, `"20.0"`. Dual-layer profiles (4, 7) append the enhancement-layer kind: `"7.6 (FEL)"`, `"4.2 (MEL)"`. When no compatibility id is available the minor is a convention default for profiles 8 (`8.1`), 7 (`7.6`, the only combination Dolby defines; an untouched BDMV M2TS carries no DV descriptor, so this is the common Blu-ray-original case) and 4 (`4.2`); any other profile then prints its bare major, e.g. `"5"` |
 | `profile_compat_assumed` | boolean | only when `true` | The minor digit above was supplied by convention rather than read from data. Set only for metadata-only sidecars (a raw RPU bin); a video input's base-layer signalling backs the inference, so it is never flagged there |
 | `structure` | string | optional | Layer/track layout, present only for dual-layer content: `"Single track, dual layer"` or `"Dual track, dual layer"` |
-| `level` | integer | optional | DV level from the container `dvcC`/`dvvC`; absent when there is no container config (raw streams, sidecars) |
+| `level` | integer | optional | DV level, from the container `dvcC`/`dvvC`/TS descriptor when one declares it. When no config carries a level (an authentic disc M2TS — UHD-BD signals DV via the playlist, not the PMT — or a raw elementary stream) it is derived from the coded stream's resolution and frame rate against the Dolby level table (smallest level admitting `width x height x fps` and the width) and flagged via `level_derived`. The derivation is a pixel-rate floor: the level's bitrate/tier axis is not probed. Absent for metadata sidecars (no coded stream) and when the frame rate is unknown |
+| `level_derived` | boolean | only when `true` | The `level` above was derived from stream properties rather than declared by a container config |
 | `bl_present` | boolean | always | Base layer present **in the reported logical track** (container flag, else derived from the profile). A dual-track mux declares `bl_present` 0 on the enhancement-layer sub-stream's own config ("no BL in *this* stream"); once that EL is folded into its base layer's track group the merged report says `true` — the group holds both layers by construction. A genuinely BL-less input (an EL-only cut with no base layer in the mux) still reports `false` |
 | `el_present` | boolean | always | Enhancement layer present in the reported logical track (same dual-track fold rule as `bl_present`) |
 | `rpu_present` | boolean | always | RPU substream present |

@@ -408,6 +408,11 @@ impl DvAggregate {
             profile_compat_assumed,
             structure,
             level: cfg.and_then(|c| c.level),
+            // Filled by `fill_derived_level` (main.rs only) when no config
+            // declared a level: the derivation needs the track's real coded
+            // dimensions and frame rate, which a metadata sidecar (assumed
+            // canvas, declared-not-coded rate) doesn't have.
+            level_derived: false,
             bl_present: bl,
             el_present: el,
             rpu_present: rpu,
@@ -516,6 +521,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         profile_compat_assumed: false,
         structure: structure_str(el, dual_track),
         level: cfg.level,
+        level_derived: false,
         bl_present: bl,
         el_present: el,
         rpu_present: rpu,
@@ -597,6 +603,60 @@ pub fn flag_mastering_primaries_mismatch(dv: &mut DolbyVision, bl_primaries: Opt
             bl_primaries: bl.to_string(),
             rpu_primaries: l9.to_string(),
         });
+    }
+}
+
+/// The Dolby Vision level table ("Dolby Vision Profiles and Levels", the
+/// dsigPL table Dolby's own dlb_mp4base muxer derives levels from): each
+/// level's max pixel rate is exactly its anchor format's `width x height x
+/// fps`, plus a max-width axis that splits the equal-rate UHD@120 / 8K@30
+/// pair (levels 10/11). Rows are `(level, max pixels/second, max width)`,
+/// ascending, so the first admitting row is the smallest sufficient level.
+const DV_LEVEL_LIMITS: [(u8, u64, u32); 13] = [
+    (1, 22_118_400, 1280),     // 1280x720x24
+    (2, 27_648_000, 1280),     // 1280x720x30
+    (3, 49_766_400, 1920),     // 1920x1080x24
+    (4, 62_208_000, 1920),     // 1920x1080x30
+    (5, 124_416_000, 1920),    // 1920x1080x60
+    (6, 199_065_600, 3840),    // 3840x2160x24
+    (7, 248_832_000, 3840),    // 3840x2160x30
+    (8, 398_131_200, 3840),    // 3840x2160x48
+    (9, 497_664_000, 3840),    // 3840x2160x60
+    (10, 995_328_000, 3840),   // 3840x2160x120
+    (11, 995_328_000, 7680),   // 7680x4320x30
+    (12, 1_990_656_000, 7680), // 7680x4320x60
+    (13, 3_981_312_000, 7680), // 7680x4320x120
+];
+
+/// Fill a missing DV level from the coded stream's shape: the smallest level
+/// of `DV_LEVEL_LIMITS` admitting `width x height x fps`, flagged via
+/// `level_derived`. A declared container level always wins (the fill is gated
+/// on `level == None`), and nothing is derived without real dimensions and a
+/// known frame rate — never a guess.
+///
+/// This exists because the level is otherwise unobtainable for authentic disc
+/// content: a UHD-BD M2TS signals DV via the playlist STN table, not a PMT
+/// `0xB0` descriptor (only remuxes add one), and the RPU doesn't carry the
+/// level either. The derivation is a pixel-rate floor only — the table's
+/// bitrate/tier axis is deliberately not compared (the default probe reads a
+/// bounded head window, and consumers probe truncated chunks), which matches
+/// how the level is defined: the anchor-format pixel rate is the level's
+/// identity, the tier a bound within it. `main.rs` is the only caller, on the
+/// video path: a metadata sidecar's canvas is an *assumed* UHD and a DV XML's
+/// rate is an authoring declaration, so deriving there would manufacture a
+/// stream fact no stream backs.
+pub fn fill_derived_level(dv: &mut DolbyVision, width: u32, height: u32, fps: Option<f64>) {
+    if dv.level.is_some() || width == 0 || height == 0 {
+        return;
+    }
+    let Some(fps) = fps.filter(|f| *f > 0.0) else { return };
+    let px_rate = width as f64 * height as f64 * fps;
+    let fit = DV_LEVEL_LIMITS
+        .iter()
+        .find(|&&(_, max_rate, max_width)| px_rate <= max_rate as f64 && width <= max_width);
+    if let Some(&(level, _, _)) = fit {
+        dv.level = Some(level);
+        dv.level_derived = true;
     }
 }
 
@@ -995,6 +1055,55 @@ mod tests {
         // Config-less raw AV1 is single-layer by construction: flagged.
         let dv = finalize(rpu(Some(DoviELType::MEL)), None, true);
         assert!(dv.unconverted_dual_layer_rpu);
+    }
+
+    #[test]
+    fn derived_level_is_the_smallest_admitting_pixel_rate_and_width() {
+        let derive = |w: u32, h: u32, fps: Option<f64>| {
+            let cfg = DvConfig {
+                profile: 7,
+                level: None,
+                bl_present: true,
+                el_present: true,
+                rpu_present: true,
+                bl_compatibility_id: Some(6),
+            };
+            let mut dv = container_only(&cfg, false);
+            fill_derived_level(&mut dv, w, h, fps);
+            (dv.level, dv.level_derived)
+        };
+
+        // The motivating case: a genuine UHD-BD clip (no PMT descriptor),
+        // 3840x2160 @ 23.976 — just under level 6's anchor rate.
+        assert_eq!(derive(3840, 2160, Some(24000.0 / 1001.0)), (Some(6), true));
+        // Each anchor format sits exactly at its own level's bound.
+        assert_eq!(derive(1280, 720, Some(24.0)), (Some(1), true));
+        assert_eq!(derive(1920, 1080, Some(24.0)), (Some(3), true));
+        assert_eq!(derive(1920, 1080, Some(30000.0 / 1001.0)), (Some(4), true));
+        assert_eq!(derive(3840, 2160, Some(60000.0 / 1001.0)), (Some(9), true));
+        assert_eq!(derive(3840, 2160, Some(120.0)), (Some(10), true));
+        // The equal-rate UHD@120 / 8K@30 pair splits on the width axis.
+        assert_eq!(derive(7680, 4320, Some(30.0)), (Some(11), true));
+        assert_eq!(derive(7680, 4320, Some(120.0)), (Some(13), true));
+        // Beyond the table: absent, never a guess.
+        assert_eq!(derive(7680, 4320, Some(144.0)), (None, false));
+        // No frame rate / degenerate dimensions: absent, never a guess.
+        assert_eq!(derive(3840, 2160, None), (None, false));
+        assert_eq!(derive(3840, 2160, Some(0.0)), (None, false));
+        assert_eq!(derive(0, 0, Some(24.0)), (None, false));
+
+        // A declared container level always wins, unflagged.
+        let cfg = DvConfig {
+            profile: 7,
+            level: Some(9),
+            bl_present: true,
+            el_present: true,
+            rpu_present: true,
+            bl_compatibility_id: Some(6),
+        };
+        let mut dv = container_only(&cfg, false);
+        fill_derived_level(&mut dv, 3840, 2160, Some(24000.0 / 1001.0));
+        assert_eq!((dv.level, dv.level_derived), (Some(9), false));
     }
 
     #[test]
