@@ -318,10 +318,13 @@ impl DvAggregate {
             self.metadata_only && compat_id.is_none() && matches!(profile, 4 | 7 | 8);
         let profile_str = dv_profile_label(profile, compat_id, self.el_type.as_ref());
 
-        // Presence: prefer explicit container flags, else derive from profile.
+        // Presence: prefer explicit container flags (translated to the logical
+        // track by `track_presence`), else derive from profile — with the same
+        // dual-track override, since a folded group holds both layers whatever
+        // the surviving declaration says.
         let (bl, el, rpu) = match cfg {
-            Some(c) => (c.bl_present, c.el_present, c.rpu_present),
-            None => (true, profile == 7, true),
+            Some(c) => track_presence(c, dual_track),
+            None => (true, profile == 7 || dual_track, true),
         };
 
         // A dual-layer-authored RPU in an EL-less carriage: the NLQ composer
@@ -330,15 +333,17 @@ impl DvAggregate {
         // presence where the carriage demonstrably has no EL marks an
         // unconverted RPU — the classic custom-transcode case of a UHD-BD P7
         // RPU injected without dovi_tool `--mode 2`. Hard gates: the no-EL
-        // side must be *declared* (an explicit config with el_present == 0)
-        // or definitional (AV1, whose DV carriage is single-layer by
+        // side must be *declared* (an explicit config with el_present == 0,
+        // and no folded EL stream — a dual-track group's carriage demonstrably
+        // has one, hence the derived `el` rather than the raw flag) or
+        // definitional (AV1, whose DV carriage is single-layer by
         // construction — the same reasoning `el` derives from above). A
         // config-less raw HEVC stream never fires (its EL may legitimately
         // ride in-band), and a metadata sidecar has no carriage to compare
         // (cfg None, not AV1). Provenance observation, not an error claim:
         // the stray payload is inert for playback.
         let no_el_carriage = match cfg {
-            Some(c) => !c.el_present,
+            Some(_) => !el,
             None => is_av1,
         };
         let unconverted_dual_layer_rpu = self.el_type.is_some() && no_el_carriage;
@@ -482,21 +487,38 @@ fn cadence_verdict(pairs: usize, changes: usize) -> Option<MetadataCadence> {
     })
 }
 
+/// The reported layer-presence flags for the logical track a config describes.
+///
+/// A `DvConfig` is the verbatim carriage declaration of one *sub-stream*, and
+/// on a real dual-track mux it rides the EL track/PID, whose `bl_present == 0`
+/// truthfully says "no base layer *in this stream*" (it names its BL via
+/// `dependency_pid`). Once that EL is folded into its base layer's group, the
+/// report describes the merged logical track — which holds both layers by
+/// construction: `dv_dual_track` is set only when an EL stream folded into a
+/// group containing a BL (every backend), and an EL-only mux with no BL to
+/// fold into keeps it false, so a genuinely BL-less stream still reports its
+/// declared `bl_present == 0` here. `rpu_present` passes through: the fold
+/// implies layers, not an RPU declaration.
+fn track_presence(cfg: &DvConfig, dual_track: bool) -> (bool, bool, bool) {
+    (cfg.bl_present || dual_track, cfg.el_present || dual_track, cfg.rpu_present)
+}
+
 /// Build a DV section from the container config alone (no RPU parse), as used
 /// by `--no-rpu`. Static levels are absent since they live in the RPU.
 pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
     // No RPU parse here, so the enhancement-layer kind (FEL/MEL) is unknown.
     let profile_str = dv_profile_label(cfg.profile, cfg.bl_compatibility_id, None);
+    let (bl, el, rpu) = track_presence(cfg, dual_track);
     DolbyVision {
         profile: profile_str,
         // Container path: the convention-default compat minor is backed by the
         // base layer, not a metadata-only guess, so it is never flagged assumed.
         profile_compat_assumed: false,
-        structure: structure_str(cfg.el_present, dual_track),
+        structure: structure_str(el, dual_track),
         level: cfg.level,
-        bl_present: cfg.bl_present,
-        el_present: cfg.el_present,
-        rpu_present: cfg.rpu_present,
+        bl_present: bl,
+        el_present: el,
+        rpu_present: rpu,
         el_type: None,
         // Requires the RPU's own composer payload as evidence, so the
         // config-only path can never establish it.
@@ -973,6 +995,57 @@ mod tests {
         // Config-less raw AV1 is single-layer by construction: flagged.
         let dv = finalize(rpu(Some(DoviELType::MEL)), None, true);
         assert!(dv.unconverted_dual_layer_rpu);
+    }
+
+    #[test]
+    fn dual_track_fold_reports_the_logical_tracks_layers() {
+        // On a real dual-track mux the surviving config is the EL sub-stream's
+        // declaration (dvcC / TS 0xB0 with bl_present == 0, truthful for that
+        // stream's own carriage) — but the merged report describes the logical
+        // track, which holds both layers by construction of the fold.
+        let el_cfg = DvConfig {
+            profile: 7,
+            level: Some(6),
+            bl_present: false,
+            el_present: true,
+            rpu_present: true,
+            bl_compatibility_id: Some(6),
+        };
+        let finalize = |cfg: &DvConfig, dual_track: bool| {
+            let mut agg = DvAggregate::default();
+            let mut r = DoviRpu::default();
+            r.dovi_profile = 7;
+            agg.add(&r);
+            agg.finalize(3840, 2160, Some(cfg), false, false, dual_track).unwrap()
+        };
+
+        let dv = finalize(&el_cfg, true);
+        assert!(dv.bl_present && dv.el_present && dv.rpu_present);
+        assert_eq!(dv.structure.as_deref(), Some("Dual track, dual layer"));
+        // A genuinely BL-less input (EL-only cut, nothing folded) keeps its
+        // declared absence.
+        let dv = finalize(&el_cfg, false);
+        assert!(!dv.bl_present);
+
+        // The --no-rpu config-only path follows the same rule.
+        let dv = container_only(&el_cfg, true);
+        assert!(dv.bl_present && dv.el_present);
+        assert_eq!(dv.structure.as_deref(), Some("Dual track, dual layer"));
+        assert!(!container_only(&el_cfg, false).bl_present);
+
+        // A dual-track group's carriage demonstrably has an EL, so a config
+        // declaring none must not fire the unconverted-RPU verdict there.
+        let bl_cfg = DvConfig { bl_present: true, el_present: false, ..el_cfg.clone() };
+        let finalize_mel = |cfg: &DvConfig, dual_track: bool| {
+            let mut agg = DvAggregate::default();
+            let mut r = DoviRpu::default();
+            r.dovi_profile = 7;
+            r.el_type = Some(DoviELType::MEL);
+            agg.add(&r);
+            agg.finalize(3840, 2160, Some(cfg), false, false, dual_track).unwrap()
+        };
+        assert!(!finalize_mel(&bl_cfg, true).unconverted_dual_layer_rpu);
+        assert!(finalize_mel(&bl_cfg, false).unconverted_dual_layer_rpu);
     }
 
     #[test]
