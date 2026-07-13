@@ -138,9 +138,26 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Shell integration is an action-and-exit path: register/remove the Explorer
-    // context-menu verb, then return without touching the file pipeline.
+    // context-menu verb, then return without touching the file pipeline. Its
+    // confirmation renders in the report's own styling (masthead + section rule
+    // + kv rows), gated by the same --color policy against stdout.
     if cli.install_shell || cli.uninstall_shell {
-        let res = if cli.install_shell { shell::install() } else { shell::uninstall() };
+        let color = match cli.color {
+            ColorWhen::Always => true,
+            ColorWhen::Never => false,
+            ColorWhen::Auto => supports_color::on(supports_color::Stream::Stdout).is_some(),
+        };
+        if color {
+            print!("{}", render::render_banner(cli.theme));
+        }
+        // Same width probe as the report path: the section rule stretches to
+        // the live terminal, pipes keep the fixed fallback.
+        let wrap_width = terminal_width();
+        let res = if cli.install_shell {
+            shell::install(color, cli.theme, wrap_width)
+        } else {
+            shell::uninstall(color, cli.theme, wrap_width)
+        };
         return match res {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

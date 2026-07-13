@@ -98,7 +98,7 @@ const RULE_W: usize = 64;
 /// run, and only for colored text output (never quiet/JSON/pipes), so
 /// machine consumers and logs never see it.
 pub fn render_banner(theme: Theme) -> String {
-    let c = Colorizer { on: true, palette: theme.palette(), wrap: None, indent: 0 };
+    let c = Colorizer { on: true, palette: theme.palette(), wrap: None, indent: 0, word_wrap: false };
     let mut s = String::new();
     let _ = writeln!(s, "{}", c.bright("█ █ █▀▄ █▀█ █▀█ █▀█ █▀█ █▄▄ █▀▀"));
     let _ = writeln!(
@@ -111,9 +111,34 @@ pub fn render_banner(theme: Theme) -> String {
     s
 }
 
+/// An auxiliary confirmation (the shell install/uninstall messages) in the
+/// report's own geometry: one section rule plus aligned kv rows, inked by the
+/// same four-role hierarchy, with the report's terminal-width behaviour —
+/// the rule stretches to `wrap` and long values reflow with continuations
+/// indented to the value column. Reflow here is word-wrap
+/// (`Colorizer::word_wrap`): the registered command strings carry no part
+/// separators, so the report's separator-only rule would drop them to the
+/// terminal's column-0 hard wrap. Plain (uncolored) output keeps the
+/// identical layout minus the ink, exactly like the report body.
+pub fn render_notice(
+    title: &str,
+    rows: &[(&str, String)],
+    color: bool,
+    theme: Theme,
+    wrap: Option<usize>,
+) -> String {
+    let c = Colorizer { on: color, palette: theme.palette(), wrap, indent: 0, word_wrap: true };
+    let mut s = String::new();
+    let _ = writeln!(s, "{}", c.section(title));
+    for (label, value) in rows {
+        kv(&mut s, &c, label, value);
+    }
+    s
+}
+
 pub fn render(r: &Report, o: &RenderOpts) -> String {
     let mut s = String::new();
-    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width, indent: 0 };
+    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width, indent: 0, word_wrap: false };
     let mut notes = Footnotes::default();
 
     // Each section carries one bright headline for quick glancing (General's
@@ -620,7 +645,7 @@ fn report_header(file: &str, size_bytes: u64, o: &RenderOpts, c: &Colorizer) -> 
 /// — never before the first or after the last — so a single-file run and
 /// every machine path (quiet, JSON, NDJSON) are unchanged.
 pub fn render_divider(o: &RenderOpts) -> String {
-    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width, indent: 0 };
+    let c = Colorizer { on: o.color, palette: o.theme.palette(), wrap: o.wrap_width, indent: 0, word_wrap: false };
     format!("{}\n\n", c.bright(&"━".repeat(c.rule_width())))
 }
 
@@ -675,7 +700,7 @@ fn kv_styled(s: &mut String, c: &Colorizer, label: &str, value: &str) {
     let value_col = VALUE_COL + c.indent;
     match c.wrap {
         Some(w) if w >= MIN_WRAP_WIDTH + c.indent => {
-            for l in wrap_line(&line, w, value_col) {
+            for l in wrap_line(&line, w, value_col, c.word_wrap) {
                 let _ = writeln!(s, "{l}");
             }
         }
@@ -757,8 +782,10 @@ fn render_cells(cells: &[Cell<'_>], indent: bool, value_col: usize) -> String {
 /// double space (the gap before a warning chip or between value halves).
 /// Never inside a part, and never before the value column, so the label is
 /// untouchable. Single spaces are not candidates, which also keeps warning
-/// chips (styled spaces inside inverse video) whole.
-fn break_candidates(cells: &[Cell<'_>], value_col: usize) -> Vec<(usize, usize)> {
+/// chips (styled spaces inside inverse video) whole. With `words` set (the
+/// notice path — no chips there) every space run additionally breaks before
+/// its first space, so separator-less values word-wrap to the value column.
+fn break_candidates(cells: &[Cell<'_>], value_col: usize, words: bool) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
     let n = cells.len();
     for i in value_col..n {
@@ -766,7 +793,10 @@ fn break_candidates(cells: &[Cell<'_>], value_col: usize) -> Vec<(usize, usize)>
         let sep = match cells[i].ch {
             '·' | ',' => next_space,
             '+' => next_space && cells[i - 1].ch == ' ',
-            ' ' => next_space && cells[i].style.is_empty() && cells[i + 1].style.is_empty(),
+            ' ' => {
+                (words && cells[i - 1].ch != ' ')
+                    || (next_space && cells[i].style.is_empty() && cells[i + 1].style.is_empty())
+            }
             _ => false,
         };
         if !sep {
@@ -781,7 +811,10 @@ fn break_candidates(cells: &[Cell<'_>], value_col: usize) -> Vec<(usize, usize)>
         let gap = cells[i].ch == ' ';
         let end = if gap { i } else { i + 1 };
         let mut resume = i + 1;
-        while resume < n && cells[resume].ch == ' ' && (!gap || cells[resume].style.is_empty()) {
+        while resume < n
+            && cells[resume].ch == ' '
+            && (!gap || words || cells[resume].style.is_empty())
+        {
             resume += 1;
         }
         if resume < n {
@@ -798,13 +831,14 @@ fn break_candidates(cells: &[Cell<'_>], value_col: usize) -> Vec<(usize, usize)>
 /// single-column (the same assumption the label padding makes). A line that
 /// already fits is returned byte-identical; a part too long for any break
 /// overflows to the next separator (the terminal's hard wrap takes it from
-/// there) rather than breaking mid-part.
-fn wrap_line(line: &str, width: usize, value_col: usize) -> Vec<String> {
+/// there) rather than breaking mid-part. `words` widens the candidates to
+/// word boundaries (`break_candidates`).
+fn wrap_line(line: &str, width: usize, value_col: usize, words: bool) -> Vec<String> {
     let cells = parse_cells(line);
     if cells.len() <= width {
         return vec![line.to_string()];
     }
-    let candidates = break_candidates(&cells, value_col);
+    let candidates = break_candidates(&cells, value_col, words);
     let mut out = Vec::new();
     let mut start = 0usize;
     loop {
@@ -1163,6 +1197,13 @@ struct Colorizer {
     /// so the shared row/section builders shift without signature churn; the
     /// value column and reflow geometry follow it.
     indent: usize,
+    /// Reflow kv values at any word boundary, not only at part separators —
+    /// the notice path's mode: its registered command strings carry no
+    /// `·`/`,`/` + ` joins, and without word breaks they'd fall through to
+    /// the terminal's column-0 hard wrap instead of the value column. Report
+    /// rows keep this false: their parts are semantic units that never split
+    /// internally.
+    word_wrap: bool,
 }
 
 impl Colorizer {
@@ -1258,6 +1299,66 @@ mod tests {
 
     fn range_only() -> ColorInfo {
         ColorInfo { range: Some("full".to_string()), ..Default::default() }
+    }
+
+    /// Visible column count of a styled line (escape codes are zero-width).
+    fn visible_len(line: &str) -> usize {
+        parse_cells(line).len()
+    }
+
+    /// The auxiliary notice shares the report's row geometry: plain output is
+    /// the bare section name plus gutter-and-label-column kv rows, no ANSI.
+    #[test]
+    fn notice_plain_uses_report_row_geometry() {
+        let rows = [("Registered", "31 file types + folders".to_string())];
+        assert_eq!(
+            render_notice("Shell integration", &rows, false, Theme::Paper, None),
+            "Shell integration\n  Registered        31 file types + folders\n"
+        );
+    }
+
+    /// Colored, the notice gets the report's ruled section header and the
+    /// label/value ink roles from the active palette, and the rule stretches
+    /// to the probed terminal width like a report section.
+    #[test]
+    fn notice_colored_rules_and_inks_like_a_section() {
+        let rows = [("Removed", "1 file type".to_string())];
+        let s = render_notice("Shell integration", &rows, true, Theme::Green, Some(90));
+        assert!(s.contains("SHELL INTEGRATION"), "section name uppercases under color: {s}");
+        assert!(s.contains(&format!("\x1b[{}m", GREEN.label)), "label ink: {s}");
+        assert!(s.contains(&format!("\x1b[{}m", GREEN.value)), "value ink: {s}");
+        let rule = s.lines().next().unwrap();
+        assert_eq!(visible_len(rule), 90, "rule fills the probed width: {rule}");
+    }
+
+    /// Notice values word-wrap at any word boundary (not only the report's
+    /// part separators — a registered command string has none), every
+    /// continuation indented to the value column (never the terminal's
+    /// column-0 hard wrap) and no visible line over the probed width.
+    #[test]
+    fn notice_word_wraps_commands_to_the_value_column() {
+        let sep = [("Registered", "context-menu submenu · 18 file types + folders".to_string())];
+        let s = render_notice("Shell integration", &sep, false, Theme::Paper, Some(50));
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[1], "  Registered        context-menu submenu · 18 file");
+        assert_eq!(lines[2], "                    types + folders");
+
+        let cmd = r#"cmd /c "mode con: cols=110 lines=45 & cls & "C:\Programs\hdrprobe.exe" --own-console "%1" & pause""#;
+        let rows = [("Fast runs", cmd.to_string())];
+        let s = render_notice("Shell integration", &rows, false, Theme::Paper, Some(50));
+        let lines: Vec<&str> = s.lines().skip(1).collect();
+        assert!(lines.len() > 1, "the command must reflow: {s}");
+        for (i, l) in lines.iter().enumerate() {
+            assert!(l.chars().count() <= 50, "line over width: {l}");
+            if i > 0 {
+                assert!(l.starts_with(&" ".repeat(VALUE_COL)), "continuation off-column: {l}");
+            }
+        }
+        // Word breaks drop exactly one space each, so rejoining the pieces
+        // with single spaces restores the registered command verbatim.
+        let mut parts = vec![lines[0].chars().skip(VALUE_COL).collect::<String>()];
+        parts.extend(lines[1..].iter().map(|l| l.trim_start().to_string()));
+        assert_eq!(parts.join(" "), cmd);
     }
 
     /// P5's colour is definitional (never signalled), so the line must state it
@@ -1364,7 +1465,7 @@ mod tests {
     /// single-file report keeps its exact historical header shape.
     #[test]
     fn header_counter_multi_file_only() {
-        let c = Colorizer { on: false, palette: Theme::Paper.palette(), wrap: None, indent: 0 };
+        let c = Colorizer { on: false, palette: Theme::Paper.palette(), wrap: None, indent: 0, word_wrap: false };
         let single = report_header("m/movie.mkv", 1024, &opts(false, 1, 1), &c);
         assert_eq!(single, "movie.mkv  (1.00 KiB)\n");
         let multi = report_header("m/movie.mkv", 1024, &opts(false, 2, 7), &c);
@@ -1376,7 +1477,7 @@ mod tests {
     #[test]
     fn wrap_line_noop_when_it_fits() {
         let line = "  Video             HEVC (Main 10) · 3840×2160 · 23.976 fps";
-        assert_eq!(wrap_line(line, 80, VALUE_COL), vec![line.to_string()]);
+        assert_eq!(wrap_line(line, 80, VALUE_COL, false), vec![line.to_string()]);
     }
 
     /// An overlong plain value breaks after a ` · ` separator (the trailing
@@ -1385,7 +1486,7 @@ mod tests {
     #[test]
     fn wrap_line_breaks_at_separators_with_hanging_indent() {
         let line = "  Video             HEVC (Multiview Main 10, High tier @ L5) · 3840×2160 · 24.000 fps · 10-bit 4:2:0 · Stereoscopic 3D (2 views)";
-        let wrapped = wrap_line(line, 64, VALUE_COL);
+        let wrapped = wrap_line(line, 64, VALUE_COL, false);
         assert_eq!(
             wrapped,
             vec![
@@ -1404,10 +1505,10 @@ mod tests {
     /// across the wrap and never drops mid-value.
     #[test]
     fn wrap_line_reopens_style_across_the_break() {
-        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0 };
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0, word_wrap: false };
         let value = c.bright("HEVC (Multiview Main 10, High tier @ L5) · 3840×2160 · 24.000 fps");
         let line = format!("  {}{}  {}", c.label("Video"), " ".repeat(LABEL_W - 5), value);
-        let wrapped = wrap_line(&line, 64, VALUE_COL);
+        let wrapped = wrap_line(&line, 64, VALUE_COL, false);
         assert_eq!(wrapped.len(), 2);
         let bright = format!("\x1b[{}m", Theme::Green.palette().bright);
         // Every line's styling is self-contained: opens re-emitted, reset last.
@@ -1426,7 +1527,7 @@ mod tests {
     /// (its interior spaces are styled, so they are not candidates).
     #[test]
     fn wrap_line_moves_warning_chips_whole() {
-        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0 };
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0, word_wrap: false };
         let line = format!(
             "  {}{}  {}{}  {}",
             c.label("Mastering"),
@@ -1435,7 +1536,7 @@ mod tests {
             c.value(" · max 4000  min 0.0001 cd/m²"),
             c.warn("FEL brightness expansion")
         );
-        let wrapped = wrap_line(&line, 60, VALUE_COL);
+        let wrapped = wrap_line(&line, 60, VALUE_COL, false);
         assert_eq!(wrapped.len(), 2);
         let cells = parse_cells(&wrapped[1]);
         let chip: String = cells.iter().map(|c| c.ch).collect();
@@ -1612,12 +1713,18 @@ mod tests {
             let mut o = opts(false, 2, 7);
             o.wrap_width = Some(w);
             assert_eq!(render_divider(&o), format!("{}\n\n", "━".repeat(w)));
-            let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: Some(w), indent: 0 };
+            let c = Colorizer {
+                on: true,
+                palette: Theme::Green.palette(),
+                wrap: Some(w),
+                indent: 0,
+                word_wrap: false,
+            };
             let rule = c.section("General");
             assert_eq!(parse_cells(&rule).len(), w, "section rule not {w} columns");
         }
         // No probe: the section rule keeps the RULE_W fallback.
-        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0 };
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0, word_wrap: false };
         let rule = c.section("General");
         assert_eq!(parse_cells(&rule).len(), RULE_W);
     }
@@ -1631,14 +1738,20 @@ mod tests {
     fn indented_section_rule_stays_flush_right() {
         for wrap in [Some(100), None] {
             let c =
-                Colorizer { on: true, palette: Theme::Green.palette(), wrap, indent: TRACK_INDENT };
+                Colorizer {
+                    on: true,
+                    palette: Theme::Green.palette(),
+                    wrap,
+                    indent: TRACK_INDENT,
+                    word_wrap: false,
+                };
             let rule = c.section("HDR");
             let cells = parse_cells(&rule);
             assert_eq!(cells.len(), wrap.unwrap_or(RULE_W), "right edge not flush");
             let visible: String = cells.iter().map(|c| c.ch).collect();
             assert!(visible.starts_with("  └─ HDR "), "rule not a branch: {visible:?}");
         }
-        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0 };
+        let c = Colorizer { on: true, palette: Theme::Green.palette(), wrap: None, indent: 0, word_wrap: false };
         let rule = c.section("General");
         let visible: String = parse_cells(&rule).iter().map(|c| c.ch).collect();
         assert!(visible.starts_with("── GENERAL "), "base rule grew a branch: {visible:?}");

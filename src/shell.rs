@@ -271,7 +271,7 @@ mod imp {
         Ok(())
     }
 
-    pub fn install() -> Result<()> {
+    pub fn install(color: bool, theme: crate::render::Theme, wrap: Option<usize>) -> Result<()> {
         let exe = std::env::current_exe().context("locating the hdrprobe executable")?;
         let exe = exe.to_string_lossy().into_owned();
         // Prefer the Windows Terminal host when it's installed: it's the
@@ -297,23 +297,27 @@ mod imp {
         }
         write_verb_tree(DIRECTORY_ASSOC, &icon, &fast_dir, &full_dir)?;
 
-        println!("Registered the hdrprobe context-menu submenu for {n} file types and folders.");
-        println!("Fast runs: {fast}");
-        println!("Full runs: {full}");
-        println!("Folder verbs add -r (recursive scan).");
-        println!("On Windows 11 it's under \"Show more options\" in the right-click menu.");
+        let rows = [
+            ("Registered", format!("context-menu submenu · {n} file types + folders")),
+            ("Fast runs", fast),
+            ("Full runs", full),
+            ("Folder verbs", "same commands + -r (recursive scan)".to_string()),
+            ("Menu", "right-click · \"Show more options\" on Windows 11".to_string()),
+        ];
+        print!("{}", crate::render::render_notice("Shell integration", &rows, color, theme, wrap));
         Ok(())
     }
 
-    pub fn uninstall() -> Result<()> {
+    pub fn uninstall(color: bool, theme: crate::render::Theme, wrap: Option<usize>) -> Result<()> {
         let mut n = 0;
         for ext in super::all_exts() {
             if delete_verb(&assoc_key(ext))? {
                 n += 1;
             }
         }
-        let dirs = if delete_verb(DIRECTORY_ASSOC)? { " and folders" } else { "" };
-        println!("Removed the hdrprobe context-menu entry ({n} file types{dirs}).");
+        let dirs = if delete_verb(DIRECTORY_ASSOC)? { " + folders" } else { "" };
+        let rows = [("Removed", format!("context-menu submenu · {n} file types{dirs}"))];
+        print!("{}", crate::render::render_notice("Shell integration", &rows, color, theme, wrap));
         Ok(())
     }
 }
@@ -322,12 +326,12 @@ mod imp {
 pub use imp::{install, uninstall};
 
 #[cfg(not(windows))]
-pub fn install() -> anyhow::Result<()> {
+pub fn install(_color: bool, _theme: crate::render::Theme, _wrap: Option<usize>) -> anyhow::Result<()> {
     anyhow::bail!("shell integration is only available on Windows");
 }
 
 #[cfg(not(windows))]
-pub fn uninstall() -> anyhow::Result<()> {
+pub fn uninstall(_color: bool, _theme: crate::render::Theme, _wrap: Option<usize>) -> anyhow::Result<()> {
     anyhow::bail!("shell integration is only available on Windows");
 }
 
