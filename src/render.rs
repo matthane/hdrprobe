@@ -120,6 +120,12 @@ pub fn render_banner(theme: Theme) -> String {
 /// separators, so the report's separator-only rule would drop them to the
 /// terminal's column-0 hard wrap. Plain (uncolored) output keeps the
 /// identical layout minus the ink, exactly like the report body.
+///
+/// Its only production caller is the `cfg(windows)` shell verb, so the
+/// function is compiled out elsewhere (`test` keeps the unit tests building
+/// on every platform) — without the gate, non-Windows CI fails `-Dwarnings`
+/// on dead code.
+#[cfg(any(windows, test))]
 pub fn render_notice(
     title: &str,
     rows: &[(&str, String)],
