@@ -51,9 +51,15 @@ Everything is standard [SCHEMA.md](SCHEMA.md) output. Three things are specific 
   HDR10+, the full Dolby Vision section, and MP4/MKV durations (those are stated in the
   header, not measured).
 
-For HDR/DV identification, which is the point of a head probe, a truncated probe and a whole
-file probe of the same title agree: profile, level, CM version, layer structure, FEL/MEL,
-mastering display, and the L5/L6 metadata all ride the head of the stream.
+For HDR/DV identification, which is the point of a head probe, the title-stable facts agree
+between a truncated probe and a whole file probe: profile, level, CM version, layer structure,
+FEL/MEL, the mastering display, and L6 ride every part of the stream, including the head. The
+caveat is the sampled union fields, `l5_active_areas` and `trim_targets`: they are collected
+from the frames a probe actually saw, and a head probe sees only the opening minutes, while a
+file probe spreads its sample points across the whole title. A film that switches aspect ratio
+mid-way, or whose later scenes carry trim targets the opening does not, will show a smaller
+set. The report already marks these fields as sampled (`dolby_vision.sampled: true`, the same
+flag every default probe carries); read them as "at least these", never as a complete list.
 
 ## Kodi addon example (Python)
 

@@ -573,7 +573,10 @@ what a prefix cannot honestly state: a TS input's `duration_secs` (the PCR span 
 the cut, not the stream) and every `bitrate` except MP4/MOV's `video_stream` rate (whose
 sample-table sums are exact regardless of truncation). Declared header facts (MP4 `mvhd` and
 MKV Segment-Info durations, resolution, color, HDR and Dolby Vision metadata from the sampled
-head) report normally. Limits: no tail-dependent facts ever (TS runtime, MKV statistics-tag
+head) report normally. The sampled union fields (`l5_active_areas`, `trim_targets`) draw only
+on head frames: `dolby_vision.sampled` is `true` exactly as on a default file probe, but a
+head-only window is likelier to miss mid-title variation (an aspect-ratio change, trims added
+in later scenes) than a file probe's whole-file sample spread. Limits: no tail-dependent facts ever (TS runtime, MKV statistics-tag
 bitrate, an MP4 whose `moov` sits at the end fails honestly), `--full` errors on `-` (a pipe
 cannot be fully scanned), metadata sidecars are not detectable via stdin (their dispatch is
 extension-based), and `-` may be given at most once per run. A practical integration guide,
