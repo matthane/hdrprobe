@@ -989,7 +989,7 @@ SOFTWARE.
 
 Used by:
 
-- **hdrprobe 0.6.0** — <https://github.com/matthane/hdrprobe>
+- **hdrprobe 0.7.0** — <https://github.com/matthane/hdrprobe>
 
 ```
 MIT License
