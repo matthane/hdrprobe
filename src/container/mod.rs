@@ -308,6 +308,18 @@ fn sniff_demux(
     None
 }
 
+/// True when `sniff_demux` would route this head to the TS/M2TS backend: the
+/// same checks in the same order, so the stdin head budget (sized to
+/// `ts::HEAD_SCAN_BYTES` for TS, whose in-band SPS sits ~a GOP in) can never
+/// disagree with the backend the sniffer actually picks. Keep the two in sync.
+pub(crate) fn sniffs_as_ts(data: &[u8]) -> bool {
+    let earlier_check_wins = (data.len() >= 12 && &data[4..8] == b"ftyp")
+        || starts_with_ebml(data)
+        || av1::is_ivf(data)
+        || av1::is_obu_stream(data);
+    !earlier_check_wins && ts::detect_layout(data).is_some()
+}
+
 fn starts_with_start_code(data: &[u8]) -> bool {
     data.len() >= 4
         && ((data[0] == 0 && data[1] == 0 && data[2] == 1)
@@ -597,6 +609,36 @@ pub(crate) fn cicp_matrix(v: u16) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal head that sync-locks as TS: 5 sync bytes at the given stride,
+    /// zeros elsewhere (zeros fail every other sniff check).
+    fn ts_head(stride: usize) -> Vec<u8> {
+        let mut d = vec![0u8; 4 * stride + 1];
+        for k in 0..5 {
+            d[k * stride] = 0x47;
+        }
+        d
+    }
+
+    #[test]
+    fn sniffs_as_ts_locks_both_strides_and_nothing_else() {
+        assert!(sniffs_as_ts(&ts_head(188)));
+        assert!(sniffs_as_ts(&ts_head(192)));
+
+        // The other sniffable formats must classify away from the TS budget.
+        let mut ftyp = vec![0u8; 1024];
+        ftyp[4..8].copy_from_slice(b"ftyp");
+        assert!(!sniffs_as_ts(&ftyp));
+        let mut ebml = vec![0u8; 1024];
+        ebml[..4].copy_from_slice(&[0x1A, 0x45, 0xDF, 0xA3]);
+        assert!(!sniffs_as_ts(&ebml));
+        let mut ivf = vec![0u8; 1024];
+        ivf[..4].copy_from_slice(b"DKIF");
+        assert!(!sniffs_as_ts(&ivf));
+
+        assert!(!sniffs_as_ts(&[]));
+        assert!(!sniffs_as_ts(&[0u8; 1024]));
+    }
 
     #[test]
     fn dvwc_decodes_profile_20() {

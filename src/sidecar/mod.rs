@@ -219,6 +219,7 @@ fn build_report(
         hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
         file: path.display().to_string(),
         size_bytes: size,
+        input_truncated: false,
         container: container.to_string(),
         bd_iso: None,
         format_version,

@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 2.2**
+**Schema version: 2.3**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -210,12 +210,13 @@ section.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `hdrprobe_schema_version` | string | always | Version of hdrprobe's own output schema, `"<major>.<minor>"`; see Schema versioning above. Not related to the inspected file's metadata (contrast `format_version` and `video_tracks[].dolby_vision.cm_version`) |
-| `file` | string | always | The input path as given on the command line (or as found during a directory scan) |
-| `size_bytes` | integer | always | File size in bytes |
+| `file` | string | always | The input path as given on the command line (or as found during a directory scan); `"-"` for a stdin probe |
+| `size_bytes` | integer | always | File size in bytes. For a truncated stdin probe (`input_truncated` present) this is the bytes actually probed, not the source's size |
+| `input_truncated` | boolean | stdin probes only, when true | The piped stream exceeded the head budget, so only a leading window was probed: `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (TS `duration_secs`, non-MP4 `bitrate`) are withheld. Absent for file probes and for stdin streams that ended within the budget; see the stdin paragraph under "How input kind and flags affect presence" |
 | `container` | string | always | Container or sidecar kind; see the value table under `VideoTrack` below |
 | `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes" below |
 | `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
-| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a multi-program TS shares one mux timeline). Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; all sidecars) |
+| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a multi-program TS shares one mux timeline). Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; all sidecars; a truncated stdin TS probe, whose PCR span would describe the prefix, not the stream) |
 | `video_tracks` | array of `VideoTrack` | always, at least one entry | One entry per video track; see "Multiple video tracks" below |
 | `elapsed_ms` | float | always | Wall-clock parse time in milliseconds |
 
@@ -560,6 +561,24 @@ absent, and `rpu_count` is `0`.
 **`--samples <N>`.** Changes only how many seek points feed the sampled sets; it never changes
 the schema.
 
+**Stdin (`-`).** `hdrprobe -` probes a bounded head of a stream piped to stdin, for callers
+whose media has no filesystem path (Kodi VFS URLs, media-server plugins, ranged HTTP fetches).
+The format is sniffed from the first bytes and dispatched by magic, and hdrprobe reads only its
+own head budget: 24 MiB when the stream sniffs as TS/M2TS (whose metadata rides the in-band SPS
+about a GOP in), 16 MiB otherwise. When it stops reading, a pipe writer sees a broken pipe;
+that is the normal success signal, not an error. A stream that ends within the budget is
+complete and reports exactly like a file probe. A stream that exceeds it reports
+`input_truncated: true`, `size_bytes` as the bytes probed, and `file` as `"-"`, and withholds
+what a prefix cannot honestly state: a TS input's `duration_secs` (the PCR span would describe
+the cut, not the stream) and every `bitrate` except MP4/MOV's `video_stream` rate (whose
+sample-table sums are exact regardless of truncation). Declared header facts (MP4 `mvhd` and
+MKV Segment-Info durations, resolution, color, HDR and Dolby Vision metadata from the sampled
+head) report normally. Limits: no tail-dependent facts ever (TS runtime, MKV statistics-tag
+bitrate, an MP4 whose `moov` sits at the end fails honestly), `--full` errors on `-` (a pipe
+cannot be fully scanned), metadata sidecars are not detectable via stdin (their dispatch is
+extension-based), and `-` may be given at most once per run. A practical integration guide,
+including a Kodi/Python example, is in [INTEGRATION-STDIN.md](INTEGRATION-STDIN.md).
+
 ## Progress events (stderr)
 
 A `--full` scan of a large file can run for minutes (it reads every access unit), so hdrprobe
@@ -601,6 +620,12 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
 
 ## Version history
 
+- **2.3**: stdin input support (additive). `hdrprobe -` probes a bounded head of a stream piped
+  to stdin, sniff-dispatched with a format-aware read budget. The new `Report.input_truncated`
+  boolean appears (true only) when the stream exceeded the budget; `size_bytes` is then the
+  bytes probed and prefix-derived facts (a TS input's `duration_secs`, every `bitrate` except
+  MP4/MOV's exact `video_stream` rate) are withheld. `"-"` joins the `file` value space. File
+  probes are unchanged. Ships in hdrprobe 0.7.0.
 - **2.2**: Blu-ray ISO support (additive). `"Blu-ray ISO (BDMV)"` joins the `container` set,
   and the new optional `bd_iso` object on `Report` records which BDMV playlist and clip were
   auto-selected as the main feature; the rest of the report describes that clip through the

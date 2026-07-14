@@ -19,12 +19,12 @@ mod sidecar;
 mod vp9;
 
 use std::fs::File;
-use std::io::{IsTerminal as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use memmap2::Mmap;
 
@@ -34,7 +34,7 @@ use crate::render::{RenderOpts, Theme};
 #[derive(Parser, Debug)]
 #[command(name = "hdrprobe", version, about = "Fast HDR / HDR10+ / Dolby Vision metadata inspector")]
 struct Cli {
-    /// Input file(s) or directory(ies).
+    /// Input file(s) or directory(ies); '-' probes a stream head read from stdin.
     #[arg(required_unless_present_any = ["install_shell", "uninstall_shell"])]
     files: Vec<PathBuf>,
 
@@ -182,6 +182,12 @@ fn main() -> ExitCode {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
     }
 
+    // `-` (stdin) can carry at most one stream per invocation.
+    if cli.files.iter().filter(|f| f.as_os_str() == "-").count() > 1 {
+        eprintln!("error: '-' (stdin) may be given at most once");
+        return ExitCode::from(1);
+    }
+
     let paths = match collect_paths(&cli.files, cli.recursive) {
         Ok(p) => p,
         Err(e) => {
@@ -273,7 +279,12 @@ fn main() -> ExitCode {
 
     for (i, path) in paths.iter().enumerate() {
         let progress = progress::Progress::new(progress_mode, path, i + 1, paths.len());
-        match process_file(path, &cli, &progress) {
+        let result = if path.as_os_str() == "-" {
+            process_stdin(&cli, &progress)
+        } else {
+            process_file(path, &cli, &progress)
+        };
+        match result {
             Ok(report) => {
                 // On the decorated interactive path the finished file's
                 // header + bar are erased so its streamed report prints in
@@ -566,13 +577,164 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         prefetch::warm_sample_chunks(remote, &file, &demux, cli.samples, warmed_head);
     }
 
+    Ok(assemble_report(
+        path.display().to_string(),
+        size,
+        data,
+        &demux,
+        feature,
+        false,
+        cli,
+        progress,
+        &frontier,
+        started,
+    ))
+}
+
+/// `hdrprobe -`: probe a bounded head of stdin. The buffer feeds the same
+/// sniff-dispatched slice pipeline a file probe runs (no extension ⇒
+/// `container::demux` dispatches by magic bytes); everything that needs a real
+/// file — the sidecar gate, mmap, prefetch, the Blu-ray ISO branch, the
+/// `--full` frontier — is skipped. A stream that ended within the head budget
+/// is complete and reports exactly like a file probe; one that exceeded it is
+/// truncated: the report says so (`input_truncated`, `size_bytes` = bytes
+/// probed) and prefix-derived facts are withheld.
+fn process_stdin(cli: &Cli, progress: &progress::Progress) -> Result<Report> {
+    if cli.full {
+        bail!("--full cannot scan stdin (a pipe has no seekable whole); pass a file path");
+    }
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        bail!("stdin is a terminal; pipe stream data in or pass a file path");
+    }
+
+    let started = Instant::now();
+    let (buf, truncated) = read_stdin_head(stdin.lock()).context("reading stdin")?;
+    if buf.is_empty() {
+        bail!("no data on stdin");
+    }
+
+    let frontier = prefetch::Frontier::off();
+    let mut demux = container::demux(Path::new("-"), &buf, cli.full, progress, &frontier)
+        .context("demux failed")?;
+    if truncated {
+        suppress_prefix_derived_facts(&mut demux);
+    }
+
+    Ok(assemble_report(
+        "-".to_string(),
+        buf.len() as u64,
+        &buf,
+        &demux,
+        None,
+        truncated,
+        cli,
+        progress,
+        &frontier,
+        started,
+    ))
+}
+
+/// Truncation honesty for `hdrprobe -`: drop facts whose derivation spans the
+/// payload rather than a declared header — over a prefix they'd be
+/// valid-looking wrong numbers. TS duration is the head-to-tail PCR delta,
+/// and a prefix's "tail" is just the cut point. Bitrates survive only for
+/// MP4/MOV, whose stsz/trun table sums are exact regardless of truncation;
+/// MKV's summed block index can't distinguish a cleanly-cut prefix from a
+/// complete walk, and every `overall` rate divides the prefix's byte count.
+/// MP4 `mvhd` / MKV Segment-Info durations are declared header facts and
+/// stand. Keyed on the container label — never thread a truncation flag into
+/// the backends.
+fn suppress_prefix_derived_facts(demux: &mut container::Demux) {
+    if demux.container.starts_with("MPEG-2 TS") {
+        demux.duration_secs = None;
+    }
+    let mp4 = matches!(demux.container, "MP4 (ISOBMFF)" | "QuickTime (MOV)");
+    for t in &mut demux.tracks {
+        t.bitrate = t.bitrate.filter(|b| mp4 && b.scope == model::BitrateScope::VideoStream);
+    }
+}
+
+/// Sniff block read from stdin before choosing the head budget: enough for
+/// every `container::sniff_demux` magic check (the TS sync-lock needs under
+/// 1 KiB) with generous slack.
+const STDIN_SNIFF_BYTES: usize = 64 << 10; // 64 KiB
+
+/// Head budget for non-TS stdin input. A stream that sniffs as TS/M2TS gets
+/// `ts::HEAD_SCAN_BYTES` (24 MiB) instead — the same first-IDR coupling as
+/// the file path, since TS metadata rides the in-band SPS ~a GOP in. MKV/MP4
+/// declare their metadata up front and raw streams bound their head walks at
+/// 8 MiB, so 16 MiB is comfortable slack for everything else.
+const STDIN_HEAD_BYTES: usize = 16 << 20; // 16 MiB
+
+/// Head budget for a sniffed stdin block: how many bytes of the stream are
+/// worth reading before parsing begins.
+fn stdin_budget(head: &[u8]) -> usize {
+    if container::sniffs_as_ts(head) {
+        container::ts::HEAD_SCAN_BYTES as usize
+    } else {
+        STDIN_HEAD_BYTES
+    }
+}
+
+/// Read a bounded head from `r`: a sniff block first, then up to the sniffed
+/// format's budget plus one byte — reading past the budget is what makes
+/// truncation detectable (`true` ⇒ the stream held more; the extra byte is
+/// dropped). EOF at or under the budget means the input is complete.
+/// Generic over the reader and budget so tests drive it with `Cursor` and
+/// tiny budgets.
+fn read_bounded_head(
+    mut r: impl std::io::Read,
+    sniff_bytes: usize,
+    budget_for: impl FnOnce(&[u8]) -> usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut buf = Vec::new();
+    r.by_ref().take(sniff_bytes as u64).read_to_end(&mut buf)?;
+    let budget = budget_for(&buf);
+    // A short sniff read means EOF already arrived; only a full block can
+    // have more bytes behind it.
+    if buf.len() >= sniff_bytes {
+        let remaining = (budget + 1).saturating_sub(buf.len());
+        r.take(remaining as u64).read_to_end(&mut buf)?;
+    }
+    let truncated = buf.len() > budget;
+    if truncated {
+        buf.truncate(budget);
+    }
+    Ok((buf, truncated))
+}
+
+/// The stdin head read: sniff block, then the format-aware budget.
+fn read_stdin_head(r: impl std::io::Read) -> std::io::Result<(Vec<u8>, bool)> {
+    read_bounded_head(r, STDIN_SNIFF_BYTES, stdin_budget)
+}
+
+/// Sample the demuxed stream and assemble the final `Report` — the shared
+/// back half of `process_file` and `process_stdin`. `truncated` marks a
+/// stdin head cut short by its budget: the report carries it verbatim and
+/// the scan-derived duration fallback is withheld (a prefix's frame count is
+/// not the stream's). File probes always pass `false`.
+#[allow(clippy::too_many_arguments)]
+fn assemble_report(
+    file: String,
+    size_bytes: u64,
+    data: &[u8],
+    demux: &container::Demux,
+    feature: Option<bdiso::MainFeature>,
+    truncated: bool,
+    cli: &Cli,
+    progress: &progress::Progress,
+    frontier: &prefetch::Frontier,
+    started: Instant,
+) -> Report {
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
-    let scan = sample::scan(&demux, data, &opts, progress, &frontier);
+    let scan = sample::scan(demux, data, &opts, progress, frontier);
 
     // Raw AV1 `--full`: duration (frames ÷ fps) exists only after the fused
     // walk counted the frames, so it lands here instead of demux.
-    let duration_secs =
-        demux.duration_secs.or_else(|| scan.tracks.iter().find_map(|t| t.duration_secs));
+    let duration_secs = demux.duration_secs.or_else(|| {
+        (!truncated).then(|| scan.tracks.iter().find_map(|t| t.duration_secs)).flatten()
+    });
 
     let mut video_tracks = Vec::with_capacity(demux.tracks.len());
     for (track, scan) in demux.tracks.iter().zip(scan.tracks) {
@@ -673,17 +835,18 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         clip_count: f.clip_count,
     });
 
-    Ok(Report {
+    Report {
         hdrprobe_schema_version: model::SCHEMA_VERSION,
-        file: path.display().to_string(),
-        size_bytes: size,
+        file,
+        size_bytes,
+        input_truncated: truncated,
         container,
         bd_iso,
         format_version: None,
         duration_secs,
         video_tracks,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-    })
+    }
 }
 
 const VIDEO_EXTS: &[&str] = &[
@@ -739,4 +902,100 @@ fn write_output(output: &Option<PathBuf>, buf: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Drive the bounded reader with a fixed injected budget so the tests
+    /// don't depend on the sniff classifier. Returns the cursor's final
+    /// position too, guarding the "never drains past budget + 1" contract.
+    fn read_with_budget(data: &[u8], sniff: usize, budget: usize) -> (Vec<u8>, bool, u64) {
+        let mut cur = Cursor::new(data);
+        let (buf, truncated) = read_bounded_head(&mut cur, sniff, |_| budget).unwrap();
+        (buf, truncated, cur.position())
+    }
+
+    #[test]
+    fn bounded_head_reads_complete_streams_whole() {
+        // EOF below the budget: complete, everything returned.
+        let (buf, truncated, _) = read_with_budget(&[7u8; 10], 4, 100);
+        assert_eq!(buf, [7u8; 10]);
+        assert!(!truncated);
+        // EOF exactly at the budget: still complete.
+        let (buf, truncated, _) = read_with_budget(&[7u8; 100], 4, 100);
+        assert_eq!(buf.len(), 100);
+        assert!(!truncated);
+        // EOF inside the sniff block: complete without a second read.
+        let (buf, truncated, _) = read_with_budget(&[7u8; 3], 4, 100);
+        assert_eq!(buf.len(), 3);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn bounded_head_detects_and_bounds_truncation() {
+        // One byte past the budget: truncated, trimmed back to the budget.
+        let (buf, truncated, _) = read_with_budget(&[7u8; 101], 4, 100);
+        assert_eq!(buf.len(), 100);
+        assert!(truncated);
+        // Far past the budget: the reader stops at budget + 1 — the bound
+        // that lets a pipe writer stop instead of being drained.
+        let (buf, truncated, pos) = read_with_budget(&[7u8; 10_000], 4, 100);
+        assert_eq!(buf.len(), 100);
+        assert!(truncated);
+        assert_eq!(pos, 101);
+    }
+
+    #[test]
+    fn stdin_budget_couples_ts_to_its_head_scan() {
+        // A head that sniffs as TS/M2TS gets the same window the file path
+        // reads (`ts::HEAD_SCAN_BYTES`); everything else gets the flat
+        // stdin budget.
+        let mut ts = vec![0u8; 4 * 188 + 1];
+        for k in 0..5 {
+            ts[k * 188] = 0x47;
+        }
+        assert_eq!(stdin_budget(&ts), container::ts::HEAD_SCAN_BYTES as usize);
+        assert_eq!(stdin_budget(&[0u8; 1024]), STDIN_HEAD_BYTES);
+        assert_eq!(stdin_budget(&[]), STDIN_HEAD_BYTES);
+    }
+
+    fn demux_with(
+        container: &'static str,
+        duration: Option<f64>,
+        bitrate: Option<model::Bitrate>,
+    ) -> container::Demux {
+        let mut track =
+            container::TrackDemux::new(container::Codec::Hevc, container::NalFormat::AnnexB);
+        track.bitrate = bitrate;
+        container::Demux::single(container, duration, track)
+    }
+
+    #[test]
+    fn truncation_suppresses_span_derived_facts_only() {
+        use model::{Bitrate, BitrateScope};
+        let overall = Some(Bitrate { bits_per_sec: 1.0, scope: BitrateScope::Overall });
+        let stream = Some(Bitrate::video_stream_bps(1.0));
+
+        // TS: the PCR-span duration and the overall rate are prefix-derived.
+        let mut d = demux_with("MPEG-2 TS (M2TS/BDAV)", Some(2.0), overall);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, None);
+        assert!(d.tracks[0].bitrate.is_none());
+
+        // MKV: the declared Segment-Info duration stands; a summed-index
+        // rate can't prove completeness over a prefix and is dropped.
+        let mut d = demux_with("Matroska", Some(3600.0), stream);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, Some(3600.0));
+        assert!(d.tracks[0].bitrate.is_none());
+
+        // MP4: the mvhd duration and the exact stsz/trun table rate stand.
+        let mut d = demux_with("MP4 (ISOBMFF)", Some(3600.0), stream);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, Some(3600.0));
+        assert!(d.tracks[0].bitrate.is_some());
+    }
 }

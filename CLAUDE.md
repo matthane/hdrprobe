@@ -386,6 +386,27 @@ never parse bytes native-endian.
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),
   `sniff_demux` re-probes by magic bytes and is adopted only if a sniffed backend actually
   succeeds; otherwise the original, more specific error is surfaced.
+- **Stdin input (`hdrprobe -`) is head-only, sniff-dispatched, and lives entirely in main.rs.**
+  `process_stdin` reads a bounded head into a heap buffer (`read_stdin_head`: a 64 KiB sniff
+  block, then the format's budget + 1 byte — the extra byte is how truncation is detected) and
+  feeds the ordinary slice pipeline via the shared `assemble_report` (the back half of
+  `process_file`); dispatch goes through `container::demux(Path::new("-"), ..)`, whose unknown
+  extension falls to `sniff_demux`. The budget is format-aware: `container::sniffs_as_ts`
+  (deliberately the same ordered checks as `sniff_demux` — keep them in sync) selects
+  `ts::HEAD_SCAN_BYTES`, everything else gets `STDIN_HEAD_BYTES` (16 MiB, ≥ the 8 MiB raw head
+  walks). EOF within the budget ⇒ the input is complete and reports exactly like a file probe
+  (no flag); past it ⇒ `Report::input_truncated` plus `suppress_prefix_derived_facts`, a
+  post-demux fixup in main.rs keyed on the `Demux::container` label — **never thread a
+  truncation flag into backends**: it drops the TS PCR-span duration and every non-MP4 bitrate
+  (MP4/MOV `video_stream` rates are stsz/trun table sums, exact over any prefix; MKV/MP4
+  declared header durations stand). Skipped for stdin by construction: the sidecar gate
+  (extension-based), mmap, all prefetch, the ISO branch, and `--full` (a per-file error — a
+  pipe has no seekable whole; sibling path args still process). Accepted edge limits, do not
+  "fix" without a backend signal: a truncated MKV prefix holding < `mkv::HEAD_SPAN_BYTES` of
+  blocks ends its walk without `stopped_early`, so the count ÷ duration fps fallback can read
+  low; a truncated fMP4's summed-trun fallback duration describes the buffered fragments only.
+  Consumer contract (budgets, suppression table, the broken-pipe-is-success convention) is
+  documented in `docs/SCHEMA.md` and `docs/INTEGRATION-STDIN.md` — keep all three in step.
 - **Every independent video track is reported; a DV BL+EL pair is one logical track — and the
   classification is per-stream signalling, never a track count.** `Demux::tracks` holds one
   `TrackDemux` per *reported* track (report order: MKV by TrackNumber, MP4 by trak order, TS by

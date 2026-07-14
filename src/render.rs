@@ -155,7 +155,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     let multi = r.video_tracks.len() > 1;
     let sidecar = !multi && r.video_tracks[0].codec.is_empty();
 
-    s.push_str(&report_header(&r.file, r.size_bytes, o, &c));
+    s.push_str(&report_header(&r.file, r.size_bytes, r.input_truncated, o, &c));
     s.push('\n');
 
     if !multi {
@@ -621,23 +621,27 @@ fn file_name(path: &str) -> &str {
 /// need it. A multi-file run appends the progress header's `[k/N]` counter
 /// (faint colored, bracketed plain) so each report says where it sits in the
 /// run; the counter is position-in-run, so a failed file leaves an honest gap
-/// in the sequence rather than renumbering the survivors.
-fn report_header(file: &str, size_bytes: u64, o: &RenderOpts, c: &Colorizer) -> String {
+/// in the sequence rather than renumbering the survivors. A truncated stdin
+/// probe marks the size with a trailing `+` — the bytes probed, with more
+/// behind them.
+fn report_header(
+    file: &str,
+    size_bytes: u64,
+    truncated: bool,
+    o: &RenderOpts,
+    c: &Colorizer,
+) -> String {
     let name = file_name(file);
+    let size = format!("{}{}", human_size(size_bytes), if truncated { "+" } else { "" });
     let counter = if o.file_count > 1 {
         format!("  {}", c.faint(&format!("[{}/{}]", o.file_index, o.file_count)))
     } else {
         String::new()
     };
     if c.on {
-        format!(
-            "{} {}{}\n",
-            c.bright(&format!("▮ {}", name)),
-            c.faint(&human_size(size_bytes)),
-            counter
-        )
+        format!("{} {}{}\n", c.bright(&format!("▮ {}", name)), c.faint(&size), counter)
     } else {
-        format!("{}  ({}){}\n", name, human_size(size_bytes), counter)
+        format!("{}  ({}){}\n", name, size, counter)
     }
 }
 
@@ -1472,10 +1476,20 @@ mod tests {
     #[test]
     fn header_counter_multi_file_only() {
         let c = Colorizer { on: false, palette: Theme::Paper.palette(), wrap: None, indent: 0, word_wrap: false };
-        let single = report_header("m/movie.mkv", 1024, &opts(false, 1, 1), &c);
+        let single = report_header("m/movie.mkv", 1024, false, &opts(false, 1, 1), &c);
         assert_eq!(single, "movie.mkv  (1.00 KiB)\n");
-        let multi = report_header("m/movie.mkv", 1024, &opts(false, 2, 7), &c);
+        let multi = report_header("m/movie.mkv", 1024, false, &opts(false, 2, 7), &c);
         assert_eq!(multi, "movie.mkv  (1.00 KiB)  [2/7]\n");
+    }
+
+    /// A truncated stdin probe marks the header size with a trailing `+`
+    /// (bytes probed, more behind them); complete inputs keep the exact
+    /// historical shape.
+    #[test]
+    fn header_marks_truncated_stdin_size() {
+        let c = Colorizer { on: false, palette: Theme::Paper.palette(), wrap: None, indent: 0, word_wrap: false };
+        let truncated = report_header("-", 16 << 20, true, &opts(false, 1, 1), &c);
+        assert_eq!(truncated, "-  (16.00 MiB+)\n");
     }
 
     /// A plain line that fits the width comes back byte-identical in one
@@ -1561,6 +1575,7 @@ mod tests {
             hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
             file: "movie.mp4".to_string(),
             size_bytes: 0,
+            input_truncated: false,
             container: "MP4 (ISOBMFF)".to_string(),
             bd_iso: None,
             format_version: None,
@@ -1628,6 +1643,7 @@ mod tests {
             hdrprobe_schema_version: crate::model::SCHEMA_VERSION,
             file: "show.mkv".to_string(),
             size_bytes: 0,
+            input_truncated: false,
             container: "Matroska".to_string(),
             bd_iso: None,
             format_version: None,

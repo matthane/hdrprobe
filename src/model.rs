@@ -16,7 +16,7 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "2.2";
+pub const SCHEMA_VERSION: &str = "2.3";
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -27,6 +27,14 @@ pub struct Report {
     pub hdrprobe_schema_version: &'static str,
     pub file: String,
     pub size_bytes: u64,
+    /// Stdin input (`hdrprobe -`) only: true when the stream exceeded the
+    /// head budget and only a leading window was probed. When present,
+    /// `size_bytes` is the bytes actually probed (not the source's size) and
+    /// facts derived from the payload span rather than a declared header
+    /// (TS duration, non-MP4 bitrates) are withheld. File probes, and stdin
+    /// streams that ended within the budget, omit it.
+    #[serde(skip_serializing_if = "is_false")]
+    pub input_truncated: bool,
     pub container: String,
     /// Blu-ray ISO probes only: which BDMV playlist/clip was auto-selected as
     /// the main feature. The report's duration, bitrate, and tracks describe
@@ -452,6 +460,7 @@ mod tests {
             hdrprobe_schema_version: SCHEMA_VERSION,
             file: "movie.mkv".to_string(),
             size_bytes: 1,
+            input_truncated: true,
             container: "Matroska".to_string(),
             bd_iso: Some(BdIso {
                 playlist: "00800.mpls".to_string(),
@@ -602,6 +611,7 @@ mod tests {
             "hdrprobe_schema_version",
             "file",
             "size_bytes",
+            "input_truncated",
             "container",
             "bd_iso.playlist",
             "bd_iso.playlist_duration_secs",
@@ -696,9 +706,9 @@ mod tests {
 
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "2.2");
+        assert_eq!(SCHEMA_VERSION, "2.3");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "2.2");
+        assert_eq!(v["hdrprobe_schema_version"], "2.3");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
         assert_eq!(v["video_tracks"][0]["hdr10plus"]["profile"], "B");
