@@ -115,7 +115,7 @@ jobs:
           [ "$GITHUB_REF_TYPE" = "tag" ] || version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           name="hdrprobe-${version}-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/hdrprobe" LICENSE THIRD-PARTY-LICENSES.md README.md docs/SCHEMA.md docs/MIGRATION-2.0.md "$name/"
+          cp "target/${{ matrix.target }}/release/hdrprobe" LICENSE THIRD-PARTY-LICENSES.md README.md docs/SCHEMA.md docs/MIGRATION-2.0.md docs/INTEGRATION-STDIN.md "$name/"
           tar czf "$name.tar.gz" "$name"
 
       - name: Package (windows)
@@ -128,7 +128,7 @@ jobs:
           }
           $name = "hdrprobe-$version-${{ matrix.target }}"
           New-Item -ItemType Directory $name | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/hdrprobe.exe", LICENSE, THIRD-PARTY-LICENSES.md, README.md, docs/SCHEMA.md, docs/MIGRATION-2.0.md $name/
+          Copy-Item "target/${{ matrix.target }}/release/hdrprobe.exe", LICENSE, THIRD-PARTY-LICENSES.md, README.md, docs/SCHEMA.md, docs/MIGRATION-2.0.md, docs/INTEGRATION-STDIN.md $name/
           Compress-Archive -Path $name -DestinationPath "$name.zip"
 
       - uses: actions/upload-artifact@v7
