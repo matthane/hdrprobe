@@ -218,9 +218,15 @@ hdrprobe --no-rpu disc.m2ts            # container-level DV config only
 hdrprobe RPU.bin                       # inspect a raw Dolby Vision RPU sidecar
 hdrprobe metadata.json                 # inspect an HDR10+ JSON sidecar
 hdrprobe --format ndjson -r ./library > report.ndjson
+curl -sr 0-25165823 "$URL" | hdrprobe --json -   # probe the head of a piped stream
 ```
 
 A directory argument is scanned for video files. Add `-r` to descend into subdirectories.
+
+Media that has no file path (a network stream, or an app's internal virtual file system) can
+be piped to `hdrprobe -`: it probes the beginning of the stream, takes only what it needs, and
+the report says when it saw a partial stream. Integrators can start with
+[docs/INTEGRATION-STDIN.md](docs/INTEGRATION-STDIN.md).
 
 For scripting against the JSON output, every object and field is documented in
 [docs/SCHEMA.md](docs/SCHEMA.md).
