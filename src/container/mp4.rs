@@ -534,10 +534,15 @@ fn parse_video_track(
     } else {
         None
     });
-    let fps = match (duration_secs, sample_count) {
-        (Some(d), n) if d > 0.0 && n > 0 => Some(n as f64 / d),
-        _ => None,
-    };
+    // fps: prefer the stts-declared constant rate (what MediaInfo/ffprobe
+    // report for CFR); fall back to sample count over the media duration for
+    // genuinely variable tracks. Gated on a non-empty sample index so an fMP4's
+    // empty stbl leaves fps to the fragment path.
+    let fps = if sample_count > 0 { stts_uniform_fps(data, &stbl_boxes, media_timescale) } else { None }
+        .or(match (duration_secs, sample_count) {
+            (Some(d), n) if d > 0.0 && n > 0 => Some(n as f64 / d),
+            _ => None,
+        });
 
     Ok(Some(VideoTrack {
         sd,
@@ -890,6 +895,39 @@ fn parse_clli(data: &[u8], b: &BoxHdr) -> Option<ContentLight> {
 }
 
 /// Build a per-sample byte-range index from stsc/stco/co64/stsz tables.
+/// Constant frame rate declared by a uniform `stts` table: when every sample
+/// shares one delta, the exact rate is `media_timescale / delta` — the value
+/// MediaInfo and ffprobe report for a CFR track. Preferred over sample count ÷
+/// mdhd media duration, which real muxes skew by padding the media duration
+/// (corpus: hdr10plus_test_lake.mp4's mdhd runs one frame period past its
+/// summed sample durations, reading 59.983 for a 60.000 stream). A trailing
+/// entry covering a single sample is ignored — the common last-sample padding
+/// delta in otherwise-constant tracks — and any other delta mix (true VFR)
+/// yields `None`, keeping the averaged fallback.
+fn stts_uniform_fps(data: &[u8], stbl: &[BoxHdr], media_timescale: u32) -> Option<f64> {
+    let stts = find(stbl, b"stts")?;
+    let p = stts.payload;
+    let n = clamp_count(read_u32(data, p + 4) as usize, p + 8, 8, stts.end);
+    let mut delta: Option<u32> = None;
+    for i in 0..n {
+        let o = p + 8 + i * 8;
+        let (count, d) = (read_u32(data, o), read_u32(data, o + 4));
+        if count == 0 || (count == 1 && i + 1 == n && delta.is_some()) {
+            continue;
+        }
+        match delta {
+            None => delta = Some(d),
+            Some(prev) if prev == d => {}
+            Some(_) => return None,
+        }
+    }
+    let d = delta?;
+    if d == 0 || media_timescale == 0 {
+        return None;
+    }
+    Some(media_timescale as f64 / d as f64)
+}
+
 fn build_sample_index(data: &[u8], stbl: &[BoxHdr], _codec: Codec) -> Result<Vec<Chunk>> {
     // Sample sizes.
     let stsz = find(stbl, b"stsz").context("no stsz box")?;
@@ -1327,6 +1365,49 @@ mod tests {
         assert_eq!(chunks.len(), 2, "only the two real sample sizes are indexed");
         assert_eq!(chunks[0].size, 10);
         assert_eq!(chunks[1].size, 20);
+    }
+
+    #[test]
+    fn stts_uniform_fps_reads_the_declared_cfr_rate() {
+        // stts body: ver/flags, entry_count, then (count, delta) pairs.
+        let mk = |entries: &[(u32, u32)]| {
+            let mut body = vec![0, 0, 0, 0];
+            body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+            for &(c, d) in entries {
+                body.extend_from_slice(&c.to_be_bytes());
+                body.extend_from_slice(&d.to_be_bytes());
+            }
+            let buf = boxed(*b"stts", &body);
+            let boxes = iter_boxes(&buf, 0, buf.len());
+            (buf, boxes)
+        };
+        // Uniform: 3568 samples at delta 256, timescale 15360 → exactly 60.
+        let (buf, boxes) = mk(&[(3568, 256)]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(60.0));
+        // A trailing single-sample padding delta doesn't break uniformity.
+        let (buf, boxes) = mk(&[(3567, 256), (1, 512)]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(60.0));
+        // True VFR (mixed deltas over multiple samples) declares no rate.
+        let (buf, boxes) = mk(&[(100, 256), (100, 512)]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
+        // A single-entry table covering one sample is still a declared rate.
+        let (buf, boxes) = mk(&[(1, 512)]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(30.0));
+        // Degenerate values never divide: zero delta, empty table, timescale 0.
+        let (buf, boxes) = mk(&[(10, 0)]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
+        let (buf, boxes) = mk(&[]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
+        let (buf, boxes) = mk(&[(10, 256)]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 0), None);
+        // A lying entry count is clamped to the box payload (one real entry).
+        let mut body = vec![0, 0, 0, 0];
+        body.extend_from_slice(&1_000_000_000u32.to_be_bytes());
+        body.extend_from_slice(&24u32.to_be_bytes());
+        body.extend_from_slice(&1000u32.to_be_bytes());
+        let buf = boxed(*b"stts", &body);
+        let boxes = iter_boxes(&buf, 0, buf.len());
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 24000), Some(24.0));
     }
 
     /// One size-prefixed ISOBMFF box.
