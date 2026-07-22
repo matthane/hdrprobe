@@ -127,7 +127,9 @@ pub fn is_remote(_file: &File) -> bool {
 /// forcing a linear read of a genuinely local disk would be a regression — so
 /// this one errs toward `false`: Windows keeps the handle-based verdict, Linux
 /// resolves the path's mount against `/proc/self/mounts` (string parsing, no
-/// FFI, so it holds across glibc and musl), and every other platform declines.
+/// FFI, so it holds across glibc and musl), macOS and FreeBSD ask
+/// `getmntinfo(3)` for the same table (neither has a procfs mount table to
+/// read), and every other platform declines.
 #[cfg(windows)]
 pub fn is_remote_strict(file: &File, _path: &Path) -> bool {
     is_remote(file)
@@ -140,7 +142,13 @@ pub fn is_remote_strict(_file: &File, path: &Path) -> bool {
     network_fstype(&canon, &mounts)
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub fn is_remote_strict(_file: &File, path: &Path) -> bool {
+    let Ok(canon) = path.canonicalize() else { return false };
+    network_mount(&canon, &mounts_bsd())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub fn is_remote_strict(_file: &File, _path: &Path) -> bool {
     false
 }
@@ -157,23 +165,78 @@ const NETWORK_FSTYPES: &[&str] =
 /// unparseable input is `false` (the frontier just stays off).
 #[cfg(any(target_os = "linux", test))]
 fn network_fstype(path: &Path, mounts: &str) -> bool {
+    let table: Vec<(String, bool)> = mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let (_dev, mount, fstype) = (fields.next()?, fields.next()?, fields.next()?);
+            Some((unescape_mount(mount), NETWORK_FSTYPES.contains(&fstype)))
+        })
+        .collect();
+    network_mount(path, &table)
+}
+
+/// The longest-prefix half of the verdict, shared by the Linux text-table
+/// parse above and the BSD `getmntinfo` path below: the mount owning `path`
+/// is the one with the longest mount-point prefix ending at a path separator,
+/// and the verdict is that mount's network flag. Unknown paths are `false`
+/// (the frontier just stays off).
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd", test))]
+fn network_mount(path: &Path, mounts: &[(String, bool)]) -> bool {
     let path = path.to_string_lossy();
+    let path: &str = &path;
     let mut best: Option<(usize, bool)> = None;
-    for line in mounts.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        let (Some(_dev), Some(mount), Some(fstype)) = (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let mount = unescape_mount(mount);
+    for (mount, net) in mounts {
         let is_prefix = path == mount
-            || (path.starts_with(&mount)
+            || (path.starts_with(mount.as_str())
                 && (mount == "/" || path[mount.len()..].starts_with(['/', '\\'])));
         if is_prefix && best.is_none_or(|(len, _)| mount.len() >= len) {
-            best = Some((mount.len(), NETWORK_FSTYPES.contains(&fstype)));
+            best = Some((mount.len(), *net));
         }
     }
     best.is_some_and(|(_, net)| net)
+}
+
+/// Filesystem types that mean "bytes cross a network for every read", as
+/// `statfs.f_fstypename` spells them on macOS and FreeBSD. FUSE mounts are
+/// deliberately absent: both platforms name them by the generic driver
+/// (`fusefs`), not the backing filesystem, so a network FUSE mount (sshfs)
+/// is indistinguishable from a local one — the strict gate errs local on
+/// them by design.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const NETWORK_FSTYPES_BSD: &[&str] = &["nfs", "smbfs", "afpfs", "webdav", "cifs"];
+
+/// The mount table via `getmntinfo(3)`, reduced to (mount point, is-network)
+/// rows. `MNT_NOWAIT` returns the cached table without stat'ing every
+/// filesystem, so a hung NFS mount elsewhere on the system cannot stall the
+/// probe. The returned array is libc-managed storage — read, never freed.
+/// Failure is an empty table (the frontier just stays off).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn mounts_bsd() -> Vec<(String, bool)> {
+    let mut buf: *mut libc::statfs = std::ptr::null_mut();
+    // SAFETY: getmntinfo fills `buf` with a pointer to an array it owns and
+    // returns the entry count (0 or negative on failure, checked below).
+    let count = unsafe { libc::getmntinfo(&mut buf, libc::MNT_NOWAIT) };
+    if count <= 0 || buf.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the call succeeded, so `buf` points at `count` valid entries.
+    let stats = unsafe { std::slice::from_raw_parts(buf, count as usize) };
+    stats
+        .iter()
+        .map(|st| {
+            let mount = c_field_str(&st.f_mntonname);
+            let net = NETWORK_FSTYPES_BSD.contains(&c_field_str(&st.f_fstypename).as_str());
+            (mount, net)
+        })
+        .collect()
+}
+
+/// A fixed-size, NUL-terminated C string field, decoded lossily.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn c_field_str(field: &[libc::c_char]) -> String {
+    let bytes: Vec<u8> = field.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Decode the octal escapes `/proc/self/mounts` uses for whitespace in mount
@@ -618,6 +681,31 @@ server:/export /mnt/n\\040f\\040s nfs4 rw 0 0
         assert!(!net("/home/user/movie.mkv"), "root ext4");
         assert!(net("/mnt/n f s/movie.mkv"), "octal-escaped mount point decodes");
         assert!(!net("/mnt/nascar/movie.mkv"), "prefix must end at a separator");
+    }
+
+    #[test]
+    fn network_mount_matches_longest_prefix_from_a_struct_table() {
+        // The shared matcher fed the way the BSD `getmntinfo` path feeds it.
+        let mounts = vec![
+            ("/".to_string(), false),
+            ("/Volumes/media".to_string(), true),
+            ("/Volumes/media/local".to_string(), false),
+        ];
+        let net = |p: &str| super::network_mount(Path::new(p), &mounts);
+        assert!(net("/Volumes/media/movie.mkv"), "smb volume");
+        assert!(net("/Volumes/media"), "the mount point itself");
+        assert!(!net("/Volumes/media/local/movie.mkv"), "deeper local mount wins");
+        assert!(!net("/Volumes/mediacenter/movie.mkv"), "prefix must end at a separator");
+        assert!(!net("/Users/me/movie.mkv"), "root is local");
+        assert!(!super::network_mount(Path::new("/movie.mkv"), &[]), "empty table errs local");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn mounts_bsd_reads_a_live_table() {
+        // Smoke test on the real syscall: any live system has a root mount.
+        let table = super::mounts_bsd();
+        assert!(table.iter().any(|(m, _)| m == "/"), "root mount present in getmntinfo table");
     }
 
     #[test]

@@ -599,8 +599,10 @@ never parse bytes native-endian.
   walks left are the rare metadata rescues (no SPS / no sequence header in the head window).
   Gating is `is_remote_strict`, not `is_remote`: the plain verdict errs remote off-Windows
   (fine for cheap bounded warms), the strict one errs local (Linux resolves
-  `/proc/self/mounts`; unknown platforms decline) because a forced linear read of a local disk
-  would regress. TS windows and heap-buffer chunk lists never touch the frontier with buffer
+  `/proc/self/mounts`, macOS/FreeBSD the `getmntinfo(3)` table — the same longest-prefix
+  matcher, `network_mount`, on a different feed; BSD FUSE mounts stay local since
+  `f_fstypename` names the driver, not the backing fs; unknown platforms decline) because a
+  forced linear read of a local disk would regress. TS windows and heap-buffer chunk lists never touch the frontier with buffer
   offsets — only real file positions go in. The `sidx`/`mfra` ranges are a **hint
   only**: the fragment index is always built from the `moof` boxes themselves, so a wrong or
   missing index wastes a warm but can never change output. Couplings that remain numeric and easy to break
