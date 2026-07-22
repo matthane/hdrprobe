@@ -10,6 +10,18 @@ hdrprobe is a single native binary that answers one question quickly: what HDR a
 path, writing temp files, or extracting a full RPU stream to disk first. It memory-maps the
 file and reads only the bytes it needs, so it stays fast regardless of file size.
 
+## Quick start
+
+Download the archive for your platform from the
+[latest release](https://github.com/matthane/hdrprobe/releases/latest), unpack it, drop the
+`hdrprobe` binary anywhere on your `PATH`, and point it at a file:
+
+```sh
+hdrprobe movie.mkv
+```
+
+The result is a sectioned report of everything the file carries:
+
 ```
 ▮ movie.mkv 68.55 GiB
 
@@ -46,6 +58,24 @@ file and reads only the bytes it needs, so it stays fast regardless of file size
 
 * sampled from a spread of RPUs; --full reads every one
 ```
+
+## Contents
+
+- [What it reports](#what-it-reports)
+  - [General video info](#general-video-info)
+  - [HDR static metadata](#hdr-static-metadata)
+  - [Dolby Vision dynamic metadata](#dolby-vision-dynamic-metadata)
+  - [HDR10+ dynamic metadata](#hdr10-dynamic-metadata)
+  - [Badges and footnotes](#badges-and-footnotes)
+- [Supported inputs](#supported-inputs)
+- [Install](#install)
+- [Usage](#usage)
+  - [Options](#options)
+  - [Color themes](#color-themes)
+  - [Windows shell integration](#windows-shell-integration)
+- [Performance](#performance)
+- [Trademarks](#trademarks)
+- [License](#license)
 
 ## What it reports
 
