@@ -271,10 +271,7 @@ fn front_seekhead_offset_of(data: &[u8], target: u32) -> Option<usize> {
     while p < seg_end {
         let (id, p1) = read_id(data, p)?;
         let (size, p2) = read_size(data, p1)?;
-        let end = match size {
-            Some(s) => (p2 + s as usize).min(seg_end),
-            None => return None,
-        };
+        let end = (p2 + size? as usize).min(seg_end);
         if id == ID_SEEKHEAD {
             if let Some(off) = seekhead_offset_of(data, p2, end, seg_start, target) {
                 return Some(off);
