@@ -50,8 +50,10 @@ Pushing a version tag (`v*`) runs `.github/workflows/release.yml`: it enforces t
 (clippy/tests under `-Dwarnings`, the license drift check, tag == `Cargo.toml` version), builds and
 tests the binary for Windows x86_64, Linux x86_64 + aarch64 glibc + aarch64 fully-static musl
 (no libc/loader dependency, for minimal userspaces like CoreELEC/LibreELEC boxes across old
-vendor kernels through current), and macOS arm64 + Intel (Intel is
-cross-compiled on the arm64 runner and tested via Rosetta), and attaches the archives plus
+vendor kernels through current), macOS arm64 + Intel (Intel is
+cross-compiled on the arm64 runner and tested via Rosetta), and FreeBSD x86_64 (no GitHub
+runner exists, so a separate job builds, tests, and packages inside a FreeBSD VM on the Linux
+runner — keeping the build-and-test-on-target rule), and attaches the archives plus
 `SHA256SUMS` to a **draft** GitHub release for manual review. A `workflow_dispatch` run exercises
 the gates and builds without creating a release. The corpus `-q` check stays a manual pre-tag step
 (`testfiles/` is local-only). The code is deliberately portable outside `shell.rs`/`prefetch.rs`'s

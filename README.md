@@ -193,6 +193,7 @@ your platform, unpack it, and run the `hdrprobe` binary. Prebuilt binaries are p
 - Windows (x86_64)
 - Linux (x86_64, and ARM64 with both a standard and a fully-static build for minimal systems)
 - macOS (Apple Silicon and Intel)
+- FreeBSD (x86_64)
 
 The binary is self-contained with no runtime dependencies, so you can drop it anywhere on your
 `PATH` and run it. Each release lists a `SHA256SUMS` file if you want to verify your download.

@@ -1,4 +1,4 @@
-# Release builds: six per-platform binaries attached to a draft GitHub release.
+# Release builds: seven per-platform binaries attached to a draft GitHub release.
 #
 # Triggered by pushing a version tag (v0.1.0, ...). The workflow_dispatch trigger
 # exists so the whole pipeline can be exercised without cutting a release: a
@@ -22,6 +22,11 @@
 # - GitHub retired the free Intel macOS runners, so x86_64-apple-darwin is
 #   cross-compiled on the arm64 runner (Xcode ships both toolchains). Its tests
 #   still execute there via Rosetta 2.
+# - FreeBSD has no GitHub-hosted runner, so it can't join the matrix without
+#   breaking its build-and-test-on-target rule; instead a separate job boots a
+#   real FreeBSD VM (KVM on the Linux runner) and builds, tests, and packages
+#   inside it. Rust comes from rustup, not pkg — the ports toolchain tracks
+#   quarterly branches and can lag the crate's rust-version floor.
 # - Windows shell integration (--install-shell) is Windows-only by design; the
 #   other binaries build it out via cfg and need nothing here.
 
@@ -139,10 +144,48 @@ jobs:
             hdrprobe-*.zip
           if-no-files-found: error
 
+  # FreeBSD: built, tested, and packaged inside a FreeBSD VM (see the platform
+  # notes above). The prepare/run scripts are POSIX sh (usesh), and the working
+  # tree — including the tar.gz the run step leaves behind — is rsynced back to
+  # the host for the ordinary artifact upload.
+  build-freebsd:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build, test, and package in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          usesh: true
+          mem: 8192
+          # RUSTFLAGS carries the workflow's -Dwarnings bar into the VM.
+          envs: "RUSTFLAGS GITHUB_REF_NAME GITHUB_REF_TYPE"
+          prepare: |
+            pkg install -y curl jq
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          run: |
+            . "$HOME/.cargo/env"
+            cargo build --release
+            cargo test --release
+            version="${GITHUB_REF_NAME#v}"
+            [ "$GITHUB_REF_TYPE" = "tag" ] || version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+            name="hdrprobe-${version}-x86_64-unknown-freebsd"
+            mkdir "$name"
+            cp target/release/hdrprobe LICENSE THIRD-PARTY-LICENSES.md README.md docs/SCHEMA.md docs/MIGRATION-2.0.md docs/INTEGRATION-STDIN.md "$name/"
+            tar czf "$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hdrprobe-x86_64-unknown-freebsd
+          path: hdrprobe-*.tar.gz
+          if-no-files-found: error
+
   # Draft release: the archives and a checksum file are attached, but nothing
   # is published until the draft is reviewed and released by hand.
   release:
-    needs: build
+    needs: [build, build-freebsd]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     steps:
