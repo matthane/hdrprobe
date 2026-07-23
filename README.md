@@ -297,7 +297,7 @@ For scripting against the JSON output, every object and field is documented in
 | `--progress <mode>` | Progress reporting for `--full` scans: `auto` (default, bar on an interactive terminal), `bar`, `json` (machine-readable events on stderr, see [docs/SCHEMA.md](docs/SCHEMA.md)), or `off` |
 | `--no-rpu` | Report the container DV configuration only, skipping RPU parsing. Effectively instant. |
 | `-s, --samples <N>` | Number of seek points to sample (default 16). Higher values capture more distinct L5 areas. |
-| `--sections <list>` | Comma-separated list drawn from `general,hdr,dv,hdr10plus` |
+| `--sections <list>` | Comma-separated list drawn from `general,hdr,dv,hdr10plus,slhdr,hdrvivid` |
 | `--color <when>` | `auto` (default, plain when piped), `always`, or `never` |
 | `--theme <name>` | Color theme: `paper` (default), `green`, `amber`, `red`, `ice`, `purple`, or `mono` (adapts to your terminal's own colors). Set `HDRPROBE_THEME` to make it stick. |
 | `-q, --quiet` | One-line summary per file |

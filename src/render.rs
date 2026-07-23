@@ -23,6 +23,8 @@ pub struct RenderOpts {
     pub show_hdr: bool,
     pub show_dv: bool,
     pub show_hdr10plus: bool,
+    pub show_sl_hdr: bool,
+    pub show_hdr_vivid: bool,
 }
 
 /// A colour theme picks the ink for the fixed four-role hierarchy (see
@@ -313,10 +315,10 @@ fn track_sections(
     }
 
     // SL-HDR and HDR Vivid get their own sections like Dolby Vision and
-    // HDR10+ — each section exists only when the metadata was found. Both
-    // ride the HDR section's visibility gate (they are HDR facts; no
-    // dedicated --sections name).
-    if o.show_hdr {
+    // HDR10+ — each section exists only when the metadata was found, and
+    // each has its own --sections name (slhdr / hdrvivid) so the dynamic
+    // formats filter symmetrically with dv and hdr10plus.
+    if o.show_sl_hdr {
         if let Some(sl) = &t.sl_hdr {
             let _ = writeln!(s, "{}", c.section("SL-HDR"));
             // The variant headline, bright like the HDR10+ Profile row. The
@@ -340,6 +342,8 @@ fn track_sections(
             }
             s.push('\n');
         }
+    }
+    if o.show_hdr_vivid {
         if let Some(hv) = &t.hdr_vivid {
             let _ = writeln!(s, "{}", c.section("HDR Vivid"));
             kv(s, c, "Version", &format!("v{}", hv.version));
@@ -1522,6 +1526,8 @@ mod tests {
             show_hdr: true,
             show_dv: true,
             show_hdr10plus: true,
+            show_sl_hdr: true,
+            show_hdr_vivid: true,
         }
     }
 

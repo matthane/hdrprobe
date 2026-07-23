@@ -58,7 +58,7 @@ struct Cli {
     #[arg(short, long, default_value_t = 16)]
     samples: usize,
 
-    /// Comma list of sections to show: general,hdr,dv,hdr10plus.
+    /// Comma list of sections to show: general,hdr,dv,hdr10plus,slhdr,hdrvivid.
     #[arg(long)]
     sections: Option<String>,
 
@@ -373,17 +373,24 @@ fn render_opts(
     file_count: usize,
 ) -> RenderOpts {
     let (mut g, mut h, mut d, mut hp) = (true, true, true, true);
+    let (mut sl, mut hv) = (true, true);
     if let Some(list) = &cli.sections {
         g = false;
         h = false;
         d = false;
         hp = false;
+        sl = false;
+        hv = false;
         for s in list.split(',') {
             match s.trim() {
                 "general" => g = true,
                 "hdr" => h = true,
                 "dv" => d = true,
                 "hdr10plus" => hp = true,
+                // Hyphenated spellings accepted since unknown tokens are
+                // silently ignored — a near-miss shouldn't hide a section.
+                "slhdr" | "sl-hdr" => sl = true,
+                "hdrvivid" | "hdr-vivid" => hv = true,
                 _ => {}
             }
         }
@@ -398,6 +405,8 @@ fn render_opts(
         show_hdr: h,
         show_dv: d,
         show_hdr10plus: hp,
+        show_sl_hdr: sl,
+        show_hdr_vivid: hv,
     }
 }
 
