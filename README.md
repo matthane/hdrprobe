@@ -364,8 +364,10 @@ directory scan.
 ## Trademarks
 
 Dolby and Dolby Vision are trademarks of Dolby Laboratories, Inc. HDR10+ is a trademark of
-HDR10+ Technologies, LLC. All other product names, logos, and brands are the property of their
-respective owners.
+HDR10+ Technologies, LLC. SL-HDR is a standard developed by Philips, Technicolor, and
+InterDigital and standardized by ETSI. HDR Vivid is a standard developed by the China Ultra HD
+Video Industry Alliance (CUVA). All other product names, logos, and brands are the property of
+their respective owners.
 
 hdrprobe is an independent tool. It is not affiliated with, endorsed by, or sponsored by Dolby
 Laboratories or any other trademark holder named here. These names are used only to identify
