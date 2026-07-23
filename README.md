@@ -245,11 +245,11 @@ The simplest way to get hdrprobe is to download a ready-to-run binary from the
 [latest release](https://github.com/matthane/hdrprobe/releases/latest). Grab the archive for
 your platform, unpack it, and run the `hdrprobe` binary. Prebuilt binaries are provided for:
 
-- Windows (x86_64)
-- Linux (x86_64 and ARM64, each with a standard build and a fully-static build for minimal
-  systems such as Unraid or CoreELEC boxes)
-- macOS (Apple Silicon and Intel)
-- FreeBSD (x86_64)
+- Windows: `windows-x64`
+- Linux: `linux-x64` and `linux-arm64`, plus fully-static `linux-x64-static` and
+  `linux-arm64-static` builds for minimal systems such as Unraid or CoreELEC boxes
+- macOS: `macos-arm64` (Apple Silicon) and `macos-x64` (Intel)
+- FreeBSD: `freebsd-x64`
 
 The binary is self-contained with no runtime dependencies, so you can drop it anywhere on your
 `PATH` and run it. Each release lists a `SHA256SUMS` file if you want to verify your download.

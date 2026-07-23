@@ -31,6 +31,11 @@
 #   quarterly branches and can lag the crate's rust-version floor.
 # - Windows shell integration (--install-shell) is Windows-only by design; the
 #   other binaries build it out via cfg and need nothing here.
+# - Archives are named by user-facing platform (matrix.name: linux-x64-static,
+#   macos-arm64, ...), never raw target triples: the download audience is media
+#   library users, to whom "x86_64-unknown-linux-musl" reads as a build error
+#   ("unknown") and names the libc instead of the fact that matters (static vs
+#   standard). The triple still keys the toolchain steps and build paths.
 
 name: release
 
@@ -83,18 +88,25 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            name: linux-x64
             os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
+            name: linux-arm64
             os: ubuntu-22.04-arm
           - target: aarch64-unknown-linux-musl
+            name: linux-arm64-static
             os: ubuntu-22.04-arm
           - target: x86_64-unknown-linux-musl
+            name: linux-x64-static
             os: ubuntu-22.04
           - target: aarch64-apple-darwin
+            name: macos-arm64
             os: macos-latest
           - target: x86_64-apple-darwin
+            name: macos-x64
             os: macos-latest
           - target: x86_64-pc-windows-msvc
+            name: windows-x64
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
@@ -122,7 +134,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           [ "$GITHUB_REF_TYPE" = "tag" ] || version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          name="hdrprobe-${version}-${{ matrix.target }}"
+          name="hdrprobe-${version}-${{ matrix.name }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/hdrprobe" LICENSE THIRD-PARTY-LICENSES.md README.md docs/SCHEMA.md docs/MIGRATION-2.0.md docs/INTEGRATION-STDIN.md "$name/"
           tar czf "$name.tar.gz" "$name"
@@ -135,14 +147,14 @@ jobs:
           if ($env:GITHUB_REF_TYPE -ne 'tag') {
             $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
           }
-          $name = "hdrprobe-$version-${{ matrix.target }}"
+          $name = "hdrprobe-$version-${{ matrix.name }}"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/hdrprobe.exe", LICENSE, THIRD-PARTY-LICENSES.md, README.md, docs/SCHEMA.md, docs/MIGRATION-2.0.md, docs/INTEGRATION-STDIN.md $name/
           Compress-Archive -Path $name -DestinationPath "$name.zip"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: hdrprobe-${{ matrix.target }}
+          name: hdrprobe-${{ matrix.name }}
           path: |
             hdrprobe-*.tar.gz
             hdrprobe-*.zip
@@ -175,14 +187,14 @@ jobs:
             cargo test --release
             version="${GITHUB_REF_NAME#v}"
             [ "$GITHUB_REF_TYPE" = "tag" ] || version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-            name="hdrprobe-${version}-x86_64-unknown-freebsd"
+            name="hdrprobe-${version}-freebsd-x64"
             mkdir "$name"
             cp target/release/hdrprobe LICENSE THIRD-PARTY-LICENSES.md README.md docs/SCHEMA.md docs/MIGRATION-2.0.md docs/INTEGRATION-STDIN.md "$name/"
             tar czf "$name.tar.gz" "$name"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: hdrprobe-x86_64-unknown-freebsd
+          name: hdrprobe-freebsd-x64
           path: hdrprobe-*.tar.gz
           if-no-files-found: error
 
