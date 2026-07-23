@@ -91,11 +91,16 @@ Format is always three sections: **New**, **Fixed**, **Schema**.
 - Mention behavior changes only when they affect usage (CLI arguments, output,
   tooling integration).
 
-## 8. Commit, push, tag
+## 8. Merge to main, push, tag
 
-- Commit the release changes (version bump, manifest, docs). Ask for explicit
-  approval with AskUserQuestion before pushing to main.
-- Tag as `vX.Y.Z` matching Cargo.toml exactly; CI hard-fails on any mismatch.
+Each version cycle develops on its own branch (convention: `dev/vX.Y.Z`); main
+receives the cycle only here, at release time.
+
+- Commit the release changes (version bump, manifest, docs) on the development
+  branch and push it, so the branch is complete before the merge.
+- Merge the development branch into main with `--no-ff` (one merge commit marks
+  the cycle). Ask for explicit approval with AskUserQuestion before pushing main.
+- Tag main as `vX.Y.Z` matching Cargo.toml exactly; CI hard-fails on any mismatch.
 - Pushing the tag triggers `.github/workflows/release.yml`: it re-runs the gates,
   builds and tests all seven platform targets (Windows x86_64, Linux x86_64 +
   aarch64 glibc + aarch64 static musl, macOS arm64 + Intel via Rosetta, FreeBSD
@@ -103,5 +108,7 @@ Format is always three sections: **New**, **Fixed**, **Schema**.
   release. Nothing publishes automatically.
 - Watch the workflow to completion, then paste the release notes into the draft
   release for the user to review and publish manually.
+- After the release publishes, the development branch can be deleted; the next
+  cycle starts a fresh `dev/vX.Y.Z` branch off main.
 - To exercise the pipeline without cutting a release, use the workflow_dispatch
   trigger instead of a tag: it runs the gates and builds but skips the release job.

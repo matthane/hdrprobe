@@ -18,6 +18,15 @@ cargo clippy --release         # must stay at zero warnings
 Bar for any change: **zero `cargo build` warnings, zero `cargo clippy` warnings, all tests
 pass, and the corpus (`-q`) output is unchanged** unless the change intends to alter it.
 
+## Branch flow
+
+Each version cycle develops on its own branch (convention: `dev/vX.Y.Z`, named for the
+upcoming version). **Never commit work-in-progress directly to main**: main receives the
+cycle as a single `--no-ff` merge at release time, so pre-release doc/schema edits (README,
+SCHEMA.md "Ships in" notes) never appear on main ahead of the version they describe. The
+project-local `/commit` skill pushes to the development branch only; `/release` performs
+the merge, tag, and push to main. (History before v0.8.0 was committed straight to main.)
+
 ## Third-party license attribution
 
 `THIRD-PARTY-LICENSES.md` is **generated — never hand-edit it.** It lists every crate compiled
