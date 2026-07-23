@@ -244,6 +244,8 @@ fn build_report(
             hdr: None,
             dolby_vision,
             hdr10plus,
+            sl_hdr: None,
+            hdr_vivid: None,
         }],
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     }

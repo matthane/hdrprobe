@@ -782,6 +782,50 @@ fn assemble_report(
                 .then_some(info.target_max_luminance),
         });
 
+        // HDR Vivid: the MP4 `cuvv` box is the container's declaration and
+        // wins the version (its bitmap's highest bit — a multi-version stream
+        // declares them all, where a sampled SEI shows one); the SEI supplies
+        // the data-set type and target set and is the sole source everywhere
+        // else. Either alone is presence. The published versions are all X.0.
+        let hdr_vivid = match (track.cuvv_version_map, scan.sei.hdr_vivid.as_ref()) {
+            (Some(map), sei) => Some(model::HdrVivid {
+                version: format!("{}.0", 16 - map.leading_zeros()),
+                system_start_code: sei.map(|s| s.system_start_code),
+                target_max_luminances: sei
+                    .map(|s| hdr::pq_targets_to_nits(&s.target_pq))
+                    .unwrap_or_default(),
+                // Like dolby_vision.sampled: false under --no-rpu (a box-only
+                // detection sampled nothing) and under --full.
+                sampled: !cli.full && sei.is_some(),
+            }),
+            (None, Some(s)) => Some(model::HdrVivid {
+                version: format!("{}.0", s.version),
+                system_start_code: Some(s.system_start_code),
+                target_max_luminances: hdr::pq_targets_to_nits(&s.target_pq),
+                sampled: !cli.full,
+            }),
+            (None, None) => None,
+        };
+
+        let sl_hdr = scan.sei.sl_hdr.as_ref().map(|sl| model::SlHdr {
+            mode: sl.mode,
+            spec_version: format!("{}.{}", sl.spec_major, sl.spec_minor),
+            // Values past 1 are reserved in TS 103 433: name neither, never guess.
+            payload_mode: match sl.payload_mode {
+                Some(0) => Some("parameter-based".to_string()),
+                Some(1) => Some("table-based".to_string()),
+                _ => None,
+            },
+            // An unrecognized CICP code drops the name, never a guess; the
+            // luminance still reports.
+            target_primaries: sl
+                .target_primaries
+                .and_then(|c| container::cicp_primaries(c as u16))
+                .map(str::to_string),
+            target_max_luminance: sl.target_max_nits.map(u32::from),
+            source_mastering: sl.source_mastering.clone(),
+        });
+
         let hdr = Some(hdr::assemble(track, dv.as_ref(), &scan.sei));
 
         // Reflect the HLG/PQ alt-transfer SEI override in the displayed colour line.
@@ -817,6 +861,8 @@ fn assemble_report(
             hdr,
             dolby_vision: dv,
             hdr10plus,
+            sl_hdr,
+            hdr_vivid,
         });
     }
 

@@ -152,6 +152,10 @@ pub struct TrackDemux {
     pub dv_dual_track: bool,
     pub mastering: Option<MasteringDisplay>,
     pub content_light: Option<ContentLight>,
+    /// The MP4 `cuvv` box's `cuva_version_map` — HDR Vivid's container
+    /// declaration (bit 0 = CUVA v1). `None` everywhere else; only the MP4
+    /// backend sets it (no other container defines an HDR Vivid config box).
+    pub cuvv_version_map: Option<u16>,
     /// Average bitrate, computed per backend so each container's semantics stay
     /// local: a true per-stream rate where the exact video byte count (or a
     /// stated rate) is known, else a file-length overall rate. `None` without a
@@ -205,6 +209,7 @@ impl TrackDemux {
             dv_dual_track: false,
             mastering: None,
             content_light: None,
+            cuvv_version_map: None,
             bitrate: None,
             chunks: Vec::new(),
             t35_chunks: Vec::new(),

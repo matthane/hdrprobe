@@ -795,7 +795,7 @@ fn source_pq_to_mastering((min, max): (u16, u16)) -> MasteringDisplay {
 }
 
 /// SMPTE ST 2084 (PQ) EOTF for a 12-bit code value -> cd/m².
-fn pq12_to_nits(code: u16) -> f64 {
+pub(crate) fn pq12_to_nits(code: u16) -> f64 {
     let e = (code as f64) / 4095.0;
     const M1: f64 = 2610.0 / 16384.0;
     const M2: f64 = 2523.0 / 4096.0 * 128.0;
@@ -816,7 +816,7 @@ const STANDARD_NITS: &[u32] = &[
 ];
 
 /// Snap a computed nit value to the nearest standard mastering target.
-fn snap_nits(nits: f64) -> u32 {
+pub(crate) fn snap_nits(nits: f64) -> u32 {
     let n = nits.round() as i64;
     let mut best = n as u32;
     let mut best_d = i64::MAX;

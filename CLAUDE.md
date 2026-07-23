@@ -103,7 +103,15 @@ never parse bytes native-endian.
   is a different codec family and stays on the `Other` fallback.
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
 - `hdr/` — `mod.rs` (format classification + `primaries_label`, the chromaticity→gamut matcher
-  behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/alt-transfer). The AV1
+  behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/SL-HDR/HDR Vivid/
+  alt-transfer; the T.35 dynamic formats are told apart by country + provider code —
+  0xB5/0x003C HDR10+, 0xB5/0x003A ETSI SL-HDR (mode digit 1/2/3 names the variant, e.g.
+  "SL-HDR2 / HDR10"), 0x26/0x0004 CUVA HDR Vivid (2-byte oriented code = version, e.g.
+  "HDR Vivid / HLG"; the AV1 T.35 OBU route in `av1/obu.rs` shares the parser). HDR Vivid
+  also has a container declaration, the MP4 `cuvv` sample-entry box (`mp4.rs::parse_cuvv` →
+  `TrackDemux::cuvv_version_map`, zero extra I/O — the box rides the already-parsed stsd):
+  either signal is presence, the box's bitmap wins the reported version, and box-only
+  detection keeps `--no-rpu` honest (no frame reads)). The AV1
   `HDR_MDCV` OBU shares ST.2086's 24-byte shape but **not its semantics** — R/G/B (not G/B/R)
   primary order, 0.16 fixed-point chromaticities, 24.8/18.14 fixed-point luminance — so it has
   its own `sei::parse_mastering_av1`; routing it through `parse_mastering` mis-scales max

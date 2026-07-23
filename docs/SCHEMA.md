@@ -33,6 +33,8 @@ together with the conditions under which it appears.
   - [`DvCensus`](#dvcensus)
   - [`LevelPresence`](#levelpresence)
   - [`Hdr10Plus`](#hdr10plus)
+  - [`SlHdr`](#slhdr)
+  - [`HdrVivid`](#hdrvivid)
 - [How input kind and flags affect presence](#how-input-kind-and-flags-affect-presence)
 - [Progress events (stderr)](#progress-events-stderr)
 - [Version history](#version-history)
@@ -199,10 +201,12 @@ Report
    │  ├─ metadata_cadence: MetadataCadence
    │  └─ census: DvCensus
    │     └─ level_presence[]: LevelPresence
-   └─ hdr10plus: Hdr10Plus            (when HDR10+ metadata was found)
+   ├─ hdr10plus: Hdr10Plus            (when HDR10+ metadata was found)
+   ├─ sl_hdr: SlHdr                   (when an SL-HDR information SEI was found)
+   └─ hdr_vivid: HdrVivid             (when HDR Vivid metadata was found)
 ```
 
-`MasteringDisplay` is the one shape used in two places, with different meanings; see its
+`MasteringDisplay` is the one shape used in several places, with different meanings; see its
 section.
 
 ### `Report` (top level)
@@ -277,6 +281,8 @@ errors rather than guessing.
 | `hdr` | `Hdr` | video inputs only | Static HDR classification and mastering info; absent for metadata sidecars, which have no base layer |
 | `dolby_vision` | `DolbyVision` | when DV metadata was found | Present when at least one RPU parsed, when the container carries a DV configuration (including under `--no-rpu`), or for a DV sidecar |
 | `hdr10plus` | `Hdr10Plus` | when HDR10+ metadata was found | Present when ST.2094-40 metadata was parsed from the input (an HEVC SEI, an AV1 metadata OBU, or the Matroska BlockAdditions carriage used by VP9 in WebM), or for an HDR10+ JSON sidecar. Like `dolby_vision`, the object's existence is the presence signal |
+| `sl_hdr` | `SlHdr` | when an SL-HDR information SEI was found | Present when an SL-HDR (ETSI TS 103 433) information SEI was parsed from the stream (HEVC or AVC). Same existence-is-presence convention |
+| `hdr_vivid` | `HdrVivid` | when HDR Vivid metadata was found | Present when HDR Vivid (CUVA, T/UWA 005) metadata was found: an HEVC/AVC T.35 SEI, an AV1 T.35 metadata OBU, or the MP4 `cuvv` sample-entry declaration (which fires even when no frame is read, e.g. `--no-rpu`). Same existence-is-presence convention |
 
 #### `container` values
 
@@ -352,21 +358,28 @@ The string is a ` / `-joined list built from, in order:
 
 1. `Dolby Vision` when a DV section is present.
 2. `HDR10+` when HDR10+ metadata is present.
-3. A base-signal tag: `HDR10`, `HLG`, or `SDR` for non-DV content; `HDR10 (fallback)`,
+3. `SL-HDR1`, `SL-HDR2`, or `SL-HDR3` when an SL-HDR information SEI is present (the digit is
+   the stream's own signalled mode).
+4. `HDR Vivid` when HDR Vivid metadata is present.
+5. A base-signal tag: `HDR10`, `HLG`, or `SDR` for non-DV content; `HDR10 (fallback)`,
    `HLG (fallback)`, or `SDR (fallback)` for the base layer under DV. Omitted entirely when the
    DV stream has no independently viewable base (Profile 5 and Profile 20, whose base is
    IPT-PQ-c2).
 
-Examples: `"SDR"`, `"HDR10"`, `"HLG"`, `"HDR10+ / HDR10"`, `"Dolby Vision"`,
-`"Dolby Vision / HDR10 (fallback)"`, `"Dolby Vision / HDR10+ / HDR10 (fallback)"`,
-`"Dolby Vision / SDR (fallback)"`, `"Dolby Vision / HLG (fallback)"`.
+Examples: `"SDR"`, `"HDR10"`, `"HLG"`, `"HDR10+ / HDR10"`, `"SL-HDR2 / HDR10"`,
+`"HDR Vivid / HLG"`, `"Dolby Vision"`, `"Dolby Vision / HDR10 (fallback)"`,
+`"Dolby Vision / HDR10+ / HDR10 (fallback)"`, `"Dolby Vision / SDR (fallback)"`,
+`"Dolby Vision / HLG (fallback)"`.
 
 ### `MasteringDisplay`
 
-Used in two places with different meanings: `hdr.mastering` describes the **base layer's**
-declared display (container MDCV box or ST.2086 SEI), while `dolby_vision.mastering_display`
+Used in three places with different meanings: `hdr.mastering` describes the **base layer's**
+declared display (container MDCV box or ST.2086 SEI), `dolby_vision.mastering_display`
 describes the **DV grade's own** display (the RPU DM header's `source_min_pq`/`source_max_pq`,
-or a DV XML's exact Level-0 values). On dual-layer titles the two can legitimately differ.
+or a DV XML's exact Level-0 values), and `sl_hdr.source_mastering` describes the source
+display **the SL-HDR metadata itself carries** (`src_mdcv`). The values can legitimately
+differ between places — on dual-layer titles for the first two, and on re-encodes whose
+SL-HDR metadata predates the current MDCV box for the third.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
@@ -531,6 +544,37 @@ signal, mirroring `dolby_vision`.
 | `profile` | string | optional | Single-character ST.2094-40 profile: `"A"` (histogram only) or `"B"` (Bezier tone-mapping curve). Omitted when the profile could not be determined |
 | `target_max_luminance` | integer | optional | Target display max luminance the grade was made for, cd/m². Omitted when zero or absent |
 
+### `SlHdr`
+
+Present only when an SL-HDR (ETSI TS 103 433) information SEI was found in the stream; its
+existence is the presence signal, mirroring `dolby_vision` and `hdr10plus`. Only the
+title-stable header facts are reported; the per-picture reconstruction parameters (the SL-HDR
+analogue of DV L1) never are.
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `mode` | integer | always | SL-HDR mode from the SEI's `sl_hdr_mode_value_minus1`: `1` (SDR base, TS 103 433-1), `2` (PQ base, TS 103 433-2), `3` (HLG base, TS 103 433-3). Also the digit in the `hdr.format` component (`"SL-HDR2"`) |
+| `spec_version` | string | always | The TS 103 433 specification version the stream declares, `"<major>.<minor>"`, e.g. `"1.0"` |
+| `payload_mode` | string | optional | `"parameter-based"` or `"table-based"`. Omitted when the SEI carried the cancel flag or a reserved payload-mode value |
+| `target_primaries` | string | optional | Named CICP primaries of the target picture the adaptation metadata is tuned toward (e.g. `"BT.2020"`, from the same value set as `color.primaries`). Omitted when the SEI carries no target block or the code is unrecognized |
+| `target_max_luminance` | integer | optional | The target picture's max luminance, cd/m² (e.g. `100` for an SDR rendition target). Omitted when the SEI carries no target block |
+| `source_mastering` | `MasteringDisplay` | optional | The source mastering display the SL-HDR metadata itself carries (`src_mdcv`), distinct from the base layer's own MDCV/ST.2086 signalling (the `hdr.mastering` source). `primaries_level` is never set here. Omitted when the SEI carries no such block or it is zero-filled |
+
+### `HdrVivid`
+
+Present only when HDR Vivid (CUVA, T/UWA 005) metadata was found — the China-registered
+T.35 message in an HEVC/AVC SEI or an AV1 metadata OBU, or MP4's `cuvv`
+CUVVConfigurationBox (the container-level declaration, a sample-entry child like `dvcC`);
+its existence is the presence signal. Only the title-stable header facts are reported; the
+per-frame tone-mapping payload never is.
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `version` | string | always | The CUVA metadata version, `"1.0"` through `"4.0"`. From the `cuvv` box's version bitmap when the container declares one (its highest declared version — the declaration covers the whole stream, where a sampled SEI shows one frame's), else from the SEI's T.35 provider-oriented code (the field T/UWA 005.2-1 itself defines as the version; note MediaInfo's SEI-path `HDR_Format_Version` renders the data-set type below instead) |
+| `system_start_code` | integer | optional | The dynamic-metadata data-set type byte from the T.35 message; `1` in every known stream. Absent when detection came only from the `cuvv` declaration and no frame's SEI was read (e.g. `--no-rpu`) |
+| `target_max_luminances` | array of integers | when non-empty | Distinct targeted-system-display max luminances of the tone-mapping parameter sets, cd/m², sorted ascending — the display anchors the per-frame curves are computed toward, the HDR Vivid analogue of the DV trim-target set (e.g. `[100, 500]` for a title carrying an SDR curve and a 500-nit HDR curve). A sampled union unless every frame was read; verified constant across every frame of the reference samples |
+| `sampled` | boolean | always | True when `target_max_luminances` is a sampled union rather than a full-scan read, mirroring `dolby_vision.sampled` (`false` under `--full` and under `--no-rpu`, where nothing was sampled) |
+
 ## How input kind and flags affect presence
 
 The per-track presence notes below all describe fields of a `video_tracks` entry.
@@ -547,16 +591,22 @@ sidecars have no `hdr10plus` section.
 `trim_targets` are unions over the sampled RPUs and may be incomplete (though the L10-defined
 custom targets folded into the L8 set are title-global: the definition rides every RPU, so
 those entries are complete from any sample); `census` and `metadata_cadence` are absent.
+`hdr_vivid.sampled` is likewise `true`, its `target_max_luminances` a union over the sampled
+frames.
 
-**`--full`.** Every RPU is scanned: `sampled` is `false`, `census` and `metadata_cadence`
-appear, and TS inputs gain an exact video-stream `bitrate`. DV sidecars behave like `--full`
-by construction (every RPU in the file is read).
+**`--full`.** Every RPU is scanned: `sampled` is `false` (on `dolby_vision` and `hdr_vivid`
+alike), `census` and `metadata_cadence` appear, and TS inputs gain an exact video-stream
+`bitrate`. DV sidecars behave like `--full` by construction (every RPU in the file is read).
 
-**`--no-rpu`.** The DV section is built from the container configuration alone: `profile`,
-`structure`, `level`, the presence booleans, `bl_compatibility_id`, and `compatibility` can
-appear; everything RPU-derived (`el_type`, `reconstructed_bit_depth`, `cm_version`,
-L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `metadata_cadence`, `census`) is
-absent, and `rpu_count` is `0`.
+**`--no-rpu`.** No frame bytes are read at all, so every SEI-derived fact disappears, not
+just the RPU-derived ones. The DV section is built from the container configuration alone:
+`profile`, `structure`, `level`, the presence booleans, `bl_compatibility_id`, and
+`compatibility` can appear; everything RPU-derived (`el_type`, `reconstructed_bit_depth`,
+`cm_version`, L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `metadata_cadence`,
+`census`) is absent, and `rpu_count` is `0`. `hdr10plus` and `sl_hdr` are entirely absent
+(their only carriage is in-frame), SEI-sourced `hdr.mastering`/`hdr.content_light` fall away
+(container-box values still report), and `hdr_vivid` survives only via the MP4 `cuvv`
+declaration — `version` alone, no `system_start_code`, no `target_max_luminances`.
 
 **`--samples <N>`.** Changes only how many seek points feed the sampled sets; it never changes
 the schema.
@@ -623,6 +673,17 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
 
 ## Version history
 
+- **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
+  `video_tracks[].sl_hdr` object appears when an SL-HDR (ETSI TS 103 433) information SEI was
+  found in an HEVC or AVC stream, carrying `mode`, `spec_version`, `payload_mode`, the
+  target-picture facts (`target_primaries`, `target_max_luminance`), and `source_mastering`;
+  `SL-HDR1`/`SL-HDR2`/`SL-HDR3` join the `hdr.format` component set (e.g.
+  `"SL-HDR2 / HDR10"`). The new optional `video_tracks[].hdr_vivid` object appears when
+  HDR Vivid (CUVA, T/UWA 005) metadata was found (HEVC/AVC T.35 SEI, AV1 T.35 metadata
+  OBU, or the MP4 `cuvv` sample-entry declaration), carrying `version`, the optional
+  `system_start_code`, the `target_max_luminances` display-anchor set with its `sampled`
+  flag; `HDR Vivid` joins the `hdr.format` component set (e.g. `"HDR Vivid / HLG"`).
+  Streams without any of these signals are unchanged.
 - **2.3**: stdin input support (additive). `hdrprobe -` probes a bounded head of a stream piped
   to stdin, sniff-dispatched with a format-aware read budget. The new `Report.input_truncated`
   boolean appears (true only) when the stream exceeded the budget; `size_bytes` is then the

@@ -23,6 +23,20 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
     if hdr10plus {
         formats.push("HDR10+".to_string());
     }
+    // SL-HDR (ETSI TS 103 433) is dynamic reconstruction metadata over an
+    // ordinary base, so like HDR10+ it prepends the base tag: mode 2 rides a
+    // directly viewable PQ base ("SL-HDR2 / HDR10"), mode 3 an HLG base, and
+    // mode 1 an SDR base the ordinary SDR fallthrough already names.
+    if let Some(sl) = &sei.sl_hdr {
+        formats.push(format!("SL-HDR{}", sl.mode));
+    }
+    // HDR Vivid (CUVA, T/UWA 005) likewise: dynamic tone-mapping metadata
+    // over an ordinary PQ or HLG base, which keeps its own tag. Either signal
+    // suffices — the per-frame T.35 SEI/OBU, or the MP4 `cuvv` container
+    // declaration (which still fires when no frame is read, e.g. --no-rpu).
+    if sei.hdr_vivid.is_some() || demux.cuvv_version_map.is_some() {
+        formats.push("HDR Vivid".to_string());
+    }
 
     // A base signalled in Dolby's IPT-PQ-c2 colour space (matrix 15, Profile 20 /
     // MV-HEVC) is not a standard, independently viewable HDR10/HLG signal even
@@ -122,6 +136,18 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
     });
 
     Hdr { format, mastering, content_light }
+}
+
+/// HDR Vivid target codes (12-bit PQ) -> distinct nits, sorted ascending.
+/// Routed through the DV standard-target snap so an authored anchor prints
+/// its round value (2770/4095 computes to 499.98 and snaps to 500 — the same
+/// quantisation-absorbing treatment the DV mastering luminance gets).
+pub(crate) fn pq_targets_to_nits(codes: &[u16]) -> Vec<u32> {
+    let mut nits: Vec<u32> =
+        codes.iter().map(|&c| crate::dv::levels::snap_nits(crate::dv::levels::pq12_to_nits(c))).collect();
+    nits.sort_unstable();
+    nits.dedup();
+    nits
 }
 
 /// Match raw CIE 1931 mastering-display chromaticities (R, G, B primaries +

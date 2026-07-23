@@ -16,7 +16,7 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "2.3";
+pub const SCHEMA_VERSION: &str = "2.4";
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -119,6 +119,12 @@ pub struct VideoTrack {
     /// the object's existence *is* the presence signal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hdr10plus: Option<Hdr10Plus>,
+    /// Present only when an SL-HDR information SEI was found, same convention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sl_hdr: Option<SlHdr>,
+    /// Present only when HDR Vivid metadata was found, same convention.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdr_vivid: Option<HdrVivid>,
 }
 
 /// Average bitrate. `scope` says whether it's the exact video-stream rate (from a
@@ -437,6 +443,58 @@ pub struct L6 {
     pub zeroed: bool,
 }
 
+/// SL-HDR (ETSI TS 103 433) reconstruction metadata, title-stable header
+/// facts only — the per-picture reconstruction parameters are never reported.
+#[derive(Debug, Serialize)]
+pub struct SlHdr {
+    /// SL-HDR mode: 1 (SDR base), 2 (PQ base), 3 (HLG base). Also the digit
+    /// in the classified `hdr.format` component ("SL-HDR2").
+    pub mode: u8,
+    /// Declared TS 103 433 spec version, "major.minor" (e.g. "1.0").
+    pub spec_version: String,
+    /// "parameter-based" or "table-based". Absent when the SEI carried the
+    /// cancel flag or a reserved payload-mode value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_mode: Option<String>,
+    /// The target picture the adaptation metadata is tuned toward, when the
+    /// SEI carries the block: named CICP primaries and max luminance (cd/m²).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_primaries: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_max_luminance: Option<u32>,
+    /// The source mastering display carried inside the SL-HDR metadata
+    /// (`src_mdcv`), distinct from the base layer's own MDCV signalling.
+    /// `primaries_level` is never set here (it is a DV provenance tag).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_mastering: Option<MasteringDisplay>,
+}
+
+/// HDR Vivid (CUVA, T/UWA 005) metadata, title-stable header facts only —
+/// the per-frame tone-mapping payload is never reported.
+#[derive(Debug, Serialize)]
+pub struct HdrVivid {
+    /// CUVA metadata version, "major.minor" (e.g. "1.0"), from the T.35
+    /// provider-oriented code — the field the standard itself calls the
+    /// version, not the SEI-path number MediaInfo renders (which is the
+    /// data-set type below).
+    pub version: String,
+    /// `system_start_code`, the dynamic-metadata data-set type (1 in every
+    /// known stream). Absent when detection came only from the MP4 `cuvv`
+    /// declaration and no frame's SEI was read (e.g. `--no-rpu`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_start_code: Option<u8>,
+    /// Distinct targeted-system-display max luminances of the tone-mapping
+    /// parameter sets, nits (12-bit PQ codes through the standard-target
+    /// snap), sorted ascending. Display anchors the per-frame curves are
+    /// computed toward — the HDR Vivid analogue of the DV trim-target set,
+    /// and like it a sampled union unless the scan read every frame.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub target_max_luminances: Vec<u32>,
+    /// True when `target_max_luminances` came from a sampled spread of frames
+    /// rather than a full scan, mirroring `dolby_vision.sampled`.
+    pub sampled: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Hdr10Plus {
     pub application_version: u8,
@@ -575,6 +633,25 @@ mod tests {
                 profile: Some('B'),
                 target_max_luminance: Some(400),
             }),
+            sl_hdr: Some(SlHdr {
+                mode: 2,
+                spec_version: "1.0".to_string(),
+                payload_mode: Some("parameter-based".to_string()),
+                target_primaries: Some("BT.2020".to_string()),
+                target_max_luminance: Some(100),
+                source_mastering: Some(MasteringDisplay {
+                    max_luminance: 1000.0,
+                    min_luminance: 0.0001,
+                    primaries: Some("BT.2020".to_string()),
+                    primaries_level: None,
+                }),
+            }),
+            hdr_vivid: Some(HdrVivid {
+                version: "1.0".to_string(),
+                system_start_code: Some(1),
+                target_max_luminances: vec![100, 500],
+                sampled: true,
+            }),
         }
     }
 
@@ -699,6 +776,18 @@ mod tests {
             "video_tracks[].hdr10plus.num_windows",
             "video_tracks[].hdr10plus.profile",
             "video_tracks[].hdr10plus.target_max_luminance",
+            "video_tracks[].sl_hdr.mode",
+            "video_tracks[].sl_hdr.spec_version",
+            "video_tracks[].sl_hdr.payload_mode",
+            "video_tracks[].sl_hdr.target_primaries",
+            "video_tracks[].sl_hdr.target_max_luminance",
+            "video_tracks[].sl_hdr.source_mastering.max_luminance",
+            "video_tracks[].sl_hdr.source_mastering.min_luminance",
+            "video_tracks[].sl_hdr.source_mastering.primaries",
+            "video_tracks[].hdr_vivid.version",
+            "video_tracks[].hdr_vivid.system_start_code",
+            "video_tracks[].hdr_vivid.target_max_luminances[]",
+            "video_tracks[].hdr_vivid.sampled",
         ];
         expected.sort_unstable();
         assert_eq!(paths, expected, "JSON schema surface changed; see docs/SCHEMA.md");
@@ -706,9 +795,9 @@ mod tests {
 
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "2.3");
+        assert_eq!(SCHEMA_VERSION, "2.4");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "2.3");
+        assert_eq!(v["hdrprobe_schema_version"], "2.4");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
         assert_eq!(v["video_tracks"][0]["hdr10plus"]["profile"], "B");

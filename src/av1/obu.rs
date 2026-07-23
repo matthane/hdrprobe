@@ -112,7 +112,22 @@ fn handle_metadata(p: &[u8], out: &mut Av1Scan) {
 
 /// `body` starts at `itu_t_t35_country_code`. Route by terminal provider code.
 fn handle_t35(body: &[u8], out: &mut Av1Scan) {
-    if body.len() < 3 || body[0] != 0xB5 {
+    if body.len() < 3 {
+        return;
+    }
+    // HDR Vivid rides the China country code (0x26); its parser gates the
+    // full signature itself, and T/UWA 005.2-1 defines the same byte layout
+    // for the AV1 metadata OBU as for the HEVC SEI.
+    if body[0] == 0x26 {
+        if let Some(info) = sei::parse_hdr_vivid(body) {
+            match &mut out.sei.hdr_vivid {
+                Some(mine) => mine.absorb(&info),
+                slot => *slot = Some(info),
+            }
+        }
+        return;
+    }
+    if body[0] != 0xB5 {
         return;
     }
     let provider = u16::from_be_bytes([body[1], body[2]]);

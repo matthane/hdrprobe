@@ -312,6 +312,56 @@ fn track_sections(
         }
     }
 
+    // SL-HDR and HDR Vivid get their own sections like Dolby Vision and
+    // HDR10+ — each section exists only when the metadata was found. Both
+    // ride the HDR section's visibility gate (they are HDR facts; no
+    // dedicated --sections name).
+    if o.show_hdr {
+        if let Some(sl) = &t.sl_hdr {
+            let _ = writeln!(s, "{}", c.section("SL-HDR"));
+            // The variant headline, bright like the HDR10+ Profile row. The
+            // Format line carries the same numbered name — the industry
+            // treats SL-HDR1/2/3 as sibling formats (ETSI part titles, DVB
+            // component codes, MediaInfo's HDR_Format), so the digit stays a
+            // format fact, not plumbing.
+            kv_styled(s, c, "Type", &c.bright(&format!("SL-HDR{}", sl.mode)));
+            kv(s, c, "Version", &format!("v{}", sl.spec_version));
+            if let Some(pm) = &sl.payload_mode {
+                kv(s, c, "Payload mode", pm);
+            }
+            // The presentation target the adaptation metadata is tuned toward
+            // (corpus-verified title-stable), e.g. the 100-nit BT.2020 SDR
+            // rendition an SL-HDR2 receiver derives.
+            match (&sl.target_primaries, sl.target_max_luminance) {
+                (Some(p), Some(n)) => kv(s, c, "Target", &format!("{} · {} nits", p, n)),
+                (Some(p), None) => kv(s, c, "Target", p),
+                (None, Some(n)) => kv(s, c, "Target", &format!("{} nits", n)),
+                (None, None) => {}
+            }
+            s.push('\n');
+        }
+        if let Some(hv) = &t.hdr_vivid {
+            let _ = writeln!(s, "{}", c.section("HDR Vivid"));
+            kv(s, c, "Version", &format!("v{}", hv.version));
+            // The authored display anchors the per-frame curves are computed
+            // toward — a distinct set like the DV trim targets, with the same
+            // sampled caveat (its own footnote text: frames, not RPUs).
+            if !hv.target_max_luminances.is_empty() {
+                let mark = if hv.sampled { notes.mark(SAMPLED_FRAMES_NOTE) } else { "" };
+                let label =
+                    if hv.target_max_luminances.len() == 1 { "Target" } else { "Targets" };
+                let vals = hv
+                    .target_max_luminances
+                    .iter()
+                    .map(|n| format!("{n} nits"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                kv(s, c, &format!("{label}{mark}"), &vals);
+            }
+            s.push('\n');
+        }
+    }
+
     if o.show_dv {
         if let Some(dv) = &t.dolby_vision {
             let _ = writeln!(s, "{}", c.section("Dolby Vision"));
@@ -574,6 +624,10 @@ fn track_sections(
 /// The one caveat most reports carry: the default pipeline reads a spread of
 /// RPUs, so RPU-derived sets (trim targets, L5 areas) may be incomplete.
 const SAMPLED_NOTE: &str = "sampled from a spread of RPUs; --full reads every one";
+
+/// The same caveat for SEI-derived sets (the HDR Vivid target anchors), whose
+/// carrier is the frame's SEI rather than an RPU.
+const SAMPLED_FRAMES_NOTE: &str = "sampled from a spread of frames; --full reads every one";
 
 /// Caveat footnotes referenced from row labels ("Trim targets*") and spelled
 /// out once at the report's foot. Only caveats register — a full scan needs no
@@ -1597,6 +1651,8 @@ mod tests {
                 hdr: None,
                 dolby_vision: None,
                 hdr10plus: None,
+                sl_hdr: None,
+                hdr_vivid: None,
             }],
             elapsed_ms: 0.0,
         };
@@ -1635,6 +1691,8 @@ mod tests {
             }),
             dolby_vision: None,
             hdr10plus: None,
+            sl_hdr: None,
+            hdr_vivid: None,
         }
     }
 

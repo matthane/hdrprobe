@@ -461,6 +461,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
             content_light,
             bitrate,
             chunks,
+            cuvv_version_map: t.sd.cuvv_version_map,
             ..TrackDemux::new(t.sd.codec.clone(), NalFormat::LengthPrefixed(nal_len))
         });
     }
@@ -568,6 +569,7 @@ struct SampleDesc {
     stereo: Option<String>,
     mastering: Option<MasteringDisplay>,
     content_light: Option<ContentLight>,
+    cuvv_version_map: Option<u16>,
 }
 
 fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
@@ -623,6 +625,9 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut layered = false;
     // Stereo view structure from the `vexu` extended-usage box (also a child).
     let mut stereo = None;
+    // HDR Vivid's container declaration (`cuvv`, T/UWA 005.2-1 §7) — another
+    // free sample-entry child, the CUVA analogue of dvcC.
+    let mut cuvv_version_map = None;
 
     for c in &children {
         match &c.typ {
@@ -669,6 +674,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             }
             b"lhvC" => layered = true,
             b"vexu" => stereo = parse_stereo(data, c).or(stereo),
+            b"cuvv" => cuvv_version_map = parse_cuvv(&data[c.payload..c.end]),
             b"colr" => color = parse_colr(data, c).unwrap_or(color),
             b"mdcv" | b"SmDm" => mastering = parse_mdcv(data, c).or(mastering),
             b"clli" | b"CoLL" => content_light = parse_clli(data, c).or(content_light),
@@ -724,7 +730,23 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         stereo,
         mastering,
         content_light,
+        cuvv_version_map,
     })
+}
+
+/// The HDR Vivid `CUVVConfigurationBox` (T/UWA 005.2-1 Table 6, a sample-entry
+/// child after `hvcC`): `cuva_version_map` u16 (a bitmap, one bit per declared
+/// CUVA version — bit 0 = v1), `terminal_provide_code` u16 (0x0004), the
+/// highest `terminal_provide_oriented_code` u16, then reserved bytes. Gate on
+/// the provider code and a non-empty map; the map is the declaration we keep
+/// (the oriented code is derivable from its highest bit).
+fn parse_cuvv(p: &[u8]) -> Option<u16> {
+    if p.len() < 4 {
+        return None;
+    }
+    let map = u16::from_be_bytes([p[0], p[1]]);
+    let provider = u16::from_be_bytes([p[2], p[3]]);
+    (provider == 0x0004 && map != 0).then_some(map)
 }
 
 /// Decode the stereoscopic view structure from a `vexu` (Video Extended Usage)
@@ -1209,6 +1231,7 @@ mod tests {
                 stereo: None,
                 mastering: None,
                 content_light: None,
+                cuvv_version_map: None,
             },
             chunks: (0..chunks).map(|i| Chunk { offset: i as u64, size: 1 }).collect(),
             fps: Some(24.0),
@@ -1416,6 +1439,19 @@ mod tests {
         v.extend_from_slice(&typ);
         v.extend_from_slice(payload);
         v
+    }
+
+    #[test]
+    fn cuvv_box_parses_and_gates() {
+        // T/UWA 005.2-1 Table 6 payload: version_map 0x0009 (v1 + v4),
+        // provider 0x0004, highest oriented code, 16 reserved bytes.
+        let mut p = vec![0x00, 0x09, 0x00, 0x04, 0x00, 0x08];
+        p.extend_from_slice(&[0; 16]);
+        assert_eq!(parse_cuvv(&p), Some(0x0009));
+        // Wrong provider code or an empty version map is not a declaration.
+        assert_eq!(parse_cuvv(&[0x00, 0x01, 0x00, 0x05]), None);
+        assert_eq!(parse_cuvv(&[0x00, 0x00, 0x00, 0x04]), None);
+        assert_eq!(parse_cuvv(&[0x00, 0x01]), None);
     }
 
     /// A minimal `hvcC` built from a real iPhone HLG/DV MOV recording: the
