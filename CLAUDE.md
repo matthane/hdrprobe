@@ -57,9 +57,10 @@ excluded by config.
 
 Pushing a version tag (`v*`) runs `.github/workflows/release.yml`: it enforces the gates above
 (clippy/tests under `-Dwarnings`, the license drift check, tag == `Cargo.toml` version), builds and
-tests the binary for Windows x86_64, Linux x86_64 + aarch64 glibc + aarch64 fully-static musl
-(no libc/loader dependency, for minimal userspaces like CoreELEC/LibreELEC boxes across old
-vendor kernels through current), macOS arm64 + Intel (Intel is
+tests the binary for Windows x86_64, Linux x86_64 + aarch64 each as glibc + fully-static musl
+(no libc/loader dependency — aarch64 for minimal userspaces like CoreELEC/LibreELEC boxes across
+old vendor kernels through current, x86_64 for appliance NAS OSes like Unraid whose RAM-resident
+root makes a drop-in static binary the natural install), macOS arm64 + Intel (Intel is
 cross-compiled on the arm64 runner and tested via Rosetta), and FreeBSD x86_64 (no GitHub
 runner exists, so a separate job builds, tests, and packages inside a FreeBSD VM on the Linux
 runner — keeping the build-and-test-on-target rule), and attaches the archives plus

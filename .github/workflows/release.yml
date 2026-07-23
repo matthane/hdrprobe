@@ -1,4 +1,4 @@
-# Release builds: seven per-platform binaries attached to a draft GitHub release.
+# Release builds: eight per-platform binaries attached to a draft GitHub release.
 #
 # Triggered by pushing a version tag (v0.1.0, ...). The workflow_dispatch trigger
 # exists so the whole pipeline can be exercised without cutting a release: a
@@ -14,11 +14,13 @@
 # - Linux builds run on ubuntu-22.04 / ubuntu-22.04-arm so the binaries link
 #   against glibc 2.35 and run on older distros; 24.04 runners would silently
 #   raise the floor to 2.39.
-# - aarch64-unknown-linux-musl is fully static (no libc/loader dependency), for
-#   minimal userspaces like CoreELEC/LibreELEC boxes whose glibc version we
-#   can't rely on — one binary covers old vendor kernels (4.9) through current.
-#   Its tests run natively on the arm64 runner (static binaries execute fine on
-#   a glibc host).
+# - The two *-unknown-linux-musl builds are fully static (no libc/loader
+#   dependency), for systems whose glibc we can't rely on: aarch64 covers
+#   minimal userspaces like CoreELEC/LibreELEC boxes (one binary spans old
+#   vendor kernels (4.9) through current); x86_64 covers appliance NAS OSes
+#   like Unraid, whose RAM-resident root also makes a drop-in static binary
+#   the natural install format. Tests run natively on the matching runners
+#   (static binaries execute fine on a glibc host).
 # - GitHub retired the free Intel macOS runners, so x86_64-apple-darwin is
 #   cross-compiled on the arm64 runner (Xcode ships both toolchains). Its tests
 #   still execute there via Rosetta 2.
@@ -86,6 +88,8 @@ jobs:
             os: ubuntu-22.04-arm
           - target: aarch64-unknown-linux-musl
             os: ubuntu-22.04-arm
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
@@ -109,7 +113,7 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      # Native on four of the five; x86_64-apple-darwin runs under Rosetta 2.
+      # Native on six of the seven; x86_64-apple-darwin runs under Rosetta 2.
       - name: Tests on target
         run: cargo test --release --target ${{ matrix.target }}
 

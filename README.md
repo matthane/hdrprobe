@@ -246,7 +246,8 @@ The simplest way to get hdrprobe is to download a ready-to-run binary from the
 your platform, unpack it, and run the `hdrprobe` binary. Prebuilt binaries are provided for:
 
 - Windows (x86_64)
-- Linux (x86_64, and ARM64 with both a standard and a fully-static build for minimal systems)
+- Linux (x86_64 and ARM64, each with a standard build and a fully-static build for minimal
+  systems such as Unraid or CoreELEC boxes)
 - macOS (Apple Silicon and Intel)
 - FreeBSD (x86_64)
 
