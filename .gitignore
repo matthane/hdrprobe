@@ -10,3 +10,7 @@
 
 # Temporary dev reference material
 /dev
+
+# Claude Code local settings (the shared .claude/commands/ stays committed)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
