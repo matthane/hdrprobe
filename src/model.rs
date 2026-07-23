@@ -802,4 +802,22 @@ mod tests {
         // documented, not as a number.
         assert_eq!(v["video_tracks"][0]["hdr10plus"]["profile"], "B");
     }
+
+    #[test]
+    fn schema_doc_header_matches_schema_version() {
+        let doc = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs")
+            .join("SCHEMA.md");
+        let doc = std::fs::read_to_string(doc).expect("docs/SCHEMA.md must be readable");
+        let header = format!("**Schema version: {SCHEMA_VERSION}**");
+        assert!(
+            doc.contains(&header),
+            "docs/SCHEMA.md header does not state schema version {SCHEMA_VERSION}"
+        );
+        let history_entry = format!("- **{SCHEMA_VERSION}**:");
+        assert!(
+            doc.contains(&history_entry),
+            "docs/SCHEMA.md version history has no {SCHEMA_VERSION} entry"
+        );
+    }
 }

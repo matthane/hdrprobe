@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 2.3**
+**Schema version: 2.4**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -571,8 +571,8 @@ per-frame tone-mapping payload never is.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `version` | string | always | The CUVA metadata version, `"1.0"` through `"4.0"`. From the `cuvv` box's version bitmap when the container declares one (its highest declared version — the declaration covers the whole stream, where a sampled SEI shows one frame's), else from the SEI's T.35 provider-oriented code (the field T/UWA 005.2-1 itself defines as the version; note MediaInfo's SEI-path `HDR_Format_Version` renders the data-set type below instead) |
-| `system_start_code` | integer | optional | The dynamic-metadata data-set type byte from the T.35 message; `1` in every known stream. Absent when detection came only from the `cuvv` declaration and no frame's SEI was read (e.g. `--no-rpu`) |
-| `target_max_luminances` | array of integers | when non-empty | Distinct targeted-system-display max luminances of the tone-mapping parameter sets, cd/m², sorted ascending — the display anchors the per-frame curves are computed toward, the HDR Vivid analogue of the DV trim-target set (e.g. `[100, 500]` for a title carrying an SDR curve and a 500-nit HDR curve). A sampled union unless every frame was read; verified constant across every frame of the reference samples |
+| `system_start_code` | integer | optional | The dynamic-metadata data-set type byte from the T.35 message. Absent when detection came only from the `cuvv` declaration and no frame's SEI was read (e.g. `--no-rpu`) |
+| `target_max_luminances` | array of integers | when non-empty | Distinct targeted-system-display max luminances of the tone-mapping parameter sets, cd/m², sorted ascending — the display anchors the per-frame curves are computed toward, the HDR Vivid analogue of the DV trim-target set (e.g. `[100, 500]` for a title carrying an SDR curve and a 500-nit HDR curve). A sampled union unless every frame was read |
 | `sampled` | boolean | always | True when `target_max_luminances` is a sampled union rather than a full-scan read, mirroring `dolby_vision.sampled` (`false` under `--full` and under `--no-rpu`, where nothing was sampled) |
 
 ## How input kind and flags affect presence
@@ -683,7 +683,7 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   OBU, or the MP4 `cuvv` sample-entry declaration), carrying `version`, the optional
   `system_start_code`, the `target_max_luminances` display-anchor set with its `sampled`
   flag; `HDR Vivid` joins the `hdr.format` component set (e.g. `"HDR Vivid / HLG"`).
-  Streams without any of these signals are unchanged.
+  Streams without any of these signals are unchanged. Ships in hdrprobe 0.8.0.
 - **2.3**: stdin input support (additive). `hdrprobe -` probes a bounded head of a stream piped
   to stdin, sniff-dispatched with a format-aware read budget. The new `Report.input_truncated`
   boolean appears (true only) when the stream exceeded the budget; `size_bytes` is then the
