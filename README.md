@@ -66,6 +66,8 @@ The result is a sectioned report of everything the file carries:
   - [HDR static metadata](#hdr-static-metadata)
   - [Dolby Vision dynamic metadata](#dolby-vision-dynamic-metadata)
   - [HDR10+ dynamic metadata](#hdr10-dynamic-metadata)
+  - [SL-HDR dynamic metadata](#sl-hdr-dynamic-metadata)
+  - [HDR Vivid dynamic metadata](#hdr-vivid-dynamic-metadata)
   - [Badges and footnotes](#badges-and-footnotes)
 - [Supported inputs](#supported-inputs)
 - [Install](#install)
@@ -152,6 +154,29 @@ RPU parsing is native and in-process via [`libdovi`](https://github.com/quietvoi
 
 Detected wherever the format is carried: HEVC SEI messages, AV1 metadata OBUs, or the
 Matroska/WebM carriage used by VP9.
+
+### SL-HDR dynamic metadata
+
+- Presence and mode: SL-HDR1, SL-HDR2, or SL-HDR3, named on the format line alongside the
+  base signal (for example `SL-HDR2 / HDR10`)
+- Declared specification version
+- Payload carriage: parameter-based or table-based
+- The target presentation the adaptation metadata is tuned toward: its colour primaries and
+  peak luminance (for example a 100-nit BT.2020 SDR rendition)
+
+SL-HDR is defined by ETSI TS 103 433 and is most common in European broadcast. Detected
+from the per-frame carriage in HEVC and AVC streams.
+
+### HDR Vivid dynamic metadata
+
+- Presence, named on the format line alongside the base signal (for example
+  `HDR Vivid / HLG`)
+- Declared metadata version
+- The set of display targets the tone-mapping metadata is authored for (for example
+  100 nits alongside 500 nits)
+
+HDR Vivid is the UWA (CUVA) standard used in Chinese broadcast and streaming. Detected from
+the per-frame carriage in HEVC and AV1 streams, and from MP4 container signalling.
 
 ### Badges and footnotes
 
