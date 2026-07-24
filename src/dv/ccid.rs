@@ -143,6 +143,34 @@ pub fn deprecated_combination(profile: u8, ccid: u8) -> bool {
     matches!((profile, ccid), (8, 3) | (8, 5))
 }
 
+/// The base signal a decoder without a Dolby Vision decoder actually receives,
+/// named in hdrprobe's own `hdr.format` vocabulary. Table 2's "Type of
+/// cross-compatibility" column, rendered as a format tag rather than as the
+/// prose name [`compatibility_label`] gives the same column. `None` for CCID 0,
+/// whose base is Dolby's proprietary IPT-PQ-C2 and viewable by nothing, and for
+/// every reserved or unknown id.
+pub fn base_signal(ccid: u8) -> Option<&'static str> {
+    Some(match ccid {
+        1 | 6 => "HDR10",
+        2 => "SDR",
+        4 => "HLG",
+        // 0 has no viewable base; 3, 5, 7 and 15 are reserved.
+        _ => return None,
+    })
+}
+
+/// Whether the base layer's actual transfer characteristic is Dolby's
+/// proprietary "PQ with reshaping" rather than the plain PQ its VUI names.
+///
+/// v1.5 Table 2 footnote [b]: although a transfer characteristic of 16
+/// "generally indicates perceptual quantization (PQ)", "in the context of Dolby
+/// Vision CCID=0 when color_matrix is 15 ... the actual proprietary transfer
+/// characteristic, even when signaled with 16, is 'PQ with reshaping'".
+/// Repeated for profile 20 (v1.5 p13) and for profile 5 (v1.3.2 p11).
+pub fn pq_with_reshaping(ccid: u8) -> bool {
+    ccid == 0
+}
+
 /// Whether a Dolby Vision title's base layer is the CTA-861.3 HDR10 signal that
 /// MaxCLL/MaxFALL and an ST.2086 mastering display actually describe: CCID 1, or
 /// 6 (Ultra HD Blu-ray, the same CTA-861.3 base with disc constraints on top).
@@ -391,6 +419,32 @@ mod tests {
         // Reserved ids are named by nothing, never guessed.
         for reserved in [3, 5, 7, 15] {
             assert_eq!(compatibility_label(reserved), None, "CCID {reserved} is reserved");
+        }
+    }
+
+    /// The same Table 2 column rendered as an `hdr.format` tag. Kept beside
+    /// `compatibility_label` so the two renderings of one column cannot drift.
+    #[test]
+    fn base_signal_tags_match_the_cross_compatibility_column() {
+        assert_eq!(base_signal(0), None, "CCID 0's base is viewable by nothing");
+        assert_eq!(base_signal(1), Some("HDR10"));
+        assert_eq!(base_signal(2), Some("SDR"));
+        assert_eq!(base_signal(4), Some("HLG"));
+        assert_eq!(base_signal(6), Some("HDR10"), "Ultra HD Blu-ray is the same CTA-861.3 base");
+        for reserved in [3, 5, 7, 15] {
+            assert_eq!(base_signal(reserved), None, "CCID {reserved} is reserved");
+        }
+        // The HDR10 gate and the tag agree by construction.
+        for ccid in 0u8..=15 {
+            assert_eq!(
+                hdr10_base(Some(ccid), None),
+                base_signal(ccid) == Some("HDR10"),
+                "CCID {ccid}"
+            );
+        }
+        // Reshaping is CCID 0 and nothing else.
+        for ccid in 0u8..=15 {
+            assert_eq!(pq_with_reshaping(ccid), ccid == 0, "CCID {ccid}");
         }
     }
 

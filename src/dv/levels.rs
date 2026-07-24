@@ -738,7 +738,7 @@ pub fn fill_inferred_compat(dv: &mut DolbyVision, color: &crate::model::ColorInf
 /// id but is an authoring target, so asserting a base layer's transfer from it
 /// would state a fact the metadata does not carry.
 pub fn flag_pq_reshaping(dv: &mut DolbyVision) {
-    dv.pq_reshaping = dv.bl_compatibility_id == Some(0);
+    dv.pq_reshaping = dv.bl_compatibility_id.is_some_and(ccid::pq_with_reshaping);
 }
 
 /// Fill the base layer's colour description from what the Dolby Vision profile
@@ -766,6 +766,16 @@ pub fn fill_derived_color(
     dv: &DolbyVision,
 ) {
     if !matches!(dv.compat_source, Some(CompatSource::Declared | CompatSource::Spec)) {
+        return;
+    }
+    // The table row describes a *base layer*, so require one. A DV enhancement
+    // layer has its own VUI — v1.3.2 gives profile 4's as `1,2,2,2,0`, which is
+    // byte-identical to a profile 5 base layer and so indistinguishable from it
+    // in isolation — and stating the base layer's colour over a track that has
+    // no base layer would describe a stream that is not there. Every real mux
+    // folds an EL into its base layer's track, so this only ever fires on an
+    // EL-only input.
+    if !dv.bl_present {
         return;
     }
     let (Some(profile), Some(id)) = (profile_major(&dv.profile), dv.bl_compatibility_id) else {
@@ -1565,6 +1575,24 @@ mod tests {
         let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
         flag_pq_reshaping(&mut dv);
         assert!(!dv.pq_reshaping);
+    }
+
+    /// The fill describes a base layer, so a track without one gets nothing —
+    /// the enhancement-layer case, where profile 4's own VUI is byte-identical
+    /// to a profile 5 base layer and would read as one in isolation.
+    #[test]
+    fn derived_colour_needs_a_base_layer() {
+        let mut dv = dv_stub("4.2", Some(2), Some(CompatSource::Spec));
+        dv.bl_present = false;
+        let mut color = crate::model::ColorInfo::default();
+        let mut sources = crate::model::ColorSources::default();
+        fill_derived_color(&mut color, &mut sources, &dv);
+        assert_eq!(color.primaries, None, "no base layer, no base-layer colour");
+
+        dv.bl_present = true;
+        fill_derived_color(&mut color, &mut sources, &dv);
+        assert_eq!(color.primaries.as_deref(), Some("BT.709"));
+        assert_eq!(color.range.as_deref(), Some("limited"));
     }
 
     /// The colour fill's circularity gate, from the other side: an inferred id

@@ -54,24 +54,22 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
     // is tagged. Ids: 0 none, 1 HDR10, 2 SDR, 4 HLG, 6 HDR10 per UHD Blu-ray.
     let ccid = dv.and_then(|d| d.bl_compatibility_id);
     let base = match dv {
-        Some(_) => match ccid {
-            Some(0) => None,
-            Some(1) | Some(6) => Some("HDR10"),
-            Some(2) => Some("SDR"),
-            Some(4) => Some("HLG"),
-            // Unresolved (a Profile 8 whose carriage declares nothing and whose
-            // VUI separates nothing) or an id outside the defined set: fall back
-            // to whatever the base layer itself signals, which is all there is.
-            _ => {
-                if is_pq {
-                    Some("HDR10")
-                } else if is_hlg {
-                    Some("HLG")
-                } else {
-                    None
-                }
+        // A resolved id answers on its own, including id 0's "no viewable base".
+        Some(_) if ccid.is_some_and(|id| id == 0 || crate::dv::ccid::base_signal(id).is_some()) => {
+            ccid.and_then(crate::dv::ccid::base_signal)
+        }
+        // Unresolved (a Profile 8 whose carriage declares nothing and whose VUI
+        // separates nothing) or an id outside the defined set: fall back to
+        // whatever the base layer itself signals, which is all there is.
+        Some(_) => {
+            if is_pq {
+                Some("HDR10")
+            } else if is_hlg {
+                Some("HLG")
+            } else {
+                None
             }
-        },
+        }
         None if is_pq => Some("HDR10"),
         None if is_hlg => Some("HLG"),
         None => Some("SDR"),

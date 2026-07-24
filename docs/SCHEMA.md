@@ -399,7 +399,7 @@ The string is a ` / `-joined list built from, in order:
    (compatibility id 0: Profiles 5 and 20).
 
 Examples: `"SDR"`, `"HDR10"`, `"HLG"`, `"HDR10+ / HDR10"`, `"SL-HDR2 / HDR10"`,
-`"HDR Vivid / HLG"`, `"Dolby Vision"`, `"Dolby Vision / HDR10"`,
+`"HDR Vivid / HLG"`, `"HDR Vivid / HDR10"`, `"Dolby Vision"`, `"Dolby Vision / HDR10"`,
 `"Dolby Vision / HDR10+ / HDR10"`, `"Dolby Vision / SDR"`, `"Dolby Vision / HLG"`.
 
 ### `MasteringDisplay`
