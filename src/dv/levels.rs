@@ -707,8 +707,9 @@ pub fn fill_inferred_compat(dv: &mut DolbyVision, color: &crate::model::ColorInf
 
 /// The profile major from a rendered label: `"8.1"` -> 8, `"7.6 (FEL)"` -> 7,
 /// `"10"` -> 10. The label is the only place the number survives on the model,
-/// and its shape is fixed by `dv_profile_label` right above.
-fn profile_major(label: &str) -> Option<u8> {
+/// and its shape is fixed by `dv_profile_label` right above. Shared with the
+/// two consumers of `ccid::hdr10_base`, whose Profile-8 fallback needs it.
+pub(crate) fn profile_major(label: &str) -> Option<u8> {
     label.split(['.', ' ']).next()?.parse().ok()
 }
 

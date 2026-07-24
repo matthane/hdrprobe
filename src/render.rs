@@ -545,19 +545,17 @@ fn track_sections(
                 }
             }
             // L6's CLL fields exist to feed HDR10 signaling (CTA-861.3), which
-            // only an HDR10-compatible base consumes — compat id 1, or 6 (the
-            // UHD Blu-ray HDR10 base). On every other base (IPT-PQ-c2 compat 0,
-            // HLG compat 4, SDR compat 2) they're a zeroed placeholder or, if
-            // filled, inert for playback — corpus 8.4/10.4 titles carry the same
-            // zeroed L6 as P5. Keep the line out of the text report; the JSON
-            // still carries `l6` verbatim (the mastering half is real either
-            // way). Without a compat id the profile label's minor digit is the
-            // convention default, so gate on the major: P7/P8 default to an
-            // HDR10 base (7.6/8.1), while P4 (SDR) and a bare P5 (IPT) don't.
-            let hdr10_base = match dv.bl_compatibility_id {
-                Some(id) => id == 1 || id == 6,
-                None => dv.profile.starts_with('7') || dv.profile.starts_with('8'),
-            };
+            // only an HDR10-compatible base consumes. On every other base
+            // they're a zeroed placeholder or, if filled, inert for playback —
+            // corpus 8.4/10.4 titles carry the same zeroed L6 as P5. Keep the
+            // line out of the text report; the JSON still carries `l6` verbatim
+            // (the mastering half is real either way). One shared gate with the
+            // HDR section's mastering/CLL fallbacks, which suppress on exactly
+            // the same verdict.
+            let hdr10_base = crate::dv::ccid::hdr10_base(
+                dv.bl_compatibility_id,
+                crate::dv::levels::profile_major(&dv.profile),
+            );
             if let Some(l6) = dv.l6.as_ref().filter(|_| hdr10_base) {
                 let flag = if l6.zeroed { format!("  {}", c.warn("zeroed")) } else { String::new() };
                 let light = c.value(&format!("MaxCLL {} · MaxFALL {}", l6.max_cll, l6.max_fall));

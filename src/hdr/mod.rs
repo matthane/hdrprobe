@@ -38,49 +38,36 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
         formats.push("HDR Vivid".to_string());
     }
 
-    // A base signalled in Dolby's IPT-PQ-c2 colour space (matrix 15, Profile 20 /
-    // MV-HEVC) is not a standard, independently viewable HDR10/HLG signal even
-    // though its colr carries PQ/HLG — like Profile 5, its cross-compatibility is
-    // governed solely by the DV compatibility id (0=none, 4=HLG). So don't let the
-    // raw transfer imply a fallback here; fall through to the compat-id branch.
-    let ipt_base = demux.color.matrix.as_deref() == Some("IPT-PQ-c2");
-
-    let base = if is_pq && !ipt_base {
-        // HDR10 fallback is implied when DV rides on a PQ base layer.
-        if dv.is_some() {
-            Some("HDR10 (fallback)")
-        } else {
-            Some("HDR10")
-        }
-    } else if is_hlg && !ipt_base {
-        if dv.is_some() {
-            Some("HLG (fallback)")
-        } else {
-            Some("HLG")
-        }
-    } else if let Some(dv) = dv {
-        // No independently viewable base — infer it from the DV BL compatibility id
-        // (1=HDR10, 2=SDR, 4=HLG, 6=HDR10 per UHD Blu-ray). Profiles 5 and 20
-        // (compat 0) have no directly viewable base, so we show no base tag.
-        //
-        // Profile 4 is defined with an SDR (BT.709/BT.1886) base layer, so its base
-        // is SDR even when the container omits the compatibility id (older P4 TS
-        // descriptors carry no compat nibble) — infer it from the profile.
-        if dv.profile.starts_with('4') {
-            Some("SDR (fallback)")
-        } else {
-            // Compat 6 is the UHD Blu-ray base signal: the same CTA-861.3 HDR10
-            // base as compat 1 with disc constraints on top — the L6 gating
-            // below already treats the two as one HDR10 family.
-            match dv.bl_compatibility_id {
-                Some(1) | Some(6) => Some("HDR10 (fallback)"),
-                Some(2) => Some("SDR (fallback)"),
-                Some(4) => Some("HLG (fallback)"),
-                _ => None,
+    // A Dolby Vision title's cross-compatible base is decided by its
+    // compatibility id, not by the base layer's raw transfer: the id *is* the
+    // declaration of what a non-DV decoder gets. Reading the transfer instead
+    // mis-classifies the two cases where the two disagree — a Profile 5 or 20
+    // base is PQ-encoded in Dolby's own IPT-PQ-c2 space (id 0: nothing viewable
+    // without a DV decoder), and a Profile 4 base is SDR however its container
+    // is tagged. Ids: 0 none, 1 HDR10, 2 SDR, 4 HLG, 6 HDR10 per UHD Blu-ray.
+    let ccid = dv.and_then(|d| d.bl_compatibility_id);
+    let base = match dv {
+        Some(_) => match ccid {
+            Some(0) => None,
+            Some(1) | Some(6) => Some("HDR10 (fallback)"),
+            Some(2) => Some("SDR (fallback)"),
+            Some(4) => Some("HLG (fallback)"),
+            // Unresolved (a Profile 8 whose carriage declares nothing and whose
+            // VUI separates nothing) or an id outside the defined set: fall back
+            // to whatever the base layer itself signals, which is all there is.
+            _ => {
+                if is_pq {
+                    Some("HDR10 (fallback)")
+                } else if is_hlg {
+                    Some("HLG (fallback)")
+                } else {
+                    None
+                }
             }
-        }
-    } else {
-        Some("SDR")
+        },
+        None if is_pq => Some("HDR10"),
+        None if is_hlg => Some("HLG"),
+        None => Some("SDR"),
     };
     if let Some(b) = base {
         formats.push(b.to_string());
@@ -89,13 +76,16 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
     let format = formats.join(" / ");
 
     // L6 is the DV carriage of HDR10 static metadata, and Dolby's
-    // profiles/levels spec defines it as meaningful only for the compat-id-1
-    // (HDR10) base signal — so both L6 fallbacks below apply only on an HDR10
-    // base. Every other base has no consumer for it: IPT-PQ-c2 (P5/P20/AV1
-    // 10.0) has no viewable base at all, HLG (8.4/10.4) is scene-referred and
-    // consumes no static metadata (corpus 8.4/10.4 titles carry a zeroed L6
-    // placeholder, exactly like P5), and an SDR base likewise signals none.
-    let hdr10_base = base.is_some_and(|b| b.starts_with("HDR10"));
+    // profiles/levels spec defines it as meaningful only for the HDR10 base
+    // signal — so both L6 fallbacks below apply only there. Every other base has
+    // no consumer for it: CCID 0 (P5/P20/AV1 10.0) has no viewable base at all,
+    // HLG (8.4/10.4) is scene-referred and consumes no static metadata (corpus
+    // 8.4/10.4 titles carry a zeroed L6 placeholder, exactly like P5), and an
+    // SDR base likewise signals none. Same verdict the text report's own L6 line
+    // uses, from the one shared gate.
+    let hdr10_base = dv.is_some_and(|d| {
+        crate::dv::ccid::hdr10_base(ccid, crate::dv::levels::profile_major(&d.profile))
+    });
 
     // Prefer container mastering, then the SEI ST.2086 message, then DV L6.
     // This line means the *base layer's own* declared display, so the L6

@@ -126,6 +126,25 @@ pub fn compatibility_label(ccid: u8) -> Option<&'static str> {
     })
 }
 
+/// Whether a Dolby Vision title's base layer is the CTA-861.3 HDR10 signal that
+/// MaxCLL/MaxFALL and an ST.2086 mastering display actually describe: CCID 1, or
+/// 6 (Ultra HD Blu-ray, the same CTA-861.3 base with disc constraints on top).
+/// No other base has a consumer for that static metadata — CCID 0 has no
+/// viewable base at all, HLG is scene-referred, and an SDR base signals none.
+///
+/// `ccid` is the resolved id. `None` means nothing resolved it, which after the
+/// declared, spec and inferred rungs is reachable only for a Profile 8 whose
+/// carriage declared no id and whose base layer does not separate CCID 1, 2 and
+/// 4 — genuinely unresolvable, since the profile admits all three. Those keep
+/// the historical default, which the `assumed` rung's `8.1` label already
+/// states: profiles 7 and 8 assume an HDR10 base, everything else does not.
+pub fn hdr10_base(ccid: Option<u8>, profile: Option<u8>) -> bool {
+    match ccid {
+        Some(id) => id == 1 || id == 6,
+        None => matches!(profile, Some(7 | 8)),
+    }
+}
+
 /// One row of Table B (v1.5 "Table 2: Cross-compatibility ID to VUI mapping",
 /// v1.3.2's unnumbered CCID-to-VUI table): the five-part VUI in the spec's own
 /// print order — range, colour primaries, transfer characteristic, matrix
