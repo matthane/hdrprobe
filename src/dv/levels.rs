@@ -397,6 +397,9 @@ impl DvAggregate {
         Some(DolbyVision {
             profile: profile_str,
             compat_source,
+            // Video-path fact: `main.rs` sets it once the base layer is known
+            // to exist (`flag_pq_reshaping`).
+            pq_reshaping: false,
             structure,
             level: cfg.and_then(|c| c.level),
             // Filled by `fill_derived_level` (main.rs only) when no config
@@ -512,6 +515,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
     DolbyVision {
         profile: profile_str,
         compat_source,
+        pq_reshaping: false,
         structure: structure_str(el, dual_track),
         level: cfg.level,
         level_derived: false,
@@ -704,6 +708,32 @@ pub fn fill_inferred_compat(dv: &mut DolbyVision, color: &crate::model::ColorInf
     dv.compatibility = ccid::compatibility_label(id).map(str::to_string);
     dv.compat_source = Some(CompatSource::Inferred);
     dv.profile = dv_profile_label(profile, Some(id), dv.el_type.as_deref());
+}
+
+/// Flag the base layer's actual transfer characteristic as Dolby's proprietary
+/// "PQ with reshaping". Two conditions, and only two: the compatibility id
+/// resolves to 0, and the input is a video probe rather than a metadata sidecar
+/// (`main.rs` is the only caller, which is what enforces the second).
+///
+/// The spec states it flatly for CCID 0 — a transfer characteristic of 16
+/// "generally indicates perceptual quantization (PQ)", but "in the context of
+/// Dolby Vision CCID=0 when color_matrix is 15 ... the actual proprietary
+/// transfer characteristic, even when signaled with 16, is 'PQ with reshaping'"
+/// (v1.5 Table 2 footnote [b], repeated in the profile 20 notes and in v1.3.2's
+/// profile 5 notes).
+///
+/// **It does fire on an inferred id**, unlike the colour fill. The distinction
+/// is not arbitrary: the colour fill would be feeding a deduction back into the
+/// very signal it was deduced from, whereas this is new information the footnote
+/// keys on exactly this condition, a bare Profile 10 signalling matrix 15 being
+/// the footnote's own case.
+///
+/// **It does not fire for a metadata sidecar.** It is a fact about a base layer,
+/// and a sidecar has no base layer; a DV XML's `GenerateProfile` resolves the
+/// id but is an authoring target, so asserting a base layer's transfer from it
+/// would state a fact the metadata does not carry.
+pub fn flag_pq_reshaping(dv: &mut DolbyVision) {
+    dv.pq_reshaping = dv.bl_compatibility_id == Some(0);
 }
 
 /// Fill the base layer's colour description from what the Dolby Vision profile
@@ -1475,6 +1505,64 @@ mod tests {
         assert_eq!(profile_major("10"), Some(10));
         assert_eq!(profile_major("20"), Some(20));
         assert_eq!(profile_major(""), None);
+    }
+
+    /// The reshaping flag's two conditions, including the clause the corpus
+    /// cannot reach: it fires on an *inferred* CCID 0, unlike the colour fill.
+    /// The spec footnote keys on precisely that case — a bare Profile 10
+    /// signalling matrix 15 — so firing there applies the footnote literally
+    /// rather than extrapolating from it.
+    #[test]
+    fn pq_reshaping_follows_the_resolved_id_on_any_rung() {
+        for source in [CompatSource::Declared, CompatSource::Spec, CompatSource::Inferred] {
+            let mut dv = dv_stub("5.0", Some(0), Some(source));
+            flag_pq_reshaping(&mut dv);
+            assert!(dv.pq_reshaping, "CCID 0 via {source:?}");
+        }
+        // Every other base layer is signalled as it is encoded.
+        for ccid in [1u8, 2, 4, 6] {
+            let mut dv = dv_stub("8.1", Some(ccid), Some(CompatSource::Declared));
+            flag_pq_reshaping(&mut dv);
+            assert!(!dv.pq_reshaping, "CCID {ccid}");
+        }
+        // An unresolved id asserts nothing.
+        let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
+        flag_pq_reshaping(&mut dv);
+        assert!(!dv.pq_reshaping);
+    }
+
+    /// The colour fill's circularity gate, from the other side: an inferred id
+    /// must never back-fill the colour description it was inferred from, even
+    /// though the reshaping flag above happily rides the same id.
+    #[test]
+    fn derived_colour_declines_an_inferred_id() {
+        let filled = |source| {
+            let mut dv = dv_stub("5.0", Some(0), Some(source));
+            dv.profile = "5.0".to_string();
+            let mut color = crate::model::ColorInfo {
+                range: Some("full".to_string()),
+                ..Default::default()
+            };
+            let mut sources =
+                crate::model::ColorSources::of(&color, crate::model::ColorSource::Stream);
+            fill_derived_color(&mut color, &mut sources, &dv);
+            (color, sources)
+        };
+        // Declared and spec fill; the range the stream signalled is untouched.
+        for source in [CompatSource::Declared, CompatSource::Spec] {
+            let (color, sources) = filled(source);
+            assert_eq!(color.primaries.as_deref(), Some("BT.2020"), "{source:?}");
+            assert_eq!(color.matrix.as_deref(), Some(crate::container::IPT_PQ_C2), "{source:?}");
+            assert_eq!(sources.primaries, Some(crate::model::ColorSource::Spec));
+            assert_eq!(sources.range, Some(crate::model::ColorSource::Stream));
+        }
+        // Inferred does not.
+        let (color, sources) = filled(CompatSource::Inferred);
+        assert_eq!(color.primaries, None);
+        assert_eq!(color.transfer, None);
+        assert_eq!(color.matrix, None);
+        assert_eq!(sources.primaries, None);
+        assert_eq!(color.range.as_deref(), Some("full"));
     }
 
     /// Every rung, and the one profile that reaches `assumed`. The assumed rung

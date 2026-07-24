@@ -49,7 +49,7 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
     // presentation) it is already reported precisely, and separately, by
     // `dolby_vision.structure` and `el_type`. Reading the transfer instead
     // mis-classifies the two cases where the two disagree — a Profile 5 or 20
-    // base is PQ-encoded in Dolby's own IPT-PQ-c2 space (id 0: nothing viewable
+    // base is PQ-encoded in Dolby's own IPT-PQ-C2 space (id 0: nothing viewable
     // without a DV decoder), and a Profile 4 base is SDR however its container
     // is tagged. Ids: 0 none, 1 HDR10, 2 SDR, 4 HLG, 6 HDR10 per UHD Blu-ray.
     let ccid = dv.and_then(|d| d.bl_compatibility_id);

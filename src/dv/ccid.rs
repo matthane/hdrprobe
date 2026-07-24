@@ -433,7 +433,7 @@ mod tests {
         let p5 = vui_rows(5, 0)[0];
         assert_eq!(cicp_primaries(p5.primaries), Some("BT.2020"));
         assert_eq!(cicp_transfer(p5.transfer), Some("PQ (SMPTE ST 2084)"));
-        assert_eq!(cicp_matrix(p5.matrix), Some("IPT-PQ-c2"));
+        assert_eq!(cicp_matrix(p5.matrix), Some("IPT-PQ-C2"));
         assert_eq!(cicp_range(p5.range == FULL), "full");
         // The "original" rows carry H.265 "unspecified", which decodes to no
         // label at all — the reason a raw Profile 5 stream reports bare "full".
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(infer_ccid(10, &hdr10), Some(1));
         let hlg = color(Some("BT.2020"), Some("HLG (ARIB STD-B67)"), Some("BT.2020 NCL"), Some("limited"));
         assert_eq!(infer_ccid(10, &hlg), Some(4));
-        let ipt = color(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("IPT-PQ-c2"), Some("full"));
+        let ipt = color(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("IPT-PQ-C2"), Some("full"));
         assert_eq!(infer_ccid(10, &ipt), Some(0));
         // An SDR gamma transfer excludes every other candidate row.
         let sdr = color(None, Some("BT.709"), None, None);
@@ -475,7 +475,7 @@ mod tests {
         let sdr = color(Some("BT.709"), Some("BT.709"), Some("BT.709"), Some("limited"));
         assert_eq!(infer_ccid(8, &sdr), Some(2));
         // Profile 8 does not admit CCID 0, so an IPT matrix names nothing.
-        let ipt = color(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("IPT-PQ-c2"), Some("full"));
+        let ipt = color(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("IPT-PQ-C2"), Some("full"));
         assert_eq!(infer_ccid(8, &ipt), None);
     }
 
@@ -507,7 +507,7 @@ mod tests {
     fn the_matrix_alone_separates_an_ipt_base_from_an_hdr10_one() {
         let pq_no_primaries = color(None, Some("PQ (SMPTE ST 2084)"), Some("BT.2020 NCL"), Some("limited"));
         assert_eq!(infer_ccid(10, &pq_no_primaries), Some(1));
-        let ipt_no_primaries = color(None, Some("PQ (SMPTE ST 2084)"), Some("IPT-PQ-c2"), Some("full"));
+        let ipt_no_primaries = color(None, Some("PQ (SMPTE ST 2084)"), Some("IPT-PQ-C2"), Some("full"));
         assert_eq!(infer_ccid(10, &ipt_no_primaries), Some(0));
     }
 

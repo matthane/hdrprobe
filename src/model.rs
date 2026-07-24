@@ -323,6 +323,17 @@ pub struct DolbyVision {
     /// signals too little to separate its candidates).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compat_source: Option<CompatSource>,
+    /// True when the base layer's actual transfer characteristic is Dolby's
+    /// proprietary "PQ with reshaping" rather than the plain PQ its VUI names.
+    /// Dolby states this for cross-compatibility id 0 outright: a transfer
+    /// characteristic of 16 there "generally indicates perceptual quantization
+    /// (PQ)", but "the actual proprietary transfer characteristic, even when
+    /// signaled with 16, is 'PQ with reshaping'". It has no CICP code point, so
+    /// it cannot live in `color.transfer` — that object stays a strict CICP
+    /// projection. Video inputs only: a metadata sidecar has no base layer whose
+    /// transfer this would describe.
+    #[serde(skip_serializing_if = "is_false")]
+    pub pq_reshaping: bool,
     /// Layer/track layout, present only for dual-layer (Profile 7) content:
     /// "Single track, dual layer" (BL+EL interleaved in one track/stream) or
     /// "Dual track, dual layer" (BL and EL on separate tracks/PIDs).
@@ -665,6 +676,7 @@ mod tests {
             dolby_vision: Some(DolbyVision {
                 profile: "7.6 (FEL)".to_string(),
                 compat_source: Some(CompatSource::Declared),
+                pq_reshaping: true,
                 structure: Some("Single track, dual layer".to_string()),
                 level: Some(6),
                 level_derived: true,
@@ -827,6 +839,7 @@ mod tests {
             "video_tracks[].hdr.content_light.zeroed",
             "video_tracks[].dolby_vision.profile",
             "video_tracks[].dolby_vision.compat_source",
+            "video_tracks[].dolby_vision.pq_reshaping",
             "video_tracks[].dolby_vision.structure",
             "video_tracks[].dolby_vision.level",
             "video_tracks[].dolby_vision.level_derived",

@@ -616,14 +616,22 @@ pub(crate) fn cicp_range(full_range: bool) -> &'static str {
         "limited"
     }
 }
+/// The name of CICP matrix coefficient 15, Dolby's IPT-PQ-C2 colour space.
+///
+/// Spelled once because it is compared as a live value, not only printed: the
+/// Color line names this matrix and no other, and the DV spec tables in
+/// `dv::ccid` match against it. SMPTE ST 2128:2023 capitalizes the C, as does
+/// every mention across both revisions of Dolby's Profiles and Levels spec.
+pub(crate) const IPT_PQ_C2: &str = "IPT-PQ-C2";
+
 pub(crate) fn cicp_matrix(v: u16) -> Option<&'static str> {
     Some(match v {
         0 => "RGB",
         1 => "BT.709",
         9 => "BT.2020 NCL",
         10 => "BT.2020 CL",
-        // Dolby's IPT-PQ-c2 colour space, signalled by Profile 20 (MV-HEVC) colr.
-        15 => "IPT-PQ-c2",
+        // Dolby's IPT-PQ-C2 colour space, signalled by Profile 20 (MV-HEVC) colr.
+        15 => IPT_PQ_C2,
         _ => return None,
     })
 }
@@ -696,7 +704,9 @@ mod tests {
 
     #[test]
     fn cicp_matrix_names_dolby_ipt() {
-        assert_eq!(cicp_matrix(15), Some("IPT-PQ-c2"));
+        // Spelled out rather than compared to the constant: this pins the
+        // rendered value, per SMPTE ST 2128:2023 and both Dolby revisions.
+        assert_eq!(cicp_matrix(15), Some("IPT-PQ-C2"));
     }
 
     #[test]

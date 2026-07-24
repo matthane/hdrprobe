@@ -789,6 +789,8 @@ fn assemble_report(
             // override would erase. Both spellings resolve to the same id, so
             // this is about reading the table as written, not about the answer.
             dv::levels::fill_inferred_compat(dv, &track.color);
+            // And the base-layer transfer fact that rides the resolved id.
+            dv::levels::flag_pq_reshaping(dv);
         }
 
         let hdr10plus = scan.sei.hdr10plus.map(|info| Hdr10Plus {

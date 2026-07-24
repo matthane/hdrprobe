@@ -979,17 +979,17 @@ fn build_color_line(cc: &ColorInfo) -> String {
     let mut parts = Vec::new();
 
     // Presentation policy, not inference: of the matrix coefficients, only
-    // Dolby's IPT-PQ-c2 (CICP 15) is worth naming on this line. It is the one
+    // Dolby's IPT-PQ-C2 (CICP 15) is worth naming on this line. It is the one
     // that identifies a colour space the primaries and transfer alone do not
     // describe — Profile 5 and Profile 20 both ride it — where every other
     // matrix restates what the primaries already said.
-    if cc.matrix.as_deref() == Some("IPT-PQ-c2") {
-        parts.push("IPT-PQ-c2".to_string());
+    if cc.matrix.as_deref() == Some(crate::container::IPT_PQ_C2) {
+        parts.push(crate::container::IPT_PQ_C2.to_string());
     }
     // Colour space (primaries) and encoding (transfer). When the two carry the
     // same name (Rec.709 SDR: a BT.709 gamut with a BT.709 transfer), collapse
     // the pair to one label instead of printing "BT.709 · BT.709". Distinct
-    // pairs (BT.2020 + PQ, and P5's IPT-PQ-c2 + BT.2020 + PQ) all show.
+    // pairs (BT.2020 + PQ, and P5's IPT-PQ-C2 + BT.2020 + PQ) all show.
     match (cc.primaries.as_deref(), cc.transfer.as_deref()) {
         (Some(p), Some(t)) if p == t => parts.push(p.to_string()),
         (p, t) => {
@@ -1333,16 +1333,16 @@ mod tests {
     /// The Profile 5 shape, now assembled entirely from the model: the fill
     /// supplies primaries/transfer/matrix, the stream supplies the range, and
     /// the line must show all four because P5's encoding (PQ) genuinely differs
-    /// from its colour space (IPT-PQ-c2 over BT.2020).
+    /// from its colour space (IPT-PQ-C2 over BT.2020).
     #[test]
     fn the_ipt_matrix_prints_alongside_primaries_and_transfer() {
         let cc = ColorInfo {
             primaries: Some("BT.2020".to_string()),
             transfer: Some("PQ (SMPTE ST 2084)".to_string()),
-            matrix: Some("IPT-PQ-c2".to_string()),
+            matrix: Some("IPT-PQ-C2".to_string()),
             range: Some("full".to_string()),
         };
-        assert_eq!(build_color_line(&cc), "IPT-PQ-c2 · BT.2020 · PQ (SMPTE ST 2084) · full");
+        assert_eq!(build_color_line(&cc), "IPT-PQ-C2 · BT.2020 · PQ (SMPTE ST 2084) · full");
     }
 
     /// Every other matrix restates what the primaries already said, so only the
