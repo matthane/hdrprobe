@@ -737,3 +737,20 @@ Cross-check against `mediainfo --Output=JSON` / `ffprobe` / `dovi_tool info` (th
 used throughout). The corpus lives in `testfiles/integration/` (the whole `testfiles/` tree is
 local-only and gitignored — nothing under it is committed). For robustness work, byte-mutation
 fuzz the release binary over the corpus and assert no `panicked`/exit codes outside {0,2}.
+
+# Fable family (think / act / prove) — HARD GATES, not style guidance
+- ENTRY GATE: when a message asks you to investigate, debug, fix, implement, build,
+  or change something, invoke the Skill tool with `fable:fable-method` BEFORE your
+  first tool call. Following the loop "in spirit" without loading the skill does not
+  count. If a turn that started as a question escalates into edits, run the gate
+  before the first Edit/Write.
+  When a message contains an instruction to present your investigation results, show
+  them first, before continuing and await confirmation from the user.
+- EXIT GATE: work that produced an artifact (code change, commit, PR/issue/reply
+  text, config change) is NOT DONE until a `fable:fable-judge` pass has run on it.
+  Do not commit and do not present work as finished before the judge pass.
+  "Did that actually work?" = fable-judge.
+- Skipping either gate is allowed only for trivial work and only by writing one
+  explicit line in the reply: `fable gate skipped: <reason>`. A silent skip is a
+  false-completion claim.
+- Unattended or subagent-fanout tasks: `fable:fable-loop` instead of fable-method.
