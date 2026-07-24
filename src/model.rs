@@ -220,17 +220,41 @@ impl ContentLight {
     }
 }
 
+/// Provenance of `DolbyVision::bl_compatibility_id`, in descending order of
+/// evidence. Every rung but `Assumed` fills `bl_compatibility_id` and
+/// `compatibility`; `Assumed` resolves the *label* only and leaves both fields
+/// absent, because a display convention is not a value the stream carries.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatSource {
+    /// Read from a container dvcC/dvvC/TS descriptor, or a DV CM XML's declared
+    /// `GenerateProfile`.
+    Declared,
+    /// Fixed by the profile's own definition — Dolby's profile table pairs
+    /// profiles 4, 5, 7 and 9 (and the legacy 0-3, 6) with exactly one id, so no
+    /// stream evidence is needed.
+    Spec,
+    /// Deduced from the base layer's signalled VUI, for a profile whose
+    /// definition admits several ids. Returned only when exactly one candidate
+    /// survives; an ambiguous signal resolves nothing.
+    Inferred,
+    /// Convention default with no evidence behind it: a Profile 8 that declares
+    /// no id and whose base layer does not separate CCID 1, 2 and 4 is labelled
+    /// `8.1` because that is what the ecosystem writes, and this field is how
+    /// the report discloses that the digit is not backed by data.
+    Assumed,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DolbyVision {
     /// `profile.compatibility`, e.g. "8.1", "7.6 (FEL)", "5.0", "10.4".
     pub profile: String,
-    /// True when the compatibility minor digit was supplied by convention rather
-    /// than read from data — i.e. no container dvcC/dvvC and no XML-declared
-    /// profile carried the `dv_bl_signal_compatibility_id` (a raw RPU bin, or a
-    /// legacy Profile-4 mux whose compact descriptor omits the nibble). The
-    /// major number is still RPU-derived; only the `.1`/`.2` is a default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub profile_compat_assumed: bool,
+    /// Where the base-layer cross-compatibility id behind the profile's minor
+    /// digit came from. Absent only when nothing resolved it and the profile has
+    /// no convention default either (a bare Profile 10 or 20 whose base layer
+    /// signals too little to separate its candidates).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compat_source: Option<CompatSource>,
     /// Layer/track layout, present only for dual-layer (Profile 7) content:
     /// "Single track, dual layer" (BL+EL interleaved in one track/stream) or
     /// "Dual track, dual layer" (BL and EL on separate tracks/PIDs).
@@ -566,7 +590,7 @@ mod tests {
             }),
             dolby_vision: Some(DolbyVision {
                 profile: "7.6 (FEL)".to_string(),
-                profile_compat_assumed: true,
+                compat_source: Some(CompatSource::Declared),
                 structure: Some("Single track, dual layer".to_string()),
                 level: Some(6),
                 level_derived: true,
@@ -724,7 +748,7 @@ mod tests {
             "video_tracks[].hdr.content_light.max_fall",
             "video_tracks[].hdr.content_light.zeroed",
             "video_tracks[].dolby_vision.profile",
-            "video_tracks[].dolby_vision.profile_compat_assumed",
+            "video_tracks[].dolby_vision.compat_source",
             "video_tracks[].dolby_vision.structure",
             "video_tracks[].dolby_vision.level",
             "video_tracks[].dolby_vision.level_derived",

@@ -183,11 +183,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// assumed UHD master (`ASSUMED_CANVAS`) for both DV sidecars, since neither
 /// records a resolution. Passing `None` (used only by tests / callers with no
 /// canvas) shows bare offsets with dimensions omitted.
-fn finalize_dv(mut agg: DvAggregate, canvas: Option<(u32, u32)>) -> Result<Payload> {
+fn finalize_dv(agg: DvAggregate, canvas: Option<(u32, u32)>) -> Result<Payload> {
     let (cw, ch) = canvas.unwrap_or((0, 0));
-    // Metadata-only input: no base layer, so a convention-default compat minor
-    // (P8 -> .1) can't be backed by a base-layer VUI and is flagged as assumed.
-    agg.mark_metadata_only();
     // Every RPU in the sidecar was accounted for, so this is an exhaustive census,
     // not a sample: pass full=true for the per-level presence / scene-cut counts.
     // There is no container dvcC, it isn't AV1, and it isn't dual-track.

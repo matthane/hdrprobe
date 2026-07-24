@@ -97,6 +97,35 @@ pub fn profile_ccid(profile: u8) -> Option<ProfileCcid> {
     })
 }
 
+/// The CCID a profile's definition fixes, `None` when the profile admits
+/// several (or is undefined). This is the *spec* rung of CCID resolution: it
+/// needs no stream evidence at all, only the profile ID, which is why a raw
+/// Profile 5 elementary stream with no dvcC still has a real compatibility id
+/// rather than a convention default.
+pub fn spec_ccid(profile: u8) -> Option<u8> {
+    match profile_ccid(profile)? {
+        ProfileCcid::Fixed(id) => Some(id),
+        ProfileCcid::Variable(_) => None,
+    }
+}
+
+/// The human name for a CCID, from Table 2's "Type of cross-compatibility"
+/// column plus the prose definition of each id (v1.5 p10-11). CCIDs 3, 5, 7 and
+/// 15 are reserved and 6 is "Ultra HD Blu-ray Disc HDR (per Blu-ray Disc
+/// Association standard)" — the same CTA-861.3 HDR10 base as id 1 with disc
+/// constraints on top, which is why the L6/MaxCLL gating treats them as one
+/// HDR10 family.
+pub fn compatibility_label(ccid: u8) -> Option<&'static str> {
+    Some(match ccid {
+        0 => "no cross-compatibility",
+        1 => "HDR10-compatible",
+        2 => "SDR-compatible",
+        4 => "HLG-compatible",
+        6 => "Ultra HD Blu-ray-compatible",
+        _ => return None,
+    })
+}
+
 /// One row of Table B (v1.5 "Table 2: Cross-compatibility ID to VUI mapping",
 /// v1.3.2's unnumbered CCID-to-VUI table): the five-part VUI in the spec's own
 /// print order — range, colour primaries, transfer characteristic, matrix
@@ -275,6 +304,30 @@ mod tests {
         // Reserved profile IDs carry no CCID at all.
         for profile in [11, 12, 19, 21, 50, 99] {
             assert_eq!(profile_ccid(profile), None, "profile {profile} is reserved");
+        }
+        // The spec rung answers only for the definitionally fixed profiles.
+        assert_eq!(spec_ccid(4), Some(2));
+        assert_eq!(spec_ccid(5), Some(0));
+        assert_eq!(spec_ccid(7), Some(6));
+        assert_eq!(spec_ccid(9), Some(2));
+        assert_eq!(spec_ccid(8), None);
+        assert_eq!(spec_ccid(10), None);
+        assert_eq!(spec_ccid(20), None);
+        assert_eq!(spec_ccid(11), None);
+    }
+
+    /// Table 2's cross-compatibility labels, including CCID 6 — every Profile 7
+    /// title carries it, and it used to report as an unnamed id.
+    #[test]
+    fn compatibility_labels_cover_every_defined_ccid() {
+        assert_eq!(compatibility_label(0), Some("no cross-compatibility"));
+        assert_eq!(compatibility_label(1), Some("HDR10-compatible"));
+        assert_eq!(compatibility_label(2), Some("SDR-compatible"));
+        assert_eq!(compatibility_label(4), Some("HLG-compatible"));
+        assert_eq!(compatibility_label(6), Some("Ultra HD Blu-ray-compatible"));
+        // Reserved ids are named by nothing, never guessed.
+        for reserved in [3, 5, 7, 15] {
+            assert_eq!(compatibility_label(reserved), None, "CCID {reserved} is reserved");
         }
     }
 

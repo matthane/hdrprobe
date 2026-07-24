@@ -781,6 +781,14 @@ fn assemble_report(
             // frame rate — a metadata sidecar has neither (assumed canvas,
             // authoring-declared rate).
             dv::levels::fill_derived_level(dv, track.width, track.height, fps);
+            // Likewise the last rung of compatibility-id resolution: deducing
+            // the id from the base layer's signalled VUI needs a base layer.
+            // The *signalled* colour, before the alt-transfer SEI override
+            // applied below — Dolby's table defines the DVB HLG row in terms of
+            // the transfer characteristic the VUI carries (14), which that
+            // override would erase. Both spellings resolve to the same id, so
+            // this is about reading the table as written, not about the answer.
+            dv::levels::fill_inferred_compat(dv, &track.color);
         }
 
         let hdr10plus = scan.sei.hdr10plus.map(|info| Hdr10Plus {
