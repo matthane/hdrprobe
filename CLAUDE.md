@@ -113,7 +113,18 @@ never parse bytes native-endian.
   carries no `colr` box at all, leaving the frame header's CICP as the only colour signal
   (verified: without the fill such a PQ master classifies SDR). ProRes RAW (`aprn`/`aprh`)
   is a different codec family and stays on the `Other` fallback.
-- `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
+- `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation),
+  `ccid.rs` (the Dolby "Profiles and Levels" tables as data: profile -> admitted CCID(s),
+  CCID -> the five-part base-layer VUI as **CICP code points**, the reverse lookup
+  `infer_ccid`, the `hdr10_base` gate, the CCID label set, and the withdrawn 8.3/8.5
+  pairings). **Every CCID/profile/VUI fact resolves here** — the change that created it
+  existed to delete six hand-rolled projections of these tables, so a seventh is a
+  regression, not a shortcut. Rows hold codes, never display labels, and names come from
+  the shared `container::cicp_*` decoders so a derived label can't drift from a signalled
+  one. The admitted-CCID sets are the **union across spec revisions** (v1.5 narrowed P8 to
+  {1,4} and P10 to {0,1,4}; 8.2 content is everywhere) — narrowing would refuse to name
+  legal streams. Sources and page cites are in the module docs; every row is pinned by a
+  test naming its table.
 - `hdr/` — `mod.rs` (format classification + `primaries_label`, the chromaticity→gamut matcher
   behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/SL-HDR/HDR Vivid/
   alt-transfer; the T.35 dynamic formats are told apart by country + provider code —
@@ -238,13 +249,18 @@ never parse bytes native-endian.
 - **Report title-stable DV levels only.** Show profile/level/compat, L254 (CM version), L6, L9,
   L11, and the *set* of L2/L8 trim targets. Never emit L1 or per-shot trim *values*.
   **MaxCLL/MaxFALL is HDR10 (CTA-861.3) signaling whose only consumer is an HDR10 base**
-  (compat id 1, or 6 for UHD Blu-ray). Every other base still carries L6 on every frame but it
-  is inert there: on IPT-PQ-c2 (compat 0: P5/P20/AV1 10.0) and HLG (compat 4: 8.4/10.4) the CLL
+  (compat id 1, or 6 for UHD Blu-ray) — one gate, `ccid::hdr10_base`, shared by
+  `hdr::assemble`'s mastering/CLL fallbacks and the text report's own L6 line, which used to
+  carry a second copy of the rule that could drift. Every other base still carries L6 on every frame but it
+  is inert there: on IPT-PQ-C2 (compat 0: P5/P20/AV1 10.0) and HLG (compat 4: 8.4/10.4) the CLL
   half is a zeroed placeholder (corpus-verified, including Dolby's own P5 demo and the 8.4/10.4
   samples), and an SDR base signals no static metadata either (the P9 corpus file's *filled* L6
   is not counter-evidence: it is a frankenstein built from a real HDR title's RPU, not Dolby P9
   tooling output). So unless the base is HDR10 the text report drops the L6 line (`render.rs`;
-  with no compat id the profile major decides: P7/P8 default to HDR10, P4/P5 do not) and the HDR
+  **with no *resolvable* id the profile major decides: P7/P8 default to HDR10, P4/P5 do not** —
+  after the spec and inferred rungs that state is reachable only for a P8 admitting CCID 1, 2
+  and 4 with nothing to separate them, and the heuristic must stay explicit: it gates the
+  corpus-verified L6/MaxCLL suppression, so losing it would be an invisible regression) and the HDR
   section's CLL *and* Mastering lines never fall back to L6 (`hdr::assemble`, both gated on
   `hdr10_base`; the L6 mastering half is just the grade's display, already on the DV Mastering
   line); a *signalled* MDCV/CLL box or SEI still shows, and the JSON keeps `dolby_vision.l6`
@@ -465,36 +481,45 @@ never parse bytes native-endian.
 - **Profile number authority.** libdovi's `dovi_profile` can't express AV1 P10 (returns 5/8),
   so `levels::finalize` takes the profile number from the container dvcC when present, else 10
   for AV1. Don't trust the RPU's profile field for the number.
-- **The compat *minor* digit is container-only; a bare RPU can only assume it.** `get_dovi_profile`
-  gives the *major* (5/7/8) from the RPU header, but the minor is `dv_bl_signal_compatibility_id`
-  (the base-layer type: 8.1 HDR10 vs 8.4 HLG), which lives only in the dvcC/dvvC — the RPU can't
-  distinguish them. A metadata-only sidecar has no dvcC: a **DV XML declares its profile**
-  (`dv_xml.rs` maps `GenerateProfile` -> compat via `DvAggregate::set_compat_id`, so the minor is
-  real), but a **raw RPU bin has nothing**, so its minor is a convention default (P8 -> .1,
-  P7 -> .6, P4 -> .2) recorded as `model::profile_compat_assumed`. That JSON pair is the whole
-  story for a sidecar: the **text report drops the Profile line for metadata-only sidecars
-  entirely** (`render.rs`) — an RPU is profile-agnostic (dovi_tool's blanket "8" for extracted
-  RPUs is remux convention, not a definition) and a DV XML's `GenerateProfile` is an authoring
-  target, so a rendered profile reads as a fact the metadata doesn't carry. The P7 default
-  also covers the common *video* case of an untouched BDMV M2TS, which has **no `0xB0` DV
-  descriptor at all** — Blu-ray signals DV via the HDMV registration descriptor and the playlist
-  STN table; only remuxes (tsMuxeR etc.) add the descriptor. That flag is gated to metadata-only
-  sidecars via `DvAggregate::mark_metadata_only`: a video input — **even a raw HEVC/AV1 elementary
-  stream with no dvcC** — has a base-layer VUI that officially backs the inference, so it's never
-  flagged. Don't widen the flag to `cfg.is_none()`; raw bitstreams share that state but aren't
-  metadata-only. **A bare Profile 5/10's compat digit is display-completed; the JSON stays
-  verbatim.** A raw elementary stream has no dvcC/dvvC to declare the minor, and neither profile
-  has a `dv_profile_label` convention default, so `render.rs::dv_profile_display` completes the
-  digit for the text report and `-q` line when it is certain: a bare "5" ⇒ "5.0" definitionally
-  (compat 0 is the only value the P&L spec admits for P5); a bare "10" (P10's compat set is
-  {0,1,2,4}) from the base layer's signalled CICP only when the deduction is airtight
-  (`infer_p10_compat`): IPT-PQ-c2 matrix ⇒ .0, explicit SDR gamma transfer ⇒ .2, PQ/HLG ⇒ .1/.4
-  but only over BT.2020 primaries *and* an explicit non-IPT matrix — IPT is itself PQ-encoded and
-  its convention (from P5) leaves CICP unspecified, so PQ alone can't exclude a 10.0 base;
-  anything less explicit stays a bare "10". Display only: the JSON
-  `profile`/`bl_compatibility_id`/`compatibility` keep the mux's declaration (the bare number /
-  null) so machine consumers get raw facts and draw their own inferences — never move this into
-  `levels.rs`/`model.rs`.
+- **The compat *minor* digit resolves on four rungs, and the report says which.** The RPU header
+  gives the *major* (5/7/8); the minor is `dv_bl_signal_compatibility_id`, which the RPU cannot
+  carry at all. `levels::resolve_compat` walks: **declared** (container dvcC/dvvC/TS descriptor,
+  or a DV XML's `GenerateProfile` via `DvAggregate::set_compat_id`) -> **spec**
+  (`ccid::spec_ccid` — Dolby's profile table fixes exactly one id for P4/P5/P7/P9 and the legacy
+  P0-3/P6, so a raw elementary stream with no dvcC still has a *real* id) -> **inferred**
+  (`levels::fill_inferred_compat`, a main.rs post-pass because it needs the track's signalled
+  `ColorInfo`: `ccid::infer_ccid` matches the VUI against the profile's candidate Table 2 rows
+  and answers only when exactly one survives) -> **assumed** (P8's ecosystem `8.1` convention,
+  and *only* P8's — P10/P20 admit several ids with no convention, so they keep a bare major).
+  The rung lands on `model::compat_source`; the old boolean `profile_compat_assumed` is gone.
+  **The `assumed` rung fills the label only** — `bl_compatibility_id` and `compatibility` stay
+  `None`, keeping the older invariant that an absent compat nibble reads as unknown and never as
+  a guessed value. Everything else does fill them, which is why a raw P5 now reports `5.0`/id 0
+  and a raw P10 HDR10 stream reports `10.1`/id 1 in **JSON as well as text** (the old
+  `render::dv_profile_display` completion is deleted; the renderer states no opinion about
+  profile digits or colour any more). The metadata-only gate is likewise gone: `assumed` is
+  evidence-based, so a raw video P8 whose VUI can't separate CCID 1/2/4 is `assumed` for the
+  same reason a sidecar is. The **text report still drops the Profile line for metadata-only
+  sidecars** (`render.rs`) — an RPU is profile-agnostic and a DV XML's `GenerateProfile` is an
+  authoring target, so a rendered profile would read as a fact the metadata doesn't carry. The
+  P7 spec rung also covers the common *video* case of an untouched BDMV M2TS, which has **no
+  `0xB0` DV descriptor at all** — Blu-ray signals DV via the HDMV registration descriptor and
+  the playlist STN table; only remuxes (tsMuxeR etc.) add the descriptor.
+- **The base-layer colour a profile defines is filled into the model, with per-field
+  provenance.** `ColorInfo` is omitted per field when *neither signalled nor defined*, and
+  `model::ColorSources` says which of `container`/`stream`/`sei`/`spec` produced each value it
+  does carry (per field, not per object: a P5 stream signals its range and derives the other
+  three). `levels::fill_derived_color` is a main.rs post-pass alongside `fill_derived_level`,
+  video inputs only, and has two hard gates. **Signalled always wins** — the fill only ever
+  touches an absent field, so the corpus's declared 8.4 signalling full range against the
+  table's limited keeps `full`. And it runs on a **declared or spec id only, never an
+  inferred one**: an inferred id was deduced *from* this colour description, so filling it back
+  would launder a deduction into three fields that read as facts (and would add nothing — an
+  inferable id implies the signal was largely present). `dolby_vision.pq_reshaping` deliberately
+  does *not* share that gate: it fires on a resolved CCID 0 from any rung, because it is new
+  information rather than a back-fill, and Dolby's footnote keys on exactly that condition.
+  Order matters in `main.rs`: `hdr::assemble` runs on the *demuxed* colour before any of this,
+  so nothing derived can feed back into classification.
 - **AVC (Profile 9) RPU is found by *content*, not by NAL number.** The DV RPU rides in an H.264
   *unspecified* NAL (Dolby uses type 28; the range is 24..=31), payload = the RPU EBSP beginning
   with the `rpu_nal_prefix` byte `0x19`. `sample.rs` treats an unspecified-range NAL as an RPU only
@@ -509,7 +534,7 @@ never parse bytes native-endian.
   also what gives an SDR AVC MKV its 8-bit / Hi10P 10-bit report), TS from PMT `stream_type`
   (`0x1B` AVC vs
   `0x24` HEVC), falling back to DV profile 9 ⇒ AVC only when no video `stream_type` is present (a
-  bare DV/EL PID). P9 has no EL and an SDR base (CCID 2 ⇒ `SDR (fallback)` in `hdr::assemble`, the
+  bare DV/EL PID). P9 has no EL and an SDR base (CCID 2 ⇒ `SDR` in `hdr::assemble`, the
   same branch Profile 4 uses); its Rec.709 VUI (`0,1,1,1,0`) collapses to a single `BT.709` label
   because primaries == transfer (unlike P5, whose encoding differs from its colour space).
 - **`--full` changes demux behaviour, not just sampling.** It threads into `container::demux(..,

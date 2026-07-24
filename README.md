@@ -34,7 +34,7 @@ The result is a sectioned report of everything the file carries:
   Color             BT.2020 · PQ (SMPTE ST 2084) · limited
 
 ── HDR ───────────────────────────────────────────────────────────
-  Format            Dolby Vision / HDR10+ / HDR10 (fallback)
+  Format            Dolby Vision / HDR10+ / HDR10
   Mastering         DCI-P3 D65 · max 1000  min 0.0001 cd/m²
   Content light     MaxCLL 737 · MaxFALL 130
 

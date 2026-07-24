@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 2.4**
+**Schema version: 3.0**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -20,6 +20,7 @@ together with the conditions under which it appears.
   - [`VideoTrack`](#videotrack)
   - [`Bitrate`](#bitrate)
   - [`ColorInfo`](#colorinfo)
+  - [`ColorSources`](#colorsources)
   - [`Hdr`](#hdr)
   - [`MasteringDisplay`](#masteringdisplay)
   - [`ContentLight`](#contentlight)
@@ -123,8 +124,8 @@ either use `--format ndjson` or normalize after parsing, e.g. in Python:
   no value. No field in the schema is ever serialized as `null`.
 - **Empty arrays are omitted.** `l5_active_areas` and `trim_targets` are absent rather than `[]`
   when nothing was found.
-- **Default-false booleans may be omitted.** `profile_compat_assumed`, `level_derived`, and
-  `unconverted_dual_layer_rpu` appear only when `true`. All other booleans (`bl_present`,
+- **Default-false booleans may be omitted.** `level_derived`, `unconverted_dual_layer_rpu`,
+  `pq_reshaping`, and `deprecated_combination` appear only when `true`. All other booleans (`bl_present`,
   `el_present`, `rpu_present`, `sampled`, `zeroed`, `l11_reference_mode`) are serialized
   whenever their containing object is.
 - **Numbers.** JSON has a single number type; the tables below note the underlying type.
@@ -188,6 +189,7 @@ Report
 └─ video_tracks[]: VideoTrack         (always at least one entry)
    ├─ bitrate: Bitrate
    ├─ color: ColorInfo
+   ├─ color_source: ColorSources
    ├─ hdr: Hdr                        (video inputs only)
    │  ├─ mastering: MasteringDisplay
    │  └─ content_light: ContentLight
@@ -277,7 +279,8 @@ errors rather than guessing.
 | `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
 | `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"` (a reserved signalling value renders `"?"`) |
 | `stereo` | string | optional | Stereoscopic view structure from MP4 `vexu`/`stri` (MV-HEVC, DV Profile 20): `"Stereoscopic 3D (2 views)"`, `"Monoscopic (1 view)"`, or `"Multiview 3D (2+ views)"`. Absent for ordinary monoscopic video |
-| `color` | `ColorInfo` | always | Colour signalling; may be `{}` when nothing was signalled |
+| `color` | `ColorInfo` | always | The track's colour description; may be `{}` when nothing signalled it and nothing defines it |
+| `color_source` | `ColorSources` | always | Where each `color` field came from, field for field; `{}` when `color` is |
 | `hdr` | `Hdr` | video inputs only | Static HDR classification and mastering info; absent for metadata sidecars, which have no base layer |
 | `dolby_vision` | `DolbyVision` | when DV metadata was found | Present when at least one RPU parsed, when the container carries a DV configuration (including under `--no-rpu`), or for a DV sidecar |
 | `hdr10plus` | `Hdr10Plus` | when HDR10+ metadata was found | Present when ST.2094-40 metadata was parsed from the input (an HEVC SEI, an AV1 metadata OBU, or the Matroska BlockAdditions carriage used by VP9 in WebM), or for an HDR10+ JSON sidecar. Like `dolby_vision`, the object's existence is the presence signal |
@@ -329,18 +332,44 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 
 ### `ColorInfo`
 
-All four fields are optional; each is omitted when the input does not signal it or signals a
-code hdrprobe does not name.
+All four fields are optional; each is omitted when nothing signals it, nothing defines it, and
+no fallback names it — including when the input signals a code hdrprobe does not name.
 
 | Field | Type | Values |
 |---|---|---|
 | `primaries` | string | `"BT.709"`, `"BT.601 (PAL)"`, `"BT.601 (NTSC)"`, `"BT.2020"`, `"DCI-P3"`, `"Display P3"` |
 | `transfer` | string | `"BT.709"`, `"BT.601"`, `"BT.2020 (10-bit)"`, `"BT.2020 (12-bit)"`, `"PQ (SMPTE ST 2084)"`, `"HLG (ARIB STD-B67)"` |
-| `matrix` | string | `"RGB"`, `"BT.709"`, `"BT.2020 NCL"`, `"BT.2020 CL"`, `"IPT-PQ-c2"` |
+| `matrix` | string | `"RGB"`, `"BT.709"`, `"BT.2020 NCL"`, `"BT.2020 CL"`, `"IPT-PQ-C2"` |
 | `range` | string | `"limited"`, `"full"` |
 
-When an HLG/PQ preferred-transfer SEI (alternative transfer characteristics) is present, it
-overrides the VUI value in `transfer`.
+A value can reach this object three ways, and `color_source` says which per field:
+
+- **Signalled** by a container colour box/element or by the coded stream's own VUI.
+- **Overridden** by an SEI: an HLG/PQ preferred-transfer message (alternative transfer
+  characteristics) replaces the VUI value in `transfer`.
+- **Defined** by a Dolby Vision profile and compatibility id, for fields nothing signalled.
+  Dolby's specification pairs each cross-compatibility id with an exact base-layer VUI, so a
+  Profile 5 stream (whose colour space has no CICP encoding, leaving the SPS at "unspecified")
+  and a legacy Profile 4 mux (which often omits the colour description entirely) both report
+  the colour their profile defines rather than a gap. A signalled value always wins; the fill
+  only ever touches an absent field, and never runs when the compatibility id was itself
+  inferred from this colour description.
+
+### `ColorSources`
+
+Per-field provenance for `ColorInfo`, same four field names. A field is present here exactly
+when `ColorInfo` carries a value for it, so the two objects always have the same key set.
+
+| Value | Meaning |
+|---|---|
+| `"container"` | A container colour box or element: MP4 `colr` or `vpcC`, MKV `Colour` |
+| `"stream"` | The coded stream's own signalling: an SPS/sequence-header VUI, read in band or from the parameter set embedded in an `hvcC`/`avcC`/`av1C` record, or a VP9/ProRes frame header |
+| `"sei"` | An SEI message overriding the above; today only the HLG/PQ alternative-transfer-characteristics message |
+| `"spec"` | Not signalled anywhere: defined by the Dolby Vision profile and compatibility id |
+
+The sources genuinely differ within one track, which is why this is per field and not a single
+flag: a Dolby Vision Profile 5 stream signals its range and nothing else, so `range` reads
+`"stream"` while `primaries`, `transfer` and `matrix` read `"spec"`.
 
 ### `Hdr`
 
@@ -349,8 +378,8 @@ Present for every video input; absent for sidecars.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `format` | string | always | Overall classification; see below |
-| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values. Like `content_light`, the L6 fallback applies only on an HDR10 base (an `HDR10` tag in `format`), where L6 by definition mirrors the base layer's own static metadata. On any other base (IPT-PQ-c2, HLG, SDR) the L6 values merely restate the DV grade's own display, which `dolby_vision.mastering_display` already reports, so the field is omitted. A container or SEI value, when actually signalled, is always reported |
-| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values. MaxCLL/MaxFALL is HDR10 (CTA-861.3) convention, so the L6 fallback applies only on an HDR10 base (an `HDR10` tag in `format`); no other base consumes it, and on an IPT-PQ-c2 or HLG base L6 is typically a zeroed placeholder, so the field is omitted rather than echo noise. A container or SEI value, when actually signalled, is always reported |
+| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values. Like `content_light`, the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6), where L6 by definition mirrors the base layer's own static metadata. On any other base (IPT-PQ-C2, HLG, SDR) the L6 values merely restate the DV grade's own display, which `dolby_vision.mastering_display` already reports, so the field is omitted. A container or SEI value, when actually signalled, is always reported |
+| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values. MaxCLL/MaxFALL is HDR10 (CTA-861.3) convention, so the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6); no other base consumes it, and on an IPT-PQ-C2 or HLG base L6 is typically a zeroed placeholder, so the field is omitted rather than echo noise. A container or SEI value, when actually signalled, is always reported |
 
 #### `format` values
 
@@ -361,15 +390,17 @@ The string is a ` / `-joined list built from, in order:
 3. `SL-HDR1`, `SL-HDR2`, or `SL-HDR3` when an SL-HDR information SEI is present (the digit is
    the stream's own signalled mode).
 4. `HDR Vivid` when HDR Vivid metadata is present.
-5. A base-signal tag: `HDR10`, `HLG`, or `SDR` for non-DV content; `HDR10 (fallback)`,
-   `HLG (fallback)`, or `SDR (fallback)` for the base layer under DV. Omitted entirely when the
-   DV stream has no independently viewable base (Profile 5 and Profile 20, whose base is
-   IPT-PQ-c2).
+5. A base-signal tag: `HDR10`, `HLG`, or `SDR`, naming the signal a decoder without the
+   dynamic-metadata layer receives. Under Dolby Vision the tag is decided by the
+   compatibility id (1 or 6 -> `HDR10`, 2 -> `SDR`, 4 -> `HLG`) rather than by the base
+   layer's raw transfer characteristic, which disagrees for Profile 4 (SDR base, however
+   tagged) and Profile 5/20 (a PQ-encoded IPT-PQ-C2 base that no ordinary decoder can
+   present). Omitted entirely when the DV stream has no independently viewable base
+   (compatibility id 0: Profiles 5 and 20).
 
 Examples: `"SDR"`, `"HDR10"`, `"HLG"`, `"HDR10+ / HDR10"`, `"SL-HDR2 / HDR10"`,
-`"HDR Vivid / HLG"`, `"Dolby Vision"`, `"Dolby Vision / HDR10 (fallback)"`,
-`"Dolby Vision / HDR10+ / HDR10 (fallback)"`, `"Dolby Vision / SDR (fallback)"`,
-`"Dolby Vision / HLG (fallback)"`.
+`"HDR Vivid / HLG"`, `"Dolby Vision"`, `"Dolby Vision / HDR10"`,
+`"Dolby Vision / HDR10+ / HDR10"`, `"Dolby Vision / SDR"`, `"Dolby Vision / HLG"`.
 
 ### `MasteringDisplay`
 
@@ -400,8 +431,8 @@ SL-HDR metadata predates the current MDCV box for the third.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `profile` | string | always | `<major>.<minor>` from the container config, e.g. `"8.1"`, `"5.0"`, `"10.4"`, `"20.0"`. Dual-layer profiles (4, 7) append the enhancement-layer kind: `"7.6 (FEL)"`, `"4.2 (MEL)"`. When no compatibility id is available the minor is a convention default for profiles 8 (`8.1`), 7 (`7.6`, the only combination Dolby defines; an untouched BDMV M2TS carries no DV descriptor, so this is the common Blu-ray-original case) and 4 (`4.2`); any other profile then prints its bare major, e.g. `"5"` |
-| `profile_compat_assumed` | boolean | only when `true` | The minor digit above was supplied by convention rather than read from data. Set only for metadata-only sidecars (a raw RPU bin); a video input's base-layer signalling backs the inference, so it is never flagged there |
+| `profile` | string | always | `<major>.<minor>`, e.g. `"8.1"`, `"5.0"`, `"10.4"`, `"20.0"`. Dual-layer profiles (4, 7) append the enhancement-layer kind: `"7.6 (FEL)"`, `"4.2 (MEL)"`. The minor is the resolved compatibility id; `compat_source` says how it was resolved. Only a Profile 8 that resolves nothing prints a convention minor (`8.1`), and only Profiles 10 and 20 can print a bare major (`"10"`, `"20"`) when their base layer does not separate the ids they admit |
+| `compat_source` | string | optional | Provenance of `bl_compatibility_id`, in descending order of evidence: `"declared"` (a container `dvcC`/`dvvC`/TS descriptor, or a DV CM XML's `GenerateProfile`), `"spec"` (fixed by the profile's own definition -- Dolby pairs profiles 4, 5, 7 and 9, and the legacy 0-3 and 6, with exactly one id, so no stream evidence is needed), `"inferred"` (deduced from the base layer's signalled VUI for a profile admitting several ids, and only when exactly one candidate survives), or `"assumed"` (Profile 8's convention default, no evidence). **The `assumed` rung resolves the label only**: `bl_compatibility_id` and `compatibility` stay absent, because a display convention is not a value the stream carries. Absent when nothing resolved the id and the profile has no convention either |
 | `structure` | string | optional | Layer/track layout, present only for dual-layer content: `"Single track, dual layer"` or `"Dual track, dual layer"` |
 | `level` | integer | optional | DV level, from the container `dvcC`/`dvvC`/TS descriptor when one declares it. When no config carries a level (an authentic disc M2TS, where UHD-BD signals DV via the playlist rather than the PMT, or a raw elementary stream) it is derived from the coded stream's resolution and frame rate against the Dolby level table (smallest level admitting `width x height x fps` and the width) and flagged via `level_derived`. The derivation is a pixel-rate floor: the level's bitrate/tier axis is not probed. Absent for metadata sidecars (no coded stream) and when the frame rate is unknown |
 | `level_derived` | boolean | only when `true` | The `level` above was derived from stream properties rather than declared by a container config |
@@ -411,8 +442,10 @@ SL-HDR metadata predates the current MDCV box for the third.
 | `el_type` | string | optional | `"FEL"` or `"MEL"`; absent for single-layer profiles and under `--no-rpu` (the kind is read from the RPU) |
 | `unconverted_dual_layer_rpu` | boolean | only when `true` | The RPU carries the dual-layer composer payload (the NLQ block whose fingerprint is `el_type`) but the carriage has no enhancement layer: an explicit container config with `el_present` 0 (and no folded dual-track EL stream, which is an enhancement layer regardless of the declaration), or AV1 (whose DV carriage is single-layer by construction). The signature of a custom transcode that injected a UHD-BD Profile 7 RPU without converting it; the stray payload is inert for playback but misleads tools that guess a profile from the RPU (mkvmerge derives an AV1 `dvvC` compat id that way, producing out-of-spec profile strings like `"10.6"`). A provenance observation, not an error claim. Never set for metadata sidecars (no carriage to compare) or config-less raw HEVC (its EL may legitimately ride in-band). Renders as the `Unconverted RPU` chip on the Profile line |
 | `reconstructed_bit_depth` | integer | optional | The composer's reconstructed signal bit depth, read verbatim from the RPU header's `vdr_bit_depth` field: `12` for Profile 7 FEL, `14` for Profile 4 FEL (never assumed from the profile). Present only when `el_type` is `"FEL"`, the one case where a real residual reconstructs beyond the 10-bit base layer; MEL and single-layer RPUs signal a value too, but it describes composer arithmetic precision rather than content depth, so it is withheld. Absent under `--no-rpu` |
-| `bl_compatibility_id` | integer | optional | Raw `dv_bl_signal_compatibility_id` (0, 1, 2, 4, ...) from the container or a DV XML's declared profile; absent when neither carries it |
-| `compatibility` | string | optional | Human name for the id above: `"no cross-compatibility"`, `"HDR10-compatible"`, `"SDR-compatible"`, `"HLG-compatible"`. Absent for ids outside that set |
+| `bl_compatibility_id` | integer | optional | `dv_bl_signal_compatibility_id` (0, 1, 2, 4, 6), resolved via `compat_source`'s declared, spec or inferred rung. Absent when nothing resolved it -- including on the `assumed` rung, which never fills this field |
+| `compatibility` | string | optional | Human name for the id above: `"no cross-compatibility"`, `"HDR10-compatible"`, `"SDR-compatible"`, `"HLG-compatible"`, `"Ultra HD Blu-ray-compatible"`. Absent for ids outside that set, and whenever `bl_compatibility_id` is |
+| `pq_reshaping` | boolean | only when `true` | The base layer's actual transfer characteristic is Dolby's proprietary "PQ with reshaping" rather than the plain PQ its VUI names. Dolby states this for compatibility id 0 outright: a transfer characteristic of 16 there generally indicates PQ, but the actual proprietary characteristic, even when signalled as 16, is PQ with reshaping. It has no CICP code point, so it cannot live in `color.transfer`, which stays a strict CICP projection. Set for any resolved id of 0 on a video input; never for a metadata sidecar, which has no base layer whose transfer it could describe |
+| `deprecated_combination` | boolean | only when `true` | The profile and compatibility id pair into a combination Dolby has withdrawn: `8.3` or `8.5`, the two rows of the specification's Annex I that name a pairing rather than a whole profile. Profile 8 itself is current, and the legacy *profiles* Annex I also lists (0, 1, 2, 3, 4, 6) are not flagged -- plenty of real content uses them. A provenance observation about how the stream was authored, not a playability claim. Renders as the `Deprecated combination` chip on the Profile line |
 | `cm_version` | string | optional | Content-mapping version from L254: `"CM v4.0"` or `"CM v2.9"`. Absent under `--no-rpu` |
 | `l5_active_areas` | array of `ActiveArea` | omitted when empty | Distinct L5 active areas seen. A sampled set unless `--full` or a sidecar (both exhaustive) |
 | `l5_assumed_canvas` | array `[width, height]` | optional | Present only for DV sidecars, which record no resolution: the canvas (3840x2160) the active-area dimensions were computed against |
@@ -600,8 +633,10 @@ alike), `census` and `metadata_cadence` appear, and TS inputs gain an exact vide
 
 **`--no-rpu`.** No frame bytes are read at all, so every SEI-derived fact disappears, not
 just the RPU-derived ones. The DV section is built from the container configuration alone:
-`profile`, `structure`, `level`, the presence booleans, `bl_compatibility_id`, and
-`compatibility` can appear; everything RPU-derived (`el_type`, `reconstructed_bit_depth`,
+`profile`, `compat_source`, `structure`, `level`, the presence booleans,
+`bl_compatibility_id`, `compatibility`, and `deprecated_combination` can appear (as can
+`color`'s spec-defined fill and `pq_reshaping`, both of which need only the container's
+declared profile and id); everything RPU-derived (`el_type`, `reconstructed_bit_depth`,
 `cm_version`, L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `metadata_cadence`,
 `census`) is absent, and `rpu_count` is `0`. `hdr10plus` and `sl_hdr` are entirely absent
 (their only carriage is in-frame), SEI-sourced `hdr.mastering`/`hdr.content_light` fall away
@@ -673,6 +708,34 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
 
 ## Version history
 
+- **3.0**: Dolby Vision colour and compatibility provenance (**breaking**). Four changes, each
+  independently breaking, batched into one bump so consumers adapt once.
+  1. `dolby_vision.profile_compat_assumed` is **removed** and replaced by
+     `dolby_vision.compat_source`, a four-valued string (`declared` / `spec` / `inferred` /
+     `assumed`). The boolean could not express the middle two rungs. A consumer reading the old
+     field should read `compat_source == "assumed"` instead; the field's meaning is otherwise
+     preserved, including that the `assumed` rung still leaves `bl_compatibility_id` absent.
+  2. `bl_compatibility_id`, `compatibility` and the `profile` minor digit now **resolve for
+     inputs that previously left them absent**: a profile whose definition fixes the id (4, 5,
+     7, 9 and the legacy 0-3, 6) resolves it with no stream evidence, and a profile admitting
+     several resolves it from the base layer's signalled VUI when that is unambiguous. A raw
+     Profile 5 elementary stream reports `"5.0"` with id 0 where it reported `"5"` and nothing;
+     a raw Profile 10 reports `"10.1"`. `compatibility` also gains
+     `"Ultra HD Blu-ray-compatible"` for id 6, which previously reported no name at all.
+  3. `hdr.format`'s Dolby Vision base-signal tags **lose the `(fallback)` suffix**:
+     `"Dolby Vision / HDR10 (fallback)"` becomes `"Dolby Vision / HDR10"`, and likewise for
+     `HLG` and `SDR`. The word was not Dolby's terminology and no other layered format's base
+     carried it. A consumer matching the old strings should match the unsuffixed forms, which
+     is one comparison instead of two.
+  4. `color.matrix`'s IPT value is respelled `"IPT-PQ-C2"` (was `"IPT-PQ-c2"`), per SMPTE
+     ST 2128:2023 and both revisions of Dolby's Profiles and Levels specification.
+  Additive alongside those: the new always-present `video_tracks[].color_source` object gives
+  per-field provenance for `color` (`container` / `stream` / `sei` / `spec`); `color` itself now
+  reports the base-layer colour a Dolby Vision profile and compatibility id define, closing the
+  case where a Profile 5 track reported only `{"range": "full"}` and a Profile 4 track reported
+  `{}`; and `dolby_vision` gains the optional `pq_reshaping` and `deprecated_combination`
+  booleans. Inputs with no Dolby Vision metadata see only the new `color_source` object.
+  Ships in hdrprobe 0.9.0.
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
   `video_tracks[].sl_hdr` object appears when an SL-HDR (ETSI TS 103 433) information SEI was
   found in an HEVC or AVC stream, carrying `mode`, `spec_version`, `payload_mode`, the

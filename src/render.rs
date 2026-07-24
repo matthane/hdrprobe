@@ -399,9 +399,9 @@ fn track_sections(
             // bare metadata: an RPU is profile-agnostic (dovi_tool's blanket
             // "8" for extracted RPUs is remux convention, not a definition)
             // and a DV XML's GenerateProfile is an authoring target. So the
-            // line is skipped for sidecars; the JSON keeps `profile` and
-            // `profile_compat_assumed` (that flag fires only on these inputs,
-            // so its old "[compat assumed]" tag no longer renders anywhere).
+            // line is skipped for sidecars; the JSON keeps `profile` and its
+            // `compat_source`, so a consumer can still see both the label and
+            // the evidence (or lack of it) behind the minor digit.
             if !sidecar {
                 // A dual-layer-authored RPU riding an EL-less carriage: the
                 // usual product of a custom transcode that injected a UHD-BD
