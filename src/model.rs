@@ -334,6 +334,15 @@ pub struct DolbyVision {
     /// transfer this would describe.
     #[serde(skip_serializing_if = "is_false")]
     pub pq_reshaping: bool,
+    /// True when the profile and compatibility id pair into a combination Dolby
+    /// has withdrawn: `8.3` or `8.5`, the two rows of Annex I ("Profiles not
+    /// supported for new applications") that name a pairing rather than a whole
+    /// profile. Profile 8 itself is current, and the legacy *profiles* Annex I
+    /// also lists (0, 1, 2, 3, 4, 6) are not flagged — plenty of real content
+    /// uses them and "legacy" is not a defect. A provenance observation about
+    /// how the stream was authored, not a playability claim.
+    #[serde(skip_serializing_if = "is_false")]
+    pub deprecated_combination: bool,
     /// Layer/track layout, present only for dual-layer (Profile 7) content:
     /// "Single track, dual layer" (BL+EL interleaved in one track/stream) or
     /// "Dual track, dual layer" (BL and EL on separate tracks/PIDs).
@@ -677,6 +686,7 @@ mod tests {
                 profile: "7.6 (FEL)".to_string(),
                 compat_source: Some(CompatSource::Declared),
                 pq_reshaping: true,
+                deprecated_combination: true,
                 structure: Some("Single track, dual layer".to_string()),
                 level: Some(6),
                 level_derived: true,
@@ -840,6 +850,7 @@ mod tests {
             "video_tracks[].dolby_vision.profile",
             "video_tracks[].dolby_vision.compat_source",
             "video_tracks[].dolby_vision.pq_reshaping",
+            "video_tracks[].dolby_vision.deprecated_combination",
             "video_tracks[].dolby_vision.structure",
             "video_tracks[].dolby_vision.level",
             "video_tracks[].dolby_vision.level_derived",

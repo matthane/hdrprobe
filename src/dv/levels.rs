@@ -400,6 +400,8 @@ impl DvAggregate {
             // Video-path fact: `main.rs` sets it once the base layer is known
             // to exist (`flag_pq_reshaping`).
             pq_reshaping: false,
+            deprecated_combination: compat_id
+                .is_some_and(|id| ccid::deprecated_combination(profile, id)),
             structure,
             level: cfg.and_then(|c| c.level),
             // Filled by `fill_derived_level` (main.rs only) when no config
@@ -516,6 +518,8 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         profile: profile_str,
         compat_source,
         pq_reshaping: false,
+        deprecated_combination: compat_id
+            .is_some_and(|id| ccid::deprecated_combination(cfg.profile, id)),
         structure: structure_str(el, dual_track),
         level: cfg.level,
         level_derived: false,
@@ -707,6 +711,7 @@ pub fn fill_inferred_compat(dv: &mut DolbyVision, color: &crate::model::ColorInf
     dv.bl_compatibility_id = Some(id);
     dv.compatibility = ccid::compatibility_label(id).map(str::to_string);
     dv.compat_source = Some(CompatSource::Inferred);
+    dv.deprecated_combination = ccid::deprecated_combination(profile, id);
     dv.profile = dv_profile_label(profile, Some(id), dv.el_type.as_deref());
 }
 
@@ -1505,6 +1510,37 @@ mod tests {
         assert_eq!(profile_major("10"), Some(10));
         assert_eq!(profile_major("20"), Some(20));
         assert_eq!(profile_major(""), None);
+    }
+
+    /// The withdrawn-pairing flag reaches the model from every path that can
+    /// resolve a compatibility id.
+    #[test]
+    fn deprecated_combination_reaches_the_model_from_every_path() {
+        let cfg = |ccid| DvConfig {
+            profile: 8,
+            level: None,
+            bl_present: true,
+            el_present: false,
+            rpu_present: true,
+            bl_compatibility_id: Some(ccid),
+        };
+        assert!(container_only(&cfg(5), false).deprecated_combination, "declared 8.5");
+        assert!(container_only(&cfg(3), false).deprecated_combination, "declared 8.3");
+        assert!(!container_only(&cfg(1), false).deprecated_combination, "8.1 is current");
+        // The inferred rung cannot produce one: `profile_ccid` admits only
+        // 1, 2 and 4 for Profile 8, so no withdrawn pairing is inferable.
+        let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
+        fill_inferred_compat(
+            &mut dv,
+            &crate::model::ColorInfo {
+                primaries: Some("BT.2020".to_string()),
+                transfer: Some("HLG (ARIB STD-B67)".to_string()),
+                matrix: Some("BT.2020 NCL".to_string()),
+                range: Some("limited".to_string()),
+            },
+        );
+        assert_eq!(dv.bl_compatibility_id, Some(4));
+        assert!(!dv.deprecated_combination);
     }
 
     /// The reshaping flag's two conditions, including the clause the corpus

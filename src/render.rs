@@ -415,8 +415,16 @@ fn track_sections(
                 } else {
                     String::new()
                 };
+                // Likewise a profile/compatibility pairing Dolby has withdrawn
+                // (8.3, 8.5): an authoring observation about the digits on this
+                // very line, so it rides them too.
+                let deprecated = if dv.deprecated_combination {
+                    format!("  {}", c.warn("Deprecated combination"))
+                } else {
+                    String::new()
+                };
                 let profile = c.bright(&dv.profile.clone());
-                kv_styled(s, c, "Profile", &format!("{profile}{unconverted}"));
+                kv_styled(s, c, "Profile", &format!("{profile}{unconverted}{deprecated}"));
             }
 
             // The DV level only defines the codec bit-rate envelope; it says
@@ -1582,6 +1590,57 @@ mod tests {
             video_tracks: tracks,
             elapsed_ms: 0.0,
         }
+    }
+
+    /// A withdrawn profile/compatibility pairing chips the Profile line it
+    /// describes. No corpus file is 8.3 or 8.5, so this is the only place the
+    /// chip is exercised.
+    #[test]
+    fn a_deprecated_combination_chips_the_profile_line() {
+        let dv = |deprecated| crate::model::DolbyVision {
+            profile: "8.5".to_string(),
+            compat_source: Some(crate::model::CompatSource::Declared),
+            pq_reshaping: false,
+            deprecated_combination: deprecated,
+            structure: None,
+            level: None,
+            level_derived: false,
+            bl_present: true,
+            el_present: false,
+            rpu_present: true,
+            el_type: None,
+            unconverted_dual_layer_rpu: false,
+            reconstructed_bit_depth: None,
+            bl_compatibility_id: Some(5),
+            compatibility: None,
+            cm_version: None,
+            l5_active_areas: Vec::new(),
+            l5_assumed_canvas: None,
+            mastering_display: None,
+            fel_brightness_expansion: None,
+            mastering_primaries_mismatch: None,
+            l6: None,
+            l9_mastering: None,
+            l11_content: None,
+            l11_white_point: None,
+            l11_reference_mode: None,
+            trim_targets: Vec::new(),
+            rpu_count: 1,
+            sampled: true,
+            metadata_cadence: None,
+            census: None,
+        };
+        let mut track = test_track("HEVC", 3840, None);
+        track.dolby_vision = Some(dv(true));
+        let out = render(&test_report(vec![track]), &opts(false, 1, 1));
+        assert!(out.contains("Profile"), "profile line present");
+        assert!(out.contains("8.5  (Deprecated combination)"), "chip missing:
+{out}");
+
+        let mut track = test_track("HEVC", 3840, None);
+        track.dolby_vision = Some(dv(false));
+        let out = render(&test_report(vec![track]), &opts(false, 1, 1));
+        assert!(!out.contains("Deprecated combination"), "chip fired without the flag");
     }
 
     /// Multi-track reports render one rule-titled group per track with the

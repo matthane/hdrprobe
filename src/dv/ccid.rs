@@ -126,6 +126,23 @@ pub fn compatibility_label(ccid: u8) -> Option<&'static str> {
     })
 }
 
+/// Whether this profile/CCID pairing is one Dolby has withdrawn — the rows of
+/// Annex I ("Profiles not supported for new applications") that name a
+/// *combination* rather than a whole profile. Profile 8 is current; only two of
+/// its pairings are not.
+///
+/// - **8.3** — v1.3.2 Table 6 p20. Dropped from v1.5's Annex I because CCID 3
+///   became "Reserved for Dolby Vision proprietary, non-SDR and non-HDR base
+///   layer", so the pairing cannot be legal under either revision.
+/// - **8.5** — v1.3.2 Table 6 p20 and v1.5 Table 6 p23, withdrawn in both.
+///
+/// Whole profiles Annex I lists (0, 1, 2, 3, 4, 6) are deliberately *not* here:
+/// hdrprobe reports plenty of Profile 4 and 7 content and "legacy" is not a
+/// defect. This flags only the pairings, which no encoder should now produce.
+pub fn deprecated_combination(profile: u8, ccid: u8) -> bool {
+    matches!((profile, ccid), (8, 3) | (8, 5))
+}
+
 /// Whether a Dolby Vision title's base layer is the CTA-861.3 HDR10 signal that
 /// MaxCLL/MaxFALL and an ST.2086 mastering display actually describe: CCID 1, or
 /// 6 (Ultra HD Blu-ray, the same CTA-861.3 base with disc constraints on top).
@@ -345,6 +362,21 @@ mod tests {
         assert_eq!(spec_ccid(10), None);
         assert_eq!(spec_ccid(20), None);
         assert_eq!(spec_ccid(11), None);
+    }
+
+    /// Annex I's withdrawn profile/CCID *combinations*, and only those: the
+    /// legacy whole profiles it also lists stay reportable.
+    #[test]
+    fn deprecated_combinations_are_the_two_annex_i_pairings() {
+        assert!(deprecated_combination(8, 3), "v1.3.2 Table 6 p20");
+        assert!(deprecated_combination(8, 5), "v1.3.2 Table 6 p20, v1.5 Table 6 p23");
+        for ccid in [1u8, 2, 4] {
+            assert!(!deprecated_combination(8, ccid), "8.{ccid} is current");
+        }
+        // Annex I's legacy profiles are not flagged: the corpus reports them.
+        for (profile, ccid) in [(4u8, 2u8), (7, 6), (0, 2), (1, 0), (2, 2), (3, 0), (6, 1)] {
+            assert!(!deprecated_combination(profile, ccid), "profile {profile} is legacy, not withdrawn");
+        }
     }
 
     /// Table 2's cross-compatibility labels, including CCID 6 — every Profile 7
