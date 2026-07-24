@@ -1393,6 +1393,108 @@ mod tests {
         assert!(dv.metadata_cadence.is_none());
     }
 
+    /// A `DolbyVision` in whatever compat state a test needs, built the way the
+    /// production paths build one so the field set stays in step.
+    fn dv_stub(profile: &str, ccid: Option<u8>, source: Option<CompatSource>) -> DolbyVision {
+        let cfg = DvConfig {
+            profile: profile_major(profile).unwrap_or(8),
+            level: None,
+            bl_present: true,
+            el_present: false,
+            rpu_present: true,
+            bl_compatibility_id: ccid,
+        };
+        let mut d = container_only(&cfg, false);
+        d.profile = profile.to_string();
+        d.bl_compatibility_id = ccid;
+        d.compatibility = ccid.and_then(ccid::compatibility_label).map(str::to_string);
+        d.compat_source = source;
+        d
+    }
+
+    /// The label is the only place the profile number survives on the model,
+    /// so the two consumers of the HDR10-base gate depend on reading it back.
+    #[test]
+    fn profile_major_reads_back_every_label_shape() {
+        assert_eq!(profile_major("8.1"), Some(8));
+        assert_eq!(profile_major("10.4"), Some(10));
+        assert_eq!(profile_major("20.0"), Some(20));
+        assert_eq!(profile_major("7.6 (FEL)"), Some(7));
+        assert_eq!(profile_major("4.2 (MEL)"), Some(4));
+        // The bare forms `dv_profile_label` can still emit.
+        assert_eq!(profile_major("10"), Some(10));
+        assert_eq!(profile_major("20"), Some(20));
+        assert_eq!(profile_major(""), None);
+    }
+
+    /// Every rung, and the one profile that reaches `assumed`. The assumed rung
+    /// must leave the raw id empty: it is a display convention, not a value the
+    /// stream carries.
+    #[test]
+    fn compat_resolution_rungs_follow_the_evidence() {
+        use CompatSource::{Assumed, Declared, Spec};
+        assert_eq!(resolve_compat(8, Some(4)), (Some(4), Some(Declared)));
+        assert_eq!(resolve_compat(5, Some(0)), (Some(0), Some(Declared)));
+        // Spec-fixed profiles resolve with no stream evidence at all.
+        assert_eq!(resolve_compat(4, None), (Some(2), Some(Spec)));
+        assert_eq!(resolve_compat(5, None), (Some(0), Some(Spec)));
+        assert_eq!(resolve_compat(7, None), (Some(6), Some(Spec)));
+        assert_eq!(resolve_compat(9, None), (Some(2), Some(Spec)));
+        // Profile 8 is the only convention default, and it fills no id.
+        assert_eq!(resolve_compat(8, None), (None, Some(Assumed)));
+        // Profiles 10 and 20 admit several ids and have no convention, so an
+        // unresolved one claims no provenance either.
+        assert_eq!(resolve_compat(10, None), (None, None));
+        assert_eq!(resolve_compat(20, None), (None, None));
+        assert_eq!(resolve_compat(11, None), (None, None));
+    }
+
+    /// The inferred rung relabels and fills together, and never overwrites an
+    /// id an earlier rung already resolved.
+    #[test]
+    fn inferred_compat_fills_only_an_unresolved_id() {
+        let hdr10 = crate::model::ColorInfo {
+            primaries: Some("BT.2020".to_string()),
+            transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+            matrix: Some("BT.2020 NCL".to_string()),
+            range: Some("limited".to_string()),
+        };
+        let hlg = crate::model::ColorInfo {
+            transfer: Some("HLG (ARIB STD-B67)".to_string()),
+            ..hdr10.clone()
+        };
+
+        // A bare Profile 10 resolves and relabels.
+        let mut dv = dv_stub("10", None, None);
+        fill_inferred_compat(&mut dv, &hdr10);
+        assert_eq!(dv.profile, "10.1");
+        assert_eq!(dv.bl_compatibility_id, Some(1));
+        assert_eq!(dv.compatibility.as_deref(), Some("HDR10-compatible"));
+        assert_eq!(dv.compat_source, Some(CompatSource::Inferred));
+
+        // A Profile 8 sitting on the assumed convention is corrected by its own
+        // base layer: an HLG base is 8.4, never 8.1.
+        let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
+        fill_inferred_compat(&mut dv, &hlg);
+        assert_eq!(dv.profile, "8.4");
+        assert_eq!(dv.bl_compatibility_id, Some(4));
+        assert_eq!(dv.compat_source, Some(CompatSource::Inferred));
+
+        // A declared id is never second-guessed, however the base layer reads.
+        let mut dv = dv_stub("8.1", Some(1), Some(CompatSource::Declared));
+        fill_inferred_compat(&mut dv, &hlg);
+        assert_eq!(dv.profile, "8.1");
+        assert_eq!(dv.bl_compatibility_id, Some(1));
+        assert_eq!(dv.compat_source, Some(CompatSource::Declared));
+
+        // An ambiguous signal changes nothing.
+        let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
+        fill_inferred_compat(&mut dv, &crate::model::ColorInfo::default());
+        assert_eq!(dv.profile, "8.1");
+        assert_eq!(dv.bl_compatibility_id, None);
+        assert_eq!(dv.compat_source, Some(CompatSource::Assumed));
+    }
+
     #[test]
     fn merged_targets_keep_the_combined_provenance_shape() {
         // A 100-nit target from both L2 and L8, a 600-nit L2-only value, and an

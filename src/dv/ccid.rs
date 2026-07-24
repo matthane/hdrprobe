@@ -387,6 +387,33 @@ mod tests {
         assert_eq!(p7_el, vui_rows(7, 6)[0], "P7's EL VUI matches its BL VUI");
     }
 
+    /// The gate behind every MaxCLL/mastering suppression rule, including the
+    /// one case no corpus file reaches: a Profile 8 that declares no id and
+    /// whose base layer does not separate CCID 1, 2 and 4. The profile admits
+    /// all three, so nothing can resolve it, and the historical default — a
+    /// profile 7 or 8 assumes an HDR10 base, nothing else does — has to be kept
+    /// explicitly rather than assumed to fall out of the table.
+    #[test]
+    fn the_hdr10_base_gate_keeps_its_profile_8_fallback() {
+        // Resolved ids answer on their own, whatever the profile.
+        assert!(hdr10_base(Some(1), Some(8)));
+        assert!(hdr10_base(Some(6), Some(7)));
+        assert!(!hdr10_base(Some(0), Some(5)));
+        assert!(!hdr10_base(Some(2), Some(9)));
+        assert!(!hdr10_base(Some(4), Some(8)));
+        // A resolved id beats the fallback it disagrees with: an 8.4 is an HLG
+        // base even though the fallback would have assumed HDR10 for a bare 8.
+        assert!(!hdr10_base(Some(4), Some(8)));
+        // Unresolved: the retained heuristic.
+        assert!(hdr10_base(None, Some(7)));
+        assert!(hdr10_base(None, Some(8)));
+        assert!(!hdr10_base(None, Some(4)));
+        assert!(!hdr10_base(None, Some(5)));
+        assert!(!hdr10_base(None, Some(10)));
+        assert!(!hdr10_base(None, Some(20)));
+        assert!(!hdr10_base(None, None));
+    }
+
     /// Table rows must decode through the same `cicp_*` decoders the signalled
     /// report path uses, so a derived and a signalled label can never drift.
     #[test]
