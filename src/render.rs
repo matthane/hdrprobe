@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::model::{BitrateScope, ColorInfo, DolbyVision, Report, VideoTrack};
+use crate::model::{BitrateScope, ColorInfo, Report, VideoTrack};
 
 pub struct RenderOpts {
     pub color: bool,
@@ -415,7 +415,7 @@ fn track_sections(
                 } else {
                     String::new()
                 };
-                let profile = c.bright(&dv_profile_display(dv, t));
+                let profile = c.bright(&dv.profile.clone());
                 kv_styled(s, c, "Profile", &format!("{profile}{unconverted}"));
             }
 
@@ -727,7 +727,7 @@ pub fn render_quiet(r: &Report) -> String {
         .map(|(i, t)| {
             let mut parts = Vec::new();
             if let Some(dv) = &t.dolby_vision {
-                parts.push(format!("DV {}", dv_profile_display(dv, t)));
+                parts.push(format!("DV {}", dv.profile.clone()));
             }
             if let Some(hdr) = &t.hdr {
                 parts.push(hdr.format.clone());
@@ -966,104 +966,45 @@ fn video_line(g: &VideoTrack) -> String {
 }
 
 fn color_line(t: &VideoTrack) -> String {
-    // The profile-defined colour inferences inside apply only to video inputs: a
-    // metadata-only sidecar (no codec — the same signal that suppresses the Video
-    // line) has no base layer whose colour they could describe.
-    build_color_line(
-        &t.color,
-        t.dolby_vision.as_ref().map(|dv| dv.profile.as_str()),
-        !t.codec.is_empty(),
-    )
+    build_color_line(&t.color)
 }
 
-fn build_color_line(cc: &ColorInfo, dv_profile: Option<&str>, has_video: bool) -> String {
+/// The Color line: the model's colour description, rendered. Every value here
+/// is one the model resolved — signalled by the container or the coded stream,
+/// overridden by an SEI, or defined by the Dolby Vision profile and
+/// compatibility id (`dv::levels::fill_derived_color`). The renderer states no
+/// opinion of its own about what the colour *is*; the only judgments left are
+/// presentational.
+fn build_color_line(cc: &ColorInfo) -> String {
     let mut parts = Vec::new();
 
-    // Dolby Vision Profile 5 is spec-locked to Dolby's IPT-PQ-c2 colour space over
-    // BT.2020 primaries / PQ / full range — that's definitional, not signalled. The
-    // colour space can't be expressed in CICP, so the SPS carries "unspecified"
-    // (2/2/2) and only the range survives, leaving a bare "full". Any CICP a P5
-    // stream did happen to carry would be noise, so state the fixed profile colour.
-    // Match by prefix: the label carries the compat minor when a dvcC supplied one
-    // ("5.0"), but a raw elementary stream has no dvcC and labels bare ("5").
-    let is_p5 = has_video && dv_profile.is_some_and(|p| p.starts_with('5'));
-    // Profile 4's base layer is defined as Rec.709 SDR (VUI 0,1,1,1,0). Older P4
-    // muxes omit the colour description entirely (colour_description_present_flag=0),
-    // so the SPS yields no primaries/transfer at all — like the P5 case, state the
-    // profile-defined base colour rather than leave it blank. A P4 stream that *does*
-    // signal a colour description keeps its own values (this only fills the gap).
-    let is_p4 = has_video && dv_profile.is_some_and(|p| p.starts_with('4'));
-    let p4_colour_absent = is_p4 && cc.primaries.is_none() && cc.transfer.is_none();
-    if is_p5 {
-        // P5 is the case that must *not* collapse: its encoding (PQ) genuinely
-        // differs from its colour space (IPT-PQ-c2 over BT.2020), so all three show.
+    // Presentation policy, not inference: of the matrix coefficients, only
+    // Dolby's IPT-PQ-c2 (CICP 15) is worth naming on this line. It is the one
+    // that identifies a colour space the primaries and transfer alone do not
+    // describe — Profile 5 and Profile 20 both ride it — where every other
+    // matrix restates what the primaries already said.
+    if cc.matrix.as_deref() == Some("IPT-PQ-c2") {
         parts.push("IPT-PQ-c2".to_string());
-        parts.push("BT.2020".to_string());
-        parts.push("PQ (SMPTE ST 2084)".to_string());
-    } else {
-        // Dolby's IPT-PQ-c2 (CICP matrix 15) is the one matrix coefficient worth
-        // naming: it identifies the colour space of Profile 20 (MV-HEVC) DV, which —
-        // unlike P5 — signals valid primaries/transfer/range in its colr box.
-        if cc.matrix.as_deref() == Some("IPT-PQ-c2") {
-            parts.push("IPT-PQ-c2".to_string());
-        }
-        // Colour space (primaries) and encoding (transfer). For Profile 4 with no
-        // signalled colour description, both are the profile-defined Rec.709.
-        let primaries = if p4_colour_absent { Some("BT.709") } else { cc.primaries.as_deref() };
-        let transfer = if p4_colour_absent { Some("BT.709") } else { cc.transfer.as_deref() };
-        // When the colour space and encoding carry the same name (Rec.709 SDR: a
-        // BT.709 gamut with a BT.709 transfer), collapse the pair to one label
-        // instead of printing "BT.709 · BT.709". Distinct pairs (e.g. BT.2020 + PQ)
-        // both show.
-        match (primaries, transfer) {
-            (Some(p), Some(t)) if p == t => parts.push(p.to_string()),
-            _ => {
-                if let Some(p) = primaries {
-                    parts.push(p.to_string());
-                }
-                if let Some(t) = transfer {
-                    parts.push(t.to_string());
-                }
+    }
+    // Colour space (primaries) and encoding (transfer). When the two carry the
+    // same name (Rec.709 SDR: a BT.709 gamut with a BT.709 transfer), collapse
+    // the pair to one label instead of printing "BT.709 · BT.709". Distinct
+    // pairs (BT.2020 + PQ, and P5's IPT-PQ-c2 + BT.2020 + PQ) all show.
+    match (cc.primaries.as_deref(), cc.transfer.as_deref()) {
+        (Some(p), Some(t)) if p == t => parts.push(p.to_string()),
+        (p, t) => {
+            if let Some(p) = p {
+                parts.push(p.to_string());
+            }
+            if let Some(t) = t {
+                parts.push(t.to_string());
             }
         }
     }
     if let Some(m) = &cc.range {
         parts.push(m.clone());
-    } else if p4_colour_absent {
-        parts.push("limited".to_string());
     }
     parts.join(" · ")
-}
-
-/// The Dolby Vision Profile value as displayed (the text report's Profile line
-/// and the `--quiet` summary): the model's label, except that a bare number —
-/// a raw elementary stream, where no dvcC/dvvC *exists* to declare the
-/// compatibility minor — is completed when the digit is certain: "5" from the
-/// profile's definition (compat 0 is the only value P5 admits), "10" from the
-/// base layer's signalled CICP when that signal picks the digit airtight
-/// (`infer_p10_compat`). Video inputs only: a metadata sidecar has no base
-/// layer to read. Display-only opinion by design: the JSON `profile` /
-/// `bl_compatibility_id` / `compatibility` keep exactly what the mux declares
-/// (the bare number / null), so machine consumers get the raw facts and draw
-/// their own inferences.
-fn dv_profile_display(dv: &DolbyVision, track: &VideoTrack) -> String {
-    // A bare label implies no compat id was declared anywhere — a declared or
-    // XML-supplied id would already have rendered the minor digit.
-    if !track.codec.is_empty() {
-        // Profile 5 admits *only* compat 0 (IPT-PQ-c2, no cross-compatible
-        // base — Dolby's P&L spec), so a bare "5" (a raw ES with no dvcC)
-        // completes definitionally, no base-layer signal needed — the same
-        // definition `build_color_line` already states for its Color line.
-        if dv.profile == "5" {
-            return "5.0".to_string();
-        }
-        if dv.profile == "10" {
-            if let Some(id) = crate::dv::ccid::infer_ccid(10, &track.color) {
-                return format!("10.{id}");
-            }
-        }
-    }
-    dv.profile.clone()
 }
 
 fn fmt_num(v: f64) -> String {
@@ -1389,52 +1330,54 @@ mod tests {
         assert_eq!(parts.join(" "), cmd);
     }
 
-    /// P5's colour is definitional (never signalled), so the line must state it
-    /// whether the profile labels with a compat minor ("5.0", from a container
-    /// dvcC) or bare ("5", a raw elementary stream with no dvcC).
+    /// The Profile 5 shape, now assembled entirely from the model: the fill
+    /// supplies primaries/transfer/matrix, the stream supplies the range, and
+    /// the line must show all four because P5's encoding (PQ) genuinely differs
+    /// from its colour space (IPT-PQ-c2 over BT.2020).
     #[test]
-    fn p5_states_definitional_colour_for_both_label_shapes() {
-        for label in ["5.0", "5"] {
-            assert_eq!(
-                build_color_line(&range_only(), Some(label), true),
-                "IPT-PQ-c2 · BT.2020 · PQ (SMPTE ST 2084) · full",
-                "profile label {label}"
-            );
-        }
-    }
-
-    /// A metadata-only sidecar has no base layer, so the profile-defined colour
-    /// inferences (P5 IPT-PQ-c2, P4 Rec.709 SDR) must never fire for one.
-    #[test]
-    fn sidecar_gets_no_profile_defined_colour() {
-        assert_eq!(build_color_line(&ColorInfo::default(), Some("5"), false), "");
-        assert_eq!(build_color_line(&ColorInfo::default(), Some("4.2"), false), "");
-    }
-
-    /// Profile 20 signals real CICP in its colr box; the matrix name is prepended
-    /// to the signalled values rather than substituted for them.
-    #[test]
-    fn p20_keeps_signalled_cicp() {
+    fn the_ipt_matrix_prints_alongside_primaries_and_transfer() {
         let cc = ColorInfo {
             primaries: Some("BT.2020".to_string()),
             transfer: Some("PQ (SMPTE ST 2084)".to_string()),
             matrix: Some("IPT-PQ-c2".to_string()),
             range: Some("full".to_string()),
         };
-        assert_eq!(
-            build_color_line(&cc, Some("20.0"), true),
-            "IPT-PQ-c2 · BT.2020 · PQ (SMPTE ST 2084) · full"
-        );
+        assert_eq!(build_color_line(&cc), "IPT-PQ-c2 · BT.2020 · PQ (SMPTE ST 2084) · full");
     }
 
-    /// A P4 mux with no signalled colour description states the profile-defined
-    /// Rec.709 SDR base, collapsed to one label plus the default limited range.
+    /// Every other matrix restates what the primaries already said, so only the
+    /// IPT one is named.
     #[test]
-    fn p4_fills_absent_colour_description() {
-        assert_eq!(
-            build_color_line(&ColorInfo::default(), Some("4.2 (FEL)"), true),
-            "BT.709 · limited"
-        );
+    fn an_ordinary_matrix_is_not_named() {
+        let cc = ColorInfo {
+            primaries: Some("BT.2020".to_string()),
+            transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+            matrix: Some("BT.2020 NCL".to_string()),
+            range: Some("limited".to_string()),
+        };
+        assert_eq!(build_color_line(&cc), "BT.2020 · PQ (SMPTE ST 2084) · limited");
+    }
+
+    /// Rec.709 SDR: a BT.709 gamut with a BT.709 transfer collapses to one
+    /// label rather than printing the same name twice. This is the shape a
+    /// Profile 4 or 9 base layer takes once the model has filled it.
+    #[test]
+    fn a_matching_gamut_and_transfer_collapse_to_one_label() {
+        let cc = ColorInfo {
+            primaries: Some("BT.709".to_string()),
+            transfer: Some("BT.709".to_string()),
+            matrix: Some("BT.709".to_string()),
+            range: Some("limited".to_string()),
+        };
+        assert_eq!(build_color_line(&cc), "BT.709 · limited");
+    }
+
+    /// A track the model resolved nothing for — a metadata-only sidecar — has
+    /// an empty line, not an invented one.
+    #[test]
+    fn an_empty_colour_description_renders_nothing() {
+        assert_eq!(build_color_line(&ColorInfo::default()), "");
+        assert_eq!(build_color_line(&range_only()), "full");
     }
 
     fn opts(color: bool, file_index: usize, file_count: usize) -> RenderOpts {
