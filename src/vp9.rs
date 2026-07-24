@@ -133,7 +133,7 @@ fn color_info(color_space: u32, full_range: bool) -> ColorInfo {
         primaries: None,
         transfer: None,
         matrix: cicp.and_then(crate::container::cicp_matrix).map(str::to_string),
-        range: Some(if full_range { "full" } else { "limited" }.to_string()),
+        range: Some(crate::container::cicp_range(full_range).to_string()),
     }
 }
 

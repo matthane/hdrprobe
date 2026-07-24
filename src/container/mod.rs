@@ -500,7 +500,7 @@ pub(crate) fn color_from_vui(vui: &crate::hevc::sps::VuiColor) -> ColorInfo {
         primaries: cicp_primaries(vui.primaries as u16).map(str::to_string),
         transfer: cicp_transfer(vui.transfer as u16).map(str::to_string),
         matrix: cicp_matrix(vui.matrix as u16).map(str::to_string),
-        range: Some(if vui.full_range { "full" } else { "limited" }.to_string()),
+        range: Some(cicp_range(vui.full_range).to_string()),
     }
 }
 
@@ -598,6 +598,16 @@ pub(crate) fn cicp_transfer(v: u16) -> Option<&'static str> {
         18 => "HLG (ARIB STD-B67)",
         _ => return None,
     })
+}
+/// The `video_full_range_flag` label. Not a CICP code point, but it rides the
+/// same five-part VUI tuple as the three that are, and the DV spec tables in
+/// `dv::ccid` compare against it, so it shares their one decoder namespace.
+pub(crate) fn cicp_range(full_range: bool) -> &'static str {
+    if full_range {
+        "full"
+    } else {
+        "limited"
+    }
 }
 pub(crate) fn cicp_matrix(v: u16) -> Option<&'static str> {
     Some(match v {

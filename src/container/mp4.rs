@@ -844,7 +844,7 @@ fn parse_vpcc(data: &[u8], b: &BoxHdr) -> Option<VpccInfo> {
         primaries: super::cicp_primaries(data[p + 7] as u16).map(str::to_string),
         transfer: super::cicp_transfer(data[p + 8] as u16).map(str::to_string),
         matrix: super::cicp_matrix(data[p + 9] as u16).map(str::to_string),
-        range: Some(if full_range { "full" } else { "limited" }.to_string()),
+        range: Some(super::cicp_range(full_range).to_string()),
     };
     Some(VpccInfo {
         bit_depth,
@@ -872,7 +872,7 @@ fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<ColorInfo> {
         // stays None for the caller to recover from the SPS VUI.
         let range = if kind == b"nclx" && b.end >= p + 11 {
             let full = (data[p + 10] & 0x80) != 0;
-            Some(if full { "full".to_string() } else { "limited".to_string() })
+            Some(super::cicp_range(full).to_string())
         } else {
             None
         };

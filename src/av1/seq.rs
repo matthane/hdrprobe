@@ -268,7 +268,7 @@ fn parse_color_config(
         primaries: cicp_primaries(cp).map(str::to_string),
         transfer: cicp_transfer(tc).map(str::to_string),
         matrix: cicp_matrix(mc).map(str::to_string),
-        range: Some(if range_full { "full" } else { "limited" }.to_string()),
+        range: Some(crate::container::cicp_range(range_full).to_string()),
     };
 
     Some((bit_depth, chroma, color, color_description_present))

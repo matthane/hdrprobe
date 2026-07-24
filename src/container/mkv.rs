@@ -1241,8 +1241,7 @@ fn parse_colour(
             }
             ID_RANGE => {
                 color.range = match read_uint(data, p2, s) {
-                    1 => Some("limited".to_string()),
-                    2 => Some("full".to_string()),
+                    v @ (1 | 2) => Some(super::cicp_range(v == 2).to_string()),
                     _ => None,
                 }
             }

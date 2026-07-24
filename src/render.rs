@@ -1060,50 +1060,12 @@ fn dv_profile_display(dv: &DolbyVision, track: &VideoTrack) -> String {
             return "5.0".to_string();
         }
         if dv.profile == "10" {
-            if let Some(id) = infer_p10_compat(&track.color) {
+            if let Some(id) = crate::dv::ccid::infer_ccid(10, &track.color) {
                 return format!("10.{id}");
             }
         }
     }
     dv.profile.clone()
-}
-
-/// The compatibility minor for a bare Profile 10, deduced by elimination from
-/// the base layer's signalled CICP. Profile 10 admits compat ids {0, 1, 2, 4}
-/// (IPT / HDR10 / SDR / HLG bases), so an explicit base-layer colour signal
-/// leaves exactly one candidate — but only an *explicit* one:
-///
-/// - The IPT-PQ-c2 matrix (CICP 15) is Dolby's own colour system → 0.
-/// - An explicit SDR gamma transfer → 2. No matrix tag needed to exclude IPT:
-///   IPT-PQ-c2 is PQ-encoded by definition.
-/// - PQ → 1 and HLG → 4 additionally require BT.2020 primaries *and* an
-///   explicit non-IPT matrix: an IPT base is itself PQ-encoded and its
-///   signalling convention (inherited from Profile 5) leaves CICP
-///   unspecified, so PQ over an absent matrix is not airtight evidence of an
-///   HDR10 base — it could be a 10.0 stream tagging only its EOTF.
-///
-/// Anything less explicit returns `None` and the label stays bare. Matching
-/// on the closed label strings from `container::cicp_*` keeps this in one
-/// value space with the rest of the renderer.
-fn infer_p10_compat(cc: &ColorInfo) -> Option<u8> {
-    let matrix = cc.matrix.as_deref();
-    if matrix == Some("IPT-PQ-c2") {
-        return Some(0);
-    }
-    let transfer = cc.transfer.as_deref()?;
-    // The SDR gamma transfers `container::cicp_transfer` can name (BT.2020
-    // 10/12-bit are the wide-gamut SDR curves, same OETF family as BT.709).
-    if matches!(transfer, "BT.709" | "BT.601" | "BT.2020 (10-bit)" | "BT.2020 (12-bit)") {
-        return Some(2);
-    }
-    if cc.primaries.as_deref() != Some("BT.2020") || matrix.is_none() {
-        return None;
-    }
-    match transfer {
-        "PQ (SMPTE ST 2084)" => Some(1),
-        "HLG (ARIB STD-B67)" => Some(4),
-        _ => None,
-    }
 }
 
 fn fmt_num(v: f64) -> String {
@@ -1475,44 +1437,6 @@ mod tests {
             build_color_line(&ColorInfo::default(), Some("4.2 (FEL)"), true),
             "BT.709 · limited"
         );
-    }
-
-    fn cc(primaries: Option<&str>, transfer: Option<&str>, matrix: Option<&str>) -> ColorInfo {
-        ColorInfo {
-            primaries: primaries.map(str::to_string),
-            transfer: transfer.map(str::to_string),
-            matrix: matrix.map(str::to_string),
-            range: Some("limited".to_string()),
-        }
-    }
-
-    /// A fully explicit CICP picks the Profile 10 compat digit by elimination:
-    /// PQ over a real BT.2020 matrix can only be an HDR10 base (1), HLG an HLG
-    /// base (4), an SDR gamma transfer an SDR base (2), and the IPT-PQ-c2
-    /// matrix Dolby's own colour system (0).
-    #[test]
-    fn p10_compat_from_explicit_cicp() {
-        let pq = cc(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("BT.2020 NCL"));
-        assert_eq!(infer_p10_compat(&pq), Some(1));
-        let hlg = cc(Some("BT.2020"), Some("HLG (ARIB STD-B67)"), Some("BT.2020 NCL"));
-        assert_eq!(infer_p10_compat(&hlg), Some(4));
-        let sdr = cc(Some("BT.709"), Some("BT.709"), None);
-        assert_eq!(infer_p10_compat(&sdr), Some(2));
-        let ipt = cc(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("IPT-PQ-c2"));
-        assert_eq!(infer_p10_compat(&ipt), Some(0));
-    }
-
-    /// PQ without an explicit matrix is *not* airtight — an IPT (10.0) base is
-    /// itself PQ-encoded and conventionally leaves CICP unspecified — and an
-    /// empty colour block (a mux signalling nothing, or a sidecar) infers
-    /// nothing at all.
-    #[test]
-    fn p10_compat_declines_ambiguous_cicp() {
-        let pq_no_matrix = cc(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), None);
-        assert_eq!(infer_p10_compat(&pq_no_matrix), None);
-        let pq_no_primaries = cc(None, Some("PQ (SMPTE ST 2084)"), Some("BT.2020 NCL"));
-        assert_eq!(infer_p10_compat(&pq_no_primaries), None);
-        assert_eq!(infer_p10_compat(&ColorInfo::default()), None);
     }
 
     fn opts(color: bool, file_index: usize, file_count: usize) -> RenderOpts {
