@@ -13,7 +13,7 @@ use anyhow::{bail, Result};
 use crate::av1::obu::{obus, OBU_SEQUENCE_HEADER, OBU_TEMPORAL_DELIMITER};
 use crate::av1::seq::{parse_sequence_header, SeqInfo};
 use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream, TrackDemux};
-use crate::model::ColorInfo;
+use crate::model::{ColorInfo, ColorSource, ColorSources};
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
@@ -431,6 +431,7 @@ fn build_demux(
         bit_depth,
         chroma,
         codec_profile,
+        color_source: ColorSources::of(&color, ColorSource::Stream),
         color,
         chunks,
         // NalFormat::LengthPrefixed(0) is unused for AV1 (OBU-walked).

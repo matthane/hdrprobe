@@ -24,7 +24,7 @@
 use anyhow::{Context, Result};
 
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
-use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
+use crate::model::{Bitrate, ColorInfo, ColorSource, ColorSources, ContentLight, MasteringDisplay};
 use crate::prefetch::Frontier;
 
 // --- EBML element IDs (stored with their length-descriptor marker retained). ---
@@ -459,6 +459,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
             chroma: track.chroma,
             codec_profile: track.codec_profile,
             color: track.color,
+            color_source: track.color_source,
             dv_config: track.dv_config,
             dv_dual_track: g.dv_dual_track,
             mastering: track.mastering,
@@ -914,6 +915,7 @@ struct TrackInfo {
     width: u32,
     height: u32,
     color: ColorInfo,
+    color_source: ColorSources,
     mastering: Option<MasteringDisplay>,
     content_light: Option<ContentLight>,
     dv_config: Option<DvConfig>,
@@ -1010,6 +1012,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     // "unspecified") gets just the range from the same parameter set, keeping
     // the container's authority over primaries/transfer/matrix — the MP4
     // nclc-colr treatment.
+    let mut color_source = ColorSources::of(&color, ColorSource::Container);
     if color.transfer.is_none() || color.range.is_none() {
         let stream_color = match cc.codec {
             Codec::Hevc => super::color_from_hvcc(codec_private),
@@ -1020,8 +1023,12 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
         if let Some(c) = stream_color {
             if color.transfer.is_none() {
                 color = c;
+                color_source = ColorSources::of(&color, ColorSource::Stream);
             } else if color.range.is_none() {
                 color.range = c.range;
+                if color.range.is_some() {
+                    color_source.range = Some(ColorSource::Stream);
+                }
             }
         }
     }
@@ -1038,6 +1045,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
         width,
         height,
         color,
+        color_source,
         mastering,
         content_light,
         dv_config,
@@ -1181,9 +1189,15 @@ fn fill_vp9_stream_fields(track: &mut TrackDemux, data: &[u8]) {
         && track.color.matrix.is_none();
     if signalled_nothing {
         track.color.matrix = f.color.matrix.clone();
+        if track.color.matrix.is_some() {
+            track.color_source.matrix = Some(ColorSource::Stream);
+        }
     }
     if track.color.range.is_none() {
         track.color.range = f.color.range.clone();
+        if track.color.range.is_some() {
+            track.color_source.range = Some(ColorSource::Stream);
+        }
     }
 }
 
@@ -1762,6 +1776,7 @@ mod tests {
             width: w,
             height: w / 2,
             color: ColorInfo::default(),
+            color_source: ColorSources::default(),
             mastering: None,
             content_light: None,
             dv_config: dv,

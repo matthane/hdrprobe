@@ -16,7 +16,8 @@ use dolby_vision::rpu::vdr_dm_data::VdrDmData;
 use crate::container::DvConfig;
 use crate::dv::ccid;
 use crate::model::{
-    ActiveArea, CompatSource, DolbyVision, DvCensus, FelBrightnessExpansion, L6, LevelPresence,
+    ActiveArea, ColorSource, CompatSource, DolbyVision, DvCensus, FelBrightnessExpansion, L6,
+    LevelPresence,
     MasteringDisplay, MasteringPrimariesMismatch, MetadataCadence, TrimTarget,
 };
 
@@ -703,6 +704,55 @@ pub fn fill_inferred_compat(dv: &mut DolbyVision, color: &crate::model::ColorInf
     dv.compatibility = ccid::compatibility_label(id).map(str::to_string);
     dv.compat_source = Some(CompatSource::Inferred);
     dv.profile = dv_profile_label(profile, Some(id), dv.el_type.as_deref());
+}
+
+/// Fill the base layer's colour description from what the Dolby Vision profile
+/// and compatibility id define, for the fields nothing signalled. `main.rs` is
+/// the only caller, on the video path: a metadata-only sidecar has no base layer
+/// whose colour this could describe.
+///
+/// **Signalled always wins; this only fills absences.** A Profile 5 stream
+/// signals its range and nothing else — its colour space cannot be expressed in
+/// CICP at all, so the SPS carries "unspecified" — and a legacy Profile 4 mux
+/// often omits the colour description entirely. Those gaps are what this closes.
+/// Where a stream does signal a field, even one contradicting the table (the
+/// corpus has a declared 8.4 signalling full range against the table's limited),
+/// the signalled value stands untouched.
+///
+/// **Gated to a declared or spec-fixed compatibility id, never an inferred
+/// one.** An inferred id was deduced *from* this very colour description, so
+/// filling the description back from it would launder a deduction into three
+/// fields that read as facts, and would add nothing anyway: an id inferable at
+/// all implies the signal was largely present. The profile label and the colour
+/// fill therefore sit at deliberately different confidence bars.
+pub fn fill_derived_color(
+    color: &mut crate::model::ColorInfo,
+    sources: &mut crate::model::ColorSources,
+    dv: &DolbyVision,
+) {
+    if !matches!(dv.compat_source, Some(CompatSource::Declared | CompatSource::Spec)) {
+        return;
+    }
+    let (Some(profile), Some(id)) = (profile_major(&dv.profile), dv.bl_compatibility_id) else {
+        return;
+    };
+    let Some(vui) = ccid::defined_vui(profile, id) else { return };
+    let fill = |field: &mut Option<String>,
+                    source: &mut Option<ColorSource>,
+                    defined: Option<&str>| {
+        if let (None, Some(v)) = (&*field, defined) {
+            *field = Some(v.to_string());
+            *source = Some(ColorSource::Spec);
+        }
+    };
+    fill(&mut color.primaries, &mut sources.primaries, crate::container::cicp_primaries(vui.primaries));
+    fill(&mut color.transfer, &mut sources.transfer, crate::container::cicp_transfer(vui.transfer));
+    fill(&mut color.matrix, &mut sources.matrix, crate::container::cicp_matrix(vui.matrix));
+    fill(
+        &mut color.range,
+        &mut sources.range,
+        Some(crate::container::cicp_range(vui.range == 1)),
+    );
 }
 
 /// The profile major from a rendered label: `"8.1"` -> 8, `"7.6 (FEL)"` -> 7,

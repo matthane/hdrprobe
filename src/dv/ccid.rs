@@ -258,6 +258,18 @@ pub fn vui_rows(profile: u8, ccid: u8) -> &'static [Vui] {
     }
 }
 
+/// The VUI a profile's base layer carries under a given CCID, for filling in
+/// what a stream did not signal. The first of [`vui_rows`], which makes the
+/// choice **deliberately lossy in one place**: CCID 4 has two rows for profile
+/// 8, and this returns the ARIB one (transfer 18). The DVB variant (transfer 14)
+/// exists only as an explicitly signalled 14 paired with an alt-transfer SEI, so
+/// it can never be the right answer to "what did this stream leave out" — if 14
+/// is signalled there is nothing to fill. Both rows stay in the table because
+/// the reverse lookup needs them.
+pub fn defined_vui(profile: u8, ccid: u8) -> Option<Vui> {
+    vui_rows(profile, ccid).first().copied()
+}
+
 /// Deduce the CCID from the base layer's *signalled* VUI, for a profile whose
 /// definition does not fix one ([`spec_ccid`] resolves those without reading a
 /// stream at all). Returns a value only when exactly one admitted CCID has a

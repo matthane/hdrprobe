@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream, TrackDemux};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::{parse_sps, SpsInfo};
-use crate::model::ColorInfo;
+use crate::model::{ColorInfo, ColorSource, ColorSources};
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
@@ -78,6 +78,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         bit_depth,
         chroma,
         codec_profile,
+        color_source: ColorSources::of(&color, ColorSource::Stream),
         color,
         chunks,
         sps_chunk,

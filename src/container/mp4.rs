@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
-use crate::model::{ColorInfo, ContentLight, MasteringDisplay};
+use crate::model::{ColorInfo, ColorSource, ColorSources, ContentLight, MasteringDisplay};
 
 struct BoxHdr {
     typ: [u8; 4],
@@ -401,19 +401,25 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         let stereo = t.sd.stereo.clone().or_else(|| group_els.iter().find_map(|e| e.sd.stereo.clone()));
         // Colour: prefer signalling that actually resolved (a bare BL may omit
         // its colr box / carry only an SPS the base parse can't reach).
-        let color = if t.sd.color.transfer.is_some() {
-            t.sd.color.clone()
+        let (color, mut color_source) = if t.sd.color.transfer.is_some() {
+            (t.sd.color.clone(), t.sd.color_source)
         } else {
             group_els
                 .iter()
                 .find(|e| e.sd.color.transfer.is_some())
-                .map(|e| e.sd.color.clone())
-                .unwrap_or_else(|| t.sd.color.clone())
+                .map(|e| (e.sd.color.clone(), e.sd.color_source))
+                .unwrap_or_else(|| (t.sd.color.clone(), t.sd.color_source))
         };
         // Last resort for colour: recover the VUI colour from an in-band SPS in
         // this track's own samples (the `hev1` case), as TS does.
         let color = if color.transfer.is_none() {
-            color_from_stream(data, &t.chunks, t.sd.nal_len).unwrap_or(color)
+            match color_from_stream(data, &t.chunks, t.sd.nal_len) {
+                Some(c) => {
+                    color_source = ColorSources::of(&c, ColorSource::Stream);
+                    c
+                }
+                None => color,
+            }
         } else {
             color
         };
@@ -455,6 +461,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
             codec_profile: t.sd.codec_profile.clone(),
             stereo,
             color,
+            color_source,
             dv_config,
             dv_dual_track,
             mastering,
@@ -565,6 +572,7 @@ struct SampleDesc {
     chroma: Option<String>,
     nal_len: u8,
     color: ColorInfo,
+    color_source: ColorSources,
     dv_config: Option<DvConfig>,
     stereo: Option<String>,
     mastering: Option<MasteringDisplay>,
@@ -696,23 +704,30 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     // field — iPhone HLG/DV MOVs are the common case): the colr keeps authority
     // over primaries/transfer/matrix and just the VUI's video_full_range_flag
     // fills in, the same stream-sourced range MediaInfo reports for these files.
+    let mut color_source = ColorSources::of(&color, ColorSource::Container);
     if color.transfer.is_none() || color.range.is_none() {
-        let cfg_color = if let Some(h) = hvcc_bytes {
-            super::color_from_hvcc(h)
+        // The parameter-set forms are the coded stream's own signalling; `vpcC`
+        // is a container record carrying CICP directly, so it stays Container.
+        let (cfg_color, cfg_src) = if let Some(h) = hvcc_bytes {
+            (super::color_from_hvcc(h), ColorSource::Stream)
         } else if let Some(a) = avcc_bytes {
-            super::color_from_avcc(a)
+            (super::color_from_avcc(a), ColorSource::Stream)
         } else if let Some(v) = av1c_bytes {
-            super::color_from_av1c(v)
+            (super::color_from_av1c(v), ColorSource::Stream)
         } else {
             // `vpcC` carries the CICP triplet + range directly (VP9 has no
             // parameter set to embed), same fallback treatment.
-            vpcc_color
+            (vpcc_color, ColorSource::Container)
         };
         if let Some(c) = cfg_color {
             if color.transfer.is_none() {
                 color = c;
+                color_source = ColorSources::of(&color, cfg_src);
             } else if color.range.is_none() {
                 color.range = c.range;
+                if color.range.is_some() {
+                    color_source.range = Some(cfg_src);
+                }
             }
         }
     }
@@ -726,6 +741,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         chroma,
         nal_len,
         color,
+        color_source,
         dv_config,
         stereo,
         mastering,
@@ -1227,6 +1243,7 @@ mod tests {
                 chroma: Some("4:2:0".to_string()),
                 nal_len,
                 color: ColorInfo::default(),
+                color_source: ColorSources::default(),
                 dv_config: dv,
                 stereo: None,
                 mastering: None,

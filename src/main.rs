@@ -845,12 +845,22 @@ fn assemble_report(
 
         let hdr = Some(hdr::assemble(track, dv.as_ref(), &scan.sei));
 
-        // Reflect the HLG/PQ alt-transfer SEI override in the displayed colour line.
+        // Reflect the HLG/PQ alt-transfer SEI override in the displayed colour
+        // line. Deliberately after `hdr::assemble`, which reads the demuxed
+        // colour: nothing derived below may feed back into classification.
         let mut color = track.color.clone();
+        let mut color_source = track.color_source;
         if let Some(pt) = scan.sei.preferred_transfer {
             if let Some(t) = container::cicp_transfer(pt as u16) {
                 color.transfer = Some(t.to_string());
+                color_source.transfer = Some(model::ColorSource::Sei);
             }
+        }
+        // Last: the base-layer colour a Dolby Vision profile and compatibility
+        // id define outright, for the fields nothing signalled. Video path only
+        // — a metadata sidecar has no base layer to describe.
+        if let Some(dv) = dv.as_ref() {
+            dv::levels::fill_derived_color(&mut color, &mut color_source, dv);
         }
 
         video_tracks.push(model::VideoTrack {
@@ -875,6 +885,7 @@ fn assemble_report(
             chroma: track.chroma.clone(),
             stereo: track.stereo.clone(),
             color,
+            color_source,
             hdr,
             dolby_vision: dv,
             hdr10plus,

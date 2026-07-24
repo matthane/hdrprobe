@@ -1576,6 +1576,7 @@ mod tests {
                 chroma: Some("4:2:0".to_string()),
                 stereo: Some("Stereoscopic 3D (2 views)".to_string()),
                 color: ColorInfo::default(),
+                color_source: Default::default(),
                 hdr: None,
                 dolby_vision: None,
                 hdr10plus: None,
@@ -1612,6 +1613,7 @@ mod tests {
             chroma: None,
             stereo: None,
             color: ColorInfo::default(),
+            color_source: Default::default(),
             hdr: Some(crate::model::Hdr {
                 format: "SDR".to_string(),
                 mastering: None,

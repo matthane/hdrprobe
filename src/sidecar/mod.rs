@@ -238,6 +238,7 @@ fn build_report(
             chroma: None,
             stereo: None,
             color: ColorInfo::default(),
+            color_source: crate::model::ColorSources::default(),
             hdr: None,
             dolby_vision,
             hdr10plus,

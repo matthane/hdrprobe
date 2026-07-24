@@ -13,7 +13,7 @@ use std::path::Path;
 use anyhow::{bail, Result};
 
 use crate::bits::BitReader;
-use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
+use crate::model::{Bitrate, ColorInfo, ColorSource, ColorSources, ContentLight, MasteringDisplay};
 use crate::prefetch::Frontier;
 use crate::progress::Progress;
 
@@ -143,6 +143,11 @@ pub struct TrackDemux {
     /// ordinary monoscopic video. Only MV-HEVC (DV Profile 20) sets it today.
     pub stereo: Option<String>,
     pub color: ColorInfo,
+    /// Per-field provenance for `color`, tagged as each backend assembles it in
+    /// precedence order (container box/element first, then the coded stream's
+    /// own parameter set). The SEI override and the Dolby Vision spec fill are
+    /// added later, in `main.rs`, where those inputs exist.
+    pub color_source: ColorSources,
     pub dv_config: Option<DvConfig>,
     /// True when the base layer and Dolby Vision enhancement layer are carried on
     /// separate tracks/streams (MP4 dual-`trak`, TS dual-PID) rather than
@@ -205,6 +210,7 @@ impl TrackDemux {
             codec_profile: None,
             stereo: None,
             color: ColorInfo::default(),
+            color_source: ColorSources::default(),
             dv_config: None,
             dv_dual_track: false,
             mastering: None,
@@ -574,6 +580,7 @@ pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
         track.color.primaries = f.color.primaries;
         track.color.transfer = f.color.transfer;
         track.color.matrix = f.color.matrix;
+        track.color_source.tag(&track.color, ColorSource::Stream);
     }
 }
 

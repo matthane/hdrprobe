@@ -30,7 +30,7 @@ use crate::avc::nal as avc_nal;
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::{parse_sps, SpsInfo};
-use crate::model::{Bitrate, ColorInfo};
+use crate::model::{Bitrate, ColorInfo, ColorSource, ColorSources};
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
@@ -188,6 +188,8 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             bit_depth,
             chroma,
             codec_profile,
+            // TS carries no colour box: every field here is the in-band SPS VUI.
+            color_source: ColorSources::of(&color, ColorSource::Stream),
             color,
             dv_config: g.streams.iter().find_map(|e| e.dv_config.clone()),
             dv_dual_track: g.dv_dual_track,

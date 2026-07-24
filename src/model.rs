@@ -111,6 +111,8 @@ pub struct VideoTrack {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stereo: Option<String>,
     pub color: ColorInfo,
+    /// Where each `color` field came from, same field order.
+    pub color_source: ColorSources,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hdr: Option<Hdr>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -179,6 +181,72 @@ pub struct ColorInfo {
     pub matrix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range: Option<String>,
+}
+
+/// Where one field of `ColorInfo` came from. Per field rather than per object
+/// because the two genuinely differ: a Dolby Vision Profile 5 stream signals its
+/// range and nothing else, so its range is `Stream` while its primaries,
+/// transfer and matrix are `Spec`.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorSource {
+    /// A container colour box or element: MP4 `colr`/`vpcC`, MKV `Colour`.
+    Container,
+    /// The coded stream's own signalling: an SPS/sequence-header VUI, whether
+    /// read in band or from the parameter set embedded in a codec config record
+    /// (`hvcC`/`avcC`/`av1C`), or a VP9/ProRes frame header.
+    Stream,
+    /// An SEI message overriding the above — today only the HLG/PQ
+    /// `alternative_transfer_characteristic` message (SEI 147).
+    Sei,
+    /// Not signalled anywhere: supplied by the Dolby Vision profile and
+    /// compatibility id, which define the base layer's colour outright. Only
+    /// ever fills a field nothing signalled, and only when the compatibility id
+    /// was itself declared or spec-fixed — never when it was inferred from the
+    /// very colour this would be filling.
+    Spec,
+}
+
+/// Per-field provenance for `ColorInfo`, in the same field order. A field is
+/// tagged exactly when `ColorInfo` carries a value for it.
+#[derive(Debug, Serialize, Default, Clone, Copy)]
+pub struct ColorSources {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primaries: Option<ColorSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<ColorSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<ColorSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<ColorSource>,
+}
+
+impl ColorSources {
+    /// Every field the description carries, tagged with one source — the shape
+    /// a backend with a single colour input produces.
+    pub fn of(color: &ColorInfo, src: ColorSource) -> Self {
+        let mut sources = ColorSources::default();
+        sources.tag(color, src);
+        sources
+    }
+
+    /// Tag every field the description carries with `src`, overwriting any tag
+    /// already there. Call once per assembly step, in the same precedence order
+    /// the colour itself is assembled, so the last writer of a field wins.
+    pub fn tag(&mut self, color: &ColorInfo, src: ColorSource) {
+        if color.primaries.is_some() {
+            self.primaries = Some(src);
+        }
+        if color.transfer.is_some() {
+            self.transfer = Some(src);
+        }
+        if color.matrix.is_some() {
+            self.matrix = Some(src);
+        }
+        if color.range.is_some() {
+            self.range = Some(src);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -578,6 +646,12 @@ mod tests {
                 matrix: Some("BT.2020 NCL".to_string()),
                 range: Some("limited".to_string()),
             },
+            color_source: ColorSources {
+                primaries: Some(ColorSource::Container),
+                transfer: Some(ColorSource::Sei),
+                matrix: Some(ColorSource::Stream),
+                range: Some(ColorSource::Spec),
+            },
             hdr: Some(Hdr {
                 format: "Dolby Vision / HDR10".to_string(),
                 mastering: Some(MasteringDisplay {
@@ -739,6 +813,10 @@ mod tests {
             "video_tracks[].color.transfer",
             "video_tracks[].color.matrix",
             "video_tracks[].color.range",
+            "video_tracks[].color_source.primaries",
+            "video_tracks[].color_source.transfer",
+            "video_tracks[].color_source.matrix",
+            "video_tracks[].color_source.range",
             "video_tracks[].hdr.format",
             "video_tracks[].hdr.mastering.max_luminance",
             "video_tracks[].hdr.mastering.min_luminance",
