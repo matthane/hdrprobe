@@ -750,7 +750,7 @@ mod tests {
         // record header, then the sequence-header OBU whose color_config carries
         // CICP 9/16/9 limited (BT.2020 / PQ). mkvmerge wrote no MKV Colour
         // element for that file — this OBU is the only colour signal it has, and
-        // missing it misclassified the DV base (no "HDR10 (fallback)").
+        // missing it misclassified the DV base (no "HDR10" base tag).
         let av1c = [
             0x81, 0x0c, 0x4e, 0x00, // marker+version, Main profile L5.0, 10-bit 4:2:0
             0x0a, 0x0f, // OBU header: sequence header, 15-byte payload

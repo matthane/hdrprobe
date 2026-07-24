@@ -40,7 +40,14 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
 
     // A Dolby Vision title's cross-compatible base is decided by its
     // compatibility id, not by the base layer's raw transfer: the id *is* the
-    // declaration of what a non-DV decoder gets. Reading the transfer instead
+    // declaration of what a non-DV decoder gets. It is named exactly as every
+    // other layered format's base is ("HDR10+ / HDR10", "SL-HDR2 / HDR10"), with
+    // no editorial suffix: the reportable fact is whether a cross-compatible
+    // base exists at all, and the tag's *presence* already states it — which is
+    // why a CCID-0 title renders a bare "Dolby Vision". Where the distinction
+    // that suffix gestured at is real (a dual-layer P4/P7 base is not the full
+    // presentation) it is already reported precisely, and separately, by
+    // `dolby_vision.structure` and `el_type`. Reading the transfer instead
     // mis-classifies the two cases where the two disagree — a Profile 5 or 20
     // base is PQ-encoded in Dolby's own IPT-PQ-c2 space (id 0: nothing viewable
     // without a DV decoder), and a Profile 4 base is SDR however its container
@@ -49,17 +56,17 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
     let base = match dv {
         Some(_) => match ccid {
             Some(0) => None,
-            Some(1) | Some(6) => Some("HDR10 (fallback)"),
-            Some(2) => Some("SDR (fallback)"),
-            Some(4) => Some("HLG (fallback)"),
+            Some(1) | Some(6) => Some("HDR10"),
+            Some(2) => Some("SDR"),
+            Some(4) => Some("HLG"),
             // Unresolved (a Profile 8 whose carriage declares nothing and whose
             // VUI separates nothing) or an id outside the defined set: fall back
             // to whatever the base layer itself signals, which is all there is.
             _ => {
                 if is_pq {
-                    Some("HDR10 (fallback)")
+                    Some("HDR10")
                 } else if is_hlg {
-                    Some("HLG (fallback)")
+                    Some("HLG")
                 } else {
                     None
                 }
