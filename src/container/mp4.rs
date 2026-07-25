@@ -630,13 +630,42 @@ struct SampleDesc {
     cuvv_version_map: Option<u16>,
 }
 
+/// The pre-encryption sample-entry FourCC of a protected entry: `encv` →
+/// `sinf` → `frma` → the original format. `None` for an ordinary unprotected
+/// entry, whose own FourCC already is the format.
+///
+/// Only `encv` is unwrapped. `enca`/`encs`/`enct` are the audio, subtitle and
+/// text forms, and this backend reports video tracks only.
+fn original_format(data: &[u8], entry: &BoxHdr) -> Option<[u8; 4]> {
+    if &entry.typ != b"encv" {
+        return None;
+    }
+    // Children sit after the fixed VisualSampleEntry fields, as below.
+    let sinf = iter_boxes(data, entry.start + 86, entry.end);
+    let sinf = find(&sinf, b"sinf")?;
+    let frma = iter_boxes(data, sinf.payload, sinf.end);
+    let frma = find(&frma, b"frma")?;
+    let f = data.get(frma.payload..frma.payload + 4)?;
+    Some([f[0], f[1], f[2], f[3]])
+}
+
 fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     // stsd: version(1)+flags(3)+entry_count(4), then entries.
     let entries_start = stsd.payload + 8;
     let entries = iter_boxes(data, entries_start, stsd.end);
     let entry = entries.first().context("empty stsd")?;
 
-    let format = entry.typ;
+    // Under ISO/IEC 23001-7 common encryption the real sample-entry FourCC is
+    // swapped for `encv` and preserved in a `sinf`/`frma` box — both the Dolby
+    // HLS and MPEG-DASH carriage specs say so outright ("the fourCC string (for
+    // example, dvh1 for profile 5) must be replaced with encv"). Recover it, so
+    // an encrypted track reports its actual codec instead of the literal
+    // "encv". Everything else is unaffected: `sinf` is an *added* child, so the
+    // original `hvcC`/`avcC`/`dvcC` boxes stay where the walk below expects
+    // them. Sampling such a track is sound because both specs also require the
+    // NAL length fields, the nal_unit_type bytes, and the whole Dolby Vision
+    // RPU to be left unencrypted; only slice payload is ciphertext.
+    let format = original_format(data, entry).unwrap_or(entry.typ);
     let codec = match &format {
         b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => Codec::Hevc,
         // `avc2`/`avc4` are AVC2SampleEntry, which *Dolby Vision Streams Within
@@ -1638,6 +1667,31 @@ mod tests {
         let data = stsd_with_fourcc(*fourcc, children);
         let top = iter_boxes(&data, 0, data.len());
         parse_stsd(&data, &top[0]).unwrap().codec
+    }
+
+    /// A common-encryption `sinf` preserving `orig` as the original format.
+    fn sinf_box(orig: &[u8; 4]) -> Vec<u8> {
+        boxed(*b"sinf", &boxed(*b"frma", orig))
+    }
+
+    #[test]
+    fn encv_resolves_to_the_original_codec_via_sinf_frma() {
+        // ISO/IEC 23001-7 swaps the sample-entry FourCC for `encv` and keeps
+        // the real one in sinf/frma. Both Dolby streaming specs require it:
+        // "the fourCC string (for example, dvh1 for profile 5) must be
+        // replaced with encv".
+        assert_eq!(codec_of(b"encv", &[sinf_box(b"dvh1")]), Codec::Hevc);
+        assert_eq!(codec_of(b"encv", &[sinf_box(b"hvc1")]), Codec::Hevc);
+        assert_eq!(codec_of(b"encv", &[sinf_box(b"dvav")]), Codec::Avc);
+        assert_eq!(codec_of(b"encv", &[sinf_box(b"av01")]), Codec::Av1);
+        // The unwrap must not fabricate a codec when the chain is incomplete:
+        // no sinf, no frma, or a truncated frma each stay on the fallback.
+        let enc = Codec::Other("encv".to_string());
+        assert_eq!(codec_of(b"encv", &[]), enc);
+        assert_eq!(codec_of(b"encv", &[boxed(*b"sinf", &[])]), enc);
+        assert_eq!(codec_of(b"encv", &[boxed(*b"sinf", &boxed(*b"frma", b"dv"))]), enc);
+        // An unprotected entry is never unwrapped, even carrying a stray sinf.
+        assert_eq!(codec_of(b"hvc1", &[sinf_box(b"av01")]), Codec::Hevc);
     }
 
     #[test]
