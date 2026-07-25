@@ -589,7 +589,13 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let format = entry.typ;
     let codec = match &format {
         b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => Codec::Hevc,
-        b"avc1" | b"avc3" | b"dva1" | b"dvav" => Codec::Avc,
+        // `avc2`/`avc4` are AVC2SampleEntry, which *Dolby Vision Streams Within
+        // the ISO Base Media File Format* lists alongside `avc1`/`avc3` as a
+        // container for a dvcC/dvvC box (§3.1, §8.1.1). Without them such a
+        // track fell to `Codec::Other`, which reports the raw FourCC as the
+        // codec and — because the sampler has no arm for it — skips RPU
+        // scanning entirely, dropping the whole dynamic half of the report.
+        b"avc1" | b"avc3" | b"avc2" | b"avc4" | b"dva1" | b"dvav" => Codec::Avc,
         b"av01" | b"dav1" => Codec::Av1,
         b"vp09" => Codec::Vp9,
         // The six ProRes video profiles. ProRes RAW (`aprn`/`aprh`) is a
@@ -1504,16 +1510,44 @@ mod tests {
 
     /// An stsd holding one `hvc1` VisualSampleEntry with the given child boxes.
     fn stsd_with(children: &[Vec<u8>]) -> Vec<u8> {
+        stsd_with_fourcc(*b"hvc1", children)
+    }
+
+    /// As [`stsd_with`], with the sample entry's FourCC chosen by the caller.
+    fn stsd_with_fourcc(fourcc: [u8; 4], children: &[Vec<u8>]) -> Vec<u8> {
         let mut entry_payload = vec![0u8; 78]; // fixed VisualSampleEntry fields
         entry_payload[24..26].copy_from_slice(&3840u16.to_be_bytes()); // width (entry offset 32)
         entry_payload[26..28].copy_from_slice(&2160u16.to_be_bytes()); // height (entry offset 34)
         for c in children {
             entry_payload.extend_from_slice(c);
         }
-        let entry = boxed(*b"hvc1", &entry_payload);
+        let entry = boxed(fourcc, &entry_payload);
         let mut stsd_payload = vec![0, 0, 0, 0, 0, 0, 0, 1]; // ver/flags + entry_count
         stsd_payload.extend_from_slice(&entry);
         boxed(*b"stsd", &stsd_payload)
+    }
+
+    /// The `codec` a one-entry stsd with this sample-entry FourCC resolves to.
+    fn codec_of(fourcc: &[u8; 4], children: &[Vec<u8>]) -> Codec {
+        let data = stsd_with_fourcc(*fourcc, children);
+        let top = iter_boxes(&data, 0, data.len());
+        parse_stsd(&data, &top[0]).unwrap().codec
+    }
+
+    #[test]
+    fn avc2_and_avc4_sample_entries_are_avc() {
+        // AVC2SampleEntry is a dvcC/dvvC container per the Dolby ISOBMFF spec
+        // (§3.1 container list, §8.1.1), so it must resolve to AVC like its
+        // avc1/avc3 siblings rather than falling through to the raw-FourCC
+        // fallback, which also costs the track its RPU scan.
+        for f in [b"avc1", b"avc3", b"avc2", b"avc4", b"dva1", b"dvav"] {
+            assert_eq!(codec_of(f, &[]), Codec::Avc, "{}", String::from_utf8_lossy(f));
+        }
+        for f in [b"hvc1", b"hev1", b"dvh1", b"dvhe"] {
+            assert_eq!(codec_of(f, &[]), Codec::Hevc, "{}", String::from_utf8_lossy(f));
+        }
+        // An unrelated FourCC still falls through, reported verbatim.
+        assert_eq!(codec_of(b"mp4v", &[]), Codec::Other("mp4v".to_string()));
     }
 
     #[test]
