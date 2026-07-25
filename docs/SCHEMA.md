@@ -489,9 +489,20 @@ both sides resolved to a recognized gamut name and the names differ: the DV grad
 recognized L9 block (`dolby_vision.mastering_display.primaries` with `primaries_level` 9), and
 the base layer's own declared mastering primaries from a *signalled* container MDCV box or
 ST.2086 SEI (never a fallback value). Both names come from the same gamut matcher, so the
-comparison is exact. The classic trigger is re-encode drift, such as a BT.2020-claiming MDCV
-written by an encoder over a DCI-P3 D65 grade. Unrecognized coordinates on either side suppress
-the comparison entirely, and a metadata sidecar (no base layer) never carries the object.
+comparison is exact.
+
+The two sides describe the same thing: Dolby defines L9 as the primaries and white point of the
+mastering monitor used for the project, which is what an ST.2086 mastering display colour volume
+also describes. A difference therefore means one of the two is imprecise. It does **not** mean the
+stream is out of spec: the values come from different specifications written by different tools
+(L9 by the Dolby authoring tool, ST.2086 by the encoder or muxer), and no specification requires
+the pair to match. Dolby's studio spec attaches a matching requirement to colour *encoding*
+primaries and deliberately attaches none to the mastering display primaries. Both directions occur
+in the wild, including a P3-D65 base layer against a BT.2020 L9 in Dolby's own reference streams,
+so the flag reports a disagreement and asserts no cause for it.
+
+Unrecognized coordinates on either side suppress the comparison entirely, and a metadata sidecar
+(no base layer) never carries the object.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|

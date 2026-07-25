@@ -392,9 +392,23 @@ never parse bytes native-endian.
   quantization — never re-compare coordinates with a second tolerance). Hard gates: L9
   provenance only (`primaries_level == 9`, so a DV XML's L0 never fires), a signalled BL label
   only (never the L6 fallback, whose primaries *are* the L9 — self-comparison), both sides
-  recognized (unmatched coordinates suppress the verdict, never guess). The classic trigger is
-  re-encode drift (a BT.2020-claiming MDCV over a P3-D65 grade), so the badge is a provenance
-  observation, not an error claim. The third sibling is the **`Unconverted RPU` chip**
+  recognized (unmatched coordinates suppress the verdict, never guess). **The two sides really are
+  the same quantity** — Dolby's "Dolby Vision Metadata Levels" defines L9 as "the color primaries
+  and white point of the Mastering Monitor/Display used for the project", calculated from the
+  colorist's mastering-display selection, which is exactly what an ST.2086 mastering display colour
+  volume describes (L0's Mastering Display is that same display, which is why the `[L9]`/`[L0]`
+  tags on the DV Mastering line are not a conflation). Do not re-derive L9's meaning from observed
+  values: `<SourceColorPrimary>`, libdovi's per-shot `parse_level9_trim`, and the studio spec's
+  separate "Colour Encoding Primaries" row all *suggest* an encoding quantity, and that reading is
+  wrong — the encoding primaries are the VUI/container ones, and the RPU carries no such field.
+  **A difference is a quirk, not a spec violation**: the two values come from different
+  specifications written by different tools (L9 by the DV authoring tool, ST.2086 by the encoder or
+  muxer), nothing requires them to match, and Dolby's studio spec pointedly attaches "must match
+  corresponding video content" to colour *encoding* primaries while attaching no matching rule at
+  all to the mastering display primaries. So the badge is a provenance observation, not an error
+  claim — and **both directions occur**: the corpus's only firings are a P3-D65 base layer against
+  a BT.2020 L9 (the reverse of re-encode drift), in the `dv7fel_dt` frankenfile *and* in Dolby's
+  own OTT reference streams, so never re-document it as one-directional. The third sibling is the **`Unconverted RPU` chip**
   (`levels::finalize`, rendered on the Profile line, JSON
   `dolby_vision.unconverted_dual_layer_rpu`): the RPU carries the dual-layer NLQ composer
   payload (`el_type` is Some — that fingerprint exists only in P4/P7-authored RPUs) while the
