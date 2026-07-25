@@ -329,21 +329,11 @@ fn sniff_demux(
         return Some(ts::demux(data, full, progress, frontier));
     }
     match classify_start_code(data) {
-        Some(StartCode::AnnexB) => Some(annexb::demux(data, full, progress, frontier)),
-        // Routed away from the Annex-B backend but with no backend of their own
-        // yet, so they land on an honest error. Both were previously reported as
-        // `raw HEVC (Annex-B)`: the empty-video-section case at best, and at
-        // worst a fully-populated wrong answer, since a start-code scan over
-        // MPEG bytes finds byte patterns it reads as NAL headers and can parse
-        // one as an SPS. A real DVD VOB reported an HEVC profile, tier, level
-        // and bit depth with no HEVC anywhere in the file, off an MPEG audio PES
-        // header (`0xC2`, which `(b >> 1) & 0x3F` reads as NAL type 33).
-        Some(StartCode::ProgramStream) => Some(Err(anyhow!(
-            "unsupported container: MPEG program stream (MPEG-1 system / MPEG-2 PS)"
-        ))),
-        Some(StartCode::MpegVideoEs) => Some(Err(anyhow!(
-            "unsupported container: MPEG-1/2 or MPEG-4 Part 2 video elementary stream"
-        ))),
+        Some(StreamFamily::AnnexB) => Some(annexb::demux(data, full, progress, frontier)),
+        // Routed away from the Annex-B backend, which used to claim both and
+        // invent metadata from them (see `hevc::nal::emit_nal`), but with no
+        // backend of their own yet, so they land on an honest error.
+        Some(f) => Some(Err(anyhow!("unsupported container: {}", f.label()))),
         None => None,
     }
 }
@@ -360,19 +350,36 @@ pub(crate) fn sniffs_as_ts(data: &[u8]) -> bool {
     !earlier_check_wins && ts::detect_layout(data).is_some()
 }
 
-/// Which family owns a head that begins with an MPEG-style start code. The
-/// three-byte prefix `00 00 01` is shared by H.264/H.265 Annex-B, MPEG-1/2 and
-/// MPEG-4 Part 2 video, and the MPEG-1 system / MPEG-2 program stream layers,
-/// so the byte *after* the prefix is what tells them apart.
+/// Which stream family owns a head that begins with an MPEG-style start code.
+/// The three-byte prefix `00 00 01` is shared by H.264/H.265 Annex-B, MPEG-1/2
+/// and MPEG-4 Part 2 video, and the MPEG-1 system / MPEG-2 program stream
+/// layers, so the byte *after* the prefix is what tells them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartCode {
+enum StreamFamily {
     /// H.264 / H.265 Annex-B elementary stream.
     AnnexB,
     /// MPEG-1 system stream or MPEG-2 program stream: a pack, a system header,
     /// or (on a mid-file cut) a bare PES packet.
     ProgramStream,
-    /// Raw MPEG-1/2 or MPEG-4 Part 2 video elementary stream.
+    /// Raw MPEG-1/2 or MPEG-4 Part 2 video elementary stream. Deliberately one
+    /// verdict for both, because the byte after the prefix cannot always split
+    /// them: `0xB0`/`0xB1`/`0xB6` are Part 2 and reserved in MPEG-2, `0xB7`/
+    /// `0xB8` the reverse, but `0xB3` and `0xB5` are genuinely ambiguous, and
+    /// resolving those needs a scan for the first unambiguous code. The backend
+    /// that parses the stream makes that call.
     MpegVideoEs,
+}
+
+impl StreamFamily {
+    /// Human-readable name, so every backend that has to decline a stream of
+    /// this family declines it in the same words.
+    fn label(self) -> &'static str {
+        match self {
+            StreamFamily::AnnexB => "H.264/H.265 Annex-B elementary stream",
+            StreamFamily::ProgramStream => "MPEG program stream (MPEG-1 system / MPEG-2 PS)",
+            StreamFamily::MpegVideoEs => "MPEG-1/2 or MPEG-4 Part 2 video elementary stream",
+        }
+    }
 }
 
 /// Route a head beginning with a start code to the family that owns it.
@@ -380,21 +387,14 @@ enum StartCode {
 /// only reading their start code allows.
 ///
 /// The load-bearing rule: **H.264 and H.265 both open their NAL header with
-/// `forbidden_zero_bit`, which must be 0, and every MPEG-1/2, MPEG-4 Part 2 and
-/// MPEG system start code has bit 7 set.** So a value `>= 0x80` rules out
-/// Annex-B structurally rather than heuristically, and that half of the range
-/// is decided, not guessed. Below `0x80` the two spaces genuinely overlap and
-/// the answer is only as good as the plausibility check in
-/// [`nal_header_plausible`]; see the caveat there. `dev/sdr-format-reference.md`
-/// §9 is the source for the whole ladder.
-///
-/// This matters far less than the range split suggests, because a file's *first*
-/// start code is not an arbitrary draw: a raw MPEG video stream opens on a
-/// sequence header (`0xB3`) or a VOS (`0xB0`), a program stream on a pack
-/// (`0xBA`), and an Annex-B stream on an AUD, VPS or SPS. The overlap is
-/// reachable only by a stream cut mid-picture, which is exactly the case the
-/// caveat covers.
-fn classify_start_code(data: &[u8]) -> Option<StartCode> {
+/// `forbidden_zero_bit`, which must be 0 (H.264 §7.3.1, H.265 §7.3.1.2), while
+/// every MPEG-1/2, MPEG-4 Part 2 and MPEG system start code has bit 7 set
+/// (ISO/IEC 13818-2 Table 6-1, 13818-1 Table 2-18).** So a value `>= 0x80`
+/// rules out Annex-B structurally rather than heuristically, and that half of
+/// the range is decided, not guessed. Below `0x80` the two spaces genuinely
+/// overlap, and the answer is only as good as [`looks_like_nal_header`]; the
+/// caveat lives there.
+fn classify_start_code(data: &[u8]) -> Option<StreamFamily> {
     // MPEG-1/2 systems and video always write the 3-byte prefix, so the 4-byte
     // form is Annex-B's alone; classifying both through one rule costs nothing
     // and leaves no gap for a stream that leads with a zero byte.
@@ -409,33 +409,30 @@ fn classify_start_code(data: &[u8]) -> Option<StartCode> {
     let next = data.get(sc + 1).copied();
     Some(match value {
         // pack_start_code. The next byte pins the variant: `01xxxxxx` is an
-        // MPEG-2 pack, `0010xxxx` an MPEG-1 one. Anything else is not a pack
-        // header, so these bytes are not a program stream head, and saying
-        // nothing beats naming a format the bytes contradict. (Reference §9
-        // step 3a says "fall through" here, but its next rung explicitly
-        // excludes `0xBA`, so there is nothing to fall through to.)
+        // MPEG-2 pack (ISO/IEC 13818-1 §2.5.3.4), `0010xxxx` an MPEG-1 one
+        // (ISO/IEC 11172-1 §2.4.3.2). Anything else is not a pack header, so
+        // these bytes are not a program stream head, and saying nothing beats
+        // naming a format the bytes contradict.
         0xBA => match next {
-            Some(b) if b & 0xC0 == 0x40 || b & 0xF0 == 0x20 => StartCode::ProgramStream,
+            Some(b) if b & 0xC0 == 0x40 || b & 0xF0 == 0x20 => StreamFamily::ProgramStream,
             _ => return None,
         },
         // program_end, system header, program stream map, or any PES packet:
         // the system layer, or a cut that starts inside one.
-        0xB9 | 0xBB..=0xFF => StartCode::ProgramStream,
+        0xB9 | 0xBB..=0xFF => StreamFamily::ProgramStream,
         // Video-layer start codes (`0xB0`..`0xB8`: VOS, sequence header, GOP,
-        // extension and so on) and the high slice codes `0x80`..`0xAF`.
-        // Reference §9's ladder never assigns `0x80`..`0xAF`; ISO/IEC 13818-2
-        // Table 6-1 runs `slice_start_code` from `0x01` to `0xAF`, and the
-        // bit-7 rule already excludes Annex-B, so it belongs here.
-        0x80..=0xB8 => StartCode::MpegVideoEs,
+        // extension and so on) plus the high slice codes, since ISO/IEC 13818-2
+        // Table 6-1 runs `slice_start_code` from `0x01` all the way to `0xAF`.
+        0x80..=0xB8 => StreamFamily::MpegVideoEs,
         // `forbidden_zero_bit` is clear, so this could be a NAL header. MPEG's
         // picture start code (`0x00`) and its low slice codes (`0x01`..`0x7F`)
         // live here too, so validate, and read a failure as MPEG rather than
         // dispatching a backend that would invent metadata.
         _ => {
-            if nal_header_plausible(value, next) {
-                StartCode::AnnexB
+            if looks_like_nal_header(value, next) {
+                StreamFamily::AnnexB
             } else {
-                StartCode::MpegVideoEs
+                StreamFamily::MpegVideoEs
             }
         }
     })
@@ -444,30 +441,29 @@ fn classify_start_code(data: &[u8]) -> Option<StartCode> {
 /// Whether `b0` (with `b1`, the byte after it) can open an H.265 or H.264 NAL
 /// header. Called only where `forbidden_zero_bit` is already clear.
 ///
-/// **This is permissive, and knowing how permissive is the point.** The two
-/// codecs read the same byte differently, so a value only has to satisfy one of
-/// them, and the AVC reading alone admits every `b0` outside
-/// `{0x00, 0x20, 0x40, 0x60}`: 124 of the 128 values below `0x80`. For those
-/// four the HEVC reading still admits 224 of the 256 possible `b1`. Measured
-/// against real content by simulating a cut at every start code in
-/// `mpeg2.m2v`, `mpeg1.m1v` and a retail DVD VOB, 97.8% to 98.8% of the
-/// sub-`0x80` start codes in an MPEG stream would be accepted here.
+/// **Permissive by construction, and the margin is the point.** The two codecs
+/// read the same byte differently and a value need satisfy only one of them, so
+/// the AVC reading alone admits every `b0` except `{0x00, 0x20, 0x40, 0x60}`.
+/// Measured by simulating a cut at every start code in `mpeg2.m2v`, `mpeg1.m1v`
+/// and a retail DVD VOB, 97.8% to 98.8% of an MPEG stream's sub-`0x80` start
+/// codes pass here.
 ///
-/// Both readings have to stay, and neither may be tightened casually: a
-/// VPS-first HEVC stream (`b0 == 0x40`) survives only through the HEVC arm's
-/// `b1` test, and an H.264 AUD (`0x09`, whose `b1` is usually
-/// `primary_pic_type << 5`) survives only through the AVC arm. Requiring both
-/// would reject both.
+/// Both readings must stay, and neither may be tightened casually: a VPS-first
+/// HEVC stream (`b0 == 0x40`) survives only on the HEVC arm, and an H.264 AUD
+/// (`0x09`, whose `b1` is usually `primary_pic_type << 5`) only on the AVC arm,
+/// so requiring both would reject both.
 ///
-/// What keeps this honest in practice is that a whole file's first start code
-/// is never an arbitrary draw (see [`classify_start_code`]), and that
-/// `hevc::nal` and `avc::nal` reject `forbidden_zero_bit` a second time, so a
-/// stream that slips through here still reports nothing rather than something
-/// invented. Separating a mid-file cut properly needs a whole-head start-code
-/// census (reference §9's closing paragraph endorses transcribing ffmpeg's
-/// `mpegps_probe` thresholds); that belongs with the program stream backend,
-/// not here, and Phase 3 of `dev/sdr-coverage-plan.md` is where it lands.
-fn nal_header_plausible(b0: u8, b1: Option<u8>) -> bool {
+/// What keeps this honest is that a whole file's first start code is not an
+/// arbitrary draw: a raw MPEG video stream opens on a sequence header (`0xB3`)
+/// or a VOS (`0xB0`), a program stream on a pack (`0xBA`), and an Annex-B
+/// stream on an AUD, VPS or SPS, so the overlap is reachable only by a stream
+/// cut mid-picture. For that case `hevc::nal` and `avc::nal` reject
+/// `forbidden_zero_bit` a second time while splitting, so a stream slipping
+/// through here still reports nothing rather than something invented. Deciding
+/// a mid-file cut properly needs a whole-head start-code census, over the
+/// thresholds ffmpeg encodes in `libavformat/mpeg.c::mpegps_probe`; that
+/// belongs with a program stream backend, not here.
+fn looks_like_nal_header(b0: u8, b1: Option<u8>) -> bool {
     // HEVC: forbidden_zero(1) nal_unit_type(6) nuh_layer_id(6)
     // nuh_temporal_id_plus1(3). Types 41..=47 are reserved and never written,
     // and the temporal id is stored plus one, so a zero field is illegal. With
@@ -901,7 +897,7 @@ mod tests {
 
     #[test]
     fn start_code_discriminator_routes_on_the_byte_after_the_prefix() {
-        use StartCode::*;
+        use StreamFamily::{AnnexB, MpegVideoEs, ProgramStream};
 
         // Annex-B: an HEVC VPS (type 32 => 0x40, temporal id 1) behind the
         // 4-byte prefix, and an AVC SPS (0x67) behind the 3-byte one.
@@ -916,9 +912,12 @@ mod tests {
         // `0xBA` whose next byte fits neither pack form is not a pack at all.
         assert_eq!(classify_start_code(&[0, 0, 1, 0xBA, 0x99, 0x00]), None);
 
-        // Raw MPEG video: an MPEG-1/2 sequence header and a Part 2 VOS.
+        // Raw MPEG video: an MPEG-1/2 sequence header and a Part 2 VOS. A
+        // zero-padded MPEG head reads as a 4-byte start code and must land here
+        // too, which is why both prefix lengths run the same ladder.
         assert_eq!(classify_start_code(&[0, 0, 1, 0xB3, 0x02, 0xD0]), Some(MpegVideoEs));
         assert_eq!(classify_start_code(&[0, 0, 1, 0xB0, 0xF5]), Some(MpegVideoEs));
+        assert_eq!(classify_start_code(&[0, 0, 0, 1, 0xB3, 0x02, 0xD0]), Some(MpegVideoEs));
 
         // Not a start code, or too short to read the value byte.
         assert_eq!(classify_start_code(&[0x47, 0, 0, 1]), None);
@@ -942,8 +941,8 @@ mod tests {
         // backend. The second line of defence for that case is the
         // `forbidden_zero_bit` rejection in `hevc::nal` / `avc::nal`.
         let picture = [0, 0, 1, 0x00, 0x00, 0x0F, 0xFF, 0xF8];
-        assert_eq!(classify_start_code(&picture), Some(StartCode::MpegVideoEs));
-        assert!(!nal_header_plausible(0x00, Some(0x00)));
+        assert_eq!(classify_start_code(&picture), Some(StreamFamily::MpegVideoEs));
+        assert!(!looks_like_nal_header(0x00, Some(0x00)));
 
         // And the sniffer turns that into an error, never a report.
         let sniffed = sniff_demux(&picture, false, &Progress::off(), &Frontier::off());
@@ -981,10 +980,10 @@ mod tests {
         // admitted only by the HEVC reading; an H.264 AUD (`0x09`, whose next
         // byte is `primary_pic_type << 5`) has a zero HEVC temporal id and is
         // admitted only by the AVC reading. Requiring both would reject both,
-        // which is why `nal_header_plausible` ORs them.
-        assert!(nal_header_plausible(0x40, Some(0x01)));
+        // which is why `looks_like_nal_header` ORs them.
+        assert!(looks_like_nal_header(0x40, Some(0x01)));
         assert_eq!(0x40u8 & 0x1F, 0, "the AVC reading alone would reject a VPS");
-        assert!(nal_header_plausible(0x09, Some(0x10)));
+        assert!(looks_like_nal_header(0x09, Some(0x10)));
         assert_eq!(0x10u8 & 0x07, 0, "the HEVC reading alone would reject an AUD");
     }
 

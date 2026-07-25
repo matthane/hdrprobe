@@ -100,6 +100,30 @@ fn emit_nal(data: &[u8], start: usize, mut end: usize, on_nal: &mut impl FnMut(N
     on_nal(NalRef { nal_type: t, start, end });
 }
 
+/// Offset of the last NAL payload in `data`: the byte just past the final 3- or
+/// 4-byte start code, or `None` when the buffer holds no start code at all.
+///
+/// A bounded head walk uses this to name the NAL its window edge cuts. It must
+/// not infer that from the emitted list, because [`split_annexb`] skips a header
+/// whose `forbidden_zero_bit` is set, so the last emitted NAL is not reliably
+/// the cut one.
+pub fn last_nal_start(data: &[u8]) -> Option<usize> {
+    let n = data.len();
+    if n < 3 {
+        return None;
+    }
+    let mut i = n - 3;
+    loop {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            return Some(i + 3);
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
 /// Split a length-prefixed (HVCC / ISOBMFF) sample into NAL units.
 /// `nlen` is the NAL length field size in bytes (1..=4, from hvcC).
 ///
@@ -193,6 +217,24 @@ mod tests {
         assert_eq!(out.len(), 1, "only the SPS is a NAL");
         assert_eq!(out[0].nal_type, NAL_SPS);
         assert_eq!(data[out[0].start], 0x42);
+    }
+
+    #[test]
+    fn last_nal_start_finds_the_final_boundary_either_prefix_length() {
+        // 3-byte and 4-byte start codes both report the payload offset, and a
+        // buffer with no start code at all reports none.
+        assert_eq!(last_nal_start(&[0, 0, 1, 0x42, 0xAA, 0, 0, 1, 0x7C]), Some(8));
+        assert_eq!(last_nal_start(&[0, 0, 1, 0x42, 0xAA, 0, 0, 0, 1, 0x7C]), Some(9));
+        assert_eq!(last_nal_start(&[0x42, 0x01, 0xAA, 0xBB]), None);
+        assert_eq!(last_nal_start(&[0, 0]), None);
+        assert_eq!(last_nal_start(&[]), None);
+        // It reports the boundary regardless of whether that NAL would be
+        // emitted, which is the whole reason it exists.
+        let skipped = [0, 0, 1, 0x42, 0xAA, 0, 0, 1, 0xB3];
+        assert_eq!(last_nal_start(&skipped), Some(8));
+        let mut out = Vec::new();
+        split_annexb(&skipped, &mut out);
+        assert!(out.iter().all(|n| n.start != 8), "the bit-7 NAL is not emitted");
     }
 
     #[test]

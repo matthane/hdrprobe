@@ -74,7 +74,7 @@ fn push_nal(data: &[u8], start: usize, mut end: usize, out: &mut Vec<NalRef>) {
     }
     // `forbidden_zero_bit` is 0 in every H.264 NAL header, while every MPEG-1/2,
     // MPEG-4 Part 2 and MPEG system start code sets that bit. The same second
-    // line [`crate::hevc::nal`] draws, for the same reason.
+    // line `crate::hevc::nal` draws, and its comment carries the evidence.
     if data[start] & 0x80 != 0 {
         return;
     }
