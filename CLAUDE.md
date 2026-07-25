@@ -725,6 +725,16 @@ never parse bytes native-endian.
   mirroring the TS tail-PCR warm; keep the two in sync). Under `--full` the walk reaches `Tags`
   naturally. A track may carry several `Tag`s for one UID (e.g. SOURCE_ID before the statistics), so
   select the first entry with a usable value, not the first UID match.
+- **A closed stdout is a success signal, not an error.** `hdrprobe … | head` and `| less` (quit
+  early) are ordinary use, and `print!` *panics* on the write failure they produce — a Rust
+  backtrace over the user's terminal and exit 101, a code outside the tool's contract (0 ok,
+  1 usage, 2 unreadable) and outside the fuzz gate's asserted `{0,2}`. Every report write
+  therefore goes through `main::write_stdout`, which treats `ErrorKind::BrokenPipe` as the
+  consumer having read its fill: the streaming loop stops scanning (nobody is left to read the
+  remaining reports), the buffered tail write is skipped, and the run exits 0. This is the same
+  convention the *stdin* path documents from the other end — there hdrprobe is the reader and
+  the upstream writer sees the broken pipe, which `docs/INTEGRATION-STDIN.md` already calls the
+  normal success signal. Don't reintroduce a bare `print!` on the report path.
 - **Progress is `--full`-only, stderr-only, and single-threaded by design.** `main` resolves
   every `--progress` mode to `Off` unless `--full` is set (the fast path never reports), and
   nothing progress-related may ever write to stdout — SCHEMA.md promises stdout is the pure

@@ -270,13 +270,13 @@ fn main() -> ExitCode {
     if show_banner {
         let banner = render::render_banner(cli.theme);
         if banner_eager {
-            print!("{banner}");
-            let _ = std::io::stdout().flush();
+            write_stdout(&banner);
         } else {
             out_buf.push_str(&banner);
         }
     }
 
+    let mut stdout_gone = false;
     for (i, path) in paths.iter().enumerate() {
         let progress = progress::Progress::new(progress_mode, path, i + 1, paths.len());
         let result = if path.as_os_str() == "-" {
@@ -323,8 +323,13 @@ fn main() -> ExitCode {
                     }
                 }
                 if stream_reports {
-                    print!("{piece}");
-                    let _ = std::io::stdout().flush();
+                    if !write_stdout(&piece) {
+                        // The consumer stopped reading (`| head`). Nothing left
+                        // to say, and continuing would scan files whose reports
+                        // no one will see.
+                        stdout_gone = true;
+                        break;
+                    }
                 } else {
                     out_buf.push_str(&piece);
                 }
@@ -353,9 +358,11 @@ fn main() -> ExitCode {
     // so a clear here would wipe output the user is already reading. The
     // decorated interactive path stays clean anyway — `finish_erased` above
     // removes each file's progress display before its report prints.
-    if let Err(e) = write_output(&cli.output, &out_buf) {
-        eprintln!("error: writing output: {e}");
-        return ExitCode::from(1);
+    if !stdout_gone {
+        if let Err(e) = write_output(&cli.output, &out_buf) {
+            eprintln!("error: writing output: {e}");
+            return ExitCode::from(1);
+        }
     }
 
     if had_error {
@@ -980,10 +987,35 @@ fn write_output(output: &Option<PathBuf>, buf: &str) -> Result<()> {
             f.write_all(buf.as_bytes())?;
         }
         None => {
-            print!("{buf}");
+            write_stdout(buf);
         }
     }
     Ok(())
+}
+
+/// Write a piece of the report stream to stdout, treating a closed pipe as the
+/// consumer having read its fill rather than as a failure.
+///
+/// `hdrprobe … | head` and `| less` (quit early) are ordinary use, and the
+/// `print!` macro *panics* on the write error they produce — printing a Rust
+/// backtrace over the user's terminal and exiting 101, a code outside this
+/// tool's contract entirely (0 ok, 1 usage, 2 unreadable). This is the same
+/// convention the stdin path already documents from the other end of the pipe:
+/// when the far side stops, that is a success signal, not an error.
+///
+/// Returns `false` once stdout is gone, so callers stop writing rather than
+/// repeating the failure once per remaining file. A genuine write error (a full
+/// disk on a redirect) still reports itself and stops the stream.
+fn write_stdout(buf: &str) -> bool {
+    let mut out = std::io::stdout().lock();
+    match out.write_all(buf.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => false,
+        Err(e) => {
+            eprintln!("error: writing output: {e}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
