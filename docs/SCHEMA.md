@@ -333,18 +333,18 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 ### `ColorInfo`
 
 All four fields are optional; each is omitted when nothing signals it, nothing defines it, and
-no fallback names it — including when the input signals a code hdrprobe does not name.
+no fallback names it.
 
 | Field | Type | Values |
 |---|---|---|
 | `primaries` | string | `"BT.709"`, `"BT.470M"`, `"BT.601 (PAL)"`, `"BT.601 (NTSC)"`, `"SMPTE 240M"`, `"Film"`, `"BT.2020"`, `"XYZ (SMPTE ST 428-1)"`, `"DCI-P3"`, `"Display P3"`, `"EBU 3213-E"` |
 | `transfer` | string | `"BT.709"`, `"Gamma 2.2"`, `"Gamma 2.8"`, `"BT.601"`, `"SMPTE 240M"`, `"Linear"`, `"Log (100:1)"`, `"Log (316:1)"`, `"xvYCC (IEC 61966-2-4)"`, `"BT.1361"`, `"sRGB (IEC 61966-2-1)"`, `"BT.2020 (10-bit)"`, `"BT.2020 (12-bit)"`, `"PQ (SMPTE ST 2084)"`, `"SMPTE ST 428-1"`, `"HLG (ARIB STD-B67)"` |
 | `matrix` | string | `"RGB"`, `"BT.709"`, `"FCC"`, `"BT.601 (PAL)"`, `"BT.601 (NTSC)"`, `"SMPTE 240M"`, `"YCgCo"`, `"BT.2020 NCL"`, `"BT.2020 CL"`, `"SMPTE ST 2085"`, `"Chroma-derived NCL"`, `"Chroma-derived CL"`, `"ICtCp"`, `"IPT-PQ-C2"`, `"YCgCo-Re"`, `"YCgCo-Ro"` |
-
-Together these cover every code point ITU-T H.273 defines. A field is omitted only when the
-input signalled nothing, signalled the explicit "unspecified" code (2), or signalled a value
-H.273 reserves.
 | `range` | string | `"limited"`, `"full"` |
+
+The three CICP fields cover every code point ITU-T H.273 defines, so one of them is absent only
+when the input signalled nothing, signalled the explicit "unspecified" code (2), or signalled a
+value H.273 reserves.
 
 A value can reach this object three ways, and `color_source` says which per field:
 
@@ -755,7 +755,8 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   Inputs with no Dolby Vision metadata see only the new `color_source` object, with one
   unreachable-in-practice exception: a non-DV stream signalling CICP matrix 15 previously
   classified as `SDR` and now classifies on its transfer like any other stream.
-  Ships in hdrprobe 0.9.0.
+  Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
+  [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
   `video_tracks[].sl_hdr` object appears when an SL-HDR (ETSI TS 103 433) information SEI was
   found in an HEVC or AVC stream, carrying `mode`, `spec_version`, `payload_mode`, the
