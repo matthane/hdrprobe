@@ -270,7 +270,7 @@ errors rather than guessing.
 | `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID. Absent where no such id exists (raw elementary streams, sidecars) |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, or `"ProRes"`. The empty string `""` for metadata sidecars, which carry no video |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, or `"ProRes"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"`, or a Matroska CodecID such as `"V_MPEG2"`), so treat the list as the recognized set rather than a closed one |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |

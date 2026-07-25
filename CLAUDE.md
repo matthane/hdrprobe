@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 248 unit tests
+cargo test                     # 257 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -317,7 +317,16 @@ never parse bytes native-endian.
   from the coded stream's resolution and reported frame rate against the Dolby P&L table
   (`levels::fill_derived_level`, a main.rs-only post-pass like the Mastering badges; JSON-only
   via `dolby_vision.level_derived`, never text-rendered): the smallest level admitting the pixel
-  rate and width, a pixel-rate floor only (the bitrate/tier axis is not probed). A declared
+  rate and width, a pixel-rate floor only (the bitrate/tier axis is not probed — the level ID has
+  no tier field, so a bitrate cap can only ever say a stream is non-conformant *at* its level, and
+  feeding it to the selector would push a high-bitrate 1080p24 up to level 6; the axis is also
+  unavailable exactly where the derivation runs, since raw ES has no bitrate at all and TS has
+  only an `overall` one that counts audio). **`DV_LEVEL_LIMITS`' two columns come from two
+  different spec columns and disagree**: the rate is the row's anchor format (`w × h × fps`), but
+  the width is the row's own *Maximum decoded bitstream video width*, which is deliberately wider
+  than the anchor on levels 4 and 5 (2560 and 3840 against a 1920-wide anchor). Deriving the width
+  from the anchor instead reads plausible and silently pushes ultrawide-but-low-rate content up
+  two levels — take each column from the spec, never one from the other. A declared
   level always wins, sidecars never derive (assumed canvas), and no fps means no level — never
   a guess. The DV Mastering line's **luminance** is the DM header's
   `source_min_pq`/`source_max_pq` (present in every CM version); its **gamut** comes only from a
@@ -464,8 +473,14 @@ never parse bytes native-endian.
   multi-track arm ever sets a nonzero indent). A second video track/PID is a DV
   enhancement layer **only when its own config says so**: an MP4 trak / MKV TrackEntry whose
   dvcC has `bl_present == 0`, or a TS PID whose 0xB0 descriptor says `bl_present == 0` (its
-  `dependency_pid` names the BL PID it folds into) or that is DV-flagged with no video
-  stream_type (the bare EL/RPU PID shape). Such an EL folds into its base layer's track — chunks
+  `dependency_pid` names the BL PID it folds into). **A present 0xB0 descriptor is authoritative
+  and the stream type is not consulted**: §7.1.2 of the Dolby TS spec signals a legal single-PID
+  Profile 5 stream with PES-private `stream_type` 0x06 (its BL isn't SDR/HDR compliant, so it may
+  not claim 0x1B/0x24) *and* `bl_present_flag == 1`, so that PID is a base layer wearing a private
+  stream type. Only with **no** descriptor is the shape inferred — a DV-flagged PID carrying no
+  video stream_type is the bare EL/RPU PID. (Inferring it regardless was benign for a lone PID,
+  which the "only EL-shaped PIDs" fallback rescued, and merged two tracks into one when a sibling
+  video PID shared the program.) Such an EL folds into its base layer's track — chunks
   concatenated so the RPU is scanned, dvcC donated, per-track `dv_dual_track` set, rendering the
   `Structure` line's `Dual track, dual layer` (still gated behind `el_present` via
   `structure_str` in `levels::{finalize,container_only}`); anything else is an independent
@@ -567,7 +582,9 @@ never parse bytes native-endian.
   strips the **1-byte** AVC header, clears emulation prevention (`bits::ebsp_to_rbsp`), and calls
   `DoviRpu::parse_rpu` (which locates the `0x19` prefix). Don't route AVC through
   `parse_unspec62_nalu` — that strips a **2-byte** HEVC header. **Codec authority:** MP4 from the
-  sample entry (`avc1`/`avc3`/`dva1`/`dvav` → `Codec::Avc`), MKV from the `V_MPEG4/ISO/AVC` CodecID
+  sample entry (`avc1`/`avc3`/`avc2`/`avc4`/`dva1`/`dvav` → `Codec::Avc`; `avc2`/`avc4` are
+  AVC2SampleEntry, which the Dolby ISOBMFF spec lists beside `avc1`/`avc3` as a dvcC container),
+  MKV from the `V_MPEG4/ISO/AVC` CodecID
   (CodecPrivate is an `avcC`; `parse_avcc_record`'s embedded SPS supplies depth/chroma/profile —
   also what gives an SDR AVC MKV its 8-bit / Hi10P 10-bit report), TS from PMT `stream_type`
   (`0x1B` AVC vs
@@ -575,6 +592,29 @@ never parse bytes native-endian.
   bare DV/EL PID). P9 has no EL and an SDR base (CCID 2 ⇒ `SDR` in `hdr::assemble`, the
   same branch Profile 4 uses); its Rec.709 VUI (`0,1,1,1,0`) collapses to a single `BT.709` label
   because primaries == transfer (unlike P5, whose encoding differs from its colour space).
+- **An unrecognized sample-entry FourCC silently costs the whole dynamic report.** `Codec::Other`
+  has no arm in `sample.rs`, so the track is never scanned for RPUs: container facts survive
+  (`dvcC`/`hvcC`/`avcC` parse by box type) while every sampled DV level, the trim set, the cadence
+  verdict and the EL type vanish, and the codec renders as the raw FourCC. The MP4 sample-entry
+  match is therefore a correctness surface, not a cosmetic one. Two forms feed it that aren't the
+  obvious four: **`avc2`/`avc4`** (AVC2SampleEntry — the Dolby ISOBMFF spec's §3.1 container list,
+  §8.1.1 and box hierarchy all name it as a `dvcC`/`dvvC` container beside `avc1`/`avc3`), and
+  **`encv`**, the ISO/IEC 23001-7 common-encryption form, whose real FourCC is preserved in
+  `sinf`/`frma` and recovered by `mp4::original_format` *before* the codec match runs (both Dolby
+  streaming specs state the substitution outright). Reading an encrypted track is sound rather than
+  opportunistic: those same specs require the NAL length fields, the `nal_unit_type` bytes and the
+  **whole RPU** to stay unencrypted, so only slice payload is ciphertext, and `sinf` is an *added*
+  child so the original `hvcC`/`dvcC` sit where the walk already expects them. An incomplete chain
+  (no `sinf`, no `frma`, a truncated `frma`) stays on the fallback rather than guessing a codec.
+  Only `encv` is unwrapped — `enca`/`encs`/`enct` are media types this backend never reports.
+- **A DV enhancement layer folds by its `tref`/`vdep` reference, not by picture size.** §8.2.2 of
+  the Dolby ISOBMFF spec requires a dual-track file to name the dependency there, and it is the
+  exact analogue of the TS backend's `dependency_pid` — keep both carriage paths resolving the
+  fact the same way. ELs bucket per target, so a mux with several base traks routes each residual
+  by what it references. The widest-independent-trak heuristic stays as the fallback (plenty of
+  muxes omit `tref`) but must never outrank a resolvable reference, and a `vdep` naming a track the
+  file lacks falls back rather than dropping the EL. `vdep` carries no count field, so its entry
+  total is implied by the box extent and bounded by `MAX_TREF_REFS`.
 - **`--full` changes demux behaviour, not just sampling.** It threads into `container::demux(..,
   full)`: TS streams the whole video ES through the sampler in bounded `ts::STREAM_WINDOW_BYTES`
   windows — demux itself stays a head-window metadata pass, plus an SPS-rescue walk only when the
