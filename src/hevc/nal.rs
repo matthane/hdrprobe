@@ -84,12 +84,29 @@ fn emit_nal(data: &[u8], start: usize, mut end: usize, on_nal: &mut impl FnMut(N
     if end <= start {
         return;
     }
+    // `forbidden_zero_bit` is 0 in every H.265 NAL header, while every MPEG-1/2,
+    // MPEG-4 Part 2 and MPEG system start code sets that bit. Without the check
+    // a start-code scan over non-Annex-B bytes mints NAL types out of them, and
+    // some of those parse: a retail DVD VOB fed to this splitter reported an
+    // HEVC profile, tier, level and bit depth off an MPEG audio PES header
+    // (`0xC2`, which `(b >> 1) & 0x3F` reads as NAL type 33, an SPS).
+    // `container::classify_start_code` keeps sniffed input off this path in the
+    // first place; this is the second line, and it is what covers a stream that
+    // arrives by extension instead.
+    if data[start] & 0x80 != 0 {
+        return;
+    }
     let t = nal_type(data[start]);
     on_nal(NalRef { nal_type: t, start, end });
 }
 
 /// Split a length-prefixed (HVCC / ISOBMFF) sample into NAL units.
 /// `nlen` is the NAL length field size in bytes (1..=4, from hvcC).
+///
+/// Deliberately **not** guarded by the `forbidden_zero_bit` check the Annex-B
+/// path applies: the container declared both the codec and each NAL's length,
+/// so there is no start-code scan here to mint NAL units out of unrelated
+/// bytes. The asymmetry is intentional, not an oversight.
 pub fn split_length_prefixed(data: &[u8], nlen: u8, out: &mut Vec<NalRef>) {
     let nlen = nlen as usize;
     let mut i = 0usize;
@@ -161,6 +178,21 @@ mod tests {
         assert!(!ticks.is_empty(), "a walk past TICK_BYTES must tick");
         assert!(ticks.windows(2).all(|w| w[0] < w[1]));
         assert!(ticks.iter().all(|&p| p <= data.len()));
+    }
+
+    #[test]
+    fn forbidden_zero_bit_rejects_mpeg_start_codes() {
+        // An MPEG-2 sequence header (0xB3) and a program stream pack header
+        // (0xBA) both set bit 7, H.265's `forbidden_zero_bit`, so neither may
+        // become a NAL, while a real SPS in the same buffer still does.
+        let data = [
+            0, 0, 1, 0xB3, 0x02, 0xD0, 0, 0, 1, 0xBA, 0x44, 0, 0, 1, 0x42, 0x01, 0xAA,
+        ];
+        let mut out = Vec::new();
+        split_annexb(&data, &mut out);
+        assert_eq!(out.len(), 1, "only the SPS is a NAL");
+        assert_eq!(out[0].nal_type, NAL_SPS);
+        assert_eq!(data[out[0].start], 0x42);
     }
 
     #[test]

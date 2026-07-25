@@ -72,11 +72,21 @@ fn push_nal(data: &[u8], start: usize, mut end: usize, out: &mut Vec<NalRef>) {
     if end <= start {
         return;
     }
+    // `forbidden_zero_bit` is 0 in every H.264 NAL header, while every MPEG-1/2,
+    // MPEG-4 Part 2 and MPEG system start code sets that bit. The same second
+    // line [`crate::hevc::nal`] draws, for the same reason.
+    if data[start] & 0x80 != 0 {
+        return;
+    }
     out.push(NalRef { nal_type: nal_type(data[start]), start, end });
 }
 
 /// Split a length-prefixed (avcC / ISOBMFF) sample into NAL units. `nlen` is the
 /// NAL length field size in bytes (1..=4, from avcC `lengthSizeMinusOne + 1`).
+///
+/// Unguarded by the `forbidden_zero_bit` check for the same reason as
+/// [`crate::hevc::nal::split_length_prefixed`]: no start-code scan, no bogus
+/// NAL units to reject.
 pub fn split_length_prefixed(data: &[u8], nlen: u8, out: &mut Vec<NalRef>) {
     let nlen = nlen as usize;
     let mut i = 0usize;
@@ -147,6 +157,17 @@ mod tests {
         // RPU payload begins with the 0x19 rpu_nal_prefix right after the header.
         assert_eq!(data[out[1].start], 0x1C);
         assert_eq!(data[out[1].start + 1], 0x19);
+    }
+
+    #[test]
+    fn forbidden_zero_bit_rejects_mpeg_start_codes() {
+        // An MPEG-2 sequence header (0xB3) sets bit 7, H.264's
+        // `forbidden_zero_bit`, so it yields no NAL; the SPS beside it does.
+        let data = [0, 0, 1, 0xB3, 0x02, 0xD0, 0, 0, 1, 0x67, 0x42, 0xC0];
+        let mut out = Vec::new();
+        split_annexb(&data, &mut out);
+        assert_eq!(out.len(), 1, "only the SPS is a NAL");
+        assert_eq!(out[0].nal_type, NAL_SPS);
     }
 
     #[test]

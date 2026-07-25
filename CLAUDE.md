@@ -455,6 +455,32 @@ never parse bytes native-endian.
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),
   `sniff_demux` re-probes by magic bytes and is adopted only if a sniffed backend actually
   succeeds; otherwise the original, more specific error is surfaced.
+- **A leading `00 00 01` is not evidence of Annex-B; the sniffer routes on the byte after it.**
+  H.264 and H.265 open their NAL header with `forbidden_zero_bit`, which must be 0, while every
+  MPEG-1/2, MPEG-4 Part 2 and MPEG system start code sets bit 7, so `container::classify_start_code`
+  treats `>= 0x80` as a structural refutation of Annex-B rather than a heuristic: `0xBA` plus a
+  valid pack byte is a program stream, `0xB9`/`0xBB..=0xFF` the system layer, `0x80..=0xB8` a raw
+  MPEG video ES, and only the sub-`0x80` space is validated as a NAL header before dispatch.
+  `sniff_demux` returns an honest `Err` for the two MPEG families until their backends exist.
+  Before this, `.mpg`/`.vob`/`.m2v` all demuxed as `raw HEVC (Annex-B)`, and a retail DVD VOB
+  printed a *fully populated* HEVC profile, tier, level and bit depth built from an MPEG audio PES
+  header (`0xC2`, which `(b >> 1) & 0x3F` reads as NAL type 33). Two couplings are load-bearing.
+  `nal_header_plausible` ORs an AVC and an HEVC reading and must keep both: a VPS-first HEVC stream
+  survives only on the HEVC arm, an H.264 AUD only on the AVC arm, so requiring both would reject
+  both. And it is deliberately permissive (measured: roughly 98% of a *cut* MPEG stream's
+  sub-`0x80` start codes pass), which is why `hevc::nal`/`avc::nal` reject `forbidden_zero_bit` a
+  second time while splitting Annex-B, and why the *length-prefixed* splitters deliberately do not:
+  there the container already declared the codec and each NAL's length, so no start-code scan can
+  mint NAL units out of unrelated bytes. Separating a mid-file MPEG cut properly needs a whole-head
+  start-code census (ffmpeg's `mpegps_probe` thresholds), which belongs with a program stream
+  backend, not in the sniffer.
+- **A backend may leave `TrackDemux::chunks` empty.** `sample::scan` returns early when every
+  track's list is, so a metadata-only backend (its whole report served by container headers, no
+  bitstream side channel to sample) needs no chunk index, no sampler arm, and no progress or
+  frontier plumbing on the default path. That stops at the default path: a `--full` walk that must
+  read payload the default never touches still needs its own streaming plan on `Demux`, in the
+  `ts_stream`/`mkv_stream`/`raw_stream` shape. A backend that can cheaply name its first frame's
+  byte range should still fill a one-entry list, because the codec header parsers run over it.
 - **Stdin input (`hdrprobe -`) is head-only, sniff-dispatched, and lives entirely in main.rs.**
   `process_stdin` reads a bounded head into a heap buffer (`read_stdin_head`: a 64 KiB sniff
   block, then the format's budget + 1 byte — the extra byte is how truncation is detected) and
