@@ -392,12 +392,16 @@ never parse bytes native-endian.
   quantization — never re-compare coordinates with a second tolerance). Hard gates: L9
   provenance only (`primaries_level == 9`, so a DV XML's L0 never fires), a signalled BL label
   only (never the L6 fallback, whose primaries *are* the L9 — self-comparison), both sides
-  recognized (unmatched coordinates suppress the verdict, never guess). **The two sides really are
-  the same quantity** — Dolby's "Dolby Vision Metadata Levels" defines L9 as "the color primaries
-  and white point of the Mastering Monitor/Display used for the project", calculated from the
-  colorist's mastering-display selection, which is exactly what an ST.2086 mastering display colour
-  volume describes (L0's Mastering Display is that same display, which is why the `[L9]`/`[L0]`
-  tags on the DV Mastering line are not a conflation). Do not re-derive L9's meaning from observed
+  recognized (unmatched coordinates suppress the verdict, never guess). **Both sides are a mastering
+  display, but from different pipeline stages, so a difference does not make either one wrong.**
+  Dolby's "Dolby Vision Metadata Levels" defines L9 as "the color primaries and white point of the
+  Mastering Monitor/Display used for the project", calculated from the display "selection made by
+  the colorist *during the Dolby Vision content creation process*" — the DV pass, a step after the
+  base layer's own grade and often in a different suite with a different colorist working from a
+  delivered master. The base layer's ST.2086 describes *its* grade's display. Two accurate values
+  can therefore disagree, which is exactly why no spec requires them to match. (L0's Mastering
+  Display is the same DV-pass selection as L9, so the `[L9]`/`[L0]` tags on the DV Mastering line
+  are not a conflation.) Do not re-derive L9's meaning from observed
   values: `<SourceColorPrimary>`, libdovi's per-shot `parse_level9_trim`, and the studio spec's
   separate "Colour Encoding Primaries" row all *suggest* an encoding quantity, and that reading is
   wrong — the encoding primaries are the VUI/container ones, and the RPU carries no such field.

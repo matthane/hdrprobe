@@ -491,15 +491,20 @@ the base layer's own declared mastering primaries from a *signalled* container M
 ST.2086 SEI (never a fallback value). Both names come from the same gamut matcher, so the
 comparison is exact.
 
-The two sides describe the same thing: Dolby defines L9 as the primaries and white point of the
-mastering monitor used for the project, which is what an ST.2086 mastering display colour volume
-also describes. A difference therefore means one of the two is imprecise. It does **not** mean the
-stream is out of spec: the values come from different specifications written by different tools
-(L9 by the Dolby authoring tool, ST.2086 by the encoder or muxer), and no specification requires
-the pair to match. Dolby's studio spec attaches a matching requirement to colour *encoding*
-primaries and deliberately attaches none to the mastering display primaries. Both directions occur
-in the wild, including a P3-D65 base layer against a BT.2020 L9 in Dolby's own reference streams,
-so the flag reports a disagreement and asserts no cause for it.
+A difference here does **not** mean the stream is out of spec, and does not imply either value is
+wrong. The two sides describe the mastering display at **different stages of the pipeline**. The
+base layer's ST.2086 records the display its own grade was mastered on. L9 records, in Dolby's
+words, the display "selection made by the colorist *during the Dolby Vision content creation
+process*" — a later, separate step, frequently performed in a different suite and sometimes by a
+different colorist working from a delivered base-layer master. Two accurate values can therefore
+disagree.
+
+Consistent with that, the values are produced by different tools under different specifications (L9
+by the Dolby authoring tool, ST.2086 by the encoder or muxer), and no specification requires the
+pair to match: Dolby's studio spec attaches a matching requirement to colour *encoding* primaries
+and deliberately attaches none to the mastering display primaries. Both directions occur in the
+wild, including a P3-D65 base layer against a BT.2020 L9 in Dolby's own reference streams, so the
+flag reports the disagreement and asserts no cause for it.
 
 Unrecognized coordinates on either side suppress the comparison entirely, and a metadata sidecar
 (no base layer) never carries the object.
