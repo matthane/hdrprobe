@@ -547,10 +547,13 @@ never parse bytes native-endian.
   `ColorInfo` and `ColorSources` together through `container::color_from_cicp`, the one place
   that still sees the raw codes, and an unnamed code is marked `ColorSource::UnnamedCode` for
   the fill to skip. That marker is internal: `model::hidden` keeps it out of the report, so the
-  documented guarantee that `color` and `color_source` carry the same key set still holds. This
-  is reachable, not theoretical — the corpus ProRes frame header carries matrix 6. There is
-  deliberately no constructor deriving provenance from a finished `ColorInfo`; it could not
-  make the distinction, and a caller using one would relabel fields it never wrote. **The HEVC/AVC SPS parsers keep
+  documented guarantee that `color` and `color_source` carry the same key set still holds. The
+  `cicp_*` tables name every code H.273 defines, which keeps this class small — it now covers
+  only reserved values and code points added to the standard after this build — but *small is
+  not empty*, and the failure mode is silent: a wrong value reported as though nothing was
+  signalled. There is deliberately no constructor deriving provenance from a finished
+  `ColorInfo`; it could not make the distinction, and a caller using one would relabel fields
+  it never wrote. **The HEVC/AVC SPS parsers keep
   `video_full_range_flag` even when `colour_description_present_flag` is 0**, decoding the
   three CICP values as the 2 (unspecified) that H.264/H.265 Annex E infers for them: a stream
   may legally declare full range and nothing else, and dropping the flag with the description

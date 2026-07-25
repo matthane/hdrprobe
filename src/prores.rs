@@ -108,25 +108,21 @@ mod tests {
         let f = parse_frame_header(&CORPUS_HEADER).expect("corpus header");
         assert_eq!(f.chroma, "4:2:2");
         assert_eq!(f.bit_depth, 10);
-        // CICP 2/2 are unspecified and matrix 6 has no shared-table label, so
-        // all three stay None: the container must classify this file, the
-        // header can't.
+        // The header's primaries and transfer are CICP 2, "unspecified", so
+        // they stay empty and untagged — the state the Dolby Vision spec fill
+        // exists to complete. Its matrix is 6, which the shared table names, so
+        // it reports as an ordinary stream-sourced value. Real encodes leave
+        // these bytes unspecified routinely (the corpus MKV says 2/2/6 under
+        // BT.2020/PQ container signalling), which is why the container keeps
+        // authority and this only ever fills gaps.
         let (color, source) = f.color;
         assert!(color.primaries.is_none());
         assert!(color.transfer.is_none());
-        assert!(color.matrix.is_none());
+        assert_eq!(color.matrix.as_deref(), Some("BT.601 (NTSC)"));
         assert!(color.range.is_none(), "the header has no range field");
-        // But the two cases are not the same, and the provenance says so: the
-        // unspecified codes leave no tag, while matrix 6 is a code this header
-        // really carried and this build cannot name. Anything that fills absent
-        // colour must skip the third and may fill the first two.
         assert_eq!(source.primaries, None, "CICP 2 declines to say");
         assert_eq!(source.transfer, None, "CICP 2 declines to say");
-        assert_eq!(
-            source.matrix,
-            Some(crate::model::ColorSource::UnnamedCode),
-            "matrix 6 was signalled, just not nameable"
-        );
+        assert_eq!(source.matrix, Some(crate::model::ColorSource::Stream));
         assert_eq!(source.range, None, "the header has no range field");
     }
 

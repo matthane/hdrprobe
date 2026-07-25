@@ -633,24 +633,46 @@ pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
     }
 }
 
+/// ITU-T H.273 `colour_primaries`. Every code the standard defines is named:
+/// an unnamed code is indistinguishable in `ColorInfo` from an unsignalled one,
+/// which is a distinction the report should not have to make often. 2 stays
+/// unnamed on purpose — it *is* "unspecified" — as do the reserved values.
 pub(crate) fn cicp_primaries(v: u16) -> Option<&'static str> {
     Some(match v {
         1 => "BT.709",
+        4 => "BT.470M",
         5 => "BT.601 (PAL)",
         6 => "BT.601 (NTSC)",
+        7 => "SMPTE 240M",
+        8 => "Film",
         9 => "BT.2020",
+        10 => "XYZ (SMPTE ST 428-1)",
         11 => "DCI-P3",
         12 => "Display P3",
+        22 => "EBU 3213-E",
         _ => return None,
     })
 }
+/// ITU-T H.273 `transfer_characteristics`, named on the same principle as
+/// [`cicp_primaries`]. Note that no name here may contain "PQ" or "HLG" unless
+/// the curve really is one: `hdr::assemble` classifies on exactly that substring.
 pub(crate) fn cicp_transfer(v: u16) -> Option<&'static str> {
     Some(match v {
         1 => "BT.709",
+        4 => "Gamma 2.2",
+        5 => "Gamma 2.8",
         6 => "BT.601",
+        7 => "SMPTE 240M",
+        8 => "Linear",
+        9 => "Log (100:1)",
+        10 => "Log (316:1)",
+        11 => "xvYCC (IEC 61966-2-4)",
+        12 => "BT.1361",
+        13 => "sRGB (IEC 61966-2-1)",
         14 => "BT.2020 (10-bit)",
         15 => "BT.2020 (12-bit)",
         16 => "PQ (SMPTE ST 2084)",
+        17 => "SMPTE ST 428-1",
         18 => "HLG (ARIB STD-B67)",
         _ => return None,
     })
@@ -673,14 +695,29 @@ pub(crate) fn cicp_range(full_range: bool) -> &'static str {
 /// every mention across both revisions of Dolby's Profiles and Levels spec.
 pub(crate) const IPT_PQ_C2: &str = "IPT-PQ-C2";
 
+/// ITU-T H.273 `matrix_coefficients`, named on the same principle as
+/// [`cicp_primaries`]. Codes 5 and 6 carry identical coefficients and differ
+/// only in the document defining them, so they take the same practical names as
+/// the matching primaries.
 pub(crate) fn cicp_matrix(v: u16) -> Option<&'static str> {
     Some(match v {
         0 => "RGB",
         1 => "BT.709",
+        4 => "FCC",
+        5 => "BT.601 (PAL)",
+        6 => "BT.601 (NTSC)",
+        7 => "SMPTE 240M",
+        8 => "YCgCo",
         9 => "BT.2020 NCL",
         10 => "BT.2020 CL",
+        11 => "SMPTE ST 2085",
+        12 => "Chroma-derived NCL",
+        13 => "Chroma-derived CL",
+        14 => "ICtCp",
         // Dolby's IPT-PQ-C2 colour space, signalled by Profile 20 (MV-HEVC) colr.
         15 => IPT_PQ_C2,
+        16 => "YCgCo-Re",
+        17 => "YCgCo-Ro",
         _ => return None,
     })
 }
@@ -717,6 +754,105 @@ mod tests {
 
         assert!(!sniffs_as_ts(&[]));
         assert!(!sniffs_as_ts(&[0u8; 1024]));
+    }
+
+    /// Every code ITU-T H.273 defines has a name, cross-checked against
+    /// ffmpeg's own enum tables (`ffmpeg -h full`, the `color_primaries`,
+    /// `color_trc` and `colorspace` options). An unnamed code is
+    /// indistinguishable in `ColorInfo` from an unsignalled one, so the fewer
+    /// of them the better.
+    #[test]
+    fn cicp_tables_name_every_defined_code() {
+        for (code, name) in [
+            (1u16, "BT.709"),
+            (4, "BT.470M"),
+            (5, "BT.601 (PAL)"),
+            (6, "BT.601 (NTSC)"),
+            (7, "SMPTE 240M"),
+            (8, "Film"),
+            (9, "BT.2020"),
+            (10, "XYZ (SMPTE ST 428-1)"),
+            (11, "DCI-P3"),
+            (12, "Display P3"),
+            (22, "EBU 3213-E"),
+        ] {
+            assert_eq!(cicp_primaries(code), Some(name), "primaries {code}");
+        }
+        for (code, name) in [
+            (1u16, "BT.709"),
+            (4, "Gamma 2.2"),
+            (5, "Gamma 2.8"),
+            (6, "BT.601"),
+            (7, "SMPTE 240M"),
+            (8, "Linear"),
+            (9, "Log (100:1)"),
+            (10, "Log (316:1)"),
+            (11, "xvYCC (IEC 61966-2-4)"),
+            (12, "BT.1361"),
+            (13, "sRGB (IEC 61966-2-1)"),
+            (14, "BT.2020 (10-bit)"),
+            (15, "BT.2020 (12-bit)"),
+            (16, "PQ (SMPTE ST 2084)"),
+            (17, "SMPTE ST 428-1"),
+            (18, "HLG (ARIB STD-B67)"),
+        ] {
+            assert_eq!(cicp_transfer(code), Some(name), "transfer {code}");
+        }
+        for (code, name) in [
+            (0u16, "RGB"),
+            (1, "BT.709"),
+            (4, "FCC"),
+            (5, "BT.601 (PAL)"),
+            (6, "BT.601 (NTSC)"),
+            (7, "SMPTE 240M"),
+            (8, "YCgCo"),
+            (9, "BT.2020 NCL"),
+            (10, "BT.2020 CL"),
+            (11, "SMPTE ST 2085"),
+            (12, "Chroma-derived NCL"),
+            (13, "Chroma-derived CL"),
+            (14, "ICtCp"),
+            (15, "IPT-PQ-C2"),
+            (16, "YCgCo-Re"),
+            (17, "YCgCo-Ro"),
+        ] {
+            assert_eq!(cicp_matrix(code), Some(name), "matrix {code}");
+        }
+
+        // 2 is "unspecified" and must stay unnamed: `dv::levels` distinguishes
+        // it from an unnamed code to decide whether the spec fill may run.
+        assert_eq!(cicp_primaries(2), None);
+        assert_eq!(cicp_transfer(2), None);
+        assert_eq!(cicp_matrix(2), None);
+        // Reserved values name nothing either, and never guess.
+        for reserved in [0u16, 3, 13, 21, 23, 255] {
+            assert_eq!(cicp_primaries(reserved), None, "primaries {reserved} is reserved");
+        }
+        for reserved in [0u16, 3, 19, 255] {
+            assert_eq!(cicp_transfer(reserved), None, "transfer {reserved} is reserved");
+        }
+        for reserved in [3u16, 18, 255] {
+            assert_eq!(cicp_matrix(reserved), None, "matrix {reserved} is reserved");
+        }
+    }
+
+    /// `hdr::assemble` classifies a base layer by looking for "PQ" and "HLG" as
+    /// substrings of the transfer name, so no other curve may contain either.
+    #[test]
+    fn only_the_pq_and_hlg_curves_carry_those_substrings() {
+        for code in 0u16..=255 {
+            let Some(name) = cicp_transfer(code) else { continue };
+            assert_eq!(
+                name.contains("PQ"),
+                code == 16,
+                "transfer {code} ({name}) must not read as PQ"
+            );
+            assert_eq!(
+                name.contains("HLG"),
+                code == 18,
+                "transfer {code} ({name}) must not read as HLG"
+            );
+        }
     }
 
     #[test]
