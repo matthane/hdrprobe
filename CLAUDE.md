@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 219 unit tests
+cargo test                     # 248 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -119,7 +119,10 @@ never parse bytes native-endian.
   `infer_ccid`, the `hdr10_base` gate, the CCID label set, and the withdrawn 8.3/8.5
   pairings). **Every CCID/profile/VUI fact resolves here** — the change that created it
   existed to delete six hand-rolled projections of these tables, so a seventh is a
-  regression, not a shortcut. Rows hold codes, never display labels, and names come from
+  regression, not a shortcut. (Profile 8's `8.1` convention default is *not* one of those
+  facts: it is ecosystem practice rather than a spec-table row, which is why it legitimately
+  lives in `levels.rs` — in `resolve_compat` and `dv_profile_label` — and nowhere in the
+  tables.) Rows hold codes, never display labels, and names come from
   the shared `container::cicp_*` decoders so a derived label can't drift from a signalled
   one. The admitted-CCID sets are the **union across spec revisions** (v1.5 narrowed P8 to
   {1,4} and P10 to {0,1,4}; 8.2 content is everywhere) — narrowing would refuse to name
@@ -338,9 +341,10 @@ never parse bytes native-endian.
   descriptor through the ISOBMFF parser reads the compat nibble 16 bits early (P7 dual-PID showed
   a bogus `8` instead of `6`). The compat id becomes the profile's minor digit
   (`levels::dv_profile_label`: `7.6`, `8.1`, `10.4`, …). **Profile 4 is dual-layer** (like P7): its EL presence and MEL/FEL tag come from
-  the config + RPU the same way, and its **SDR base is inferred from the profile** in
-  `hdr::assemble` (P4 is SDR-compatible by definition) since old P4 muxes carry neither a compat
-  id nor a base-layer transfer VUI. The **reconstructed bit depth**
+  the config + RPU the same way, and its **SDR base comes from the spec rung**
+  (`ccid::spec_ccid(4)` is 2, P4 being SDR-compatible by definition), which is what covers old
+  P4 muxes carrying neither a compat id nor a base-layer transfer VUI — `hdr::assemble` itself
+  only reads the resolved id. The **reconstructed bit depth**
   (`model::DolbyVision::reconstructed_bit_depth`, the report's `Reconstruction` line) is the RPU
   header's signaled `vdr_bit_depth` read verbatim — **never assumed from the profile**: P7 FEL
   signals 12 but P4 FEL signals 14 (corpus-verified on every frame, in both the header and the DM
@@ -478,6 +482,19 @@ never parse bytes native-endian.
   mmap-backed multi-track files scan one merged file-ordered pass over `select_track_chunks`,
   the same selection `prefetch::warm_sample_chunks` replays) — never one pass per track, never
   a parallel reduce.
+- **The DVB form of CCID 4 is defined by an SEI, so inference reads the *effective* colour.**
+  Dolby's Table 2 gives CCID 4 a second row for Profile 8, transfer characteristic 14 — but the
+  defining sentence (v1.5 p10) is "a transfer characteristic VUI value of 14 ... (and optionally
+  1, 6, or 15) ... **when used with the alternative_transfer_characteristic SEI message, at every
+  random access point, with the preferred_transfer_function set to 18**". The SEI is
+  constitutive: 14 is chosen precisely so an SDR receiver reads the stream as SDR BT.2020, and
+  the SEI is the only thing that says otherwise, so a bare 14 is an ordinary SDR wide-gamut
+  curve and must resolve to *nothing*. `ccid::vui_rows` therefore omits the DVB row entirely
+  (it stays pinned by a test as documentation) and `main.rs` hands `fill_inferred_compat` the
+  colour with the SEI override already applied — a real DVB stream then reads transfer 18 and
+  matches the ARIB row, the same answer by the same table, and all four transfers the spec
+  admits for the variant are covered by one rule. Reading the raw VUI instead resolved a bare
+  14 to `8.4`, printing a report whose Color line said SDR while its Format line said HLG.
 - **Profile number authority.** libdovi's `dovi_profile` can't express AV1 P10 (returns 5/8),
   so `levels::finalize` takes the profile number from the container dvcC when present, else 10
   for AV1. Don't trust the RPU's profile field for the number.
@@ -497,9 +514,9 @@ never parse bytes native-endian.
   a guessed value. Everything else does fill them, which is why a raw P5 now reports `5.0`/id 0
   and a raw P10 HDR10 stream reports `10.1`/id 1 in **JSON as well as text** (the old
   `render::dv_profile_display` completion is deleted; the renderer states no opinion about
-  profile digits or colour any more). The metadata-only gate is likewise gone: `assumed` is
-  evidence-based, so a raw video P8 whose VUI can't separate CCID 1/2/4 is `assumed` for the
-  same reason a sidecar is. The **text report still drops the Profile line for metadata-only
+  profile digits or colour any more). The metadata-only gate is likewise gone: `assumed`
+  discloses its own lack of evidence, which is what made a separate flag redundant, so a raw
+  video P8 whose VUI can't separate CCID 1/2/4 is `assumed` for the same reason a sidecar is. The **text report still drops the Profile line for metadata-only
   sidecars** (`render.rs`) — an RPU is profile-agnostic and a DV XML's `GenerateProfile` is an
   authoring target, so a rendered profile would read as a fact the metadata doesn't carry. The
   P7 spec rung also covers the common *video* case of an untouched BDMV M2TS, which has **no
@@ -510,16 +527,23 @@ never parse bytes native-endian.
   `model::ColorSources` says which of `container`/`stream`/`sei`/`spec` produced each value it
   does carry (per field, not per object: a P5 stream signals its range and derives the other
   three). `levels::fill_derived_color` is a main.rs post-pass alongside `fill_derived_level`,
-  video inputs only, and has two hard gates. **Signalled always wins** — the fill only ever
+  video inputs only, and has **three** hard gates. **Signalled always wins** — the fill only ever
   touches an absent field, so the corpus's declared 8.4 signalling full range against the
   table's limited keeps `full`. And it runs on a **declared or spec id only, never an
   inferred one**: an inferred id was deduced *from* this colour description, so filling it back
   would launder a deduction into three fields that read as facts (and would add nothing — an
-  inferable id implies the signal was largely present). `dolby_vision.pq_reshaping` deliberately
+  inferable id implies the signal was largely present). Third, it requires a **base layer**
+  (`bl_present`): a Table B row describes a base layer's VUI, and a P4 EL's own VUI is
+  byte-identical to a P5 base layer, so stating it over an EL-only track would describe a
+  stream that is not there. `dolby_vision.pq_reshaping` deliberately
   does *not* share that gate: it fires on a resolved CCID 0 from any rung, because it is new
   information rather than a back-fill, and Dolby's footnote keys on exactly that condition.
   Order matters in `main.rs`: `hdr::assemble` runs on the *demuxed* colour before any of this,
-  so nothing derived can feed back into classification.
+  so nothing derived can feed back into classification. **The HEVC/AVC SPS parsers keep
+  `video_full_range_flag` even when `colour_description_present_flag` is 0**, decoding the
+  three CICP values as the 2 (unspecified) that H.264/H.265 Annex E infers for them: a stream
+  may legally declare full range and nothing else, and dropping the flag with the description
+  would let the spec fill state the *opposite* range as though nothing had been signalled.
 - **AVC (Profile 9) RPU is found by *content*, not by NAL number.** The DV RPU rides in an H.264
   *unspecified* NAL (Dolby uses type 28; the range is 24..=31), payload = the RPU EBSP beginning
   with the `rpu_nal_prefix` byte `0x19`. `sample.rs` treats an unspecified-range NAL as an RPU only

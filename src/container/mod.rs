@@ -577,10 +577,22 @@ pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
         track.chroma = Some(f.chroma.to_string());
     }
     if signalled_nothing {
+        // Field by field, never `ColorSources::tag`: that tags every field the
+        // description carries, and this fill never writes `range` (the frame
+        // header has none), so a container-supplied range would be relabelled
+        // as stream-sourced.
         track.color.primaries = f.color.primaries;
         track.color.transfer = f.color.transfer;
         track.color.matrix = f.color.matrix;
-        track.color_source.tag(&track.color, ColorSource::Stream);
+        if track.color.primaries.is_some() {
+            track.color_source.primaries = Some(ColorSource::Stream);
+        }
+        if track.color.transfer.is_some() {
+            track.color_source.transfer = Some(ColorSource::Stream);
+        }
+        if track.color.matrix.is_some() {
+            track.color_source.matrix = Some(ColorSource::Stream);
+        }
     }
 }
 

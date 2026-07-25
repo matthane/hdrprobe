@@ -5,6 +5,12 @@
 
 use crate::bits::{ebsp_to_rbsp, BitReader};
 
+/// The CICP code point meaning "unspecified", shared by primaries, transfer and
+/// matrix. Also what H.264/H.265 Annex E *infers* for all three when the VUI
+/// carries no `colour_description`, which is why a range-only VUI decodes to
+/// this triplet rather than to nothing.
+pub const UNSPECIFIED_CICP: u8 = 2;
+
 /// CICP colour signalling from the SPS VUI (`colour_description` + range).
 #[derive(Debug, Clone, Copy)]
 pub struct VuiColor {
@@ -238,13 +244,16 @@ fn parse_vui_inner(
         // video_signal_type_present_flag
         r.skip_bits(3)?; // video_format
         let full_range = r.read_bits(1)? == 1;
-        if r.read_bits(1)? == 1 {
-            // colour_description_present_flag
-            let primaries = r.read_bits(8)? as u8;
-            let transfer = r.read_bits(8)? as u8;
-            let matrix = r.read_bits(8)? as u8;
-            out.color = Some(VuiColor { primaries, transfer, matrix, full_range });
-        }
+        // `colour_description_present_flag`. When it is 0 the three CICP values
+        // are *inferred* as 2 (unspecified) per H.265 Annex E, but
+        // `video_full_range_flag` was signalled either way and must not be lost
+        // with them: a stream can legally declare full range and nothing else.
+        let (primaries, transfer, matrix) = if r.read_bits(1)? == 1 {
+            (r.read_bits(8)? as u8, r.read_bits(8)? as u8, r.read_bits(8)? as u8)
+        } else {
+            (UNSPECIFIED_CICP, UNSPECIFIED_CICP, UNSPECIFIED_CICP)
+        };
+        out.color = Some(VuiColor { primaries, transfer, matrix, full_range });
     }
     if r.read_bits(1)? == 1 {
         // chroma_loc_info_present_flag

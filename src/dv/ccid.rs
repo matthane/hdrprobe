@@ -30,14 +30,40 @@
 //! (p10, p11) gives the profile 4 EL and profile 5 BL VUI as `2,2,2,1,0`,
 //! transposed against its own table and its own prose (`1,2,2,2,0`, decoded on
 //! p9 as "full-range, unspecified, unspecified, unspecified, and center-left
-//! siting"). v1.5 fixed the note. The tables are authoritative here.
+//! siting"). Fixed in **v1.3.6**, whose changelog lists "Errata related to
+//! section 2.1.1 Note to profiles in Notes to Profile 5" — v1.4 already carries
+//! the corrected `1,2,2,2,0`. The tables are authoritative here.
+//!
+//! **The DVB variant of CCID 4 is not in [`vui_rows`] either**, and its absence
+//! is load-bearing. v1.5 p10 defines it as a transfer characteristic of 14
+//! "(and optionally 1, 6, or 15) ... **when used with the
+//! alternative_transfer_characteristic SEI message, at every random access
+//! point, with the preferred_transfer_function set to 18**". The SEI is
+//! constitutive, not incidental: transfer 14 is chosen precisely so that an SDR
+//! receiver reads the stream as SDR BT.2020, and the SEI is the only thing that
+//! says otherwise. A bare 14 with no such SEI is an ordinary SDR wide-gamut
+//! curve and must resolve to nothing.
+//!
+//! Rather than carry the row plus an SEI condition, the caller resolves it: the
+//! inference reads the base layer's *effective* colour, with the SEI override
+//! already applied (`main.rs`). A DVB stream therefore arrives with its transfer
+//! reading 18 and matches the ARIB row, which is the same answer by the same
+//! table; and all four transfers the spec admits for the row (14, 1, 6, 15) are
+//! handled by one rule instead of four. A stream that signals 14 and no SEI
+//! matches nothing, which is correct. The row is pinned by a test below so the
+//! table stays complete as documentation.
 //!
 //! **Enhancement-layer rows are not in [`vui_rows`]** (which describes base
-//! layers only), but they exist and are pinned by the tests below: v1.3.2 gives
-//! the profile 4 EL as `1,2,2,2,0` — byte-identical to a profile 5 base layer,
-//! which is why a P4 enhancement layer read in isolation is indistinguishable
-//! from P5 — and both revisions give the profile 7 EL as `0,9,16,9,2`, the same
-//! as its base layer.
+//! layers only), but they exist and are pinned by the tests below: v1.3.2 and
+//! v1.4 give the profile 4 EL as `1,2,2,2,0` — byte-identical to a profile 5
+//! base layer, which is why a P4 enhancement layer read in isolation is
+//! indistinguishable from P5 — and every revision gives the profile 7 EL as
+//! `0,9,16,9,2`, the same as its base layer. v1.5 dropped the P4 EL row when it
+//! deprecated profile 4.
+//!
+//! **Citation trap.** Annex I's table is "Table 6" in v1.3.2 and v1.5 but
+//! **"Table 7" in v1.4**, where "Table 6" is an unrelated mapping of Dolby
+//! profiles to ETSI CCM profiles. Cite v1.4's Annex I as Table 7 or not at all.
 
 use crate::container::{cicp_matrix, cicp_primaries, cicp_transfer};
 use crate::model::ColorInfo;
@@ -84,12 +110,19 @@ pub fn profile_ccid(profile: u8) -> Option<ProfileCcid> {
         5 => Fixed(0),  // dvhe.05, 10-bit HEVC single-layer
         6 => Fixed(1),  // dvhe.dth, 10-bit HEVC 1:1/4
         7 => Fixed(6),  // dvhe.07, Blu-ray dual layer
-        // v1.3.2/v1.4 Table 1: "1, 2, or 4"; v1.5 narrowed to "1 or 4". 8.2 is
-        // widely deployed, so keep the union. (8.3 and 8.5 are separately
-        // withdrawn — see `deprecated_combination`.)
+        // v1.3.2/v1.4 Table 1: "1, 2, or 4"; v1.5 narrowed to "1 or 4", and its
+        // changelog is explicit about why: "Deprecated use of CCID = 2 with
+        // Dolby Vision profiles 8 and 10. (Note that Dolby Vision profile 9.2
+        // is still supported)". Keep the union anyway — 8.2 is a widely
+        // deployed distribution format and was fully current under the
+        // revisions it was authored against. It is deliberately *not* reported
+        // as a withdrawn pairing either: Dolby moved profile 4 into Annex I
+        // when deprecating it but left 8.2 out, so following Annex I exactly
+        // is the spec's own signal (see `deprecated_combination`).
         8 => Variable(&[1, 2, 4]),
         9 => Fixed(2),  // dvav.09, 8-bit AVC single-layer
-        // v1.4 Table 1: "0, 1, 2, or 4"; v1.5 narrowed to "0, 1 or 4".
+        // v1.4 Table 1: "0, 1, 2, or 4"; v1.5 narrowed to "0, 1 or 4" under the
+        // same CCID-2 deprecation as profile 8 above. Union, same reasoning.
         10 => Variable(&[0, 1, 2, 4]),
         // v1.4 Table 1: "0"; v1.5 widened to "0 or 4".
         20 => Variable(&[0, 4]),
@@ -139,6 +172,13 @@ pub fn compatibility_label(ccid: u8) -> Option<&'static str> {
 /// Whole profiles Annex I lists (0, 1, 2, 3, 4, 6) are deliberately *not* here:
 /// hdrprobe reports plenty of Profile 4 and 7 content and "legacy" is not a
 /// defect. This flags only the pairings, which no encoder should now produce.
+///
+/// **8.2 and 10.2 are deliberately absent too**, although v1.5's changelog says
+/// "Deprecated use of CCID = 2 with Dolby Vision profiles 8 and 10". Dolby moved
+/// profile 4 *into* Annex I when deprecating it and left those pairings out, so
+/// Annex I membership is the spec's own line and this follows it. 8.2 is also a
+/// widely deployed distribution format; flagging every such file would be noise,
+/// not information.
 pub fn deprecated_combination(profile: u8, ccid: u8) -> bool {
     matches!((profile, ccid), (8, 3) | (8, 5))
 }
@@ -259,14 +299,9 @@ const CCID1_P10: [Vui; 1] = [vui(LIMITED, 9, 16, 9, 1)];
 /// CCID 2 (SDR). v1.5 states it for profile 9; v1.3.2 states it generically, so
 /// it is equally the base layer of legacy profiles 0, 2 and 4.
 const CCID2_BL: [Vui; 1] = [vui(LIMITED, 1, 1, 1, 0)];
-/// CCID 4 (HLG), ARIB form — profiles 8, 10 and 20.
-const CCID4_ARIB: Vui = vui(LIMITED, 9, 18, 9, 2);
-/// CCID 4, profile 8: the ARIB form plus the DVB BT.2020 form, whose transfer
-/// 14 pairs with an `alternative_transfer_characteristic` SEI carrying
-/// `preferred_transfer_function = 18` at every RAP (ETSI TS 101 154 v2.5.1).
-const CCID4_P8: [Vui; 2] = [CCID4_ARIB, vui(LIMITED, 9, 14, 9, 0)];
-/// CCID 4 elsewhere (profiles 10 and 20): ARIB only, no DVB row.
-const CCID4_ARIB_ONLY: [Vui; 1] = [CCID4_ARIB];
+/// CCID 4 (HLG), ARIB form — profiles 8, 10 and 20. The only CCID-4 row the
+/// lookups below use; see the module docs for why the DVB row is not one.
+const CCID4_ARIB: [Vui; 1] = [vui(LIMITED, 9, 18, 9, 2)];
 /// CCID 6 (Ultra HD Blu-ray), profile 7 base layer.
 const CCID6_P7: [Vui; 1] = [vui(LIMITED, 9, 16, 9, 2)];
 
@@ -296,21 +331,14 @@ pub fn vui_rows(profile: u8, ccid: u8) -> &'static [Vui] {
         (10, 1) => &CCID1_P10,
         (_, 1) => &CCID1_P8,
         (_, 2) => &CCID2_BL,
-        (8, 4) => &CCID4_P8,
-        (_, 4) => &CCID4_ARIB_ONLY,
+        (_, 4) => &CCID4_ARIB,
         (_, 6) => &CCID6_P7,
         _ => &[],
     }
 }
 
 /// The VUI a profile's base layer carries under a given CCID, for filling in
-/// what a stream did not signal. The first of [`vui_rows`], which makes the
-/// choice **deliberately lossy in one place**: CCID 4 has two rows for profile
-/// 8, and this returns the ARIB one (transfer 18). The DVB variant (transfer 14)
-/// exists only as an explicitly signalled 14 paired with an alt-transfer SEI, so
-/// it can never be the right answer to "what did this stream leave out" — if 14
-/// is signalled there is nothing to fill. Both rows stay in the table because
-/// the reverse lookup needs them.
+/// what a stream did not signal: the first of [`vui_rows`].
 pub fn defined_vui(profile: u8, ccid: u8) -> Option<Vui> {
     vui_rows(profile, ccid).first().copied()
 }
@@ -323,9 +351,13 @@ pub fn defined_vui(profile: u8, ccid: u8) -> Option<Vui> {
 ///
 /// This generalizes what used to be a Profile 10-only reverse lookup. The
 /// generalization is sound because each profile's candidate rows are separated
-/// by fields real streams do carry: profile 8's four rows differ in transfer
-/// alone (16 -> 1, 1 -> 2, 18 -> 4, 14 -> 4, the DVB variant), and profile 10's
-/// CCID-0 rows are full-range where every other candidate is limited.
+/// by fields real streams do carry: profile 8's rows differ in transfer alone
+/// (16 -> 1, 1 -> 2, 18 -> 4), and the CCID-0 rows are the only ones carrying
+/// the IPT-PQ-C2 matrix.
+///
+/// `cc` must be the base layer's *effective* colour, with any alt-transfer SEI
+/// already applied. That is what lets the CCID-4 rule be one row rather than
+/// five: see the module docs on the DVB variant.
 pub fn infer_ccid(profile: u8, cc: &ColorInfo) -> Option<u8> {
     let ProfileCcid::Variable(candidates) = profile_ccid(profile)? else { return None };
     let mut found = None;
@@ -461,8 +493,10 @@ mod tests {
         assert_eq!(vui_rows(10, 1), &[vui(0, 9, 16, 9, 1)]);
         // CCID 2 - SDR.
         assert_eq!(vui_rows(9, 2), &[vui(0, 1, 1, 1, 0)]);
-        // CCID 4 - HLG: the ARIB row for every profile, plus profile 8's DVB row.
-        assert_eq!(vui_rows(8, 4), &[vui(0, 9, 18, 9, 2), vui(0, 9, 14, 9, 0)]);
+        // CCID 4 - HLG: the ARIB row, for every profile that admits the id.
+        // Profile 8's DVB row is deliberately absent; see the module docs and
+        // `the_dvb_ccid4_row_is_recorded_but_not_matched` below.
+        assert_eq!(vui_rows(8, 4), &[vui(0, 9, 18, 9, 2)]);
         assert_eq!(vui_rows(10, 4), &[vui(0, 9, 18, 9, 2)]);
         assert_eq!(vui_rows(20, 4), &[vui(0, 9, 18, 9, 2)]);
         // CCID 6 - Ultra HD Blu-ray.
@@ -470,6 +504,35 @@ mod tests {
         // Combinations the spec pairs with no VUI.
         assert!(vui_rows(5, 1).is_empty());
         assert!(vui_rows(9, 15).is_empty());
+    }
+
+    /// The DVB variant of CCID 4: its data is still spec, so it stays pinned,
+    /// but it must never match on its own. v1.5 p10 makes the
+    /// `alternative_transfer_characteristic` SEI constitutive of the row, and a
+    /// bare transfer of 14 with no such SEI is an ordinary SDR wide-gamut curve.
+    /// A stream that really is DVB HLG arrives here with the SEI already
+    /// applied, so it reads transfer 18 and matches the ARIB row instead.
+    #[test]
+    fn the_dvb_ccid4_row_is_recorded_but_not_matched() {
+        let dvb_row = vui(LIMITED, 9, 14, 9, 0);
+        assert!(!vui_rows(8, 4).contains(&dvb_row), "the DVB row must not be reverse-matched");
+
+        // A bare 14 resolves nothing, whatever else it signals.
+        let bare_14 =
+            color(Some("BT.2020"), Some("BT.2020 (10-bit)"), Some("BT.2020 NCL"), Some("limited"));
+        assert_eq!(infer_ccid(8, &bare_14), None, "transfer 14 without the SEI is not CCID 4");
+
+        // The spec admits 1, 6 and 15 for the same row; all behave the same way,
+        // and 1 keeps resolving as the SDR row it also legitimately matches.
+        let bare_15 =
+            color(Some("BT.2020"), Some("BT.2020 (12-bit)"), Some("BT.2020 NCL"), Some("limited"));
+        assert_eq!(infer_ccid(8, &bare_15), None);
+
+        // With the SEI applied the transfer reads 18, so the ARIB row answers —
+        // one rule covering all four transfers the spec lists for the variant.
+        let with_sei =
+            color(Some("BT.2020"), Some("HLG (ARIB STD-B67)"), Some("BT.2020 NCL"), Some("limited"));
+        assert_eq!(infer_ccid(8, &with_sei), Some(4));
     }
 
     /// The enhancement-layer rows, kept checkable even though `vui_rows`
@@ -549,15 +612,11 @@ mod tests {
     }
 
     #[test]
-    fn infers_profile_8_including_the_dvb_hlg_variant() {
+    fn infers_profile_8_from_its_effective_colour() {
         let hdr10 = color(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("BT.2020 NCL"), Some("limited"));
         assert_eq!(infer_ccid(8, &hdr10), Some(1));
         let arib = color(Some("BT.2020"), Some("HLG (ARIB STD-B67)"), Some("BT.2020 NCL"), Some("limited"));
         assert_eq!(infer_ccid(8, &arib), Some(4));
-        // Transfer 14 is profile 8's DVB HLG row, *not* the SDR gamma family it
-        // would read as under a profile-blind rule.
-        let dvb = color(Some("BT.2020"), Some("BT.2020 (10-bit)"), Some("BT.2020 NCL"), Some("limited"));
-        assert_eq!(infer_ccid(8, &dvb), Some(4));
         let sdr = color(Some("BT.709"), Some("BT.709"), Some("BT.709"), Some("limited"));
         assert_eq!(infer_ccid(8, &sdr), Some(2));
         // Profile 8 does not admit CCID 0, so an IPT matrix names nothing.

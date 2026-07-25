@@ -378,8 +378,8 @@ Present for every video input; absent for sidecars.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `format` | string | always | Overall classification; see below |
-| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values. Like `content_light`, the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6), where L6 by definition mirrors the base layer's own static metadata. On any other base (IPT-PQ-C2, HLG, SDR) the L6 values merely restate the DV grade's own display, which `dolby_vision.mastering_display` already reports, so the field is omitted. A container or SEI value, when actually signalled, is always reported |
-| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values. MaxCLL/MaxFALL is HDR10 (CTA-861.3) convention, so the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6); no other base consumes it, and on an IPT-PQ-C2 or HLG base L6 is typically a zeroed placeholder, so the field is omitted rather than echo noise. A container or SEI value, when actually signalled, is always reported |
+| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values. Like `content_light`, the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6, or an unresolved id on Profile 8, which keeps the historical HDR10-base default), where L6 by definition mirrors the base layer's own static metadata. On any other base (IPT-PQ-C2, HLG, SDR) the L6 values merely restate the DV grade's own display, which `dolby_vision.mastering_display` already reports, so the field is omitted. A container or SEI value, when actually signalled, is always reported |
+| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values. MaxCLL/MaxFALL is HDR10 (CTA-861.3) convention, so the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6, or an unresolved id on Profile 8); no other base consumes it, and on an IPT-PQ-C2 or HLG base L6 is typically a zeroed placeholder, so the field is omitted rather than echo noise. A container or SEI value, when actually signalled, is always reported |
 
 #### `format` values
 
@@ -395,8 +395,11 @@ The string is a ` / `-joined list built from, in order:
    compatibility id (1 or 6 -> `HDR10`, 2 -> `SDR`, 4 -> `HLG`) rather than by the base
    layer's raw transfer characteristic, which disagrees for Profile 4 (SDR base, however
    tagged) and Profile 5/20 (a PQ-encoded IPT-PQ-C2 base that no ordinary decoder can
-   present). Omitted entirely when the DV stream has no independently viewable base
-   (compatibility id 0: Profiles 5 and 20).
+   present). When nothing resolves the id (a Profile 8 whose carriage declares none and
+   whose base layer does not separate the ids it admits), the tag falls back to the base
+   layer's own transfer: PQ reads `HDR10`, HLG reads `HLG`, anything else omits the tag.
+   Omitted entirely when the DV stream has no independently viewable base (compatibility
+   id 0: Profiles 5, 10 and 20).
 
 Examples: `"SDR"`, `"HDR10"`, `"HLG"`, `"HDR10+ / HDR10"`, `"SL-HDR2 / HDR10"`,
 `"HDR Vivid / HLG"`, `"HDR Vivid / HDR10"`, `"Dolby Vision"`, `"Dolby Vision / HDR10"`,
@@ -729,12 +732,19 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
      is one comparison instead of two.
   4. `color.matrix`'s IPT value is respelled `"IPT-PQ-C2"` (was `"IPT-PQ-c2"`), per SMPTE
      ST 2128:2023 and both revisions of Dolby's Profiles and Levels specification.
+  5. `color.primaries`, `color.transfer` and `color.matrix` now **appear on Dolby Vision inputs
+     that signalled nothing**, filled from the colour the profile and compatibility id define
+     and tagged `spec` in `color_source`. A Profile 5 track that reported `{"range": "full"}`
+     now reports all four fields; a Profile 4 track that reported `{}` now reports Rec.709.
+     This is a presence change, so a 2.4 script that read an absent field as "the stream did
+     not signal this" must read `color_source` instead: `spec` is the derived case, and
+     `container` / `stream` / `sei` are the signalled ones.
   Additive alongside those: the new always-present `video_tracks[].color_source` object gives
-  per-field provenance for `color` (`container` / `stream` / `sei` / `spec`); `color` itself now
-  reports the base-layer colour a Dolby Vision profile and compatibility id define, closing the
-  case where a Profile 5 track reported only `{"range": "full"}` and a Profile 4 track reported
-  `{}`; and `dolby_vision` gains the optional `pq_reshaping` and `deprecated_combination`
-  booleans. Inputs with no Dolby Vision metadata see only the new `color_source` object.
+  per-field provenance for `color` (`container` / `stream` / `sei` / `spec`), and
+  `dolby_vision` gains the optional `pq_reshaping` and `deprecated_combination` booleans.
+  Inputs with no Dolby Vision metadata see only the new `color_source` object, with one
+  unreachable-in-practice exception: a non-DV stream signalling CICP matrix 15 previously
+  classified as `SDR` and now classifies on its transfer like any other stream.
   Ships in hdrprobe 0.9.0.
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
   `video_tracks[].sl_hdr` object appears when an SL-HDR (ETSI TS 103 433) information SEI was

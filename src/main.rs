@@ -763,6 +763,19 @@ fn assemble_report(
             _ => None,
         });
 
+        // The base layer's *effective* colour: what the container or coded
+        // stream signalled, with the HLG/PQ alt-transfer SEI override applied.
+        // Built here, before the Dolby Vision post-passes, because the
+        // compatibility-id inference reads it — see `fill_inferred_compat`.
+        let mut color = track.color.clone();
+        let mut color_source = track.color_source;
+        if let Some(pt) = scan.sei.preferred_transfer {
+            if let Some(t) = container::cicp_transfer(pt as u16) {
+                color.transfer = Some(t.to_string());
+                color_source.transfer = Some(model::ColorSource::Sei);
+            }
+        }
+
         // The two grade-vs-base-layer verdicts (FEL brightness expansion,
         // mastering primaries mismatch) are only decidable here on the video
         // path: both need the base layer's own declared mastering display
@@ -782,13 +795,15 @@ fn assemble_report(
             // authoring-declared rate).
             dv::levels::fill_derived_level(dv, track.width, track.height, fps);
             // Likewise the last rung of compatibility-id resolution: deducing
-            // the id from the base layer's signalled VUI needs a base layer.
-            // The *signalled* colour, before the alt-transfer SEI override
-            // applied below — Dolby's table defines the DVB HLG row in terms of
-            // the transfer characteristic the VUI carries (14), which that
-            // override would erase. Both spellings resolve to the same id, so
-            // this is about reading the table as written, not about the answer.
-            dv::levels::fill_inferred_compat(dv, &track.color);
+            // the id from the base layer's colour needs a base layer. It reads
+            // the *effective* colour, with the alt-transfer SEI already applied,
+            // because that SEI is what distinguishes the two streams Dolby's
+            // table separates: a transfer characteristic of 14 is CCID 4 only
+            // "when used with the alternative_transfer_characteristic SEI
+            // message ... with the preferred_transfer_function set to 18". A
+            // bare 14 with no such SEI is an ordinary SDR wide-gamut curve and
+            // must resolve nothing.
+            dv::levels::fill_inferred_compat(dv, &color);
             // And the base-layer transfer fact that rides the resolved id.
             dv::levels::flag_pq_reshaping(dv);
         }
@@ -847,20 +862,11 @@ fn assemble_report(
 
         let hdr = Some(hdr::assemble(track, dv.as_ref(), &scan.sei));
 
-        // Reflect the HLG/PQ alt-transfer SEI override in the displayed colour
-        // line. Deliberately after `hdr::assemble`, which reads the demuxed
-        // colour: nothing derived below may feed back into classification.
-        let mut color = track.color.clone();
-        let mut color_source = track.color_source;
-        if let Some(pt) = scan.sei.preferred_transfer {
-            if let Some(t) = container::cicp_transfer(pt as u16) {
-                color.transfer = Some(t.to_string());
-                color_source.transfer = Some(model::ColorSource::Sei);
-            }
-        }
         // Last: the base-layer colour a Dolby Vision profile and compatibility
         // id define outright, for the fields nothing signalled. Video path only
-        // — a metadata sidecar has no base layer to describe.
+        // — a metadata sidecar has no base layer to describe. After
+        // `hdr::assemble`, which reads the demuxed colour: nothing derived here
+        // may feed back into classification.
         if let Some(dv) = dv.as_ref() {
             dv::levels::fill_derived_color(&mut color, &mut color_source, dv);
         }

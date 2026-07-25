@@ -9,7 +9,7 @@
 //! (`time_scale / (2 * num_units_in_tick)`).
 
 use crate::bits::{ebsp_to_rbsp, BitReader};
-use crate::hevc::sps::VuiColor;
+use crate::hevc::sps::{VuiColor, UNSPECIFIED_CICP};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SpsInfo {
@@ -215,13 +215,16 @@ fn parse_vui(r: &mut BitReader, info: &mut SpsInfo) -> Option<()> {
         // video_signal_type_present_flag
         r.skip_bits(3)?; // video_format
         let full_range = r.read_bit()? == 1;
-        if r.read_bit()? == 1 {
-            // colour_description_present_flag
-            let primaries = r.read_bits(8)? as u8;
-            let transfer = r.read_bits(8)? as u8;
-            let matrix = r.read_bits(8)? as u8;
-            info.color = Some(VuiColor { primaries, transfer, matrix, full_range });
-        }
+        // `colour_description_present_flag`. When it is 0 the three CICP values
+        // are *inferred* as 2 (unspecified) per H.264 Annex E, but
+        // `video_full_range_flag` was signalled either way and must not be lost
+        // with them: a stream can legally declare full range and nothing else.
+        let (primaries, transfer, matrix) = if r.read_bit()? == 1 {
+            (r.read_bits(8)? as u8, r.read_bits(8)? as u8, r.read_bits(8)? as u8)
+        } else {
+            (UNSPECIFIED_CICP, UNSPECIFIED_CICP, UNSPECIFIED_CICP)
+        };
+        info.color = Some(VuiColor { primaries, transfer, matrix, full_range });
     }
     if r.read_bit()? == 1 {
         // chroma_loc_info_present_flag
