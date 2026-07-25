@@ -13,7 +13,7 @@ use anyhow::{bail, Result};
 use crate::av1::obu::{obus, OBU_SEQUENCE_HEADER, OBU_TEMPORAL_DELIMITER};
 use crate::av1::seq::{parse_sequence_header, SeqInfo};
 use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream, TrackDemux};
-use crate::model::{ColorInfo, ColorSource, ColorSources};
+use crate::model::{ColorInfo, ColorSources};
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
@@ -414,14 +414,14 @@ fn build_demux(
         (Some(n), Some(f)) if f > 0.0 => Some(n as f64 / f),
         _ => None,
     };
-    let (bit_depth, chroma, color, codec_profile) = match &seq {
+    let (bit_depth, chroma, (color, color_source), codec_profile) = match &seq {
         Some(s) => (
             Some(s.bit_depth),
             Some(s.chroma.to_string()),
             s.color.clone(),
             Some(crate::av1::seq::av1_profile_label(s.seq_profile, s.seq_tier, s.seq_level_idx)),
         ),
-        None => (None, None, ColorInfo::default(), None),
+        None => (None, None, (ColorInfo::default(), ColorSources::default()), None),
     };
     // AV1 Dolby Vision (Profile 10) is single-layer, single-track.
     let track = TrackDemux {
@@ -431,7 +431,7 @@ fn build_demux(
         bit_depth,
         chroma,
         codec_profile,
-        color_source: ColorSources::of(&color, ColorSource::Stream),
+        color_source,
         color,
         chunks,
         // NalFormat::LengthPrefixed(0) is unused for AV1 (OBU-walked).

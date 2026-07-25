@@ -500,19 +500,63 @@ pub(crate) fn parse_av1c_record(rec: &[u8]) -> Option<(u8, &'static str, String)
     Some((bit_depth, chroma, crate::av1::seq::av1_profile_label(seq_profile, seq_tier, seq_level_idx)))
 }
 
-/// Build a `ColorInfo` from SPS VUI CICP signalling.
-pub(crate) fn color_from_vui(vui: &crate::hevc::sps::VuiColor) -> ColorInfo {
-    ColorInfo {
-        primaries: cicp_primaries(vui.primaries as u16).map(str::to_string),
-        transfer: cicp_transfer(vui.transfer as u16).map(str::to_string),
-        matrix: cicp_matrix(vui.matrix as u16).map(str::to_string),
-        range: Some(cicp_range(vui.full_range).to_string()),
+/// The provenance tag for one decoded CICP field.
+///
+/// Three outcomes, and the middle one is why this exists: a code that decoded
+/// to a name is tagged with its source; a code the source carried but this
+/// build cannot name is tagged `UnnamedCode`, which keeps the Dolby Vision spec
+/// fill from overwriting a real signal; and "unspecified" (2), or no code at
+/// all, is left untagged, which is exactly the state the fill is *for*.
+pub(crate) fn cicp_source(code: u16, decoded: Option<&str>, src: ColorSource) -> Option<ColorSource> {
+    match decoded {
+        Some(_) => Some(src),
+        None if code == crate::hevc::sps::UNSPECIFIED_CICP as u16 => None,
+        None => Some(ColorSource::UnnamedCode),
     }
+}
+
+/// Decode a CICP triplet plus an optional range flag into a colour description
+/// and its per-field provenance together. Kept as one step so the raw codes are
+/// still in scope when the provenance is decided — `ColorInfo` alone cannot
+/// distinguish "unspecified" from "signalled something we have no name for".
+pub(crate) fn color_from_cicp(
+    primaries: u16,
+    transfer: u16,
+    matrix: u16,
+    full_range: Option<bool>,
+    src: ColorSource,
+) -> (ColorInfo, ColorSources) {
+    let (p, t, m) = (cicp_primaries(primaries), cicp_transfer(transfer), cicp_matrix(matrix));
+    let color = ColorInfo {
+        primaries: p.map(str::to_string),
+        transfer: t.map(str::to_string),
+        matrix: m.map(str::to_string),
+        range: full_range.map(|f| cicp_range(f).to_string()),
+    };
+    let sources = ColorSources {
+        primaries: cicp_source(primaries, p, src),
+        transfer: cicp_source(transfer, t, src),
+        matrix: cicp_source(matrix, m, src),
+        range: full_range.map(|_| src),
+    };
+    (color, sources)
+}
+
+/// Build a `ColorInfo` and its provenance from SPS VUI CICP signalling. A VUI is
+/// always the coded stream's own signalling, so the source is never in doubt.
+pub(crate) fn color_from_vui(vui: &crate::hevc::sps::VuiColor) -> (ColorInfo, ColorSources) {
+    color_from_cicp(
+        vui.primaries as u16,
+        vui.transfer as u16,
+        vui.matrix as u16,
+        Some(vui.full_range),
+        ColorSource::Stream,
+    )
 }
 
 /// Recover colour info from the SPS embedded in an `hvcC` record, for HEVC files
 /// whose container carries no explicit colour box/element.
-pub(crate) fn color_from_hvcc(hvcc: &[u8]) -> Option<ColorInfo> {
+pub(crate) fn color_from_hvcc(hvcc: &[u8]) -> Option<(ColorInfo, ColorSources)> {
     let sps = crate::hevc::sps::find_sps_in_hvcc(hvcc)?;
     let info = crate::hevc::sps::parse_sps(sps)?;
     info.color.as_ref().map(color_from_vui)
@@ -521,7 +565,7 @@ pub(crate) fn color_from_hvcc(hvcc: &[u8]) -> Option<ColorInfo> {
 /// Recover colour info from the SPS embedded in an `avcC` record, for AVC files
 /// whose container carries no explicit `colr` box (Profile 9's Rec.709 SDR base
 /// signals its VUI here).
-pub(crate) fn color_from_avcc(avcc: &[u8]) -> Option<ColorInfo> {
+pub(crate) fn color_from_avcc(avcc: &[u8]) -> Option<(ColorInfo, ColorSources)> {
     let info = crate::avc::sps::parse_sps(crate::avc::nal::find_sps_in_avcc(avcc)?)?;
     info.color.as_ref().map(color_from_vui)
 }
@@ -536,7 +580,7 @@ pub(crate) fn color_from_avcc(avcc: &[u8]) -> Option<ColorInfo> {
 /// `color_description` (the analogue of the SPS VUI's
 /// `colour_description_present_flag`), so a CICP-unspecified stream never
 /// overwrites container colour with defaults.
-pub(crate) fn color_from_av1c(av1c: &[u8]) -> Option<ColorInfo> {
+pub(crate) fn color_from_av1c(av1c: &[u8]) -> Option<(ColorInfo, ColorSources)> {
     let config_obus = av1c.get(4..)?;
     let seq = crate::av1::obu::obus(config_obus)
         .find(|o| o.obu_type == crate::av1::obu::OBU_SEQUENCE_HEADER)?;
@@ -577,22 +621,15 @@ pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
         track.chroma = Some(f.chroma.to_string());
     }
     if signalled_nothing {
-        // Field by field, never `ColorSources::tag`: that tags every field the
-        // description carries, and this fill never writes `range` (the frame
-        // header has none), so a container-supplied range would be relabelled
-        // as stream-sourced.
-        track.color.primaries = f.color.primaries;
-        track.color.transfer = f.color.transfer;
-        track.color.matrix = f.color.matrix;
-        if track.color.primaries.is_some() {
-            track.color_source.primaries = Some(ColorSource::Stream);
-        }
-        if track.color.transfer.is_some() {
-            track.color_source.transfer = Some(ColorSource::Stream);
-        }
-        if track.color.matrix.is_some() {
-            track.color_source.matrix = Some(ColorSource::Stream);
-        }
+        // Field by field, and never `range`: the frame header has none, so a
+        // container-supplied range must keep its own value and provenance.
+        let (fc, fs) = f.color;
+        track.color.primaries = fc.primaries;
+        track.color.transfer = fc.transfer;
+        track.color.matrix = fc.matrix;
+        track.color_source.primaries = fs.primaries;
+        track.color_source.transfer = fs.transfer;
+        track.color_source.matrix = fs.matrix;
     }
 }
 
@@ -767,7 +804,7 @@ mod tests {
         assert_eq!(a.nal_len, 4);
         assert_eq!(a.profile_str, "High @ L4");
         // Its embedded SPS also yields the Rec.709 base-layer colour.
-        let c = color_from_avcc(&avcc).expect("VUI colour");
+        let (c, _) = color_from_avcc(&avcc).expect("VUI colour");
         assert_eq!(c.primaries.as_deref(), Some("BT.709"));
         assert_eq!(c.transfer.as_deref(), Some("BT.709"));
         assert_eq!(c.range.as_deref(), Some("limited"));
@@ -786,7 +823,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x62, 0xeb, 0xbf, 0xf2, 0x39, 0xd5, 0xf3, 0xa1, 0x22, 0x01, 0x2a,
             0x80,
         ];
-        let c = color_from_av1c(&av1c).expect("colour description");
+        let (c, _) = color_from_av1c(&av1c).expect("colour description");
         assert_eq!(c.primaries.as_deref(), Some("BT.2020"));
         assert_eq!(c.transfer.as_deref(), Some("PQ (SMPTE ST 2084)"));
         assert_eq!(c.matrix.as_deref(), Some("BT.2020 NCL"));

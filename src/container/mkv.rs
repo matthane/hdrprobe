@@ -955,6 +955,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     let mut width = 0u32;
     let mut height = 0u32;
     let mut color = ColorInfo::default();
+    let mut color_source = ColorSources::default();
     let mut mastering = None;
     let mut content_light = None;
     let mut dv_config = None;
@@ -985,6 +986,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
                 &mut width,
                 &mut height,
                 &mut color,
+                &mut color_source,
                 &mut mastering,
                 &mut content_light,
             ),
@@ -1012,7 +1014,6 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     // "unspecified") gets just the range from the same parameter set, keeping
     // the container's authority over primaries/transfer/matrix — the MP4
     // nclc-colr treatment.
-    let mut color_source = ColorSources::of(&color, ColorSource::Container);
     if color.transfer.is_none() || color.range.is_none() {
         let stream_color = match cc.codec {
             Codec::Hevc => super::color_from_hvcc(codec_private),
@@ -1020,15 +1021,13 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
             Codec::Av1 => super::color_from_av1c(codec_private),
             _ => None,
         };
-        if let Some(c) = stream_color {
+        if let Some((c, c_src)) = stream_color {
             if color.transfer.is_none() {
                 color = c;
-                color_source = ColorSources::of(&color, ColorSource::Stream);
+                color_source = c_src;
             } else if color.range.is_none() {
                 color.range = c.range;
-                if color.range.is_some() {
-                    color_source.range = Some(ColorSource::Stream);
-                }
+                color_source.range = c_src.range;
             }
         }
     }
@@ -1209,6 +1208,7 @@ fn parse_video(
     width: &mut u32,
     height: &mut u32,
     color: &mut ColorInfo,
+    color_source: &mut ColorSources,
     mastering: &mut Option<MasteringDisplay>,
     content_light: &mut Option<ContentLight>,
 ) {
@@ -1221,7 +1221,9 @@ fn parse_video(
         match id {
             ID_PIXEL_WIDTH => *width = read_uint(data, p2, s) as u32,
             ID_PIXEL_HEIGHT => *height = read_uint(data, p2, s) as u32,
-            ID_COLOUR => parse_colour(data, p2, cend, color, mastering, content_light),
+            ID_COLOUR => {
+                parse_colour(data, p2, cend, color, color_source, mastering, content_light)
+            }
             _ => {}
         }
         p = cend;
@@ -1233,6 +1235,7 @@ fn parse_colour(
     start: usize,
     end: usize,
     color: &mut ColorInfo,
+    color_source: &mut ColorSources,
     mastering: &mut Option<MasteringDisplay>,
     content_light: &mut Option<ContentLight>,
 ) {
@@ -1246,18 +1249,33 @@ fn parse_colour(
         let s = size.unwrap_or(0) as usize;
         let cend = (p2 + s).min(end);
         match id {
-            ID_MATRIX => color.matrix = super::cicp_matrix(read_uint(data, p2, s) as u16).map(str::to_string),
+            // Each CICP element carries its own provenance, so a code the
+            // Colour element signalled but this build cannot name stays
+            // distinguishable from one it never carried.
+            ID_MATRIX => {
+                let code = read_uint(data, p2, s) as u16;
+                let name = super::cicp_matrix(code);
+                color.matrix = name.map(str::to_string);
+                color_source.matrix = super::cicp_source(code, name, ColorSource::Container);
+            }
             ID_TRANSFER => {
-                color.transfer = super::cicp_transfer(read_uint(data, p2, s) as u16).map(str::to_string)
+                let code = read_uint(data, p2, s) as u16;
+                let name = super::cicp_transfer(code);
+                color.transfer = name.map(str::to_string);
+                color_source.transfer = super::cicp_source(code, name, ColorSource::Container);
             }
             ID_PRIMARIES => {
-                color.primaries = super::cicp_primaries(read_uint(data, p2, s) as u16).map(str::to_string)
+                let code = read_uint(data, p2, s) as u16;
+                let name = super::cicp_primaries(code);
+                color.primaries = name.map(str::to_string);
+                color_source.primaries = super::cicp_source(code, name, ColorSource::Container);
             }
             ID_RANGE => {
                 color.range = match read_uint(data, p2, s) {
                     v @ (1 | 2) => Some(super::cicp_range(v == 2).to_string()),
                     _ => None,
-                }
+                };
+                color_source.range = color.range.as_ref().map(|_| ColorSource::Container);
             }
             ID_MAX_CLL => max_cll = Some(read_uint(data, p2, s)),
             ID_MAX_FALL => max_fall = Some(read_uint(data, p2, s)),

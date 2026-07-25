@@ -414,8 +414,8 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         // this track's own samples (the `hev1` case), as TS does.
         let color = if color.transfer.is_none() {
             match color_from_stream(data, &t.chunks, t.sd.nal_len) {
-                Some(c) => {
-                    color_source = ColorSources::of(&c, ColorSource::Stream);
+                Some((c, c_src)) => {
+                    color_source = c_src;
                     c
                 }
                 None => color,
@@ -626,7 +626,10 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut hvcc_bytes: Option<&[u8]> = None;
     let mut avcc_bytes: Option<&[u8]> = None;
     let mut av1c_bytes: Option<&[u8]> = None;
-    let mut vpcc_color: Option<ColorInfo> = None;
+    let mut vpcc_color: Option<(ColorInfo, ColorSources)> = None;
+    // The `colr` box's own provenance, kept beside the values it produced so an
+    // unnamed CICP code is not mistaken later for a field nothing signalled.
+    let mut colr_source: Option<ColorSources> = None;
     // A layered-HEVC config box (`lhvC`) beside the base `hvcC` marks MV-HEVC — the
     // multiview form of DV Profile 20 (for 3D / dual-view); its absence is the 2D
     // single-view form. Free to detect: the box is already a sample-entry child.
@@ -683,7 +686,12 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             b"lhvC" => layered = true,
             b"vexu" => stereo = parse_stereo(data, c).or(stereo),
             b"cuvv" => cuvv_version_map = parse_cuvv(&data[c.payload..c.end]),
-            b"colr" => color = parse_colr(data, c).unwrap_or(color),
+            b"colr" => {
+                if let Some((c, src)) = parse_colr(data, c) {
+                    color = c;
+                    colr_source = Some(src);
+                }
+            }
             b"mdcv" | b"SmDm" => mastering = parse_mdcv(data, c).or(mastering),
             b"clli" | b"CoLL" => content_light = parse_clli(data, c).or(content_light),
             _ => {}
@@ -704,30 +712,29 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     // field — iPhone HLG/DV MOVs are the common case): the colr keeps authority
     // over primaries/transfer/matrix and just the VUI's video_full_range_flag
     // fills in, the same stream-sourced range MediaInfo reports for these files.
-    let mut color_source = ColorSources::of(&color, ColorSource::Container);
+    let mut color_source = colr_source.unwrap_or_default();
     if color.transfer.is_none() || color.range.is_none() {
-        // The parameter-set forms are the coded stream's own signalling; `vpcC`
-        // is a container record carrying CICP directly, so it stays Container.
-        let (cfg_color, cfg_src) = if let Some(h) = hvcc_bytes {
-            (super::color_from_hvcc(h), ColorSource::Stream)
+        // The parameter-set forms are the coded stream's own signalling and say
+        // so themselves; `vpcC` is a container record carrying CICP directly,
+        // so it is tagged Container where it is parsed.
+        let cfg_color = if let Some(h) = hvcc_bytes {
+            super::color_from_hvcc(h)
         } else if let Some(a) = avcc_bytes {
-            (super::color_from_avcc(a), ColorSource::Stream)
+            super::color_from_avcc(a)
         } else if let Some(v) = av1c_bytes {
-            (super::color_from_av1c(v), ColorSource::Stream)
+            super::color_from_av1c(v)
         } else {
             // `vpcC` carries the CICP triplet + range directly (VP9 has no
             // parameter set to embed), same fallback treatment.
-            (vpcc_color, ColorSource::Container)
+            vpcc_color
         };
-        if let Some(c) = cfg_color {
+        if let Some((c, c_src)) = cfg_color {
             if color.transfer.is_none() {
                 color = c;
-                color_source = ColorSources::of(&color, cfg_src);
+                color_source = c_src;
             } else if color.range.is_none() {
                 color.range = c.range;
-                if color.range.is_some() {
-                    color_source.range = Some(cfg_src);
-                }
+                color_source.range = c_src.range;
             }
         }
     }
@@ -796,7 +803,11 @@ fn parse_stereo(data: &[u8], vexu: &BoxHdr) -> Option<String> {
 /// Recover VUI colour from an in-band SPS in the first few samples of a track.
 /// Used when the container carries neither a `colr` box nor an hvcC SPS the base
 /// parser can reach — the base layer of some Profile 7 dual-track MP4s.
-fn color_from_stream(data: &[u8], chunks: &[Chunk], nal_len: u8) -> Option<ColorInfo> {
+fn color_from_stream(
+    data: &[u8],
+    chunks: &[Chunk],
+    nal_len: u8,
+) -> Option<(ColorInfo, ColorSources)> {
     use crate::hevc::nal;
     let mut nals = Vec::new();
     for ch in chunks.iter().take(8) {
@@ -834,7 +845,7 @@ struct VpccInfo {
     bit_depth: u8,
     chroma: &'static str,
     profile_str: String,
-    color: ColorInfo,
+    color: (ColorInfo, ColorSources),
 }
 
 /// Parse a `vpcC` box: version(1)+flags(3), then profile u8, level u8,
@@ -856,12 +867,15 @@ fn parse_vpcc(data: &[u8], b: &BoxHdr) -> Option<VpccInfo> {
         _ => "?",
     };
     let full_range = packed & 1 == 1;
-    let color = ColorInfo {
-        primaries: super::cicp_primaries(data[p + 7] as u16).map(str::to_string),
-        transfer: super::cicp_transfer(data[p + 8] as u16).map(str::to_string),
-        matrix: super::cicp_matrix(data[p + 9] as u16).map(str::to_string),
-        range: Some(super::cicp_range(full_range).to_string()),
-    };
+    // `vpcC` is a container record carrying the CICP triplet and range flag
+    // directly, so it is Container-sourced rather than stream-sourced.
+    let color = super::color_from_cicp(
+        data[p + 7] as u16,
+        data[p + 8] as u16,
+        data[p + 9] as u16,
+        Some(full_range),
+        ColorSource::Container,
+    );
     Some(VpccInfo {
         bit_depth,
         chroma,
@@ -870,7 +884,7 @@ fn parse_vpcc(data: &[u8], b: &BoxHdr) -> Option<VpccInfo> {
     })
 }
 
-fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<ColorInfo> {
+fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<(ColorInfo, ColorSources)> {
     let p = b.payload;
     if b.end < p + 4 {
         return None;
@@ -886,18 +900,18 @@ fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<ColorInfo> {
         // Only the ISO `nclx` form carries a range flag (one byte after the
         // matrix); the QuickTime `nclc` form ends at the matrix, so its range
         // stays None for the caller to recover from the SPS VUI.
-        let range = if kind == b"nclx" && b.end >= p + 11 {
-            let full = (data[p + 10] & 0x80) != 0;
-            Some(super::cicp_range(full).to_string())
+        let full_range = if kind == b"nclx" && b.end >= p + 11 {
+            Some((data[p + 10] & 0x80) != 0)
         } else {
             None
         };
-        return Some(ColorInfo {
-            primaries: super::cicp_primaries(primaries).map(str::to_string),
-            transfer: super::cicp_transfer(transfer).map(str::to_string),
-            matrix: super::cicp_matrix(matrix).map(str::to_string),
-            range,
-        });
+        return Some(super::color_from_cicp(
+            primaries,
+            transfer,
+            matrix,
+            full_range,
+            ColorSource::Container,
+        ));
     }
     None
 }
@@ -1523,7 +1537,7 @@ mod tests {
         let parse = |payload: &[u8]| {
             let data = boxed(*b"colr", payload);
             let top = iter_boxes(&data, 0, data.len());
-            parse_colr(&data, &top[0])
+            parse_colr(&data, &top[0]).map(|(c, _)| c)
         };
         // ISO nclx: the byte after the matrix carries the full-range flag.
         let c = parse(b"nclx\x00\x09\x00\x12\x00\x09\x80").unwrap();

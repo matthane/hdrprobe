@@ -6,8 +6,7 @@
 //! and stop. Never decodes.
 
 use crate::bits::BitReader;
-use crate::container::{cicp_matrix, cicp_primaries, cicp_transfer};
-use crate::model::ColorInfo;
+use crate::model::{ColorInfo, ColorSource, ColorSources};
 
 pub struct SeqInfo {
     pub seq_profile: u8,
@@ -19,7 +18,7 @@ pub struct SeqInfo {
     pub height: u32,
     pub bit_depth: u8,
     pub chroma: &'static str,
-    pub color: ColorInfo,
+    pub color: (ColorInfo, ColorSources),
     /// Whether `color_config()` carried an explicit `color_description` (CICP
     /// triplet). When false, `color`'s CICP fields are the spec's "unspecified"
     /// defaults — the stream declares nothing, which callers recovering colour
@@ -213,7 +212,7 @@ pub fn av1_chroma_str(mono_chrome: bool, ss_x: u8, ss_y: u8) -> &'static str {
 fn parse_color_config(
     r: &mut BitReader,
     seq_profile: u8,
-) -> Option<(u8, &'static str, ColorInfo, bool)> {
+) -> Option<(u8, &'static str, (ColorInfo, ColorSources), bool)> {
     let high_bitdepth = r.read_bit()? == 1;
     let bit_depth = if seq_profile == 2 && high_bitdepth {
         let twelve_bit = r.read_bit()? == 1;
@@ -264,14 +263,16 @@ fn parse_color_config(
 
     let chroma = av1_chroma_str(mono_chrome, ss_x, ss_y);
 
-    let color = ColorInfo {
-        primaries: cicp_primaries(cp).map(str::to_string),
-        transfer: cicp_transfer(tc).map(str::to_string),
-        matrix: cicp_matrix(mc).map(str::to_string),
-        range: Some(crate::container::cicp_range(range_full).to_string()),
-    };
+    // An AV1 sequence header is the coded stream's own signalling.
+    let (color, color_source) = crate::container::color_from_cicp(
+        cp,
+        tc,
+        mc,
+        Some(range_full),
+        ColorSource::Stream,
+    );
 
-    Some((bit_depth, chroma, color, color_description_present))
+    Some((bit_depth, chroma, (color, color_source), color_description_present))
 }
 
 /// AV1 uvlc() — unsigned variable-length code.

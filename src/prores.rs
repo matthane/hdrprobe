@@ -12,7 +12,7 @@
 //! profile, and Matroska's `V_PRORES` carries no FourCC anywhere — so an MKV
 //! mux gets no profile label (MediaInfo/ffprobe agree), never a guess.
 
-use crate::model::ColorInfo;
+use crate::model::{ColorInfo, ColorSources};
 
 /// What a ProRes frame header declares. Chroma format is the frame's own word;
 /// bit depth is the profile family's defined depth (the header has no depth
@@ -25,7 +25,7 @@ pub struct ProresFrameInfo {
     /// The header's own CICP primaries/transfer/matrix, mapped through the
     /// shared label tables — `None` per field for unspecified/unknown codes.
     /// The header has no range field, so `range` is always `None`.
-    pub color: ColorInfo,
+    pub color: (ColorInfo, ColorSources),
 }
 
 /// Parse the ProRes frame header at byte 0. Accepts both carriage forms: a
@@ -62,12 +62,15 @@ pub fn parse_frame_header(data: &[u8]) -> Option<ProresFrameInfo> {
     } else {
         chroma_fmt
     };
-    let color = ColorInfo {
-        primaries: crate::container::cicp_primaries(body[14] as u16).map(str::to_string),
-        transfer: crate::container::cicp_transfer(body[15] as u16).map(str::to_string),
-        matrix: crate::container::cicp_matrix(body[16] as u16).map(str::to_string),
-        range: None,
-    };
+    // The frame header is the coded stream's own signalling and carries no
+    // range field, so range stays absent for the container to supply.
+    let color = crate::container::color_from_cicp(
+        body[14] as u16,
+        body[15] as u16,
+        body[16] as u16,
+        None,
+        crate::model::ColorSource::Stream,
+    );
     Some(ProresFrameInfo { chroma, bit_depth, color })
 }
 
@@ -108,10 +111,23 @@ mod tests {
         // CICP 2/2 are unspecified and matrix 6 has no shared-table label, so
         // all three stay None: the container must classify this file, the
         // header can't.
-        assert!(f.color.primaries.is_none());
-        assert!(f.color.transfer.is_none());
-        assert!(f.color.matrix.is_none());
-        assert!(f.color.range.is_none(), "the header has no range field");
+        let (color, source) = f.color;
+        assert!(color.primaries.is_none());
+        assert!(color.transfer.is_none());
+        assert!(color.matrix.is_none());
+        assert!(color.range.is_none(), "the header has no range field");
+        // But the two cases are not the same, and the provenance says so: the
+        // unspecified codes leave no tag, while matrix 6 is a code this header
+        // really carried and this build cannot name. Anything that fills absent
+        // colour must skip the third and may fill the first two.
+        assert_eq!(source.primaries, None, "CICP 2 declines to say");
+        assert_eq!(source.transfer, None, "CICP 2 declines to say");
+        assert_eq!(
+            source.matrix,
+            Some(crate::model::ColorSource::UnnamedCode),
+            "matrix 6 was signalled, just not nameable"
+        );
+        assert_eq!(source.range, None, "the header has no range field");
     }
 
     #[test]
@@ -132,9 +148,9 @@ mod tests {
         h[15] = 16;
         h[16] = 9;
         let f = parse_frame_header(&h).expect("cicp header");
-        assert_eq!(f.color.primaries.as_deref(), Some("BT.2020"));
-        assert_eq!(f.color.transfer.as_deref(), Some("PQ (SMPTE ST 2084)"));
-        assert_eq!(f.color.matrix.as_deref(), Some("BT.2020 NCL"));
+        assert_eq!(f.color.0.primaries.as_deref(), Some("BT.2020"));
+        assert_eq!(f.color.0.transfer.as_deref(), Some("PQ (SMPTE ST 2084)"));
+        assert_eq!(f.color.0.matrix.as_deref(), Some("BT.2020 NCL"));
     }
 
     #[test]

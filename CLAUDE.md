@@ -539,7 +539,18 @@ never parse bytes native-endian.
   does *not* share that gate: it fires on a resolved CCID 0 from any rung, because it is new
   information rather than a back-fill, and Dolby's footnote keys on exactly that condition.
   Order matters in `main.rs`: `hdr::assemble` runs on the *demuxed* colour before any of this,
-  so nothing derived can feed back into classification. **The HEVC/AVC SPS parsers keep
+  so nothing derived can feed back into classification. **"Absent" has to mean *unsignalled*,
+  not merely unnamed.** A `ColorInfo` field is `None` both when the source carried nothing (or
+  the explicit "unspecified" code 2, which is the case the fill exists for) and when it carried
+  a real CICP code no shared table names — and filling the second overwrites a genuine signal,
+  then labels it `spec`, i.e. "not signalled anywhere". So **every** colour producer builds
+  `ColorInfo` and `ColorSources` together through `container::color_from_cicp`, the one place
+  that still sees the raw codes, and an unnamed code is marked `ColorSource::UnnamedCode` for
+  the fill to skip. That marker is internal: `model::hidden` keeps it out of the report, so the
+  documented guarantee that `color` and `color_source` carry the same key set still holds. This
+  is reachable, not theoretical — the corpus ProRes frame header carries matrix 6. There is
+  deliberately no constructor deriving provenance from a finished `ColorInfo`; it could not
+  make the distinction, and a caller using one would relabel fields it never wrote. **The HEVC/AVC SPS parsers keep
   `video_full_range_flag` even when `colour_description_present_flag` is 0**, decoding the
   three CICP values as the 2 (unspecified) that H.264/H.265 Annex E infers for them: a stream
   may legally declare full range and nothing else, and dropping the flag with the description

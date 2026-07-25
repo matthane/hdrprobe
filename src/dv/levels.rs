@@ -746,7 +746,10 @@ pub fn flag_pq_reshaping(dv: &mut DolbyVision) {
 /// the only caller, on the video path: a metadata-only sidecar has no base layer
 /// whose colour this could describe.
 ///
-/// **Signalled always wins; this only fills absences.** A Profile 5 stream
+/// **Signalled always wins; this only fills absences** — and "absent" means the
+/// source carried nothing or carried the explicit "unspecified" code, never that
+/// it carried a code this build cannot name (the decoder marks those, and they
+/// are skipped). A Profile 5 stream
 /// signals its range and nothing else — its colour space cannot be expressed in
 /// CICP at all, so the SPS carries "unspecified" — and a legacy Profile 4 mux
 /// often omits the colour description entirely. Those gaps are what this closes.
@@ -785,6 +788,13 @@ pub fn fill_derived_color(
     let fill = |field: &mut Option<String>,
                     source: &mut Option<ColorSource>,
                     defined: Option<&str>| {
+        // `ColorInfo` being empty is not enough: it is also empty when the
+        // source signalled a CICP code this build has no name for, which the
+        // decoder records as `UnnamedCode`. Filling over that would overwrite a
+        // real signal and then claim, via `Spec`, that nothing was signalled.
+        if *source == Some(ColorSource::UnnamedCode) {
+            return;
+        }
         if let (None, Some(v)) = (&*field, defined) {
             *field = Some(v.to_string());
             *source = Some(ColorSource::Spec);
@@ -1577,6 +1587,36 @@ mod tests {
         assert!(!dv.pq_reshaping);
     }
 
+    /// A CICP code the source signalled but this build cannot name leaves
+    /// `ColorInfo` empty, exactly like a field nothing signalled. The fill must
+    /// tell them apart, or it overwrites a real signal and then claims via
+    /// `Spec` that nothing was signalled. The corpus reaches this: the ProRes
+    /// frame header carries matrix 6, which no shared table names.
+    #[test]
+    fn derived_colour_never_overwrites_an_unnamed_code() {
+        use crate::model::{ColorInfo, ColorSource, ColorSources};
+        let dv = dv_stub("9.2", Some(2), Some(CompatSource::Spec));
+        // Primaries and transfer were never signalled; the matrix carried a
+        // code with no name (CICP 6, BT.601 — a plausible SDR base-layer tag).
+        let mut color = ColorInfo::default();
+        let mut sources =
+            ColorSources { matrix: Some(ColorSource::UnnamedCode), ..Default::default() };
+        fill_derived_color(&mut color, &mut sources, &dv);
+
+        assert_eq!(color.primaries.as_deref(), Some("BT.709"), "genuinely absent, so filled");
+        assert_eq!(color.transfer.as_deref(), Some("BT.709"));
+        assert_eq!(sources.primaries, Some(ColorSource::Spec));
+        assert_eq!(
+            color.matrix, None,
+            "a signalled code must not be replaced by the profile's default"
+        );
+        assert_eq!(
+            sources.matrix,
+            Some(ColorSource::UnnamedCode),
+            "and must not be relabelled as unsignalled"
+        );
+    }
+
     /// The fill describes a base layer, so a track without one gets nothing —
     /// the enhancement-layer case, where profile 4's own VUI is byte-identical
     /// to a profile 5 base layer and would read as one in isolation.
@@ -1607,8 +1647,10 @@ mod tests {
                 range: Some("full".to_string()),
                 ..Default::default()
             };
-            let mut sources =
-                crate::model::ColorSources::of(&color, crate::model::ColorSource::Stream);
+            let mut sources = crate::model::ColorSources {
+                range: Some(crate::model::ColorSource::Stream),
+                ..Default::default()
+            };
             fill_derived_color(&mut color, &mut sources, &dv);
             (color, sources)
         };

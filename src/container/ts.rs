@@ -30,7 +30,7 @@ use crate::avc::nal as avc_nal;
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
 use crate::hevc::nal::{self, NalRef};
 use crate::hevc::sps::{parse_sps, SpsInfo};
-use crate::model::{Bitrate, ColorInfo, ColorSource, ColorSources};
+use crate::model::{Bitrate, ColorInfo, ColorSources};
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
@@ -162,7 +162,8 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         groups.iter().zip(outs).zip(bests.into_iter().zip(sps_chunks)).zip(codecs)
     {
         let (best, sps_chunk) = best;
-        let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_fields(best);
+        let (width, height, bit_depth, chroma, codec_profile, (color, color_source), fps) =
+            sps_fields(best);
 
         // `--full`: the exact video-stream byte total is only known after the
         // sampler's streaming walk, so leave the rate unset here — main.rs
@@ -189,7 +190,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             chroma,
             codec_profile,
             // TS carries no colour box: every field here is the in-band SPS VUI.
-            color_source: ColorSources::of(&color, ColorSource::Stream),
+            color_source,
             color,
             dv_config: g.streams.iter().find_map(|e| e.dv_config.clone()),
             dv_dual_track: g.dv_dual_track,
@@ -861,7 +862,7 @@ struct SpsCommon {
     bit_depth: u8,
     chroma: String,
     profile: String,
-    color: ColorInfo,
+    color: (ColorInfo, ColorSources),
     frame_rate: Option<f64>,
     /// Index of the chunk the SPS was found in — a RAP access unit, which is
     /// where the per-GOP prefix SEIs ride (see `Demux::sps_chunk`).
@@ -883,7 +884,7 @@ fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<SpsCommon> {
 #[allow(clippy::type_complexity)]
 fn sps_fields(
     best: Option<SpsCommon>,
-) -> (u32, u32, Option<u8>, Option<String>, Option<String>, ColorInfo, Option<f64>) {
+) -> (u32, u32, Option<u8>, Option<String>, Option<String>, (ColorInfo, ColorSources), Option<f64>) {
     match best {
         Some(c) => (
             c.width,
@@ -894,7 +895,7 @@ fn sps_fields(
             c.color,
             c.frame_rate,
         ),
-        None => (0, 0, None, None, None, ColorInfo::default(), None),
+        None => (0, 0, None, None, None, (ColorInfo::default(), ColorSources::default()), None),
     }
 }
 

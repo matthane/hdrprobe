@@ -205,49 +205,43 @@ pub enum ColorSource {
     /// was itself declared or spec-fixed — never when it was inferred from the
     /// very colour this would be filling.
     Spec,
+    /// **Internal, never serialized.** The source carried a CICP code for this
+    /// field that this build has no name for, so `ColorInfo` leaves it empty —
+    /// there is no label to put there — and it is otherwise indistinguishable
+    /// from a field nothing signalled at all. Recording it keeps the Dolby
+    /// Vision spec fill from overwriting a real signal and then claiming, via
+    /// `Spec`, that nothing was signalled. `hidden` below keeps it out of the
+    /// report, so `ColorSources` still carries a tag exactly when `ColorInfo`
+    /// carries a value.
+    UnnamedCode,
+}
+
+/// `skip_serializing_if` for every `ColorSources` field: a field with no value
+/// has no provenance to report, and `UnnamedCode` marks precisely that case.
+fn hidden(v: &Option<ColorSource>) -> bool {
+    matches!(v, None | Some(ColorSource::UnnamedCode))
 }
 
 /// Per-field provenance for `ColorInfo`, in the same field order. A field is
 /// tagged exactly when `ColorInfo` carries a value for it.
 #[derive(Debug, Serialize, Default, Clone, Copy)]
 pub struct ColorSources {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "hidden")]
     pub primaries: Option<ColorSource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "hidden")]
     pub transfer: Option<ColorSource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "hidden")]
     pub matrix: Option<ColorSource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "hidden")]
     pub range: Option<ColorSource>,
 }
 
-impl ColorSources {
-    /// Every field the description carries, tagged with one source — the shape
-    /// a backend with a single colour input produces.
-    pub fn of(color: &ColorInfo, src: ColorSource) -> Self {
-        let mut sources = ColorSources::default();
-        sources.tag(color, src);
-        sources
-    }
-
-    /// Tag every field the description carries with `src`, overwriting any tag
-    /// already there. Call once per assembly step, in the same precedence order
-    /// the colour itself is assembled, so the last writer of a field wins.
-    pub fn tag(&mut self, color: &ColorInfo, src: ColorSource) {
-        if color.primaries.is_some() {
-            self.primaries = Some(src);
-        }
-        if color.transfer.is_some() {
-            self.transfer = Some(src);
-        }
-        if color.matrix.is_some() {
-            self.matrix = Some(src);
-        }
-        if color.range.is_some() {
-            self.range = Some(src);
-        }
-    }
-}
+/// Every colour producer builds `ColorInfo` and `ColorSources` together through
+/// `container::color_from_cicp`, which is the only place that sees the raw CICP
+/// codes and so the only place that can tell an unnamed code from an absent one.
+/// There is deliberately no constructor here that derives provenance from a
+/// finished `ColorInfo`: it could not make that distinction, and a caller using
+/// one would silently relabel fields it never wrote.
 
 #[derive(Debug, Serialize)]
 pub struct Hdr {
@@ -917,6 +911,27 @@ mod tests {
         ];
         expected.sort_unstable();
         assert_eq!(paths, expected, "JSON schema surface changed; see docs/SCHEMA.md");
+    }
+
+    /// `UnnamedCode` is internal bookkeeping, not a reported provenance: it
+    /// marks a field `ColorInfo` has no value for, and a field with no value has
+    /// nothing to attribute. It must never reach the output, or it would break
+    /// the documented guarantee that `color` and `color_source` carry the same
+    /// key set.
+    #[test]
+    fn the_unnamed_code_marker_never_serializes() {
+        let sources = ColorSources {
+            primaries: Some(ColorSource::Container),
+            transfer: Some(ColorSource::UnnamedCode),
+            matrix: Some(ColorSource::UnnamedCode),
+            range: Some(ColorSource::Stream),
+        };
+        let v = serde_json::to_value(sources).expect("serializes");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 2, "only the two reportable fields survive: {v}");
+        assert_eq!(obj["primaries"], "container");
+        assert_eq!(obj["range"], "stream");
+        assert!(!v.to_string().contains("unnamed"), "the marker leaked: {v}");
     }
 
     #[test]
