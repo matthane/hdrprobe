@@ -287,13 +287,25 @@ fn is_video_type(t: u8) -> bool {
     t == STREAM_TYPE_HEVC || t == STREAM_TYPE_AVC
 }
 
-/// A Dolby Vision enhancement-layer stream: its 0xB0 descriptor says the PID
-/// carries no base layer, or it is DV-flagged with no video stream type at all
-/// (the bare EL/RPU PID shape, PES-private 0x06 with only a DOVI registration
-/// descriptor).
+/// A Dolby Vision enhancement-layer stream.
+///
+/// A present 0xB0 descriptor **states this outright and is authoritative**:
+/// `bl_present_flag` decides, and the stream type is not consulted. Inferring
+/// it from the stream type instead misreads a legal single-PID Profile 5
+/// stream, which per §7.1.2 of *Dolby Vision Streams Within the MPEG-2
+/// Transport Stream Format* is signalled with PES-private `stream_type` 0x06
+/// (its base layer is not SDR/HDR compliant, so it may not claim 0x1B/0x24), a
+/// DOVI registration descriptor, **and `bl_present_flag == 1`**. That PID is a
+/// base layer wearing a private stream type, not an EL.
+///
+/// Only with no descriptor at all does the shape have to be inferred: a
+/// DV-flagged PID carrying no video stream type is the bare EL/RPU PID, which
+/// is PES-private 0x06 with only a DOVI registration descriptor.
 fn is_el_stream(e: &Es) -> bool {
-    e.dv_config.as_ref().is_some_and(|c| !c.bl_present)
-        || (e.has_dovi && !is_video_type(e.stream_type))
+    match &e.dv_config {
+        Some(c) => !c.bl_present,
+        None => e.has_dovi && !is_video_type(e.stream_type),
+    }
 }
 
 /// Group each program's video PIDs into reported tracks.
@@ -1355,6 +1367,54 @@ mod tests {
             ],
         )]);
         assert_eq!(g.len(), 2);
+        assert!(g.iter().all(|g| !g.dv_dual_track));
+    }
+
+    #[test]
+    fn private_stream_type_with_bl_present_is_a_base_layer() {
+        // TS spec §7.1.2: a single-PID Profile 5 stream (non-SDR/non-HDR
+        // compliant BL, so it may not claim 0x1B/0x24) rides PES-private
+        // stream_type 0x06 with bl_present_flag == 1. The descriptor is
+        // authoritative — inferring from the stream type calls it an EL.
+        let p5_bl = es(0x200, 0x06, Some((true, None)));
+        assert!(!is_el_stream(&p5_bl));
+        // The bare EL/RPU PID shape still reads as an EL by both routes. With
+        // a descriptor, its explicit bl_present == 0 says so:
+        assert!(is_el_stream(&es(0x300, 0x06, Some((false, None)))));
+        // With none — DV-flagged by the registration descriptor alone, which
+        // the `es` helper cannot express since its `None` clears has_dovi too —
+        // the stream type is the only evidence left, so the shape is inferred.
+        let bare = |stream_type| Es {
+            pid: 0x300,
+            stream_type,
+            has_dovi: true,
+            dv_config: None,
+            dependency_pid: None,
+        };
+        assert!(is_el_stream(&bare(0x06)));
+        // ...but a DV-flagged PID that *does* carry a video stream type is a
+        // base layer, so the inference stays confined to the private type.
+        assert!(!is_el_stream(&bare(STREAM_TYPE_HEVC)));
+
+        // Alone in its program it is one ordinary single-layer track. This
+        // case was already right by accident, via the "only EL-shaped PIDs"
+        // fallback, so it pins the outcome rather than the reasoning.
+        let g = group_video_pids(&[prog(1, vec![es(0x200, 0x06, Some((true, None)))])]);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].pids(), [0x200]);
+        assert!(!g[0].dv_dual_track);
+        assert_eq!(g[0].primary_pid(), 0x200);
+
+        // Sharing a program with an ordinary video PID is where it mattered:
+        // two independent tracks. Folding the P5 BL in as an enhancement layer
+        // merged both PIDs into one stream and claimed a dual-layer structure.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![es(0x100, STREAM_TYPE_HEVC, None), es(0x200, 0x06, Some((true, None)))],
+        )]);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].pids(), [0x100]);
+        assert_eq!(g[1].pids(), [0x200]);
         assert!(g.iter().all(|g| !g.dv_dual_track));
     }
 
