@@ -289,9 +289,11 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             })
             .unwrap_or(0);
 
-        if let Some(t) =
+        if let Some(mut t) =
             parse_video_track(data, &mdia_boxes, movie_timescale, movie_duration, track_id)?
         {
+            // `tref` is a trak child, not an mdia one, so it is read here.
+            t.vdep_refs = parse_vdep_refs(data, &trak_boxes);
             tracks.push(t);
         }
     }
@@ -358,6 +360,35 @@ struct VideoTrack {
     stream_duration_secs: Option<f64>,
     track_id: u32,
     media_timescale: u32,
+    /// Track ids named by this trak's `tref`/`vdep` box — the base layer(s) a
+    /// Dolby Vision enhancement-layer trak depends on. Empty when the file
+    /// carries no `tref`, which is common enough that it can't be required.
+    vdep_refs: Vec<u32>,
+}
+
+/// Cap on `vdep` entries read from one `tref`. The box carries no count field,
+/// so the entry total is implied by its extent; a real one names a single base
+/// layer, and the list is only ever searched for a match among the file's own
+/// traks. Bounding it keeps a corrupt box extent from driving a large alloc,
+/// per the same discipline as `clamp_count`.
+const MAX_TREF_REFS: usize = 16;
+
+/// Track ids from a trak's `tref` box with reference type `vdep`. §8.2.2 of
+/// *Dolby Vision Streams Within the ISO Base Media File Format* requires a
+/// dual-track file to signal the BL/EL dependency exactly here: "The
+/// dependency between the Dolby Vision base and enhancement track shall be
+/// signaled by the `tref` box. The reference_type shall be set to `vdep`."
+fn parse_vdep_refs(data: &[u8], trak_boxes: &[BoxHdr]) -> Vec<u32> {
+    let Some(tref) = find(trak_boxes, b"tref") else { return Vec::new() };
+    let mut refs = Vec::new();
+    for r in iter_boxes(data, tref.payload, tref.end) {
+        if &r.typ != b"vdep" {
+            continue;
+        }
+        let n = clamp_count(MAX_TREF_REFS, r.payload, 4, r.end);
+        refs.extend((0..n).map(|k| read_u32(data, r.payload + k * 4)));
+    }
+    refs
 }
 
 /// Assemble the parsed video `trak`s into reported tracks. A trak whose
@@ -369,6 +400,13 @@ struct VideoTrack {
 /// and the pair reports as one logical track with `dv_dual_track` set. Every
 /// other trak — including a second independent video track with no dvcC, or
 /// with a `bl_present == 1` dvcC — is its own reported track, in trak order.
+///
+/// An EL folds into the base layer its `tref`/`vdep` box names, which §8.2.2 of
+/// the Dolby ISOBMFF spec requires a dual-track file to signal, and which is
+/// the exact analogue of the TS backend's `dependency_pid`. Only when no `vdep`
+/// resolves to one of this file's own base traks does it fall back to the
+/// widest independent trak: plenty of real muxes omit `tref`, so the heuristic
+/// has to stay, but it must not outrank an explicit reference.
 fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str) -> Demux {
     let is_el = |t: &VideoTrack| t.sd.dv_config.as_ref().is_some_and(|c| !c.bl_present);
     let (els, base): (Vec<VideoTrack>, Vec<VideoTrack>) = tracks.into_iter().partition(is_el);
@@ -376,19 +414,30 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
     // than dropping everything (no BL exists to fold into).
     let (els, base) = if base.is_empty() { (Vec::new(), els) } else { (els, base) };
 
-    // The fold target for any ELs: the widest independent trak is the base
-    // layer whose picture the residual enhances.
-    let fold = base
+    // Fallback fold target: the widest independent trak is the base layer whose
+    // picture a residual most plausibly enhances.
+    let widest = base
         .iter()
         .enumerate()
         .max_by_key(|(_, t)| t.sd.width as u64 * t.sd.height as u64)
         .map(|(i, _)| i)
         .unwrap_or(0);
+    // Bucket each EL against its own fold target, so a file with several base
+    // traks routes each residual by what it actually references.
+    let mut buckets: Vec<Vec<VideoTrack>> = (0..base.len().max(1)).map(|_| Vec::new()).collect();
+    for e in els {
+        let target = e
+            .vdep_refs
+            .iter()
+            .find_map(|id| base.iter().position(|b| b.track_id == *id))
+            .unwrap_or(widest);
+        buckets[target].push(e);
+    }
 
     let mut duration_secs: Option<f64> = None;
     let mut out = Vec::with_capacity(base.len());
     for (i, t) in base.into_iter().enumerate() {
-        let group_els: &[VideoTrack] = if i == fold { &els } else { &[] };
+        let group_els: &[VideoTrack] = &buckets[i];
 
         // DV config / static HDR from the trak itself, gaps filled from its
         // folded EL (a real dual-track pair carries the dvcC on the EL trak).
@@ -560,6 +609,7 @@ fn parse_video_track(
         stream_duration_secs,
         track_id,
         media_timescale,
+        vdep_refs: Vec::new(),
     }))
 }
 
@@ -1276,6 +1326,7 @@ mod tests {
             stream_duration_secs: None,
             track_id: 1,
             media_timescale: 0,
+            vdep_refs: Vec::new(),
         }
     }
 
@@ -1331,6 +1382,61 @@ mod tests {
         assert_eq!(d.tracks[0].chunks.len(), 3, "no cross-track concatenation");
         assert_eq!(d.tracks[1].chunks.len(), 2);
         assert!(d.tracks.iter().all(|t| !t.dv_dual_track));
+    }
+
+    #[test]
+    fn tref_vdep_parses_referenced_track_ids() {
+        let refs = |children: &[u8]| {
+            let tref = boxed(*b"tref", children);
+            let boxes = iter_boxes(&tref, 0, tref.len());
+            parse_vdep_refs(&tref, &boxes)
+        };
+        let ids = |v: &[u32]| -> Vec<u8> {
+            v.iter().flat_map(|i| i.to_be_bytes()).collect()
+        };
+        assert_eq!(refs(&boxed(*b"vdep", &ids(&[1]))), vec![1]);
+        assert_eq!(refs(&boxed(*b"vdep", &ids(&[1, 7]))), vec![1, 7]);
+        // Other reference types share the tref and must be ignored.
+        let mut mixed = boxed(*b"cdsc", &ids(&[4]));
+        mixed.extend_from_slice(&boxed(*b"vdep", &ids(&[2])));
+        assert_eq!(refs(&mixed), vec![2]);
+        // A vdep whose extent isn't a whole number of ids reads only the
+        // complete ones, never past the box.
+        assert_eq!(refs(&boxed(*b"vdep", &[0, 0, 0, 3, 0xAA])), vec![3]);
+        assert!(refs(&[]).is_empty());
+        // No tref at all is the common case, not an error.
+        let empty: Vec<BoxHdr> = Vec::new();
+        assert!(parse_vdep_refs(&[], &empty).is_empty());
+    }
+
+    #[test]
+    fn vdep_outranks_the_width_heuristic_for_the_el_fold_target() {
+        // Two independent base traks plus an EL whose tref/vdep names the
+        // *narrower* one. §8.2.2 makes that reference the authoritative
+        // dependency signal, so the EL must fold there rather than into the
+        // widest trak the fallback would otherwise pick.
+        let a = track(3840, 2160, 4, None, 3);
+        let mut b = track(1920, 1080, 4, None, 2);
+        b.track_id = 2;
+        let mut el = track(1920, 1080, 4, Some(dv7_el()), 4);
+        el.track_id = 3;
+        el.vdep_refs = vec![2];
+        let d = assemble_tracks(&[], vec![a, b, el], "MP4 (ISOBMFF)");
+        assert_eq!(d.tracks.len(), 2);
+        assert_eq!(d.tracks[0].chunks.len(), 3, "widest trak left alone");
+        assert!(!d.tracks[0].dv_dual_track);
+        assert_eq!(d.tracks[1].chunks.len(), 6, "EL folded into the referenced trak");
+        assert!(d.tracks[1].dv_dual_track);
+
+        // A vdep naming a track the file doesn't contain is unusable, so the
+        // width fallback still runs — the EL is never dropped.
+        let mut el = track(1920, 1080, 4, Some(dv7_el()), 4);
+        el.track_id = 3;
+        el.vdep_refs = vec![99];
+        let d = assemble_tracks(&[], vec![track(3840, 2160, 4, None, 3), el], "MP4 (ISOBMFF)");
+        assert_eq!(d.tracks.len(), 1);
+        assert_eq!(d.tracks[0].chunks.len(), 7);
+        assert!(d.tracks[0].dv_dual_track);
     }
 
     #[test]
