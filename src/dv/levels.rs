@@ -608,25 +608,40 @@ pub fn flag_mastering_primaries_mismatch(dv: &mut DolbyVision, bl_primaries: Opt
 }
 
 /// The Dolby Vision level table ("Dolby Vision Profiles and Levels", the
-/// dsigPL table Dolby's own dlb_mp4base muxer derives levels from): each
-/// level's max pixel rate is exactly its anchor format's `width x height x
-/// fps`, plus a max-width axis that splits the equal-rate UHD@120 / 8K@30
-/// pair (levels 10/11). Rows are `(level, max pixels/second, max width)`,
-/// ascending, so the first admitting row is the smallest sufficient level.
+/// dsigPL table Dolby's own dlb_mp4base muxer derives levels from). Rows are
+/// `(level, max pixels/second, max width)`, ascending, so the first admitting
+/// row is the smallest sufficient level.
+///
+/// The two limits come from **different columns of the spec table, and they do
+/// not agree**: the rate is the row's "Maximum pixel rate (pps)", which equals
+/// its anchor format's `width x height x fps`, while the width is the row's own
+/// "Maximum decoded bitstream video width (pixels)" — deliberately *wider* than
+/// the anchor on levels 4 and 5 (2560 and 3840 against a 1920-wide anchor).
+/// Copying the anchor's width into this column instead reads plausible and is
+/// wrong: it pushes ultrawide-but-low-rate content (2560x1080@24, 3840x1600@20)
+/// up two levels, because the rate axis admits the row and the width axis then
+/// rejects it. Take each column from the spec, never derive one from the other.
+/// The width axis also splits the equal-rate UHD@120 / 8K@30 pair (levels
+/// 10/11), which is why it exists at all.
+///
+/// Pinned by `derived_level_is_the_smallest_admitting_pixel_rate_and_width`.
+/// Identical in P&L v1.5 (Dec 2024) and in the "Dolby Vision Streams Within the
+/// HTTP Live Streaming Format" v2.0 / "...MPEG-DASH Format" v2.0 carriage
+/// specs, so it is not a revision-drift question.
 const DV_LEVEL_LIMITS: [(u8, u64, u32); 13] = [
-    (1, 22_118_400, 1280),     // 1280x720x24
-    (2, 27_648_000, 1280),     // 1280x720x30
-    (3, 49_766_400, 1920),     // 1920x1080x24
-    (4, 62_208_000, 1920),     // 1920x1080x30
-    (5, 124_416_000, 1920),    // 1920x1080x60
-    (6, 199_065_600, 3840),    // 3840x2160x24
-    (7, 248_832_000, 3840),    // 3840x2160x30
-    (8, 398_131_200, 3840),    // 3840x2160x48
-    (9, 497_664_000, 3840),    // 3840x2160x60
-    (10, 995_328_000, 3840),   // 3840x2160x120
-    (11, 995_328_000, 7680),   // 7680x4320x30
-    (12, 1_990_656_000, 7680), // 7680x4320x60
-    (13, 3_981_312_000, 7680), // 7680x4320x120
+    (1, 22_118_400, 1280),     // rate 1280x720x24
+    (2, 27_648_000, 1280),     // rate 1280x720x30
+    (3, 49_766_400, 1920),     // rate 1920x1080x24
+    (4, 62_208_000, 2560),     // rate 1920x1080x30, width cap 2560
+    (5, 124_416_000, 3840),    // rate 1920x1080x60, width cap 3840
+    (6, 199_065_600, 3840),    // rate 3840x2160x24
+    (7, 248_832_000, 3840),    // rate 3840x2160x30
+    (8, 398_131_200, 3840),    // rate 3840x2160x48
+    (9, 497_664_000, 3840),    // rate 3840x2160x60
+    (10, 995_328_000, 3840),   // rate 3840x2160x120
+    (11, 995_328_000, 7680),   // rate 7680x4320x30
+    (12, 1_990_656_000, 7680), // rate 7680x4320x60
+    (13, 3_981_312_000, 7680), // rate 7680x4320x120
 ];
 
 /// Fill a missing DV level from the coded stream's shape: the smallest level
@@ -1219,6 +1234,21 @@ mod tests {
         // The equal-rate UHD@120 / 8K@30 pair splits on the width axis.
         assert_eq!(derive(7680, 4320, Some(30.0)), (Some(11), true));
         assert_eq!(derive(7680, 4320, Some(120.0)), (Some(13), true));
+
+        // Levels 4 and 5 admit pictures *wider* than their rate anchor: their
+        // spec width caps are 2560 and 3840 against a 1920-wide anchor format.
+        // Ultrawide-but-low-rate content is the case that separates the spec's
+        // width column from the anchor's width, so pin all three rows.
+        // 2560x900x24 = 55,296,000 pps, inside level 4's 62,208,000.
+        assert_eq!(derive(2560, 900, Some(24.0)), (Some(4), true));
+        // 2560x1080x24 = 66,355,200 pps, past level 4, inside level 5's rate.
+        assert_eq!(derive(2560, 1080, Some(24.0)), (Some(5), true));
+        // 3840x1600x20 = 122,880,000 pps, just inside level 5's 124,416,000,
+        // at exactly its 3840 width cap.
+        assert_eq!(derive(3840, 1600, Some(20.0)), (Some(5), true));
+        // The width cap is still a real bound: one pixel over level 5's 3840
+        // falls through to level 11, the next row admitting a wider picture.
+        assert_eq!(derive(3841, 1600, Some(20.0)), (Some(11), true));
         // Beyond the table: absent, never a guess.
         assert_eq!(derive(7680, 4320, Some(144.0)), (None, false));
         // No frame rate / degenerate dimensions: absent, never a guess.
