@@ -1,0 +1,12 @@
+# Store every text file with LF in the repository, whatever the working tree
+# holds. Without this, tooling that rewrites a file on Windows can silently
+# convert it: Python's `write_text` translates `\n` to `\r\n` in text mode, so a
+# script that reads a source file, edits it and writes it back leaves CRLF
+# behind. Two files were committed that way, and the damage is invisible until
+# a reviewer finds a 90-line change rendering as a 470-line delete-and-re-add.
+* text=auto eol=lf
+
+# Binary, so never touched.
+*.png binary
+*.pdf binary
+*.ico binary
