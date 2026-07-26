@@ -1057,11 +1057,26 @@ never parse bytes native-endian.
   a packet budget sized to `HEAD_SCAN_BYTES` (24 MiB, ~2× the observed SPS depth), so the read
   isn't cut short before that IDR. Don't "optimize" this down to a few MiB (drops resolution/colour, and L5 falls
   back to raw offsets) or reintroduce the old whole-file window spread (defeats the remote win).
-  **Duration is the one exception that also reads the tail:** TS has no duration box, so — like
-  MediaInfo — it comes from `last_PCR - first_PCR` on the PCR PID. The first PCR is free from the
-  head window; the last comes from a *bounded* trailing window (`ts::TAIL_SCAN_BYTES`, 4 MiB). Head
-  + tail only, never the middle. A discontinuity flag in the sampled tail, a missing PCR, or an
-  implausible span yields `None` rather than a wrong number (`ts::pcr_duration`).
+  **Duration is the one exception that also reads the tail:** TS has no duration box, so it comes
+  from the same head window plus a *bounded* trailing window (`ts::TAIL_SCAN_BYTES`, 4 MiB). Head
+  + tail only, never the middle. **The video PTS span wins, the PCR span is the fallback**
+  (`ts::clock_duration`, open-items B1): the PCR times byte *arrival* and the muxer flushes the
+  tail without one — 11.6% of the corpus `mpeg2.ts` carries no PCR at all, reading 1.92 s against
+  a true 2.000 and pushing the overall bitrate 4.2% high — while the PTS closes when the last
+  picture is shown, which is what the report calls duration. The span is completed with one frame
+  interval (`container::whole_frame_duration`, shared with the PS backend, whose PTS-over-arrival
+  design this mirrors guard for guard). The PTS route's hard gates: single program and single
+  video group only (sibling programs ride independent STCs), forward discontinuity-free PCRs in
+  both windows with the tail's clock after the head's, each window's presentation span credible
+  against its own PCR span (one stray timestamp cannot set a min/max answer), disjoint windows
+  (`tail_start.max(head_end)` — overlap makes the reset guard fire on every mid-size file), a
+  contiguous tail falling back to the head's own maximum (between them they read the whole file),
+  one wrap folded through the shared modulus, and the shared 26-hour ceiling. A discontinuity
+  flag, a missing PCR, or an implausible span downgrades to the PCR route or to `None`, never a
+  wrong number. On real content the two routes agree within a frame or two; the reference tools
+  themselves spread wider (the 1.49 GB corpus M2TS: ffprobe 119.840, MediaInfo General 119.878,
+  MediaInfo per-video-track 119.911, hdrprobe 119.953 = that span plus the final frame's display
+  time — i.e. frames × frame duration, matching MediaInfo's video-track semantics).
 - **A program stream's duration is the video PTS span plus one frame, and the SCR is not a
   fallback.** The span itself is one frame short by arithmetic, not approximation: frame `k` of
   `N` is presented at `start + k/f`, so first-to-last is `(N-1)/f` while the stream occupies

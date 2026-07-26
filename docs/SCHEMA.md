@@ -233,7 +233,7 @@ and bitrate themselves.
 | `container` | string | always | Container or sidecar kind; see the value table under `VideoTrack` below |
 | `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes" below |
 | `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
-| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a multi-program TS shares one mux timeline; an Ogg file's is its *video* stream's — audio that outlasts the video is not counted, since measuring it would mean decoding audio granule positions). Absent when the input has no duration source (raw HEVC; raw AV1 OBU and raw MPEG-1/2 ES without a full scan — under `--full` both derive frames ÷ rate, and the raw MPEG ES then also reports the `video_stream` bitrate the derivation enables; all sidecars; a truncated stdin TS probe, whose PCR span would describe the prefix, not the stream) |
+| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a TS/M2TS reports the video presentation span — head-minimum to tail-maximum video PTS plus one frame interval, matching MediaInfo's per-video-track duration; the PCR arrival span is the fallback when the PTS route is not credible, and a multi-program TS shares one mux timeline; an Ogg file's is its *video* stream's — audio that outlasts the video is not counted, since measuring it would mean decoding audio granule positions). Absent when the input has no duration source (raw HEVC; raw AV1 OBU and raw MPEG-1/2 ES without a full scan — under `--full` both derive frames ÷ rate, and the raw MPEG ES then also reports the `video_stream` bitrate the derivation enables; all sidecars; a truncated stdin TS probe, whose PCR span would describe the prefix, not the stream) |
 | `video_tracks` | array of `VideoTrack` | always, at least one entry | One entry per video track; see "Multiple video tracks" below |
 | `elapsed_ms` | float | always | Wall-clock parse time in milliseconds |
 
@@ -713,7 +713,7 @@ about a GOP in), 16 MiB otherwise. When it stops reading, a pipe writer sees a b
 that is the normal success signal, not an error. A stream that ends within the budget is
 complete and reports exactly like a file probe. A stream that exceeds it reports
 `input_truncated: true`, `size_bytes` as the bytes probed, and `file` as `"-"`, and withholds
-what a prefix cannot honestly state: a TS input's `duration_secs` (the PCR span would describe
+what a prefix cannot honestly state: a TS input's `duration_secs` (either clock's span would describe
 the cut, not the stream) and every `bitrate` except MP4/MOV's `video_stream` rate (whose
 sample-table sums are exact regardless of truncation). Declared header facts (MP4 `mvhd` and
 MKV Segment-Info durations, resolution, color, HDR and Dolby Vision metadata from the sampled
@@ -906,6 +906,13 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   Also additive: a raw MPEG-1/2 elementary stream under `--full` now reports `duration_secs`
   (picture count ÷ the sequence header's rate) and a `video_stream`-scope `bitrate`, matching
   MediaInfo's derivation byte-exactly; the default bounded probe still reports neither.
+  One value change with no shape change: **TS/M2TS `duration_secs` is now the video
+  presentation span** (head-minimum to tail-maximum video PTS plus one frame interval, the
+  program-stream backend's rule) **with the PCR span as the fallback**, because the PCR times
+  byte arrival and real muxers flush the tail without one — the corpus clip read 1.92 s against
+  a true 2.000, and its `overall` bitrate divided by the short denominator ran 4.2% high. On
+  ordinary content the change is within a frame or two; a consumer that specifically wants the
+  arrival span should read the PCRs itself.
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional

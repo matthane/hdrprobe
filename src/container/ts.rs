@@ -152,16 +152,21 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         }
     }
 
-    // Duration from the transport clock (head+tail PCR delta), file-level: a
-    // multi-program capture shares one mux timeline. Prefer the PMTs' declared
-    // PCR PIDs, falling back to the video PID(s) — most streams carry the PCR
-    // on the video PID anyway.
-    let duration_secs = programs
+    // Duration from the clocks (video PTS span, PCR fallback — see
+    // `clock_duration`), file-level: a multi-program capture shares one mux
+    // timeline. Prefer the PMTs' declared PCR PIDs, falling back to the video
+    // PID(s) — most streams carry the PCR on the video PID anyway. The PTS
+    // route is offered only for a single-program, single-video-group file:
+    // sibling programs ride independent STCs, and a span across two clocks is
+    // not a duration.
+    let video_pids: Vec<u16> = group_pids.iter().flatten().copied().collect();
+    let pts_ok = programs.len() <= 1 && group_pids.len() == 1;
+    let clock_est = programs
         .iter()
         .map(|p| p.pcr_pid)
-        .chain(group_pids.iter().flatten().copied())
+        .chain(video_pids.iter().copied())
         .filter(|&pid| pid != PID_NONE)
-        .find_map(|pid| pcr_duration(data, layout, pid));
+        .find_map(|pid| clock_duration(data, layout, pid, pts_ok.then_some(&video_pids[..])));
 
     let container = if layout.stride == 192 {
         "MPEG-2 TS (M2TS/BDAV)"
@@ -185,16 +190,10 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         // sampler's streaming walk, so leave the rate unset here — main.rs
         // fills it from `sample::Scan` (the same value the old whole-stream
         // reassembly produced, including `None` when no video bytes complete).
-        // The default bounded path reports the file-length overall rate as
-        // before — but only when this is the file's only video track: an
-        // overall rate (audio + overhead included) attributed to one of
-        // several tracks would be a wrong number, so multi-track reports
-        // `None` instead.
-        let bitrate = if full || !single {
-            None
-        } else {
-            Bitrate::overall(data.len() as u64, duration_secs)
-        };
+        // The default bounded path's overall rate is filled after this loop —
+        // its denominator is the completed duration, which needs the video
+        // track's frame rate resolved first.
+        let bitrate = None;
 
         // MPEG-1/2 has no SPS, so `best_sps` left every field unset and the
         // sequence header supplies them. It rides the reassembled elementary
@@ -233,6 +232,27 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         }
         td.reassembled = Some(buf);
         tracks.push(td);
+    }
+
+    // Complete the timeline: a PTS span is one frame short of the duration by
+    // arithmetic (the shared `whole_frame_duration`), and the frame rate that
+    // completes it — the SPS VUI's or the MPEG sequence header's — resolved
+    // inside the loop above. A PCR span is an arrival measure and takes no
+    // completion. Then the default bounded path's overall rate, whose
+    // denominator this is — only when this is the file's only video track: an
+    // overall rate (audio + overhead included) attributed to one of several
+    // tracks would be a wrong number, so multi-track reports `None` instead.
+    let duration_secs = match clock_est {
+        Some(TsDuration::PtsSpan(span)) => {
+            super::whole_frame_duration(Some(span), tracks.first().and_then(|t| t.fps))
+        }
+        Some(TsDuration::Pcr(secs)) => Some(secs),
+        None => None,
+    };
+    if !full && single {
+        if let Some(t) = tracks.first_mut() {
+            t.bitrate = Bitrate::overall(data.len() as u64, duration_secs);
+        }
     }
 
     Ok(Demux {
@@ -857,42 +877,199 @@ fn packet_pcr(data: &[u8], off: usize) -> Option<(u16, bool, u64)> {
     Some((pid, discontinuity, base * 300 + ext))
 }
 
-/// Duration in seconds from `last_PCR - first_PCR` on `clock_pid`: the first PCR
-/// is read from the head, the last from a bounded tail window. Returns `None` if
-/// either PCR is missing, a discontinuity is seen in the sampled tail (the clock
-/// reset, so the delta is meaningless), or the span is implausible.
-fn pcr_duration(data: &[u8], layout: Layout, clock_pid: u16) -> Option<f64> {
-    let head_end = (HEAD_SCAN_BYTES as usize).min(data.len());
-    let first = scan_pcr(data, layout, clock_pid, layout.first, head_end, false)?;
-
-    let tail_start = data.len().saturating_sub(TAIL_SCAN_BYTES as usize);
-    let last = scan_pcr(data, layout, clock_pid, tail_start, data.len(), true)?;
-
-    let span = if last >= first { last - first } else { last + PCR_MODULUS - first };
-    let secs = span as f64 / 27_000_000.0;
-    // Reject a zero/absurd span (junk PCRs, an undetected mid-file discontinuity,
-    // or a second wrap we can't disambiguate) rather than print a wrong number.
-    if secs <= 0.0 || secs > 26.0 * 3600.0 {
-        return None;
-    }
-    Some(secs)
+/// What the clocks in one bounded packet window showed: PCRs on the clock PID
+/// plus video PES presentation timestamps — the transport analogue of the
+/// program-stream backend's `Walk`, and the guards mirror its invariants.
+#[derive(Default)]
+struct ClockWindow {
+    pcr_first: Option<u64>,
+    pcr_last: Option<u64>,
+    /// The clock stepped backward inside this window — a reset, since a wrap
+    /// within one bounded window is a 26-hour clock folding inside a few MiB.
+    pcr_backward: bool,
+    /// The *first* PCR seen carried the discontinuity flag: the historical
+    /// abort condition for the head window's PCR read.
+    first_pcr_discontinuity: bool,
+    /// Any sampled PCR carried the discontinuity flag.
+    any_discontinuity: bool,
+    pts_min: Option<u64>,
+    pts_max: Option<u64>,
 }
 
-/// Scan packets in `[start, end)` for PCRs on `clock_pid`. Returns the first such
-/// PCR when `want_last` is false, else the last. Bails to `None` if a
-/// discontinuity flag is seen (only meaningful for the tail scan, where it means
-/// the clock is no longer comparable to the head's).
-fn scan_pcr(
+impl ClockWindow {
+    fn note_pcr(&mut self, pcr: u64, discontinuity: bool) {
+        if self.pcr_first.is_none() {
+            self.first_pcr_discontinuity = discontinuity;
+        }
+        self.any_discontinuity |= discontinuity;
+        if self.pcr_last.is_some_and(|l| pcr < l) {
+            self.pcr_backward = true;
+        }
+        self.pcr_first.get_or_insert(pcr);
+        self.pcr_last = Some(pcr);
+    }
+
+    fn note_pts(&mut self, pts: u64) {
+        self.pts_min = Some(self.pts_min.map_or(pts, |m| m.min(pts)));
+        self.pts_max = Some(self.pts_max.map_or(pts, |m| m.max(pts)));
+    }
+
+    /// Seconds of transport clock this window covers.
+    fn pcr_span(&self) -> Option<f64> {
+        let (a, b) = (self.pcr_first?, self.pcr_last?);
+        Some(b.saturating_sub(a) as f64 / 27_000_000.0)
+    }
+
+    /// Whether this window's presentation span is credible against its own
+    /// transport clock — the program-stream backend's `pts_within`, verbatim:
+    /// over the same bytes the two clocks measure the same interval, so the
+    /// presentation span may exceed the arrival span only by the decoder
+    /// buffer delay. This is what stops a single stray timestamp from setting
+    /// the answer (a min/max over a window has no other defence). It catches
+    /// an *impossible* span, never a plausible-but-wrong one.
+    fn pts_within(&self) -> bool {
+        let (Some(pcr), Some(lo), Some(hi)) = (self.pcr_span(), self.pts_min, self.pts_max)
+        else {
+            return true;
+        };
+        let pts = hi.saturating_sub(lo) as f64 / 90_000.0;
+        pts <= pcr + (0.5 * pcr).max(super::SPAN_SLACK_SECS)
+    }
+}
+
+/// How a candidate clock resolved the timeline: the video PTS span (still a
+/// bare span — the caller completes it with the last frame's own display time
+/// once the frame rate is known), or the PCR arrival span.
+pub(crate) enum TsDuration {
+    /// Video presentation span in seconds, head minimum to tail maximum.
+    PtsSpan(f64),
+    /// Transport-clock span in seconds, first PCR to last.
+    Pcr(f64),
+}
+
+/// Resolve the mux timeline for one candidate clock PID: the **video PTS span
+/// when it is credible, else the PCR span** (open-items B1).
+///
+/// The PCR alone is short on a clipped tail — the muxer flushes trailing
+/// packets without a clock, measured at 11.6% of `testfiles/sdr/mpeg2.ts`
+/// carrying no PCR at all, so the span read 1.92 s against a true 2.000 —
+/// while the video PTS closes when the last picture is *shown*, which is the
+/// quantity the report calls duration. The program-stream backend made the
+/// same move for the same reason; the guards here are its, adapted to the
+/// transport clock:
+///
+/// - both windows must show a forward-only, discontinuity-free PCR (the flag
+///   is TS's own reset signal), and the tail's clock must not start before
+///   the head's ended;
+/// - each window's presentation span must be credible against its own PCR
+///   span (`pts_within` — one stray timestamp was measured turning a real
+///   program stream into "25 h 55 m");
+/// - the two windows must stay disjoint (`tail_start.max(head_end)`), or the
+///   tail's clock starts before the head's by construction and the reset
+///   guard fires on every ordinary file in the 24–28 MiB band;
+/// - when the windows meet, they have read the whole file between them, so a
+///   timestampless tail falls back to the head's own maximum; when they do
+///   not, it must not, or the answer would describe the head window alone;
+/// - one wrap is folded through the shared modulus; a span past
+///   `MAX_SPAN_SECS` or non-positive yields `None` rather than a wrong
+///   number.
+///
+/// `video_pids` is `Some` only when the file has a single program and a
+/// single video group: PTS from a sibling program rides a different STC, and
+/// a span across two independent clocks is not a duration.
+fn clock_duration(
     data: &[u8],
     layout: Layout,
     clock_pid: u16,
+    video_pids: Option<&[u16]>,
+) -> Option<TsDuration> {
+    let head_end = (HEAD_SCAN_BYTES as usize).min(data.len());
+    let natural_tail = data.len().saturating_sub(TAIL_SCAN_BYTES as usize);
+    let contiguous = natural_tail <= head_end;
+    let tail_start = natural_tail.max(head_end);
+
+    let head = scan_clocks(data, layout, clock_pid, video_pids, layout.first, head_end);
+    let tail = scan_clocks(data, layout, clock_pid, video_pids, tail_start, data.len());
+
+    if video_pids.is_some() {
+        if let Some(span) = pts_route(&head, &tail, contiguous) {
+            return Some(TsDuration::PtsSpan(span));
+        }
+    }
+    pcr_route(&head, &tail, contiguous).map(TsDuration::Pcr)
+}
+
+/// The PTS half of [`clock_duration`]; `None` means "not credible", never a
+/// best effort.
+fn pts_route(head: &ClockWindow, tail: &ClockWindow, contiguous: bool) -> Option<f64> {
+    if head.any_discontinuity || tail.any_discontinuity {
+        return None;
+    }
+    if head.pcr_backward || tail.pcr_backward {
+        return None;
+    }
+    if let (Some(hl), Some(tf)) = (head.pcr_last, tail.pcr_first) {
+        if tf < hl {
+            return None; // the tail's clock predates the head's end: a reset
+        }
+    }
+    // The credibility checks need a clock behind them. The head window always
+    // must show one: a TS carries a PCR at least every 100 ms, so a head with
+    // none means the wrong clock PID and the checks would be vacuously true,
+    // not passed. The tail must only when the windows are disjoint — a
+    // contiguous tail is a sliver (possibly empty) whose bytes the head
+    // window already covered.
+    head.pcr_span()?;
+    if !contiguous {
+        tail.pcr_span()?;
+    }
+    if !head.pts_within() || !tail.pts_within() {
+        return None;
+    }
+    let first = head.pts_min?;
+    let last = if contiguous { tail.pts_max.or(head.pts_max) } else { tail.pts_max }?;
+    let span =
+        if last >= first { last - first } else { last + super::PTS_MODULUS - first };
+    let secs = span as f64 / 90_000.0;
+    (secs > 0.0 && secs <= super::MAX_SPAN_SECS).then_some(secs)
+}
+
+/// The PCR half of [`clock_duration`]: `last_PCR - first_PCR`, exactly the
+/// historical rule — the head's first PCR (refused when it carries the
+/// discontinuity flag), the tail's last (refused when any sampled tail PCR
+/// carries it, the clock no longer being comparable), one wrap folded, and a
+/// zero/absurd span refused rather than printed.
+fn pcr_route(head: &ClockWindow, tail: &ClockWindow, contiguous: bool) -> Option<f64> {
+    // Historical semantics per window shape. Disjoint: the head contributes
+    // only its first PCR (refused when flagged), the tail refuses on any
+    // flagged PCR. Contiguous: the head window has seen every packet the old
+    // overlapping tail scan saw, so any flagged PCR anywhere refuses.
+    let head_reset =
+        if contiguous { head.any_discontinuity } else { head.first_pcr_discontinuity };
+    if head_reset || tail.any_discontinuity {
+        return None;
+    }
+    let first = head.pcr_first?;
+    let last = if contiguous { tail.pcr_last.or(head.pcr_last) } else { tail.pcr_last }?;
+    let span = if last >= first { last - first } else { last + PCR_MODULUS - first };
+    let secs = span as f64 / 27_000_000.0;
+    (secs > 0.0 && secs <= super::MAX_SPAN_SECS).then_some(secs)
+}
+
+/// Walk `[start, end)` collecting the clocks: PCRs on `clock_pid`, and — when
+/// `video_pids` is given — the presentation timestamp of every video PES that
+/// starts in the window.
+fn scan_clocks(
+    data: &[u8],
+    layout: Layout,
+    clock_pid: u16,
+    video_pids: Option<&[u16]>,
     start: usize,
     end: usize,
-    want_last: bool,
-) -> Option<u64> {
+) -> ClockWindow {
+    let mut w = ClockWindow::default();
     let end = end.min(data.len());
-    let mut p = align(data, layout, start)?;
-    let mut found: Option<u64> = None;
+    let Some(mut p) = align(data, layout, start) else { return w };
     while p + TS_UNIT <= end {
         if data[p] != SYNC {
             match resync(data, layout, p) {
@@ -905,18 +1082,39 @@ fn scan_pcr(
         }
         if let Some((pid, discontinuity, pcr)) = packet_pcr(data, p) {
             if pid == clock_pid {
-                if discontinuity {
-                    return None;
+                w.note_pcr(pcr, discontinuity);
+            }
+        }
+        if let Some(pids) = video_pids {
+            if let Some((pid, pusi, payload)) = packet_payload(data, p) {
+                if pusi && pids.contains(&pid) {
+                    if let Some(pts) = pes_pts(payload) {
+                        w.note_pts(pts);
+                    }
                 }
-                if !want_last {
-                    return Some(pcr);
-                }
-                found = Some(pcr);
             }
         }
         p += layout.stride;
     }
-    found
+    w
+}
+
+/// The presentation timestamp of a PES packet starting in this payload, when
+/// its header declares one. TS carries only the H.222.0 `'10'`-marker header
+/// form (the 11172-1 layout is a program-stream shape).
+///
+/// `header_data_length >= 5` mirrors the program-stream backend's rule (and
+/// ffmpeg's): a packet claiming a timestamp its own declared header is too
+/// short to hold is reading its payload, not a timestamp.
+fn pes_pts(payload: &[u8]) -> Option<u64> {
+    if payload.len() < 14 || payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+        return None;
+    }
+    let flags = payload[7];
+    let header_len = payload[8] as usize;
+    (payload[6] & 0xC0 == 0x80 && flags & 0x80 != 0 && header_len >= 5)
+        .then(|| super::parse_timestamp(payload, 9))
+        .flatten()
 }
 
 /// `--full` fallback when the head window held no SPS: stream the whole
@@ -1124,6 +1322,118 @@ mod tests {
         let mut v = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
         v.extend_from_slice(es);
         v
+    }
+
+    /// A PES start declaring a presentation timestamp of `pts` 90 kHz ticks.
+    fn pes_start_pts(pts: u64) -> Vec<u8> {
+        vec![
+            0x00,
+            0x00,
+            0x01,
+            0xE0,
+            0x00,
+            0x00,
+            0x80,
+            0x80, // PTS_DTS_flags '10'
+            0x05, // PES_header_data_length
+            0x21 | (((pts >> 30) & 0x07) as u8) << 1,
+            ((pts >> 22) & 0xFF) as u8,
+            ((((pts >> 15) & 0x7F) as u8) << 1) | 0x01,
+            ((pts >> 7) & 0xFF) as u8,
+            (((pts & 0x7F) as u8) << 1) | 0x01,
+        ]
+    }
+
+    /// A packet on `pid` whose adaptation field carries a PCR of `base` 90 kHz
+    /// ticks (extension 0), with the discontinuity flag as given.
+    fn pcr_packet(pid: u16, base: u64, discontinuity: bool) -> Vec<u8> {
+        let mut pkt = vec![0xFFu8; TS_UNIT];
+        pkt[0] = SYNC;
+        pkt[1] = (pid >> 8) as u8 & 0x1F;
+        pkt[2] = (pid & 0xFF) as u8;
+        pkt[3] = 0x20; // adaptation field only
+        pkt[4] = (TS_UNIT - 5) as u8;
+        pkt[5] = 0x10 | if discontinuity { 0x80 } else { 0 };
+        pkt[6] = ((base >> 25) & 0xFF) as u8;
+        pkt[7] = ((base >> 17) & 0xFF) as u8;
+        pkt[8] = ((base >> 9) & 0xFF) as u8;
+        pkt[9] = ((base >> 1) & 0xFF) as u8;
+        pkt[10] = (((base & 1) << 7) as u8) | 0x7E;
+        pkt[11] = 0;
+        pkt
+    }
+
+    const CLOCK: u16 = 0x30;
+    const VIDEO: u16 = 0x100;
+    const LAYOUT: Layout = Layout { first: 0, stride: TS_UNIT };
+
+    /// PCRs at 0.70 s and 2.62 s (the corpus `mpeg2.ts` shape: the muxer
+    /// flushed the tail without a clock), video PTS from 0.72 s to 2.68 s.
+    fn clipped_tail_stream(stray_pts: Option<u64>, tail_discontinuity: bool) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend(pcr_packet(CLOCK, 63_000, false)); // 0.70 s
+        d.extend(ts_packet(VIDEO, true, &pes_start_pts(64_800))); // 0.72 s
+        if let Some(p) = stray_pts {
+            d.extend(ts_packet(VIDEO, true, &pes_start_pts(p)));
+        }
+        d.extend(ts_packet(VIDEO, true, &pes_start_pts(120_000)));
+        d.extend(pcr_packet(CLOCK, 235_800, tail_discontinuity)); // 2.62 s
+        d.extend(ts_packet(VIDEO, true, &pes_start_pts(241_200))); // 2.68 s
+        d
+    }
+
+    #[test]
+    fn duration_takes_the_video_pts_span_past_the_clipped_pcr_tail() {
+        // The PCR span is 1.92 s while the video presents through 2.68 s: the
+        // PTS route answers with the 1.96 s span (whole-frame completion is
+        // the demux's job, where the frame rate is known).
+        let d = clipped_tail_stream(None, false);
+        let est = clock_duration(&d, LAYOUT, CLOCK, Some(&[VIDEO]));
+        match est {
+            Some(TsDuration::PtsSpan(s)) => assert!((s - 1.96).abs() < 1e-9, "{s}"),
+            _ => panic!("expected the PTS route"),
+        }
+        // Without the video PIDs (multi-program gate) the PCR span stands.
+        match clock_duration(&d, LAYOUT, CLOCK, None) {
+            Some(TsDuration::Pcr(s)) => assert!((s - 1.92).abs() < 1e-9, "{s}"),
+            _ => panic!("expected the PCR route"),
+        }
+    }
+
+    #[test]
+    fn a_stray_pts_is_refused_by_the_arrival_clock() {
+        // One non-conforming timestamp 100 s out would otherwise set the span
+        // (a min/max has no other defence); the window's own PCR span refutes
+        // it and the route falls back to the PCR answer.
+        let d = clipped_tail_stream(Some(9_000_000), false);
+        match clock_duration(&d, LAYOUT, CLOCK, Some(&[VIDEO])) {
+            Some(TsDuration::Pcr(s)) => assert!((s - 1.92).abs() < 1e-9, "{s}"),
+            _ => panic!("a stray PTS must downgrade to the PCR span"),
+        }
+    }
+
+    #[test]
+    fn a_discontinuity_refuses_both_routes() {
+        // The tail clock reset: neither span is comparable across it.
+        let d = clipped_tail_stream(None, true);
+        assert!(clock_duration(&d, LAYOUT, CLOCK, Some(&[VIDEO])).is_none());
+    }
+
+    #[test]
+    fn pes_pts_reads_only_a_declared_credible_timestamp() {
+        let p = pes_start_pts(241_200);
+        assert_eq!(pes_pts(&p), Some(241_200));
+        // Flags clear: no timestamp claimed.
+        assert_eq!(pes_pts(&pes_start(&[1, 2, 3, 4, 5, 6])), None);
+        // A header too short to hold the timestamp it claims is reading its
+        // payload, not a timestamp.
+        let mut short = p.clone();
+        short[8] = 4;
+        assert_eq!(pes_pts(&short), None);
+        // A marker bit cleared means these are not timestamp bytes.
+        let mut bad = p;
+        bad[9] &= !0x01;
+        assert_eq!(pes_pts(&bad), None);
     }
 
     /// Two interleaved PIDs; AUs span packets; both PIDs end mid-AU, so the

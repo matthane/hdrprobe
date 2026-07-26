@@ -57,7 +57,10 @@
 
 use anyhow::{bail, Result};
 
-use crate::container::{Chunk, Codec, Demux, NalFormat, TrackDemux};
+use crate::container::{
+    parse_timestamp, whole_frame_duration, Chunk, Codec, Demux, NalFormat, TrackDemux,
+    MAX_SPAN_SECS, PTS_MODULUS, SPAN_SLACK_SECS,
+};
 use crate::model::Bitrate;
 
 /// Bytes from the head the metadata walk may cover. The video sequence header
@@ -78,23 +81,10 @@ pub const HEAD_SCAN_BYTES: usize = 8 << 20; // 8 MiB
 /// window for program streams; keep the two in sync.
 pub const TAIL_SCAN_BYTES: usize = 4 << 20; // 4 MiB
 
-/// A PTS is a 33-bit value at 90 kHz (H.222.0 §2.4.3.7, equation 2-11), so it
-/// wraps every `2^33 / 90000` seconds — about 26 h 30 min.
-const PTS_MODULUS: u64 = 1 << 33;
-
-/// Largest duration this backend reports rather than rejecting as an undetected
-/// second wrap. A deliberately conservative floor under the clock's own range,
-/// not that range itself: `2^33 / 90000` is 95443.7 s (26 h 30 m 43 s), and the
-/// 43-minute gap is the only thing separating "wrapped once" from "went
-/// backwards". The transport backend uses the identical bound for the identical
-/// reason.
-const MAX_SPAN_SECS: f64 = 26.0 * 3600.0;
-
-/// Floor on the margin allowed between a window's presentation span and its own
-/// pack clock (see [`Walk::pts_within`]). Absolute rather than proportional, so
-/// a short window whose two clocks differ by a fixed decoder-buffer delay is not
-/// rejected for it.
-const SPAN_SLACK_SECS: f64 = 2.0;
+// `PTS_MODULUS`, `MAX_SPAN_SECS`, `SPAN_SLACK_SECS`, `parse_timestamp` and
+// `whole_frame_duration` are shared with the transport backend and live in
+// `container::mod` — both carriages close their timeline from the same 90 kHz
+// clock, and a fix to any of them must reach both.
 
 // --- stream ids, H.222.0 Table 2-22 -----------------------------------------
 
@@ -276,32 +266,6 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
 }
 
 // --- duration ---------------------------------------------------------------
-
-/// Turn a presentation span into a duration by adding the last picture's own
-/// display time.
-///
-/// **The span is one frame short of the duration, by arithmetic rather than by
-/// approximation.** Frame `k` of `N` is presented at `start + k/f`, so the first
-/// picture's timestamp to the last picture's is `(N-1)/f` while the stream
-/// occupies `N/f`. Reporting the bare span makes every duration one frame low
-/// and — because the bitrate divides by it — every overall rate correspondingly
-/// high, which is 2% on a two-second clip.
-///
-/// Adding the interval reproduces MediaInfo *exactly* on all four corpus
-/// program streams (it reaches the same number from the other direction, by
-/// counting frames and dividing by the rate): 1.96 s + 1/25 = 2.000 against its
-/// 2.000 on three of them, and 60.8107 s + 1/29.97 = 60.844 against its 60.844
-/// on the retail DVD.
-///
-/// Without a frame rate there is nothing to add and the bare span stands, which
-/// is the honest fallback rather than a second guess.
-fn whole_frame_duration(span: Option<f64>, fps: Option<f64>) -> Option<f64> {
-    let span = span?;
-    Some(match fps {
-        Some(f) if f > 0.0 => span + 1.0 / f,
-        _ => span,
-    })
-}
 
 /// The **video PTS span**: the smallest presentation timestamp in the head
 /// window to the largest in the tail. Minimum and maximum rather than first and
@@ -828,27 +792,6 @@ fn pes_payload(data: &[u8], body: usize, end: usize) -> Option<(usize, Option<u6
             None
         }
     }
-}
-
-/// Decode a 33-bit 90 kHz timestamp from its 5-byte marker-interleaved form
-/// (H.222.0 Table 2-21: `'0010'` PTS[32..30] m PTS[29..15] m PTS[14..0] m).
-///
-/// The three marker bits are checked, for the same reason [`parse_pack`] checks
-/// its eight: they are the only structural evidence that these five bytes are a
-/// timestamp rather than payload, and the value they carry is the one the whole
-/// head/tail machinery exists to get right or refuse.
-fn parse_timestamp(data: &[u8], at: usize) -> Option<u64> {
-    let b = data.get(at..at + 5)?;
-    if b[0] & 0x01 == 0 || b[2] & 0x01 == 0 || b[4] & 0x01 == 0 {
-        return None;
-    }
-    Some(
-        (((b[0] & 0x0E) as u64) << 29)
-            | ((b[1] as u64) << 22)
-            | (((b[2] >> 1) as u64) << 15)
-            | ((b[3] as u64) << 7)
-            | ((b[4] >> 1) as u64),
-    )
 }
 
 // --- codec routing ----------------------------------------------------------
