@@ -19,7 +19,7 @@
 //! chromaticity block: no muxer writes V4/V5 into a video `strf`, and every
 //! demuxer reads past offset 40 as codec-private bytes.
 //!
-//! Seven facts about the format are invariants a later change would otherwise
+//! Eight facts about the format are invariants a later change would otherwise
 //! undo quietly. Each is pinned by a test.
 //!
 //! **The frame rate signal is a stream *unit* rate, not a picture rate.**
@@ -74,6 +74,19 @@
 //! gated on the file being single-RIFF. Multi-RIFF files sum the `ix##` chunks
 //! the `indx` super-index points at, which cover the whole file by
 //! construction.
+//!
+//! **The two OpenDML index levels multiply, and clamping each one is not
+//! enough.** The super-index calls the standard-index parser once per entry
+//! into a single shared vector, so N super entries all naming the same M-entry
+//! `ix##` describe N x M chunks in a file holding one — and nothing forbids the
+//! repetition, since only entry 0's base is validated. Both counts are already
+//! clamped against the bytes their own chunk holds, which is the house rule and
+//! is individually correct; the product is what escapes. Measured before
+//! `chunk_ceiling` existed, on the default path with exit 0: a 156 KiB file
+//! allocated 771 MB, quadratic in file size. This is the *same shape* as the
+//! parameter-set scan being bounded to 32 chunks while each chunk's declared
+//! span stayed unbounded, and both were found by the same review: when two
+//! declared quantities meet, bound the product, not the factors.
 //!
 //! **`idx1` entry 0 is not necessarily a video chunk** — in the corpus's
 //! multi-stream file it is `01wb`, the MP3 track — so entries are filtered by
