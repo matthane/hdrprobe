@@ -10,7 +10,7 @@ use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use rayon::prelude::*;
 
 use crate::avc::nal as avc_nal;
-use crate::container::{annexb, av1, flv, ts, Chunk, Codec, Demux, NalFormat, RawFullStream};
+use crate::container::{annexb, av1, flv, ogg, ts, Chunk, Codec, Demux, NalFormat, RawFullStream};
 use crate::dv::levels::DvAggregate;
 use crate::dv::rpu::{parse_avc_rpu, parse_hevc_rpu};
 use crate::hdr::sei::{self, SeiFindings};
@@ -497,6 +497,13 @@ fn scan_raw_full(
             let fps = av1::ivf_fps(walk.frames, walk.span, *ticks_per_sec);
             ((walk.frames > 0).then_some(walk.frames as u64), fps, None)
         }
+        RawFullStream::Ogg { serial, header_packets } => {
+            // Ogg has nothing to extract — neither Theora nor VP8 carries a
+            // bitstream side channel this project reads — so the walk is
+            // count-only, and what it produces is the exact video payload sum
+            // that replaces the file-length `overall` rate.
+            (None, None, ogg::walk_pages(data, *serial, *header_packets, tick))
+        }
         RawFullStream::Flv { data_start } => {
             // The exact video payload sum, which is what turns FLV's
             // muxer-declared `videodatarate` into a measured rate under
@@ -612,7 +619,16 @@ fn extract_chunk(data: &[u8], chunk: Chunk, fmt: NalFormat, codec: &Codec) -> Ch
         // object or VOL header, which the matching `container::fill_*` reads at
         // demux time. There is no SEI, no OBU metadata, no T.35 route and no
         // dynamic HDR carriage for any of these codecs at all.
-        Codec::Mpeg1 | Codec::Mpeg2 | Codec::Mpeg4Part2 | Codec::Vc1 | Codec::MsMpeg4(_) => {}
+        // Theora is the same again, and its backend does not even build a chunk
+        // index, so this arm is unreachable through Ogg — it exists because the
+        // codec must be named somewhere, and naming it here is what keeps a
+        // future carriage from silently falling into `Other`.
+        Codec::Mpeg1
+        | Codec::Mpeg2
+        | Codec::Mpeg4Part2
+        | Codec::Vc1
+        | Codec::MsMpeg4(_)
+        | Codec::Theora => {}
         Codec::Other(_) => {}
     }
     ChunkScan { rpus, sei: sei_findings }

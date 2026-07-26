@@ -298,6 +298,7 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     // extent below, and a generic head would stream bytes nothing parses. Raw
     // HEVC/AV1 head walks are covered by the generic head (the `<=` couplings
     // on `HEAD_WARM`).
+    let is_ogg = !is_iso && looks_like_ogg(path, data);
     let head = if is_iso {
         ISO_HEAD_WARM
     } else if is_ts {
@@ -306,6 +307,15 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
         MP4_HEAD_WARM
     } else if mkv_blocks.is_some() {
         MKV_HEAD_WARM
+    } else if is_ogg {
+        // The whole Ogg front parse is the beginning-of-stream run, which RFC
+        // 3533 §3 puts at the head as one small identification packet per
+        // logical stream — 70 bytes on a single-stream file, a few hundred on
+        // any real mux. Warming the generic 8 MiB would stream megabytes
+        // nothing parses, the same reasoning `MP4_HEAD_WARM` and
+        // `MKV_HEAD_WARM` carry. Taking the backend's own walk bound makes the
+        // coupling structural instead of two numbers that must be kept equal.
+        crate::container::ogg::HEAD_SCAN_BYTES
     } else {
         HEAD_WARM
     }
@@ -342,6 +352,18 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     // generic head covers the whole parse.
     if !is_iso && looks_like_flv(path, data) {
         let tail = crate::container::flv::TAIL_SCAN_BYTES;
+        let start = size.saturating_sub(tail);
+        ranges.push((start as u64, size - start));
+    }
+
+    // Ogg records no duration either: it comes from the last granule position
+    // in a bounded tail window, the fourth instance of the TS tail-PCR shape.
+    // Warmed at exactly `ogg::TAIL_SCAN_BYTES` — keep the two in step. The head
+    // above takes `ogg::HEAD_SCAN_BYTES` directly rather than a constant of its
+    // own, because the BOS run is the entire front parse and a second number
+    // would only be something to keep equal.
+    if is_ogg {
+        let tail = crate::container::ogg::TAIL_SCAN_BYTES;
         let start = size.saturating_sub(tail);
         ranges.push((start as u64, size - start));
     }
@@ -642,6 +664,14 @@ fn looks_like_avi(path: &Path, data: &[u8]) -> bool {
 fn looks_like_flv(path: &Path, data: &[u8]) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     ext == "flv" || crate::container::flv::is_flv(data)
+}
+
+/// Twenty-seven bytes at offset 0, so the content half is free like AVI's and
+/// FLV's.
+fn looks_like_ogg(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "ogv" | "ogg" | "oga" | "ogm" | "ogx")
+        || crate::container::ogg::is_ogg(data)
 }
 
 fn looks_like_ts(path: &Path, data: &[u8]) -> bool {

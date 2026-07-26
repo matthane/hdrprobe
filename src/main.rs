@@ -18,6 +18,7 @@ mod render;
 mod sample;
 mod shell;
 mod sidecar;
+mod theora;
 mod vc1;
 mod vp9;
 
@@ -668,9 +669,16 @@ fn suppress_prefix_derived_facts(demux: &mut container::Demux) {
     // A program stream's duration is the video PTS span from a head window to a
     // tail window, so over a prefix the "tail" is just the cut point — the same
     // reasoning as the TS head-to-tail PCR delta beside it.
+    //
+    // Ogg's is the same shape once more: it records no duration field, so the
+    // number comes from the last granule position a bounded tail window holds,
+    // and a prefix's "tail" is the cut point rather than the end of the stream.
     use container::ps::{MPEG1_SYSTEM_LABEL, MPEG2_PROGRAM_LABEL, PES_ONLY_LABEL};
     if demux.container.starts_with("MPEG-2 TS")
-        || matches!(demux.container, MPEG2_PROGRAM_LABEL | MPEG1_SYSTEM_LABEL | PES_ONLY_LABEL)
+        || matches!(
+            demux.container,
+            MPEG2_PROGRAM_LABEL | MPEG1_SYSTEM_LABEL | PES_ONLY_LABEL | container::ogg::CONTAINER_LABEL
+        )
     {
         demux.duration_secs = None;
     }
@@ -958,10 +966,14 @@ fn assemble_report(
 /// file by name would work while `hdrprobe rips/` silently skipped it.
 ///
 /// `.bin` is the deliberate omission: the raw-HEVC dispatch accepts it, but it
-/// is far too generic a name to claim in a directory of mixed files.
+/// is far too generic a name to claim in a directory of mixed files. `.wma`,
+/// `.ogg` and `.oga` are omitted for the sibling reason — all three dispatch
+/// when named, because each can carry video, but each is overwhelmingly an
+/// audio extension, and a scanned music library would print an error per track.
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts", "mts", "hevc", "h265", "265", "ivf", "obu",
     "iso", "mpg", "mpeg", "vob", "m2p", "evo", "m2v", "m1v", "mpv", "avi", "wmv", "asf", "flv",
+    "ogv",
 ];
 
 fn collect_paths(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
@@ -1132,5 +1144,18 @@ mod tests {
         suppress_prefix_derived_facts(&mut d);
         assert_eq!(d.duration_secs, Some(3600.0));
         assert!(d.tracks[0].bitrate.is_some());
+
+        // Ogg: the duration is the last granule position a tail window holds,
+        // so over a prefix it describes the cut point rather than the stream.
+        let mut d = demux_with(container::ogg::CONTAINER_LABEL, Some(7200.0), overall);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, None);
+        assert!(d.tracks[0].bitrate.is_none());
+
+        // And the label match is a constant pattern, not a catch-all binding:
+        // a container not in the list keeps its declared duration.
+        let mut d = demux_with("AVI (RIFF)", Some(7200.0), stream);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, Some(7200.0), "only listed labels suppress");
     }
 }
