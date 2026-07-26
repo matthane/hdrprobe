@@ -26,11 +26,8 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::avc::nal as avc_nal;
-use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
-use crate::hevc::nal::{self, NalRef};
-use crate::hevc::sps::{parse_sps, SpsInfo};
-use crate::model::{Bitrate, ColorInfo, ColorSources};
+use crate::container::{best_sps, sps_fields, Chunk, Codec, Demux, DvConfig, NalFormat, SpsCommon, TrackDemux};
+use crate::model::Bitrate;
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
@@ -245,6 +242,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         ts_stream,
         mkv_stream: None,
         raw_stream: None,
+        bounded_index: false,
     })
 }
 
@@ -921,59 +919,6 @@ fn scan_pcr(
     found
 }
 
-// --- SPS metadata (no container box in TS) ----------------------------------
-
-/// Common SPS-derived metadata, codec-independent, so the HEVC and AVC scans
-/// converge on one shape.
-struct SpsCommon {
-    width: u32,
-    height: u32,
-    bit_depth: u8,
-    chroma: String,
-    profile: String,
-    color: (ColorInfo, ColorSources),
-    frame_rate: Option<f64>,
-    /// Index of the chunk the SPS was found in — a RAP access unit, which is
-    /// where the per-GOP prefix SEIs ride (see `Demux::sps_chunk`).
-    chunk: usize,
-}
-
-/// Recover the widest SPS in the reassembled buffer (the base layer outranks a
-/// smaller enhancement layer). TS carries no container box, so both colour and
-/// frame rate come only from the in-band SPS VUI — parsed with the codec's own
-/// SPS reader.
-fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<SpsCommon> {
-    match codec {
-        Codec::Avc => best_avc_sps(buf, chunks),
-        // MPEG-1/2 has no SPS at all: its metadata rides the sequence header,
-        // which `container::fill_mpeg2_stream_fields` reads from the same
-        // reassembled buffer once the track exists. Running an Annex-B NAL
-        // search over MPEG bytes would find nothing at best and something
-        // invented at worst.
-        Codec::Mpeg1 | Codec::Mpeg2 | Codec::Mpeg4Part2 => None,
-        _ => best_hevc_sps(buf, chunks),
-    }
-}
-
-/// Unpack the winning SPS into the demux metadata fields.
-#[allow(clippy::type_complexity)]
-fn sps_fields(
-    best: Option<SpsCommon>,
-) -> (u32, u32, Option<u8>, Option<String>, Option<String>, (ColorInfo, ColorSources), Option<f64>) {
-    match best {
-        Some(c) => (
-            c.width,
-            c.height,
-            Some(c.bit_depth),
-            Some(c.chroma),
-            Some(c.profile),
-            c.color,
-            c.frame_rate,
-        ),
-        None => (0, 0, None, None, None, (ColorInfo::default(), ColorSources::default()), None),
-    }
-}
-
 /// `--full` fallback when the head window held no SPS: stream the whole
 /// elementary stream, window by window, through the same widest-SPS search,
 /// keeping only the running best (each window's buffer is discarded). Stops at
@@ -1020,78 +965,6 @@ fn sps_rescue(
         }
         progress.update(st.position() as u64);
     }
-}
-
-fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
-    let mut best: Option<(usize, SpsInfo)> = None;
-    let mut nals: Vec<NalRef> = Vec::new();
-    for (ci, c) in chunks.iter().enumerate() {
-        let s = c.offset as usize;
-        let e = (c.offset + c.size) as usize;
-        if e > buf.len() {
-            continue;
-        }
-        nals.clear();
-        nal::split_annexb(&buf[s..e], &mut nals);
-        for n in &nals {
-            if n.nal_type == nal::NAL_SPS {
-                if let Some(sps) = parse_sps(&buf[s + n.start..s + n.end]) {
-                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
-                        best = Some((ci, sps));
-                    }
-                }
-            }
-        }
-        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
-            break;
-        }
-    }
-    best.map(|(chunk, sps)| SpsCommon {
-        width: sps.width,
-        height: sps.height,
-        bit_depth: sps.bit_depth,
-        chroma: sps.chroma_str().to_string(),
-        profile: sps.profile_label(),
-        color: sps.color.as_ref().map(crate::container::color_from_vui).unwrap_or_default(),
-        frame_rate: sps.frame_rate,
-        chunk,
-    })
-}
-
-fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
-    let mut best: Option<(usize, crate::avc::sps::SpsInfo)> = None;
-    let mut nals: Vec<avc_nal::NalRef> = Vec::new();
-    for (ci, c) in chunks.iter().enumerate() {
-        let s = c.offset as usize;
-        let e = (c.offset + c.size) as usize;
-        if e > buf.len() {
-            continue;
-        }
-        nals.clear();
-        avc_nal::split_annexb(&buf[s..e], &mut nals);
-        for n in &nals {
-            if n.nal_type == avc_nal::NAL_SPS {
-                if let Some(sps) = crate::avc::sps::parse_sps(&buf[s + n.start..s + n.end]) {
-                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
-                        best = Some((ci, sps));
-                    }
-                }
-            }
-        }
-        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
-            break;
-        }
-    }
-    best.map(|(chunk, sps)| SpsCommon {
-        width: sps.width,
-        height: sps.height,
-        bit_depth: sps.bit_depth,
-        chroma: sps.chroma_str().to_string(),
-        profile: sps.profile_label(),
-        color: sps.color.as_ref().map(crate::container::color_from_vui).unwrap_or_default(),
-        frame_rate: sps.frame_rate,
-        chunk,
-    })
 }
 
 #[cfg(test)]

@@ -8,11 +8,12 @@ pub mod bmih;
 pub mod mkv;
 pub mod mp4;
 pub mod mpegv;
+pub mod ps;
 pub mod ts;
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 
 use crate::bits::BitReader;
 use crate::model::{Bitrate, ColorInfo, ColorSource, ColorSources, ContentLight, MasteringDisplay};
@@ -123,6 +124,18 @@ pub struct Demux {
     /// sampler ignores the track's `chunks` (the head metadata window). Every
     /// other backend, and the raw default paths, leave it `None`.
     pub raw_stream: Option<RawFullStream>,
+    /// True when the tracks' `chunks` index only a bounded head window **and**
+    /// no `--full` streaming plan above covers the rest — so a `--full` scan
+    /// reads every chunk that exists and still has not seen the whole stream.
+    ///
+    /// The report uses it to keep the sampled footnote on: `--full` normally
+    /// means "every access unit was read", and an absent mark reads as
+    /// complete. A backend with an exhaustive index (MP4's `stbl`) or a
+    /// streaming plan leaves this `false`; one with an empty `chunks` list
+    /// (`mpegv`) never reaches a sampler at all and leaves it `false` too. The
+    /// program-stream backend is the one case that needs it, until D7's
+    /// whole-file walk lands.
+    pub bounded_index: bool,
 }
 
 impl Demux {
@@ -135,6 +148,7 @@ impl Demux {
             ts_stream: None,
             mkv_stream: None,
             raw_stream: None,
+            bounded_index: false,
         }
     }
 }
@@ -303,6 +317,12 @@ pub fn demux(
         "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full, progress, frontier)),
         "ivf" | "obu" => Some(av1::demux(data, full, progress, frontier)),
         "m2v" | "m1v" | "mpv" => Some(mpegv::demux(data)),
+        // `.evo` (HD DVD) is a program stream too. Its video often rides the
+        // extended stream id `0xFD`, which this walker treats as non-video, so
+        // such a file declines with the backend's own message rather than
+        // "unrecognized container" — and one whose video sits in the ordinary
+        // range reports normally.
+        "mpg" | "mpeg" | "vob" | "m2p" | "evo" => Some(ps::demux(data)),
         "ts" | "m2ts" | "mts" => Some(ts::demux(data, full, progress, frontier)),
         _ => None,
     };
@@ -358,10 +378,7 @@ fn sniff_demux(
         // stream gets today: Part 2 shares this family (`0xB0`/`0xB6` are its
         // own start codes) and has no backend yet.
         Some(StreamFamily::MpegVideoEs) => Some(mpegv::demux(data)),
-        // Routed away from the Annex-B backend, which used to claim it and
-        // invent metadata from it (see `hevc::nal::emit_nal`), but with no
-        // backend of its own yet, so it lands on an honest error.
-        Some(f) => Some(Err(anyhow!("unsupported container: {}", f.label()))),
+        Some(StreamFamily::ProgramStream) => Some(ps::demux(data)),
         None => None,
     }
 }
@@ -438,11 +455,17 @@ fn classify_start_code(data: &[u8]) -> Option<StreamFamily> {
     Some(match value {
         // pack_start_code. The next byte pins the variant: `01xxxxxx` is an
         // MPEG-2 pack (ISO/IEC 13818-1 §2.5.3.4), `0010xxxx` an MPEG-1 one
-        // (ISO/IEC 11172-1 §2.4.3.2). Anything else is not a pack header, so
-        // these bytes are not a program stream head, and saying nothing beats
-        // naming a format the bytes contradict.
+        // (ISO/IEC 11172-1 §2.4.3.2). Anything else is not a pack header — but
+        // it need not be the whole story either, since a stream cut just before
+        // a pack, or one whose first pack is damaged, still has intact
+        // structure behind it. Asking the head census settles it on evidence
+        // rather than on one byte, which is what the earlier "say nothing"
+        // rule could not do while no program-stream backend existed.
         0xBA => match next {
             Some(b) if b & 0xC0 == 0x40 || b & 0xF0 == 0x20 => StreamFamily::ProgramStream,
+            _ if ps::looks_like_program_stream(&data[..ps::CENSUS_SPAN.min(data.len())]) => {
+                StreamFamily::ProgramStream
+            }
             _ => return None,
         },
         // program_end, system header, program stream map, or any PES packet:
@@ -753,6 +776,138 @@ pub(crate) fn color_from_av1c(av1c: &[u8]) -> Option<(ColorInfo, ColorSources)> 
         .find(|o| o.obu_type == crate::av1::obu::OBU_SEQUENCE_HEADER)?;
     let info = crate::av1::seq::parse_sequence_header(seq.payload)?;
     info.color_description_present.then_some(info.color)
+}
+
+// --- in-band SPS metadata, for the backends with no container box ------------
+//
+// TS and MPEG-PS both reassemble an elementary stream out of scattered packet
+// payloads and then have to read the picture's parameters out of the bitstream,
+// because their container layers carry no video description at all. These live
+// here rather than in either backend so the two cannot drift: a fix to how an
+// SPS is chosen would otherwise land in one carriage and not the other.
+
+/// Common SPS-derived metadata, codec-independent, so the HEVC and AVC scans
+/// converge on one shape.
+pub(crate) struct SpsCommon {
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth: u8,
+    pub chroma: String,
+    pub profile: String,
+    pub color: (ColorInfo, ColorSources),
+    pub frame_rate: Option<f64>,
+    /// Index of the chunk the SPS was found in — a RAP access unit, which is
+    /// where the per-GOP prefix SEIs ride (see `Demux::sps_chunk`).
+    pub chunk: usize,
+}
+
+/// Recover the widest SPS in a reassembled buffer (the base layer outranks a
+/// smaller enhancement layer). With no container box, both colour and frame rate
+/// come only from the in-band SPS VUI — parsed with the codec's own SPS reader.
+pub(crate) fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<SpsCommon> {
+    match codec {
+        Codec::Avc => best_avc_sps(buf, chunks),
+        // MPEG-1/2 and MPEG-4 Part 2 have no SPS at all: their metadata rides
+        // the sequence header or visual object layer, which the gap-fillers
+        // below read from the same reassembled buffer once the track exists.
+        // Running an Annex-B NAL search over MPEG bytes would find nothing at
+        // best and something invented at worst.
+        Codec::Mpeg1 | Codec::Mpeg2 | Codec::Mpeg4Part2 => None,
+        _ => best_hevc_sps(buf, chunks),
+    }
+}
+
+/// Unpack the winning SPS into the demux metadata fields.
+#[allow(clippy::type_complexity)]
+pub(crate) fn sps_fields(
+    best: Option<SpsCommon>,
+) -> (u32, u32, Option<u8>, Option<String>, Option<String>, (ColorInfo, ColorSources), Option<f64>) {
+    match best {
+        Some(c) => (
+            c.width,
+            c.height,
+            Some(c.bit_depth),
+            Some(c.chroma),
+            Some(c.profile),
+            c.color,
+            c.frame_rate,
+        ),
+        None => (0, 0, None, None, None, (ColorInfo::default(), ColorSources::default()), None),
+    }
+}
+
+fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
+    use crate::hevc::nal::{self, NalRef};
+    let mut best: Option<(usize, crate::hevc::sps::SpsInfo)> = None;
+    let mut nals: Vec<NalRef> = Vec::new();
+    for (ci, c) in chunks.iter().enumerate() {
+        let s = c.offset as usize;
+        let e = (c.offset + c.size) as usize;
+        if e > buf.len() {
+            continue;
+        }
+        nals.clear();
+        nal::split_annexb(&buf[s..e], &mut nals);
+        for n in &nals {
+            if n.nal_type == nal::NAL_SPS {
+                if let Some(sps) = crate::hevc::sps::parse_sps(&buf[s + n.start..s + n.end]) {
+                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
+                        best = Some((ci, sps));
+                    }
+                }
+            }
+        }
+        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
+            break;
+        }
+    }
+    best.map(|(chunk, sps)| SpsCommon {
+        width: sps.width,
+        height: sps.height,
+        bit_depth: sps.bit_depth,
+        chroma: sps.chroma_str().to_string(),
+        profile: sps.profile_label(),
+        color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
+        frame_rate: sps.frame_rate,
+        chunk,
+    })
+}
+
+fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
+    use crate::avc::nal as avc_nal;
+    let mut best: Option<(usize, crate::avc::sps::SpsInfo)> = None;
+    let mut nals: Vec<avc_nal::NalRef> = Vec::new();
+    for (ci, c) in chunks.iter().enumerate() {
+        let s = c.offset as usize;
+        let e = (c.offset + c.size) as usize;
+        if e > buf.len() {
+            continue;
+        }
+        nals.clear();
+        avc_nal::split_annexb(&buf[s..e], &mut nals);
+        for n in &nals {
+            if n.nal_type == avc_nal::NAL_SPS {
+                if let Some(sps) = crate::avc::sps::parse_sps(&buf[s + n.start..s + n.end]) {
+                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
+                        best = Some((ci, sps));
+                    }
+                }
+            }
+        }
+        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
+            break;
+        }
+    }
+    best.map(|(chunk, sps)| SpsCommon {
+        width: sps.width,
+        height: sps.height,
+        bit_depth: sps.bit_depth,
+        chroma: sps.chroma_str().to_string(),
+        profile: sps.profile_label(),
+        color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
+        frame_rate: sps.frame_rate,
+        chunk,
+    })
 }
 
 /// Fill a ProRes track's config/colour gaps from the first frame's header

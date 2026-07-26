@@ -283,6 +283,7 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
 
     let is_iso = looks_like_iso(path);
     let is_ts = !is_iso && looks_like_ts(path, data);
+    let is_ps = !is_iso && !is_ts && looks_like_ps(path, data);
     let is_mp4 = !is_iso && looks_like_mp4(path, data);
     let is_mkv = !is_iso && looks_like_mkv(path, data);
     let moov = if is_mp4 { crate::container::mp4::moov_extent(data) } else { None };
@@ -316,6 +317,17 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     // coalesced away by `warm_ranges`.
     if is_ts {
         let tail = crate::container::ts::TAIL_SCAN_BYTES as usize;
+        let start = size.saturating_sub(tail);
+        ranges.push((start as u64, size - start));
+    }
+
+    // A program stream has no duration field either, so it reads a bounded tail
+    // for the last presentation timestamp (see `ps::pts_span`) — the exact
+    // analogue of the TS tail-PCR warm above, and warmed alongside the head for
+    // the same reason. Its head walk needs no branch here: `ps::HEAD_SCAN_BYTES`
+    // is `<=` `HEAD_WARM`, the same coupling the raw HEVC/AV1 walks rely on.
+    if is_ps {
+        let tail = crate::container::ps::TAIL_SCAN_BYTES;
         let start = size.saturating_sub(tail);
         ranges.push((start as u64, size - start));
     }
@@ -597,6 +609,22 @@ fn looks_like_ts(path: &Path, data: &[u8]) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     matches!(ext.as_str(), "ts" | "m2ts" | "mts")
         || crate::container::ts::detect_layout(data).is_some()
+}
+
+/// The content half is byte 0 only — a `pack_start_code` and a valid pack
+/// discriminator — not the head census `ps::demux` runs. The census reads up to
+/// a megabyte, and faulting that in *before* the warm is the round-trip storm
+/// warming exists to prevent; the cost of guessing wrong here is one extra
+/// 4 MiB tail read, never a wrong report.
+fn looks_like_ps(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "mpg" | "mpeg" | "vob" | "m2p" | "evo")
+        || (data.len() >= 5
+            && data[0] == 0
+            && data[1] == 0
+            && data[2] == 1
+            && data[3] == 0xBA
+            && (data[4] & 0xC0 == 0x40 || data[4] & 0xF0 == 0x20))
 }
 
 // Extension-only on purpose, unlike the other sniffs: the ISO pipeline itself

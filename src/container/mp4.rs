@@ -567,6 +567,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         ts_stream: None,
         mkv_stream: None,
         raw_stream: None,
+        bounded_index: false,
     }
 }
 

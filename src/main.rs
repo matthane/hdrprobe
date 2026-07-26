@@ -665,7 +665,13 @@ fn process_stdin(cli: &Cli, progress: &progress::Progress) -> Result<Report> {
 /// stand. Keyed on the container label — never thread a truncation flag into
 /// the backends.
 fn suppress_prefix_derived_facts(demux: &mut container::Demux) {
-    if demux.container.starts_with("MPEG-2 TS") {
+    // A program stream's duration is the video PTS span from a head window to a
+    // tail window, so over a prefix the "tail" is just the cut point — the same
+    // reasoning as the TS head-to-tail PCR delta beside it.
+    use container::ps::{MPEG1_SYSTEM_LABEL, MPEG2_PROGRAM_LABEL, PES_ONLY_LABEL};
+    if demux.container.starts_with("MPEG-2 TS")
+        || matches!(demux.container, MPEG2_PROGRAM_LABEL | MPEG1_SYSTEM_LABEL | PES_ONLY_LABEL)
+    {
         demux.duration_secs = None;
     }
     let mp4 = matches!(demux.container, "MP4 (ISOBMFF)" | "QuickTime (MOV)");
@@ -749,6 +755,12 @@ fn assemble_report(
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
     let scan = sample::scan(demux, data, &opts, progress, frontier);
 
+    // `--full` is a promise that every access unit was read, and the report
+    // keeps its sampled footnote off on that basis. A backend whose chunk index
+    // covers only a bounded head window cannot keep that promise however many
+    // of its chunks the scan visits, so the marks stay on for it.
+    let complete_scan = cli.full && !demux.bounded_index;
+
     // Raw AV1 `--full`: duration (frames ÷ fps) exists only after the fused
     // walk counted the frames, so it lands here instead of demux.
     let duration_secs = demux.duration_secs.or_else(|| {
@@ -760,7 +772,7 @@ fn assemble_report(
         let is_av1 = matches!(track.codec, container::Codec::Av1);
         let mut dv = scan
             .dv
-            .finalize(track.width, track.height, track.dv_config.as_ref(), cli.full, is_av1, track.dv_dual_track)
+            .finalize(track.width, track.height, track.dv_config.as_ref(), complete_scan, is_av1, track.dv_dual_track)
             .or_else(|| track.dv_config.as_ref().map(|c| dv::levels::container_only(c, track.dv_dual_track)));
 
         // The reported frame rate. The `--full` streaming walks recover what
@@ -840,13 +852,13 @@ fn assemble_report(
                     .unwrap_or_default(),
                 // Like dolby_vision.sampled: false under --no-rpu (a box-only
                 // detection sampled nothing) and under --full.
-                sampled: !cli.full && sei.is_some(),
+                sampled: !complete_scan && sei.is_some(),
             }),
             (None, Some(s)) => Some(model::HdrVivid {
                 version: format!("{}.0", s.version),
                 system_start_code: Some(s.system_start_code),
                 target_max_luminances: hdr::pq_targets_to_nits(&s.target_pq),
-                sampled: !cli.full,
+                sampled: !complete_scan,
             }),
             (None, None) => None,
         };
@@ -941,9 +953,15 @@ fn assemble_report(
     }
 }
 
+/// Extensions a directory scan picks up. Every extension `container::demux`
+/// dispatches on belongs here or the format is unreachable in bulk — probing one
+/// file by name would work while `hdrprobe rips/` silently skipped it.
+///
+/// `.bin` is the deliberate omission: the raw-HEVC dispatch accepts it, but it
+/// is far too generic a name to claim in a directory of mixed files.
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts", "mts", "hevc", "h265", "265", "ivf", "obu",
-    "iso",
+    "iso", "mpg", "mpeg", "vob", "m2p", "evo", "m2v", "m1v", "mpv",
 ];
 
 fn collect_paths(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {

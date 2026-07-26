@@ -304,6 +304,9 @@ Video inputs:
 | `"raw VP9 (IVF)"` | VP9 in an IVF wrapper (`VP90` FourCC) |
 | `"raw MPEG-1 Video (ES)"` | MPEG-1 video elementary stream (`.m1v`, `.mpv`) |
 | `"raw MPEG-2 Video (ES)"` | MPEG-2 video elementary stream (`.m2v`, `.mpv`) |
+| `"MPEG-2 Program Stream"` | Program stream with ITU-T H.222.0 pack headers (`.vob`, `.mpg`, `.mpeg`, `.m2p`, `.evo`) |
+| `"MPEG-1 System Stream"` | Program stream with ISO/IEC 11172-1 pack headers. The system layer and the video codec version independently, so these routinely carry MPEG-2 video |
+| `"MPEG PES stream"` | Program-stream PES packets with no pack layer: a mid-file cut, or a bare PES stream |
 | `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
@@ -793,6 +796,15 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   `esds` names object type `0x20`, an MP4 `vc-1` sample entry, and the Matroska CodecIDs
   `V_MPEG4/ISO/SP`, `/ASP`, `/AP` and `V_MPEG4/MS/V3`. A transport stream whose only video PID
   is `stream_type` `0x10` produced no report at all before and now produces a full one.
+  Also additive: **MPEG program streams are now recognized**, so `"MPEG-2 Program Stream"`,
+  `"MPEG-1 System Stream"` and `"MPEG PES stream"` join the `container` set. `.mpg`, `.mpeg`,
+  `.vob`, `.m2p` and `.evo` produced no report at all before and now produce a full one, as does
+  any file whose bytes open on a pack or PES start code. `track_number` on these tracks is the
+  PES `stream_id` (`224`..`239`, i.e. `0xE0`..`0xEF`), one reported track per distinct video
+  stream id. `duration_secs` is the video presentation-timestamp span and is absent rather than
+  approximated when the stream's clock is discontinuous or carries no timestamps; `bitrate` is
+  `"overall"` scope, because a program stream's byte count includes audio and packet overhead,
+  and is absent when more than one video stream shares the file.
   **One presence condition changes**: `color` and `color_source` now appear on MPEG-4 Part 2 and
   VC-1 tracks that signal no colour at all, because both formats *define* what an absent signal
   means — Part 2 fills BT.709 primaries, transfer and matrix plus limited range, and VC-1 fills

@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 257 unit tests
+cargo test                     # 361 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -78,8 +78,10 @@ never parse bytes native-endian.
   `av1.rs` (which also owns the IVF wrapper's FourCC dispatch: `VP90` → the VP9 IVF demux,
   `VP80` → an honest error, else AV1), `mpegv.rs` (raw MPEG-1/2 video elementary stream, the
   thinnest backend in the tree: a bounded head read fills the General fields and `chunks` stays
-  empty, per the metadata-only contract on `TrackDemux::chunks`); `mod.rs` holds
-  `Demux`/`Chunk`/`DvConfig` and the shared dvcC/hvcC/CICP decoders.
+  empty, per the metadata-only contract on `TrackDemux::chunks`), `ps.rs` (below); `mod.rs` holds
+  `Demux`/`Chunk`/`DvConfig`, the shared dvcC/hvcC/CICP decoders, and — since TS and PS both
+  reassemble an elementary stream out of packet payloads and then have to read the picture out
+  of the bitstream — the shared in-band SPS search (`SpsCommon`, `best_sps`, `sps_fields`).
 - `hevc/` — `nal.rs` (Annex-B + length-prefixed NAL split), `sps.rs` (dims + VUI colour + VUI
   timing/frame rate).
 - `avc/` — the H.264 analogue, for Dolby Vision **Profile 9** (`dvav.09`: 8-bit AVC, single-layer,
@@ -178,6 +180,54 @@ never parse bytes native-endian.
   is the height (`unsigned_abs`, because `i32::MIN.abs()` panics). Extradata is bounded by the
   *caller's* slice, never by `biSize`, which real muxers write inconsistently — the corpus VC-1
   MKV declares 71 over a 72-byte CodecPrivate.
+- `container/ps.rs` — MPEG program stream / MPEG-1 system stream (`.mpg`, `.mpeg`, `.vob`,
+  `.m2p`, `.evo`), read against **ITU-T H.222.0 (10/2014) | ISO/IEC 13818-1**, which is free
+  from ITU and is the normative source for the pack header (Table 2-39), the PES packet
+  (Table 2-21) and the stream_id assignments (Table 2-22); the MPEG-1 pack and PES layouts are
+  11172-1's, are *not* in H.222.0, and come from ffmpeg plus corpus validation. Structurally the
+  TS backend's twin — a bounded head window reassembles the video elementary stream out of
+  scattered PES payloads, a bounded tail window closes the timeline — so the pieces both need
+  live in `mod.rs`. Five facts are invariants. **The stream id names a stream number, not a
+  codec**: Table 2-22's `1110 xxxx` row covers H.262, 11172-2, 14496-2, H.264 *and* H.265, so
+  ffmpeg's habit of writing H.264 at `0xE2` is a muxer convention and routing on it would be
+  wrong. **The reassembled ES is routed by a whole-head start-code census, never by its first
+  byte** (`classify_es`): a video PES payload often opens on a picture start code, `00 00 01 00`,
+  whose `0x00` passes `looks_like_nal_header`'s HEVC reading about seven times in eight, so
+  first-byte routing has no verdict to give at all on 96% of mid-file cuts (measured: the
+  reassembled stream opens mid-picture, with no start code). The census is sound
+  rather than probabilistic — emulation prevention means a conforming H.264/H.265 stream cannot
+  contain `00 00 01` followed by a byte `>= 0x80`, so one such code refutes Annex-B outright —
+  and the MPEG readings are tried first because the reverse order lets a DVD's tens of thousands
+  of slice start codes eventually yield a byte run that decodes as a valid SPS (the documented
+  way a VOB once reported a full HEVC profile). **The decisive Part 2 codes are `B0`/`B1`/`B6`
+  and must never include the VOL range `20`..`2F`**: that range is also MPEG-2's
+  `slice_start_code` space, where the value is `slice_vertical_position`, so slice `0x20` is
+  macroblock row 32 — every format above standard definition emits it, and it is *also* where
+  HEVC's IRAP NAL headers (`26`/`28`/`2A`) and H.264's `nal_ref_idc == 1` slices (`21`) land.
+  Including it misread PAL and HD MPEG-2, HEVC-in-PS and H.264-in-PS alike, the last of those
+  fabricating a complete `1639x6058 · 0.692 fps · BT.709 limited` report out of slice bytes.
+  Nothing is lost by excluding it: `B6` (VOP) rides every Part 2 frame. **`PES_packet_length` is
+  the only legal way to
+  advance**: a byte scan that resumes inside a packet reads audio and private payload as
+  structure, which on the corpus DVD invents seven Program Stream Maps on a disc that has none.
+  **An access unit is cut at the payload's first start code, never at its first byte**: §2.4.3.7
+  ties a timestamp to the unit whose first picture start code *commences in* that packet, which
+  need not be at offset 0, and the flag that would guarantee alignment
+  (`data_alignment_indicator`) is clear on every file observed — on ffmpeg-written program
+  streams only 1 to 3 of 42 to 50 timestamped packets open on a start code. Cutting at the first
+  byte hands `split_annexb` a chunk starting mid-slice, and since it reads a chunk's offset 0 as
+  an implicit NAL boundary it mints a NAL from compressed payload: reproduced growing a
+  *signalled* 396272 cd/m² mastering display and MaxCLL 44200 on a stream carrying neither.
+  **The SCR is not a duration** — see the duration invariant below. And **the pack variant names
+  the container, never the codec**: `ffmpeg -f mpeg` writes an 11172-1 system stream carrying
+  MPEG-2 video, so the corpus `mpeg2.mpg` is correctly `MPEG-1 System Stream` + `MPEG-2 Video`.
+  The head census (`looks_like_program_stream`) is a faithful transcription of ffmpeg's
+  `mpegps_probe`, thresholds and payload-skip arithmetic included, on the reasoning that those
+  thresholds encode two decades of misidentification reports; it is also the backend's own head
+  gate, which a backend reachable by extension needs. There is deliberately **no program stream
+  map parser**: it is absent from DVDs, from consumer `.mpg` and from ffmpeg's own muxer, the
+  content routing above covers every case it would answer, and a mis-parsed one could only
+  override a correct verdict.
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation),
   `ccid.rs` (the Dolby "Profiles and Levels" tables as data: profile -> admitted CCID(s),
   CCID -> the five-part base-layer VUI as **CICP code points**, the reverse lookup
@@ -556,7 +606,10 @@ never parse bytes native-endian.
   walks). EOF within the budget ⇒ the input is complete and reports exactly like a file probe
   (no flag); past it ⇒ `Report::input_truncated` plus `suppress_prefix_derived_facts`, a
   post-demux fixup in main.rs keyed on the `Demux::container` label — **never thread a
-  truncation flag into backends**: it drops the TS PCR-span duration and every non-MP4 bitrate
+  truncation flag into backends**: it drops the TS PCR-span duration, the MPEG-PS PTS-span
+  duration (both are head-to-tail derivations, and a prefix's "tail" is just the cut point —
+  every label `ps.rs` can emit is in that match, so renaming one means editing here too) and
+  every non-MP4 bitrate
   (MP4/MOV `video_stream` rates are stsz/trun table sums, exact over any prefix; MKV/MP4
   declared header durations stand). Skipped for stdin by construction: the sidecar gate
   (extension-based), mmap, all prefetch, the ISO branch, and `--full` (a per-file error — a
@@ -783,6 +836,46 @@ never parse bytes native-endian.
   head window; the last comes from a *bounded* trailing window (`ts::TAIL_SCAN_BYTES`, 4 MiB). Head
   + tail only, never the middle. A discontinuity flag in the sampled tail, a missing PCR, or an
   implausible span yields `None` rather than a wrong number (`ts::pcr_duration`).
+- **A program stream's duration is the video PTS span plus one frame, and the SCR is not a
+  fallback.** The span itself is one frame short by arithmetic, not approximation: frame `k` of
+  `N` is presented at `start + k/f`, so first-to-last is `(N-1)/f` while the stream occupies
+  `N/f`. `ps::whole_frame_duration` adds the interval when the frame rate is known (nothing to
+  add without one, and the bare span stands), which reproduces MediaInfo **exactly** on all four
+  corpus program streams — including the overall bitrate to the byte on three of them, since the
+  rate divides by this. The span is `ps::pts_span`: smallest PTS in the head window to largest in
+  the tail, min/max rather than first/last because a PTS is a presentation time and B-frame
+  reordering makes it non-monotonic in stream order; when the two windows *meet* a timestampless
+  tail falls back to the head's own maximum (they have read the whole file between them), and
+  when they don't it must not, or the answer would describe the head window alone.
+  The **pack clock is never a duration**: it times byte *arrival*, so it closes when the mux ends
+  rather than when the last picture is shown, measured at −11.0% on the 2 s corpus clips, −0.47%
+  on the 60 s retail DVD and **+3.2%** on an ffmpeg-muxed VOB — neither the size nor the
+  direction of the error is predictable, which is also why there is no span-comparison
+  cross-check: any tolerance wide enough to accept that spread catches nothing. What the SCR *is*
+  for is spotting a clock reset, the one way a plausible-looking span can be wholly wrong — a
+  backward step inside either window, or a tail whose clock starts before the head's ended.
+  **That second check is partial and the limit is structural**: it catches `cat a.vob b.vob` only
+  when the appended segment is short enough (~17 s at DVD rate) that its tail clock still sits
+  below the head window's last; append more and both windows are internally monotonic, each
+  wholly inside one segment, and the join is invisible — ffprobe and MediaInfo report the same
+  wrong number there, so it bounds head-and-tail probing rather than this backend. The reverse
+  order and any join inside the head window *are* caught. `None` also covers an absent timestamp,
+  a span over 26 h (the 33-bit clock's own range, one wrap being handled) and a non-positive one.
+  **The two windows must stay disjoint** (`tail_start.max(head_end)`): overlapping them makes the
+  tail's clock start before the head's by construction, so the reset guard fires on every
+  ordinary file in the 8–12 MiB band and silently drops its duration *and* its bitrate.
+  One more comparison earns its place, and it is the *same* one that fails against concatenation:
+  within a single window the two clocks measure the same bytes, so a presentation span exceeding
+  the arrival span by more than the decoder buffer delay is impossible rather than merely odd
+  (real files: at most 0.2 s over; `Walk::pts_within` allows half again or two seconds). That is
+  what stops one stray timestamp from setting the answer — the span is a min/max over a window,
+  unlike the transport backend's first-and-last pair, and a single non-conforming packet was
+  measured turning a real file into "25 h 55 m at 1.26 kb/s". The distinction is worth keeping
+  straight: the cross-check catches an *impossible* span, never a plausible-but-wrong one.
+  Bitrate is `overall` scope only (the byte count includes audio and packet
+  overhead) and `None` with more than one *reported track*; **`program_mux_rate` is never read for
+  it** — H.222.0 §2.5.3.4 defines it as a per-pack ceiling that "may vary from pack to pack",
+  and a real retail DVD writes 32964, i.e. 13.2 Mbit/s against an actual 6.6.
 - **The sampler always pins the SPS-carrying AU (`Demux::sps_chunk`).** Per-GOP prefix SEIs (HLG
   alt-transfer, ST.2086 mastering, CLL) ride only RAP access units, and a TS capture (or a raw ES
   cut) often starts mid-GOP: chunk 0 is then a pre-IDR picture and the sparse sample spread rarely
@@ -842,7 +935,12 @@ never parse bytes native-endian.
   <= `prefetch::HEAD_WARM`, so the generic head warm covers the whole walked span; **TS/M2TS** —
   the warmed head (chosen by `looks_like_ts`) is exactly `ts::HEAD_SCAN_BYTES`, the demux's
   packet budget is sized to stay within it (`HEAD_SCAN_BYTES / 192`, the larger stride), and the
-  warmed tail is exactly `ts::TAIL_SCAN_BYTES` for the last-PCR duration read; **MKV without a
+  warmed tail is exactly `ts::TAIL_SCAN_BYTES` for the last-PCR duration read; **MPEG-PS** —
+  the same head/tail pair, `ps::HEAD_SCAN_BYTES` <= `HEAD_WARM` (so the generic head covers the
+  walk, no branch needed) and the warmed tail exactly `ps::TAIL_SCAN_BYTES` for the last-PTS
+  read, routed by a `looks_like_ps` whose content half is **byte 0 only** — a pack start code
+  plus a valid discriminator, never the head census `ps::demux` runs, because faulting a
+  megabyte in *before* the warm is the round-trip storm warming exists to prevent; **MKV without a
   Cluster SeekHead entry** falls back to the old handshake, `prefetch::HEAD_WARM` >= the first
   block's offset + `mkv::HEAD_SPAN_BYTES` (with a resolved cluster the coupling is structural:
   `MKV_HEAD_WARM` holds only the front metadata, and the block span is warmed by exact extent).

@@ -705,6 +705,7 @@ mod tests {
             ts_stream: None,
             mkv_stream: None,
             raw_stream: None,
+            bounded_index: false,
         };
         let opts = Options { samples: 16, full: false, no_rpu: false };
         let s = scan(&demux, &data, &opts, &Progress::off(), &Frontier::off());
@@ -734,6 +735,7 @@ mod tests {
             ts_stream: None,
             mkv_stream: None,
             raw_stream: None,
+            bounded_index: false,
         };
         // A tiny budget still includes each track's head run and pin.
         let items = select_track_chunks(&demux, 2, false);
