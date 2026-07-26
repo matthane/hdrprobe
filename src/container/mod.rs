@@ -4,6 +4,7 @@
 
 pub mod annexb;
 pub mod av1;
+pub mod bmih;
 pub mod mkv;
 pub mod mp4;
 pub mod mpegv;
@@ -31,6 +32,15 @@ pub enum Codec {
     Mpeg1,
     /// ITU-T H.262 | ISO/IEC 13818-2.
     Mpeg2,
+    /// ISO/IEC 14496-2, "MPEG-4 Visual" — Xvid, DivX 4/5/6, 3ivx and the rest.
+    Mpeg4Part2,
+    /// SMPTE ST 421 (VC-1), all three profiles.
+    Vc1,
+    /// Microsoft's pre-standard MPEG-4 variants, carrying their version (1, 2 or
+    /// 3). Not [`Codec::Mpeg4Part2`]: DivX 3 and its relatives predate the
+    /// standard and their frame headers differ, so they get an honest name and
+    /// no parser — they signal no colour, depth or profile in any case.
+    MsMpeg4(u8),
     Other(String),
 }
 
@@ -44,6 +54,9 @@ impl Codec {
             Codec::ProRes => "ProRes".to_string(),
             Codec::Mpeg1 => "MPEG-1 Video".to_string(),
             Codec::Mpeg2 => "MPEG-2 Video".to_string(),
+            Codec::Mpeg4Part2 => "MPEG-4 Visual".to_string(),
+            Codec::Vc1 => "VC-1".to_string(),
+            Codec::MsMpeg4(v) => format!("MS-MPEG-4 v{v}"),
             Codec::Other(s) => s.clone(),
         }
     }
@@ -787,6 +800,21 @@ pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
     }
 }
 
+/// How much of one chunk — or of one codec-private blob — a start-code-scanning
+/// header parser may read.
+///
+/// The MPEG fills below hand a *scanning* parser a buffer, unlike the ProRes and
+/// VP9 fills whose parsers read a header at the buffer's own head and bail. A
+/// chunk whose declared size is huge and whose bytes hold no header would
+/// otherwise read to EOF, up to 32 times over — turning a malformed file into a
+/// whole-mmap read on the *default* path, which on a network volume is the
+/// whole-file transfer the bounded head walks exist to avoid. The same applies
+/// to a container's own copy of the headers, which is bounded only by the file:
+/// a Matroska CodecPrivate may legally declare a gigabyte. A well-formed file
+/// never pays: the header sits at the buffer's offset 0 and the search stops on
+/// the first hit.
+const HEADER_SCAN_SPAN: usize = 1 << 20;
+
 /// Fill an MPEG-1/2 track's stream-derived fields from the sequence header at
 /// the head of its first access unit, the MPEG analogue of the ProRes and VP9
 /// fills above. [`crate::mpeg2`]'s module doc says why the bitstream is usually
@@ -815,19 +843,11 @@ pub(crate) fn fill_mpeg2_stream_fields(track: &mut TrackDemux, source: &[u8]) {
     // The sequence header opens the first access unit in every mux observed,
     // but a capture cut mid-GOP puts it further in, so try a few chunks. The
     // parse scans within each for the header rather than assuming its offset.
-    // Each chunk's scanned span is capped as well as clamped. Unlike the ProRes
-    // and VP9 fills, whose parsers read a header at the chunk's own head and
-    // bail, `parse_sequence` *scans* for a start code, so a chunk whose
-    // declared size is huge and whose bytes hold no sequence header would read
-    // to EOF, up to 32 times over. That turns a malformed file into a
-    // whole-mmap read on the *default* path, which on a network volume is a
-    // whole-file transfer where the point of the bounded head walks is to avoid
-    // exactly that. A well-formed file never pays: the header sits at the first
-    // chunk's offset 0 and the search stops on the first hit.
-    const SPAN: usize = 1 << 20;
     let s = track.chunks.iter().take(32).find_map(|c| {
         let start = c.offset as usize;
-        let end = ((c.offset + c.size) as usize).min(source.len()).min(start.saturating_add(SPAN));
+        let end = ((c.offset + c.size) as usize)
+            .min(source.len())
+            .min(start.saturating_add(HEADER_SCAN_SPAN));
         (start < end).then(|| crate::mpeg2::parse_sequence(&source[start..end])).flatten()
     });
     let Some(s) = s else { return };
@@ -860,10 +880,157 @@ pub(crate) fn fill_mpeg2_stream_fields(track: &mut TrackDemux, source: &[u8]) {
     }
 }
 
+/// Fill an MPEG-4 Part 2 track's stream-derived fields, the Part 2 analogue of
+/// [`fill_mpeg2_stream_fields`].
+///
+/// Two header sources, tried in order. `headers` is whatever the container
+/// copied into its own codec-configuration slot — a Matroska CodecPrivate, an
+/// `esds` DecoderSpecificInfo, a `BITMAPINFOHEADER`'s extradata — and is the
+/// cheap path, since it costs no sample reads at all. When it holds no
+/// VideoObjectLayer (many AVI muxes leave the slot empty and put the headers in
+/// the first chunk instead) the first few access units are scanned. Both spans
+/// are capped by [`HEADER_SCAN_SPAN`], which documents why.
+///
+/// Container signalling still wins field by field, and the three CICP fields are
+/// all-or-nothing on the same `signalled_nothing` gate. That gate matters more
+/// here than for MPEG-2: Part 2 defines colour *defaults*, so this parser always
+/// produces a description, and without the gate a spec-defined BT.709 would
+/// overwrite a container's real signalling. `range` is the exception and fills
+/// on its own — Part 2 is the one codec in this family that signals one.
+pub(crate) fn fill_mpeg4part2_stream_fields(
+    track: &mut TrackDemux,
+    headers: &[u8],
+    source: &[u8],
+) {
+    let signalled_nothing = track.color.primaries.is_none()
+        && track.color.transfer.is_none()
+        && track.color.matrix.is_none();
+    let missing_cfg = track.width == 0
+        || track.height == 0
+        || track.fps.is_none()
+        || track.bit_depth.is_none()
+        || track.chroma.is_none()
+        || track.codec_profile.is_none();
+    // `range` is in the early return as well as in the fill below, because it
+    // fills independently of the three CICP fields: a track with everything else
+    // in hand and only its range missing still has work to do here, and leaving
+    // it out of the test would skip that silently.
+    if !missing_cfg && !signalled_nothing && track.color.range.is_some() {
+        return;
+    }
+    // Capped like the chunk scan below, and for the same reason: `headers` is a
+    // Matroska CodecPrivate or an `esds` DecoderSpecificInfo, both bounded only
+    // by the file, and `parse_visual` *scans*. A CodecPrivate declaring a
+    // gigabyte of bytes that hold no VOL would otherwise be walked end to end on
+    // the default path — measured at 764 ms against a 31 ms control before this
+    // cap, which on a network volume is a whole-file transfer.
+    let headers = &headers[..headers.len().min(HEADER_SCAN_SPAN)];
+    let v = crate::mpeg4part2::parse_visual(headers).or_else(|| {
+        track.chunks.iter().take(32).find_map(|c| {
+            let start = c.offset as usize;
+            let end = ((c.offset + c.size) as usize)
+                .min(source.len())
+                .min(start.saturating_add(HEADER_SCAN_SPAN));
+            (start < end).then(|| crate::mpeg4part2::parse_visual(&source[start..end])).flatten()
+        })
+    });
+    let Some(v) = v else { return };
+    if track.width == 0 || track.height == 0 {
+        track.width = v.width;
+        track.height = v.height;
+    }
+    if track.fps.is_none() {
+        track.fps = v.fps;
+    }
+    if track.bit_depth.is_none() {
+        track.bit_depth = v.bit_depth;
+    }
+    if track.chroma.is_none() {
+        track.chroma = v.chroma.map(str::to_string);
+    }
+    if track.codec_profile.is_none() {
+        track.codec_profile = v.profile_level;
+    }
+    // The three CICP fields move together on the shared gate; `range` is its own
+    // signal in Part 2 (the one codec here that has one), so it fills
+    // independently and only into an empty field.
+    let (vc, vs) = v.color;
+    if signalled_nothing {
+        track.color.primaries = vc.primaries;
+        track.color.transfer = vc.transfer;
+        track.color.matrix = vc.matrix;
+        track.color_source.primaries = vs.primaries;
+        track.color_source.transfer = vs.transfer;
+        track.color_source.matrix = vs.matrix;
+    }
+    if track.color.range.is_none() {
+        track.color.range = vc.range;
+        track.color_source.range = vs.range;
+    }
+}
+
+/// Fill a VC-1 track's stream-derived fields from its Advanced Profile sequence
+/// header, which every container copies into codec-private data.
+///
+/// Unlike the two fills above there is no chunk fallback, and that is
+/// deliberate: Simple and Main profile have no in-band sequence header to find,
+/// and Advanced Profile's is required to be present in the configuration by
+/// every carriage spec that defines one. Scanning samples could therefore only
+/// ever find what `headers` already held.
+///
+/// `range` is never touched — VC-1 signals none.
+pub(crate) fn fill_vc1_stream_fields(track: &mut TrackDemux, headers: &[u8]) {
+    let signalled_nothing = track.color.primaries.is_none()
+        && track.color.transfer.is_none()
+        && track.color.matrix.is_none();
+    let Some(s) = crate::vc1::parse_sequence_header(headers) else {
+        // Simple/Main carry no sequence header at all, but their depth is the
+        // same format constant, so the report still says 8-bit rather than
+        // nothing.
+        if track.bit_depth.is_none() {
+            track.bit_depth = Some(crate::vc1::BIT_DEPTH);
+        }
+        return;
+    };
+    if track.width == 0 || track.height == 0 {
+        track.width = s.width;
+        track.height = s.height;
+    }
+    if track.fps.is_none() {
+        track.fps = s.fps;
+    }
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(crate::vc1::BIT_DEPTH);
+    }
+    if track.chroma.is_none() {
+        track.chroma = s.chroma.map(str::to_string);
+    }
+    if track.codec_profile.is_none() {
+        track.codec_profile = s.profile_level;
+    }
+    if signalled_nothing {
+        let (sc, ss) = s.color;
+        track.color.primaries = sc.primaries;
+        track.color.transfer = sc.transfer;
+        track.color.matrix = sc.matrix;
+        track.color_source.primaries = ss.primaries;
+        track.color_source.transfer = ss.transfer;
+        track.color_source.matrix = ss.matrix;
+    }
+}
+
 /// ITU-T H.273 `colour_primaries`. Every code the standard defines is named:
 /// an unnamed code is indistinguishable in `ColorInfo` from an unsignalled one,
 /// which is a distinction the report should not have to make often. 2 stays
 /// unnamed on purpose — it *is* "unspecified" — as do the reserved values.
+///
+/// **Coupled to [`cicp_matrix`] by name.** `render::build_color_line` decides
+/// whether a matrix restates the primaries by testing whether the matrix label
+/// *starts with* the primaries label, so the two tables must keep spelling the
+/// same colour system the same way. Today the only pair that relies on it is
+/// BT.2020 (primaries 9 against matrix 9 and 10, "BT.2020 NCL" and "BT.2020
+/// CL"); lengthening `9 => "BT.2020"` here would make every HDR file start
+/// printing its matrix, and nothing but this note would catch it.
 pub(crate) fn cicp_primaries(v: u16) -> Option<&'static str> {
     Some(match v {
         1 => "BT.709",

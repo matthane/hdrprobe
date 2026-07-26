@@ -493,6 +493,20 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         if matches!(td.codec, Codec::Mpeg1 | Codec::Mpeg2) {
             super::fill_mpeg2_stream_fields(&mut td, data);
         }
+        // MPEG-4 Part 2 and VC-1 both keep their headers in CodecPrivate — the
+        // `V_MPEG4/ISO/ASP` header set directly, VC-1's sequence header behind
+        // the VfW `BITMAPINFOHEADER` — so `codec_headers` already points at the
+        // right bytes and neither costs a block read. Part 2 keeps a block
+        // fallback for muxes that leave CodecPrivate empty; VC-1 has none,
+        // because a sequence header absent from the configuration is absent
+        // from an Advanced Profile stream too.
+        let headers = data.get(track.codec_headers.clone()).unwrap_or(&[]);
+        if td.codec == Codec::Mpeg4Part2 {
+            super::fill_mpeg4part2_stream_fields(&mut td, headers, data);
+        }
+        if td.codec == Codec::Vc1 {
+            super::fill_vc1_stream_fields(&mut td, headers);
+        }
         tracks.push(td);
     }
 
@@ -927,6 +941,11 @@ struct TrackInfo {
     content_light: Option<ContentLight>,
     dv_config: Option<DvConfig>,
     default_duration_ns: Option<u64>,
+    /// Byte range of this track's codec headers inside the mmap: CodecPrivate,
+    /// advanced past a `BITMAPINFOHEADER` where there is one. Empty for every
+    /// codec whose fields come from a config record rather than a bitstream
+    /// header, and for a track with no CodecPrivate at all.
+    codec_headers: std::ops::Range<usize>,
 }
 
 /// Every video TrackEntry we can handle, in TrackNumber order (the report
@@ -958,6 +977,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     let mut default_flag = true; // EBML default when FlagDefault is absent
     let mut codec_id: &[u8] = &[];
     let mut codec_private: &[u8] = &[];
+    let mut codec_private_span = 0..0;
     let mut default_duration_ns: Option<u64> = None;
     let mut width = 0u32;
     let mut height = 0u32;
@@ -979,7 +999,10 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
             ID_TRACK_TYPE => track_type = read_uint(data, p2, s),
             ID_FLAG_DEFAULT => default_flag = read_uint(data, p2, s) != 0,
             ID_CODEC_ID => codec_id = &data[p2..cend],
-            ID_CODEC_PRIVATE => codec_private = &data[p2..cend],
+            ID_CODEC_PRIVATE => {
+                codec_private = &data[p2..cend];
+                codec_private_span = p2..cend;
+            }
             ID_DEFAULT_DURATION => {
                 let v = read_uint(data, p2, s);
                 if v > 0 {
@@ -1013,6 +1036,22 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     }
 
     let cc = classify_codec(codec_id, codec_private);
+
+    // A Video for Windows wrapper states the picture size itself. Matroska's own
+    // Video element normally does too and keeps authority; this only fills a
+    // track that carried none, which is the one case where the wrapper is the
+    // only source.
+    // The CodecID test comes first because it is a byte compare and the parse
+    // is not: nested the other way round, every track missing a PixelWidth
+    // reads its CodecPrivate as a `BITMAPINFOHEADER` before the result is
+    // thrown away, and an `hvcC` clears the `biSize >= 40` gate often enough
+    // for that to be a real read rather than a hypothetical one.
+    if (width == 0 || height == 0) && codec_id.starts_with(b"V_MS/VFW/FOURCC") {
+        if let Some(b) = super::bmih::parse(codec_private) {
+            width = b.width;
+            height = b.height;
+        }
+    }
 
     // No container Colour element? Recover colour from the parameter set in
     // CodecPrivate — the SPS in hvcC/avcC, the sequence header in av1C — with
@@ -1056,6 +1095,8 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
         content_light,
         dv_config,
         default_duration_ns,
+        codec_headers: (codec_private_span.start + cc.extradata_offset)
+            .min(codec_private_span.end)..codec_private_span.end,
     })
 }
 
@@ -1065,6 +1106,28 @@ struct CodecConfig {
     bit_depth: Option<u8>,
     chroma: Option<String>,
     codec_profile: Option<String>,
+    /// Where this codec's own headers begin inside CodecPrivate. Zero for every
+    /// CodecID that stores them directly, and 40 for `V_MS/VFW/FOURCC`, whose
+    /// CodecPrivate opens with a `BITMAPINFOHEADER`. Only the codecs whose
+    /// fields come from a bitstream header rather than a config record read it.
+    extradata_offset: usize,
+}
+
+impl CodecConfig {
+    /// A codec with no config record: everything comes from the blocks, or from
+    /// codec-private bytes a bitstream parser reads later. The `nal_format` is a
+    /// placeholder in every such case — the blocks are raw access units, never
+    /// NAL streams, and the sampler's arm for these codecs is a no-op.
+    fn bare(codec: Codec) -> Self {
+        CodecConfig {
+            codec,
+            nal_format: NalFormat::LengthPrefixed(4),
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+            extradata_offset: 0,
+        }
+    }
 }
 
 /// Map a Matroska CodecID (+ CodecPrivate) to codec, NAL framing and codec config.
@@ -1078,6 +1141,7 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth: None,
             chroma: None,
             codec_profile: None,
+            extradata_offset: 0,
         };
         if let Some(h) = super::parse_hvcc_record(codec_private) {
             cfg.nal_format = NalFormat::LengthPrefixed(h.nal_len);
@@ -1097,6 +1161,7 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth: None,
             chroma: None,
             codec_profile: None,
+            extradata_offset: 0,
         };
         if let Some(a) = super::parse_avcc_record(codec_private) {
             cfg.nal_format = NalFormat::LengthPrefixed(a.nal_len);
@@ -1119,6 +1184,7 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth: p.bit_depth,
             chroma: p.chroma.map(str::to_string),
             codec_profile: p.profile.map(|pr| crate::vp9::profile_label(pr, p.level)),
+            extradata_offset: 0,
         }
     } else if codec_id.starts_with(b"V_PRORES") {
         // CodecPrivate is void per the Matroska codec spec, and the profile
@@ -1127,13 +1193,7 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
         // first block's frame header via `fill_prores_stream_fields` after the
         // blocks are indexed. The nal_format is a placeholder: blocks are raw
         // frames (the 8-byte size+'icpf' atom stripped), never NAL streams.
-        CodecConfig {
-            codec: Codec::ProRes,
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-        }
+        CodecConfig::bare(Codec::ProRes)
     } else if codec_id.starts_with(b"V_MPEG1") || codec_id.starts_with(b"V_MPEG2") {
         // Neither CodecID carries a CodecPrivate: the Matroska codec spec says
         // the sequence header rides the blocks themselves. So everything comes
@@ -1143,13 +1203,11 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
         // MPEG access units, never NAL streams, and the sampler's arm is a
         // no-op. Match on `V_MPEG1`/`V_MPEG2` rather than a `V_MPEG` prefix,
         // which would also swallow `V_MPEG4/*`.
-        CodecConfig {
-            codec: if codec_id.starts_with(b"V_MPEG1") { Codec::Mpeg1 } else { Codec::Mpeg2 },
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-        }
+        CodecConfig::bare(if codec_id.starts_with(b"V_MPEG1") {
+            Codec::Mpeg1
+        } else {
+            Codec::Mpeg2
+        })
     } else if codec_id.starts_with(b"V_AV1") {
         // CodecPrivate is an AV1CodecConfigurationRecord (same layout as `av1C`),
         // which carries profile/tier/level and bit depth.
@@ -1163,15 +1221,60 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth,
             chroma,
             codec_profile,
+            extradata_offset: 0,
+        }
+    } else if codec_id.starts_with(b"V_MPEG4/ISO/SP")
+        || codec_id.starts_with(b"V_MPEG4/ISO/ASP")
+        || codec_id.starts_with(b"V_MPEG4/ISO/AP")
+    {
+        // The three ISO Part 2 CodecIDs — Simple, Advanced Simple and Advanced.
+        // All carry the same bitstream, and CodecPrivate holds its
+        // VOS/VisualObject/VOL header set verbatim, so
+        // `fill_mpeg4part2_stream_fields` reads it with no block access at all.
+        // The reported profile comes from that header rather than from the id,
+        // which is why one arm serves all three. `V_MPEG4/ISO/AVC` is checked
+        // above and cannot reach here.
+        CodecConfig::bare(Codec::Mpeg4Part2)
+    } else if codec_id.starts_with(b"V_MPEG4/MS/V3") {
+        // Microsoft's pre-standard v3. Its CodecPrivate is a `BITMAPINFOHEADER`
+        // in some muxes and empty in others, and either way the bitstream
+        // signals no colour, depth or profile — the container facts are the
+        // whole report.
+        CodecConfig::bare(Codec::MsMpeg4(3))
+    } else if codec_id.starts_with(b"V_MS/VFW/FOURCC") {
+        // The Video for Windows wrapper: CodecPrivate is a `BITMAPINFOHEADER`
+        // whose `biCompression` names the real codec, with that codec's own
+        // headers as trailing extradata. It is the only carriage VC-1 has in
+        // Matroska.
+        //
+        // Only codecs this build never *samples* are adopted. An AVC or HEVC
+        // FourCC would also need its NAL framing decided — VfW extradata is an
+        // `avcC` record in some muxes and raw Annex-B in others — and guessing
+        // wrong feeds the sampler bytes that are not NAL units. No fixture
+        // exists here to settle that, so those keep the identifier fallback
+        // until the AVI backend, which owns the rule, has one.
+        let bmih = super::bmih::parse(codec_private);
+        let fourcc = bmih.as_ref().map(|b| b.compression);
+        match fourcc.as_ref().and_then(super::bmih::codec_from_fourcc) {
+            Some(c @ (Codec::Mpeg4Part2 | Codec::Vc1 | Codec::MsMpeg4(_))) => {
+                CodecConfig { extradata_offset: super::bmih::HEADER_LEN, ..CodecConfig::bare(c) }
+            }
+            // The FourCC is the identifier a user recognises; the CodecID is the
+            // same six words on every such track. Only printable ASCII is
+            // adopted, because this string reaches the terminal verbatim and
+            // `biCompression` is not always text: `BI_RGB` is the integer 0,
+            // which would print four NUL bytes, and four attacker-chosen bytes
+            // could spell an ANSI escape. Anything else keeps the CodecID, which
+            // is what these tracks reported before this arm existed.
+            _ => CodecConfig::bare(Codec::Other(
+                match fourcc.filter(|f| f.iter().all(|b| (0x20..=0x7E).contains(b))) {
+                    Some(f) => String::from_utf8_lossy(&f).trim_end().to_string(),
+                    None => String::from_utf8_lossy(codec_id).to_string(),
+                },
+            ))
         }
     } else {
-        CodecConfig {
-            codec: Codec::Other(String::from_utf8_lossy(codec_id).to_string()),
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-        }
+        CodecConfig::bare(Codec::Other(String::from_utf8_lossy(codec_id).to_string()))
     }
 }
 
@@ -1579,10 +1682,14 @@ mod tests {
         // would swallow every `V_MPEG4/*` id. Those must keep their own arms.
         assert_eq!(classify_codec(b"V_MPEG4/ISO/AVC", &[]).codec, Codec::Avc);
         assert_eq!(classify_codec(b"V_MPEGH/ISO/HEVC", &[]).codec, Codec::Hevc);
+        assert_eq!(classify_codec(b"V_MPEG4/ISO/ASP", &[]).codec, Codec::Mpeg4Part2);
+        assert_eq!(classify_codec(b"V_MPEG4/MS/V3", &[]).codec, Codec::MsMpeg4(3));
+        assert_eq!(classify_codec(b"V_MPEG4/ISO/SP", &[]).codec, Codec::Mpeg4Part2);
+        assert_eq!(classify_codec(b"V_MPEG4/ISO/AP", &[]).codec, Codec::Mpeg4Part2);
         // And an unrecognized MPEG-4 id still falls through verbatim.
         assert_eq!(
-            classify_codec(b"V_MPEG4/ISO/ASP", &[]).codec,
-            Codec::Other("V_MPEG4/ISO/ASP".to_string())
+            classify_codec(b"V_MPEG4/ISO/XYZ", &[]).codec,
+            Codec::Other("V_MPEG4/ISO/XYZ".to_string())
         );
     }
 
@@ -1848,6 +1955,7 @@ mod tests {
             content_light: None,
             dv_config: dv,
             default_duration_ns: None,
+            codec_headers: 0..0,
         };
         let el_cfg = DvConfig {
             profile: 7,

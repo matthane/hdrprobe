@@ -210,7 +210,7 @@ fn vertical_size_value(data: &[u8], h: usize) -> u32 {
 
 /// Index of the next `00 00 01` prefix at or after `from`, positioned so the
 /// start-code value byte at `+3` is always readable.
-fn next_start_code(data: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn next_start_code(data: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 3 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
@@ -317,7 +317,7 @@ fn frame_rate(code: u8) -> Option<f64> {
 
 /// `chroma_format`, Table 6-5. Code 0 is reserved. No defined profile permits
 /// 4:4:4, but the field can express it, so it is named rather than refused.
-fn chroma_format(v: u8) -> Option<&'static str> {
+pub(crate) fn chroma_format(v: u8) -> Option<&'static str> {
     Some(match v {
         1 => "4:2:0",
         2 => "4:2:2",

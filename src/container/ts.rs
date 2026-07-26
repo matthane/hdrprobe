@@ -39,6 +39,8 @@ const TS_UNIT: usize = 188;
 const PID_PAT: u16 = 0x0000;
 const STREAM_TYPE_MPEG1: u8 = 0x01;
 const STREAM_TYPE_MPEG2: u8 = 0x02;
+/// ISO/IEC 14496-2 video in a PES stream, per ITU-T H.222.0 Table 2-34.
+const STREAM_TYPE_MPEG4_PART2: u8 = 0x10;
 const STREAM_TYPE_AVC: u8 = 0x1B;
 const STREAM_TYPE_HEVC: u8 = 0x24;
 
@@ -95,7 +97,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
     let programs = parse_psi(data, layout).context("no PMT / program map found")?;
     let groups = group_video_pids(&programs);
     if groups.is_empty() {
-        bail!("no MPEG-1/2, AVC, HEVC or Dolby Vision video PID in the program map");
+        bail!("no MPEG, AVC, HEVC or Dolby Vision video PID in the program map");
     }
 
     // Metadata always comes from the bounded head pass — even under `--full`,
@@ -127,15 +129,22 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         // chunks — and unneeded: the `--full` scan covers every AU, so nothing
         // must be pinned.
         //
-        // MPEG-1/2 groups are excluded: they have no SPS to find, so their
-        // `None` is not a miss, and hunting one would run the walk to EOF for a
-        // structure that cannot exist. That would make `--full` two passes over
-        // an MPEG transport stream against the single-pass invariant, and two
-        // wire transfers of a capture on a network volume.
+        // MPEG groups are excluded — MPEG-1/2 and MPEG-4 Part 2 alike: they have
+        // no SPS to find, so their `None` is not a miss, and hunting one would
+        // run the walk to EOF for a structure that cannot exist. That would make
+        // `--full` two passes over an MPEG transport stream against the
+        // single-pass invariant, and two wire transfers of a capture on a
+        // network volume.
         let targets: Vec<(usize, Vec<u16>, Codec)> = bests
             .iter()
             .enumerate()
-            .filter(|(i, b)| b.is_none() && !matches!(codecs[*i], Codec::Mpeg1 | Codec::Mpeg2))
+            .filter(|(i, b)| {
+                b.is_none()
+                    && !matches!(
+                        codecs[*i],
+                        Codec::Mpeg1 | Codec::Mpeg2 | Codec::Mpeg4Part2
+                    )
+            })
             .map(|(i, _)| (i, group_pids[i].clone(), codecs[i].clone()))
             .collect();
         if !targets.is_empty() {
@@ -218,6 +227,13 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         if matches!(td.codec, Codec::Mpeg1 | Codec::Mpeg2) {
             super::fill_mpeg2_stream_fields(&mut td, &buf);
         }
+        // MPEG-4 Part 2 has no container-side config in a transport stream — no
+        // descriptor carries the visual headers — so the headers at the head of
+        // the first access unit are the only source. Hence no `headers` slice:
+        // the chunk fallback is the whole path here.
+        if td.codec == Codec::Mpeg4Part2 {
+            super::fill_mpeg4part2_stream_fields(&mut td, &[], &buf);
+        }
         td.reassembled = Some(buf);
         tracks.push(td);
     }
@@ -250,6 +266,8 @@ fn group_codec(streams: &[Es]) -> Codec {
         || streams.iter().find_map(|e| e.dv_config.as_ref()).map(|c| c.profile) == Some(9)
     {
         Codec::Avc
+    } else if has(STREAM_TYPE_MPEG4_PART2) {
+        Codec::Mpeg4Part2
     } else if has(STREAM_TYPE_MPEG2) {
         Codec::Mpeg2
     } else if has(STREAM_TYPE_MPEG1) {
@@ -309,7 +327,14 @@ impl PidGroup {
 }
 
 fn is_video_type(t: u8) -> bool {
-    matches!(t, STREAM_TYPE_MPEG1 | STREAM_TYPE_MPEG2 | STREAM_TYPE_AVC | STREAM_TYPE_HEVC)
+    matches!(
+        t,
+        STREAM_TYPE_MPEG1
+            | STREAM_TYPE_MPEG2
+            | STREAM_TYPE_MPEG4_PART2
+            | STREAM_TYPE_AVC
+            | STREAM_TYPE_HEVC
+    )
 }
 
 /// A Dolby Vision enhancement-layer stream.
@@ -925,7 +950,7 @@ fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<SpsCommon> {
         // reassembled buffer once the track exists. Running an Annex-B NAL
         // search over MPEG bytes would find nothing at best and something
         // invented at worst.
-        Codec::Mpeg1 | Codec::Mpeg2 => None,
+        Codec::Mpeg1 | Codec::Mpeg2 | Codec::Mpeg4Part2 => None,
         _ => best_hevc_sps(buf, chunks),
     }
 }

@@ -10,6 +10,7 @@ mod hdr;
 mod hevc;
 mod model;
 mod mpeg2;
+mod mpeg4part2;
 mod prefetch;
 mod progress;
 mod prores;
@@ -17,6 +18,7 @@ mod render;
 mod sample;
 mod shell;
 mod sidecar;
+mod vc1;
 mod vp9;
 
 use std::fs::File;

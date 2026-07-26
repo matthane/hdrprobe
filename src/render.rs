@@ -992,15 +992,32 @@ fn build_color_line(cc: &ColorInfo) -> String {
     // describe — Profile 5 and Profile 20 both ride it — where every other
     // matrix restates what the primaries already said.
     //
-    // The one other case worth naming is a matrix with nothing beside it. That
-    // rationale assumes primaries to restate; when they and the transfer are
-    // both absent, suppressing the matrix empties the line entirely and the
-    // report reads as "nothing was signalled" over a stream that signalled
-    // something. MPEG-2 makes this ordinary rather than exotic: ffmpeg's
-    // encoder writes a `sequence_display_extension` whose primaries and
-    // transfer are the explicit "unspecified" code 2 and whose matrix is real.
+    // Two other cases are worth naming, and both are places where that
+    // rationale simply does not hold.
+    //
+    // **A matrix with nothing beside it.** The rationale assumes primaries to
+    // restate; when they and the transfer are both absent, suppressing the
+    // matrix empties the line entirely and the report reads as "nothing was
+    // signalled" over a stream that signalled something. MPEG-2 makes this
+    // ordinary rather than exotic: ffmpeg's encoder writes a
+    // `sequence_display_extension` whose primaries and transfer are the
+    // explicit "unspecified" code 2 and whose matrix is real.
+    //
+    // **A matrix that names a different system than the primaries.** VC-1's
+    // spec defaults are BT.709 primaries and transfer over a **BT.601** matrix,
+    // and a stream that clears `COLOR_FORMAT_FLAG` — every VC-1 file in the
+    // corpus — is defined to be exactly that. Collapsing it to "BT.709" states
+    // the opposite of the matrix half. The comparison is by name because the
+    // labels *are* the value space here, and a matrix whose name extends the
+    // primaries' (BT.2020 against BT.2020 NCL and CL) is the restatement the
+    // rule is about, not a difference.
     let matrix_alone = cc.primaries.is_none() && cc.transfer.is_none();
-    if cc.matrix.as_deref() == Some(crate::container::IPT_PQ_C2) || matrix_alone {
+    let matrix_differs = match (cc.primaries.as_deref(), cc.matrix.as_deref()) {
+        (Some(p), Some(m)) => !m.starts_with(p),
+        _ => false,
+    };
+    let ipt = cc.matrix.as_deref() == Some(crate::container::IPT_PQ_C2);
+    if ipt {
         if let Some(m) = &cc.matrix {
             parts.push(m.clone());
         }
@@ -1018,6 +1035,18 @@ fn build_color_line(cc: &ColorInfo) -> String {
             if let Some(t) = t {
                 parts.push(t.to_string());
             }
+        }
+    }
+    // A shown matrix that is not IPT-PQ-C2 goes *after* the pair and says what
+    // it is. Both halves of that matter. Leading with it puts it in the slot a
+    // reader parses as primaries, and "BT.601 (NTSC)" is a real primaries label
+    // in the same table — so `BT.601 (NTSC) · BT.709` for a VC-1 stream reads as
+    // the exact inverse of its BT.709 primaries over a BT.601 matrix. IPT-PQ-C2
+    // is exempt because it names a colour space no primaries label spells, so it
+    // cannot be misread and it leads by long-standing convention.
+    if !ipt && (matrix_alone || matrix_differs) {
+        if let Some(m) = &cc.matrix {
+            parts.push(format!("{m} matrix"));
         }
     }
     if let Some(m) = &cc.range {
@@ -1391,6 +1420,33 @@ mod tests {
         assert_eq!(build_color_line(&cc), "BT.709 · limited");
     }
 
+    /// VC-1's spec defaults are BT.709 primaries and transfer over a BT.601
+    /// matrix, and every VC-1 file in the corpus clears `COLOR_FORMAT_FLAG`, so
+    /// that mixed combination is the codec's ordinary case. Collapsing it to
+    /// "BT.709" would state the opposite of the matrix half.
+    #[test]
+    fn a_matrix_naming_a_different_system_than_the_primaries_shows() {
+        let cc = ColorInfo {
+            primaries: Some("BT.709".to_string()),
+            transfer: Some("BT.709".to_string()),
+            matrix: Some("BT.601 (NTSC)".to_string()),
+            range: None,
+        };
+        assert_eq!(build_color_line(&cc), "BT.709 · BT.601 (NTSC) matrix");
+        // A matrix whose name *extends* the primaries' is the restatement the
+        // suppression rule is about, and stays suppressed: BT.2020's two matrix
+        // rows (NCL and CL) are the only such pair in the CICP tables.
+        for m in ["BT.2020 NCL", "BT.2020 CL"] {
+            let cc = ColorInfo {
+                primaries: Some("BT.2020".to_string()),
+                transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+                matrix: Some(m.to_string()),
+                range: Some("limited".to_string()),
+            };
+            assert_eq!(build_color_line(&cc), "BT.2020 · PQ (SMPTE ST 2084) · limited");
+        }
+    }
+
     /// A track the model resolved nothing for — a metadata-only sidecar — has
     /// an empty line, not an invented one.
     #[test]
@@ -1412,15 +1468,17 @@ mod tests {
             matrix: Some(m.to_string()),
             ..ColorInfo::default()
         };
-        assert_eq!(build_color_line(&matrix_only("BT.709")), "BT.709");
-        assert_eq!(build_color_line(&matrix_only("BT.601 (PAL)")), "BT.601 (PAL)");
+        // Labelled, because a bare "BT.709" in the line's first slot is what a
+        // reader parses as primaries.
+        assert_eq!(build_color_line(&matrix_only("BT.709")), "BT.709 matrix");
+        assert_eq!(build_color_line(&matrix_only("BT.601 (PAL)")), "BT.601 (PAL) matrix");
         // With a range beside it, both show.
         let cc = ColorInfo {
             matrix: Some("BT.709".to_string()),
             range: Some("limited".to_string()),
             ..ColorInfo::default()
         };
-        assert_eq!(build_color_line(&cc), "BT.709 · limited");
+        assert_eq!(build_color_line(&cc), "BT.709 matrix · limited");
         // But as soon as either primaries or transfer is present, the matrix
         // goes back to being suppressed as a restatement.
         let cc = ColorInfo {

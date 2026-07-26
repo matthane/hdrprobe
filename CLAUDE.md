@@ -134,6 +134,50 @@ never parse bytes native-endian.
   Profile 7 shape, and MPEG has no enhancement layer, so two MPEG-2 video PIDs are two tracks),
   and MPEG groups are excluded from `ts::sps_rescue` (no SPS exists to find, and hunting one runs
   the walk to EOF, making `--full` two passes over the file).
+- `mpeg4part2.rs` — ISO/IEC 14496-2 "MPEG-4 Visual" (Xvid, DivX 4/5/6, 3ivx), read from the
+  VOS/VisualObject/VideoObjectLayer headers through the same gap-filler shape
+  (`container::fill_mpeg4part2_stream_fields`, which tries the container's own copy of those
+  headers before touching a chunk — Matroska CodecPrivate, an `esds` DecoderSpecificInfo, a
+  `BITMAPINFOHEADER`'s extradata all hold them verbatim). Three facts are invariants.
+  **Colour has spec-defined defaults, unlike MPEG-2**: an absent `video_signal_type()` or a
+  clear `colour_description` means BT.709 primaries, transfer *and* matrix plus limited range,
+  a genuine `ColorSource::Spec` fill — and the range bit sits one level above the
+  `colour_description` flag, so the two halves carry different provenance and are built
+  separately. **The frame rate is absent unless `fixed_vop_rate` is set**, which ffmpeg's
+  encoder never sets; reporting `vop_time_increment_resolution` instead (what ffmpeg's
+  *decoder* surfaces) prints "30000 fps" on ordinary content. And **every marker bit on the
+  path is checked rather than skipped** — the VOL is bit-packed with no byte alignment, one
+  missed conditional desynchronises every field after it, and the markers are the only
+  structural evidence the walk is still aligned. The parser is not a sniffer: `00 00 01 B3` is
+  an MPEG-4 group-of-VOP header *and* an MPEG-1/2 sequence header, so it runs only on bytes a
+  container already identified as Part 2. The studio VOL layout is sourced to ffmpeg alone and
+  says so at the code site (it is the only Part 2 variant signalling a depth above 8 or a
+  chroma format other than 4:2:0), and a sprite-coded layer stops the walk rather than guessing
+  a block this project has no primary source for.
+- `vc1.rs` — SMPTE ST 421 (VC-1). Read against **ST 421:2013**, not the freely circulating
+  "VC-9" Committee Draft, whose sequence header has a different layout. Two facts dominate.
+  **VC-1's colour fields are not CICP**: the value spaces are narrower, the defaults are
+  *not* all 1 (`MATRIX_COEF` defaults to **6**, BT.601, over BT.709 primaries and transfer —
+  a mixed combination, and the common case, since every real VC-1 file observed clears
+  `COLOR_FORMAT_FLAG`), and **`TRANSFER_CHAR` 8 is BT.1361 where CICP 8 is Linear**, so the
+  module translates into CICP codes rather than passing them through. ffmpeg's whitelist both
+  drops defined values and admits reserved ones, and GStreamer copies it; the published tables
+  win. **And there are two profile numberings.** The in-band sequence header's `PROFILE` is
+  2 bits, 0/1/3 for Simple/Main/Advanced. Everything in SMPTE RP 2025-2007's `dvc1` box is
+  4 bits, 0/4/12 — §8.1 for `VC1DecSpecStruc.profile`, and §8.3 says `VC1SequenceHeader_C`
+  (STRUCT_C) "shall be set to the same value", so **STRUCT_C inside a `dvc1` uses 0/4/12 too**,
+  which reads like the bitstream field and is not. `profile_from_config` is the one place that
+  numbering lives. VC-1 is also the only codec in this corner of the tree that **does** use
+  emulation prevention, so the payload between start codes is unescaped before any bit is read.
+- `container/bmih.rs` — `BITMAPINFOHEADER`, the Video for Windows description block, plus the
+  FourCC-to-codec table. It lives in `container/` rather than a backend because three carriages
+  hand one over: AVI's `strf`, ASF's type-specific data, and **Matroska's `V_MS/VFW/FOURCC`**,
+  which is the only carriage VC-1 has in an MKV. Two traps: **`biBitCount` is display bits per
+  pixel and never a bit depth** (a 4:2:0 8-bit stream routinely writes 24), so the field is not
+  exposed at all; and **`biHeight` is signed**, negative meaning top-down, so the absolute value
+  is the height (`unsigned_abs`, because `i32::MIN.abs()` panics). Extradata is bounded by the
+  *caller's* slice, never by `biSize`, which real muxers write inconsistently — the corpus VC-1
+  MKV declares 71 over a 72-byte CodecPrivate.
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation),
   `ccid.rs` (the Dolby "Profiles and Levels" tables as data: profile -> admitted CCID(s),
   CCID -> the five-part base-layer VUI as **CICP code points**, the reverse lookup
@@ -870,16 +914,31 @@ never parse bytes native-endian.
   is emitted only for a file that produced a report. The hot `nal::split_annexb` stays
   tick-free: the no-op-closure monomorphization of `split_annexb_impl` compiles the gate out;
   only `split_annexb_streamed` (the raw-HEVC `--full` fused walk) pays for it.
-- **The Color line suppresses the matrix, except when the matrix is all there is.**
-  `render::build_color_line` prints primaries and transfer but drops `color.matrix`, because every
-  matrix except Dolby's IPT-PQ-C2 restates what the primaries already said. That reasoning assumes
-  there are primaries to restate: with primaries *and* transfer both absent, suppressing the matrix
-  empties the line, and the report then reads "nothing was signalled" over a stream that signalled
-  something. So a lone matrix prints. This is not an MPEG special case even though MPEG-2 is where
-  it became ordinary (ffmpeg's encoder writes `colour_description` set with primaries and transfer
-  at the explicit "unspecified" code 2, matrix real): it applies to any track whose only colour
-  signal is a matrix, VP9 and ProRes included. The JSON always carried the matrix; only the text
-  line changed. No corpus file is affected, which is why the byte-identity gate did not move.
+- **The Color line suppresses the matrix, except where suppressing it would state something
+  false.** `render::build_color_line` prints primaries and transfer but drops `color.matrix`,
+  because every matrix except Dolby's IPT-PQ-C2 restates what the primaries already said. That
+  reasoning fails in two ways, and each has its own escape.
+  **(1) There may be no primaries to restate.** With primaries *and* transfer both absent,
+  suppressing the matrix empties the line, and the report then reads "nothing was signalled" over a
+  stream that signalled something. MPEG-2 is where this became ordinary (ffmpeg's encoder writes
+  `colour_description` set with primaries and transfer at the explicit "unspecified" code 2, matrix
+  real), but it applies to any track whose only colour signal is a matrix, VP9 and ProRes included.
+  **(2) The matrix may name a different system than the primaries.** VC-1's spec defaults are
+  BT.709 primaries and transfer over a **BT.601** matrix, and a stream clearing
+  `COLOR_FORMAT_FLAG` — every VC-1 file observed — is *defined* to be that, so collapsing the line
+  to "BT.709" states the opposite of the matrix half. The comparison is by name (`!m.starts_with(p)`)
+  because the labels are the value space, and a matrix whose name extends the primaries' is the
+  restatement the rule is about: BT.2020's NCL and CL rows are the only such pair in the CICP
+  tables, and **renaming `cicp_primaries(9)` to anything longer than `"BT.2020"` would silently
+  start printing a matrix on every HDR file** — the two tables are coupled here and nothing else
+  enforces it.
+  A matrix shown under either escape is placed **after** the primaries/transfer pair and suffixed
+  ` matrix`, because the line's first slot is where a reader parses primaries and matrix labels
+  share that namespace (`BT.601 (NTSC)` is `cicp_primaries(6)` as well as `cicp_matrix(6)`, so
+  leading with it reads as the exact inverse of the truth). IPT-PQ-C2 keeps its bare leading
+  position: it names a colour space no primaries label spells, so it cannot be misread.
+  The JSON always carried the matrix; only the text line changed. No corpus file is affected in
+  any mode, which is why the byte-identity gate did not move.
 - **Value-line reflow is terminal-only and byte-neutral everywhere else.** kv rows longer than
   the terminal wrap at their part separators (trailing ` ·`/`,`/` +`, or the unstyled double
   space before a warning chip — never mid-part, never inside a chip) with continuations

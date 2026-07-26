@@ -443,6 +443,10 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
 
     let mut duration_secs: Option<f64> = None;
     let mut out = Vec::with_capacity(base.len());
+    // Kept beside `out` rather than on `TrackDemux`: it is a byte range in the
+    // sample entry, meaningful only to the gap-fill below, and every other
+    // backend resolves its own equivalent the same way.
+    let mut part2_headers: Vec<std::ops::Range<usize>> = Vec::with_capacity(base.len());
     for (i, t) in base.into_iter().enumerate() {
         let group_els: &[VideoTrack] = &buckets[i];
 
@@ -527,6 +531,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
             cuvv_version_map: t.sd.cuvv_version_map,
             ..TrackDemux::new(t.sd.codec.clone(), NalFormat::LengthPrefixed(nal_len))
         });
+        part2_headers.push(t.sd.codec_headers.clone());
     }
 
     // A ProRes MOV without a `colr` box (ffmpeg writes none by default) signals
@@ -543,6 +548,15 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         // the sequence header in the first sample.
         if matches!(t.codec, Codec::Mpeg1 | Codec::Mpeg2) {
             super::fill_mpeg2_stream_fields(t, data);
+        }
+    }
+    // MPEG-4 Part 2 the same way, but with the `esds` DecoderSpecificInfo tried
+    // first: a muxer that wrote one has already handed over the visual headers,
+    // and only one that left it out costs a sample read. The range is resolved
+    // before this loop because `t` no longer carries the sample entry.
+    for (t, headers) in out.iter_mut().zip(part2_headers) {
+        if t.codec == Codec::Mpeg4Part2 {
+            super::fill_mpeg4part2_stream_fields(t, data.get(headers).unwrap_or(&[]), data);
         }
     }
 
@@ -642,6 +656,10 @@ struct SampleDesc {
     mastering: Option<MasteringDisplay>,
     content_light: Option<ContentLight>,
     cuvv_version_map: Option<u16>,
+    /// Byte range of this track's codec headers inside the file: today the
+    /// `esds` `DecoderSpecificInfo` of an MPEG-4 Part 2 track. Empty for every
+    /// codec whose fields come from a config record read above.
+    codec_headers: std::ops::Range<usize>,
 }
 
 /// Read an ISO/IEC 14496-1 §8.3.3 expandable class length at `*p`, advancing
@@ -660,14 +678,21 @@ fn read_descriptor_len(data: &[u8], p: &mut usize) -> Option<u32> {
     Some(len)
 }
 
-/// The `objectTypeIndication` inside an `esds` box: the byte that says which
-/// codec a generic `mp4v` sample entry actually carries.
+/// The `objectTypeIndication` inside an `esds` box — the byte that says which
+/// codec a generic `mp4v` sample entry actually carries — and the range of the
+/// `DecoderSpecificInfo` that follows it, relative to `payload`.
 ///
 /// Walks ES_Descriptor (tag 3) to DecoderConfigDescriptor (tag 4), whose first
 /// byte it is. The three optional ES_Descriptor fields are each gated on a flag
 /// bit and must be skipped in order, or the tag check lands mid-field and the
 /// whole thing reads as malformed rather than as the codec it names.
-fn esds_object_type(payload: &[u8]) -> Option<u8> {
+///
+/// The `DecoderSpecificInfo` (tag 5) is where an MPEG-4 Part 2 track keeps its
+/// VOS/VisualObject/VOL headers, byte-identical to what Matroska puts in
+/// CodecPrivate. It is optional, so an absent or truncated one yields an empty
+/// range rather than failing the whole read: the object type alone still names
+/// the codec.
+fn esds_decoder_config(payload: &[u8]) -> Option<(u8, std::ops::Range<usize>)> {
     // FullBox header: version(8) + flags(24).
     let mut p = 4usize;
     if *payload.get(p)? != 0x03 {
@@ -692,8 +717,35 @@ fn esds_object_type(payload: &[u8]) -> Option<u8> {
         return None;
     }
     p += 1;
-    read_descriptor_len(payload, &mut p)?;
-    payload.get(p).copied()
+    let config_len = read_descriptor_len(payload, &mut p)? as usize;
+    let config_end = p.saturating_add(config_len).min(payload.len());
+    let oti = *payload.get(p)?;
+    // objectTypeIndication(8) streamType(6) upStream(1) reserved(1)
+    // bufferSizeDB(24) maxBitrate(32) avgBitrate(32) = 13 bytes.
+    p += 13;
+    // Everything below is best-effort: the DecoderSpecificInfo is optional, so
+    // a missing, truncated or out-of-bounds one must still yield the object
+    // type, which is what names the codec. An earlier draft used `?` on the
+    // length read and dropped the whole descriptor chain — and with it the
+    // codec — whenever a file was cut inside that one field.
+    //
+    // `p < config_end` is the load-bearing half: a DecoderConfigDescriptor
+    // shorter than its own fixed fields leaves `p` past its declared end, and
+    // without the test the tag would be read from bytes belonging to the
+    // *next* descriptor. It also keeps the range below from inverting, which
+    // `slice::get` tolerates but this file's malformed-input discipline does
+    // not.
+    let dsi = match payload.get(p) {
+        Some(0x05) if p < config_end => {
+            p += 1;
+            match read_descriptor_len(payload, &mut p) {
+                Some(len) => p.min(config_end)..p.saturating_add(len as usize).min(config_end),
+                None => 0..0,
+            }
+        }
+        _ => 0..0,
+    };
+    Some((oti, dsi))
 }
 
 /// Map an `esds` `objectTypeIndication` to a codec, per the MP4 Registration
@@ -707,6 +759,9 @@ fn esds_object_type(payload: &[u8]) -> Option<u8> {
 /// only source in every other container, so they collapse to one codec here.
 fn codec_from_oti(oti: u8) -> Option<Codec> {
     Some(match oti {
+        // ISO/IEC 14496-2 "Visual ISO/IEC 14496-2". One row for every Part 2
+        // profile, unlike the six MPEG-2 rows below.
+        0x20 => Codec::Mpeg4Part2,
         0x60..=0x65 => Codec::Mpeg2,
         0x6A => Codec::Mpeg1,
         _ => return None,
@@ -763,6 +818,10 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         // The six ProRes video profiles. ProRes RAW (`aprn`/`aprh`) is a
         // different codec family and stays on the generic fallback.
         b"apco" | b"apcs" | b"apcn" | b"apch" | b"ap4h" | b"ap4x" => Codec::ProRes,
+        // SMPTE RP 2025-2007, "VC-1 Bitstream Storage in the ISO Base Media
+        // File Format": the sample entry is `vc-1` and always contains a `dvc1`
+        // config box, VC-1's analogue of `avcC`.
+        b"vc-1" => Codec::Vc1,
         other => Codec::Other(String::from_utf8_lossy(other).to_string()),
     };
 
@@ -776,14 +835,24 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     // itself: the `esds` descriptor's `objectTypeIndication` says what is
     // actually inside. Without this the entry falls to `Codec::Other("mp4v")`,
     // which reports the FourCC as the codec and skips the sampler entirely.
+    //
+    // The same descriptor's `DecoderSpecificInfo` is where an MPEG-4 Part 2
+    // track keeps its visual headers, so the range is carried through to the
+    // post-index fill rather than re-walked there.
+    let mut codec_headers = 0..0;
     if &format == b"mp4v" {
-        if let Some(c) = children
+        if let Some((oti, dsi)) = children
             .iter()
             .find(|c| &c.typ == b"esds")
-            .and_then(|c| esds_object_type(&data[c.payload..c.end]))
-            .and_then(codec_from_oti)
+            .and_then(|c| {
+                esds_decoder_config(&data[c.payload..c.end])
+                    .map(|(oti, r)| (oti, c.payload + r.start..c.payload + r.end))
+            })
         {
-            codec = c;
+            if let Some(c) = codec_from_oti(oti) {
+                codec = c;
+                codec_headers = dsi;
+            }
         }
     }
 
@@ -801,6 +870,13 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             bit_depth = Some(bd);
         }
     }
+    // VC-1's depth is a format constant, not a signal, so it does not depend on
+    // the `dvc1` box parsing — a track whose config box is missing or malformed
+    // is still 8-bit, and reporting nothing there would disagree with the same
+    // stream carried in Matroska.
+    if codec == Codec::Vc1 {
+        bit_depth = Some(crate::vc1::BIT_DEPTH);
+    }
     let mut nal_len = 4u8;
     let mut color = ColorInfo::default();
     let mut dv_config = None;
@@ -810,6 +886,9 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut avcc_bytes: Option<&[u8]> = None;
     let mut av1c_bytes: Option<&[u8]> = None;
     let mut vpcc_color: Option<(ColorInfo, ColorSources)> = None;
+    // The VC-1 sequence header's own colour description, which for this codec is
+    // never absent: a clear `COLOR_FORMAT_FLAG` means the spec's defaults apply.
+    let mut vc1_color: Option<(ColorInfo, ColorSources)> = None;
     // The `colr` box's own provenance, kept beside the values it produced so an
     // unnamed CICP code is not mistaken later for a field nothing signalled.
     let mut colr_source: Option<ColorSources> = None;
@@ -866,6 +945,21 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             b"dvcC" | b"dvvC" | b"dvwC" => {
                 dv_config = super::parse_dovi_config(&data[c.payload..c.end])
             }
+            // `dvc1` (`VC1DecSpecStruc`) is a config record like `hvcC`: for
+            // Advanced Profile its `seqhdr_ephdr` holds the sequence header
+            // EBDU verbatim, so the colour description costs no sample reads.
+            // Note its `profile` field numbers Simple/Main/Advanced 0/4/12,
+            // *not* the bitstream's 0/1/3 — `vc1::parse_dvc1` owns that
+            // distinction so no call site can conflate the two.
+            b"dvc1" => {
+                if let Some(cfg) = crate::vc1::parse_dvc1(&data[c.payload..c.end]) {
+                    codec_profile = cfg.profile_level;
+                    if let Some(seq) = cfg.seq {
+                        chroma = seq.chroma.map(str::to_string);
+                        vc1_color = Some(seq.color);
+                    }
+                }
+            }
             b"lhvC" => layered = true,
             b"vexu" => stereo = parse_stereo(data, c).or(stereo),
             b"cuvv" => cuvv_version_map = parse_cuvv(&data[c.payload..c.end]),
@@ -906,6 +1000,10 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             super::color_from_avcc(a)
         } else if let Some(v) = av1c_bytes {
             super::color_from_av1c(v)
+        } else if vc1_color.is_some() {
+            // The VC-1 sequence header is the coded stream's own signalling in
+            // the same sense as an SPS VUI, and tags itself accordingly.
+            vc1_color
         } else {
             // `vpcC` carries the CICP triplet + range directly (VP9 has no
             // parameter set to embed), same fallback treatment.
@@ -937,6 +1035,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         mastering,
         content_light,
         cuvv_version_map,
+        codec_headers,
     })
 }
 
@@ -1446,6 +1545,7 @@ mod tests {
                 mastering: None,
                 content_light: None,
                 cuvv_version_map: None,
+                codec_headers: 0..0,
             },
             chunks: (0..chunks).map(|i| Chunk { offset: i as u64, size: 1 }).collect(),
             fps: Some(24.0),
@@ -1797,13 +1897,16 @@ mod tests {
         // `testfiles/sdr/mpeg2.mp4`'s esds payload verbatim: FullBox header,
         // ES_Descriptor (tag 3, four-byte expandable length `80 80 80 1b`),
         // ES_ID 1, flags 0, then DecoderConfigDescriptor (tag 4) whose first
-        // byte is objectTypeIndication 0x61, MPEG-2 Main Profile.
+        // byte is objectTypeIndication 0x61, MPEG-2 Main Profile. It carries no
+        // DecoderSpecificInfo, which is why an MPEG-2 MP4 needs the sample read.
         let esds = [
             0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x1B, 0x00, 0x01, 0x00, 0x04, 0x80,
             0x80, 0x80, 0x0D, 0x61, 0x11, 0x00, 0x00, 0x00, 0x00, 0x05, 0xEB, 0xD0, 0x00, 0x05,
             0xEB, 0xD0, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02,
         ];
-        assert_eq!(esds_object_type(&esds), Some(0x61));
+        let (oti, dsi) = esds_decoder_config(&esds).unwrap();
+        assert_eq!(oti, 0x61);
+        assert!(dsi.is_empty());
         assert_eq!(codec_from_oti(0x61), Some(Codec::Mpeg2));
 
         // The single-byte length form, and the three optional ES_Descriptor
@@ -1814,7 +1917,7 @@ mod tests {
         d.extend_from_slice(&[0x03, b'a', b'b', b'c']); // URLlength + URLstring
         d.extend_from_slice(&[0x00, 0x04]); // OCR_ES_Id
         d.extend_from_slice(&[0x04, 0x05, 0x6A]); // DecoderConfig, OTI 0x6A
-        assert_eq!(esds_object_type(&d), Some(0x6A));
+        assert_eq!(esds_decoder_config(&d).unwrap().0, 0x6A);
         assert_eq!(codec_from_oti(0x6A), Some(Codec::Mpeg1));
 
         // All six 13818-2 profile rows collapse to one codec; the profile comes
@@ -1822,16 +1925,108 @@ mod tests {
         for oti in 0x60..=0x65u8 {
             assert_eq!(codec_from_oti(oti), Some(Codec::Mpeg2), "OTI {oti:#04x}");
         }
+        assert_eq!(codec_from_oti(0x20), Some(Codec::Mpeg4Part2));
         // Anything this backend cannot then describe stays unmapped, so the
         // entry keeps its FourCC fallback rather than claiming a codec.
-        assert_eq!(codec_from_oti(0x20), None, "MPEG-4 Part 2 is not wired yet");
         assert_eq!(codec_from_oti(0x40), None);
         assert_eq!(codec_from_oti(0x00), None);
 
         // Truncation and a wrong tag both decline rather than reading garbage.
-        assert_eq!(esds_object_type(&esds[..16]), None);
-        assert_eq!(esds_object_type(&[0, 0, 0, 0, 0x05, 0x01, 0x61]), None);
-        assert_eq!(esds_object_type(&[]), None);
+        assert!(esds_decoder_config(&esds[..16]).is_none());
+        assert!(esds_decoder_config(&[0, 0, 0, 0, 0x05, 0x01, 0x61]).is_none());
+        assert!(esds_decoder_config(&[]).is_none());
+    }
+
+    #[test]
+    fn the_decoder_specific_info_is_the_mpeg4_part2_header_set() {
+        // `testfiles/sdr/mpeg4p2.mp4`'s esds payload verbatim. Its
+        // DecoderSpecificInfo (tag 5, length 0x2F) is byte-identical to the same
+        // encode's Matroska CodecPrivate, so both containers reach the visual
+        // headers with no sample read at all.
+        let esds = [
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x4F, 0x00, 0x01, 0x00, 0x04, 0x80,
+            0x80, 0x80, 0x41, 0x20, 0x11, 0x00, 0x00, 0x00, 0x00, 0x05, 0x54, 0xB8, 0x00, 0x05,
+            0x54, 0xB8, 0x05, 0x80, 0x80, 0x80, 0x2F, 0x00, 0x00, 0x01, 0xB0, 0x01, 0x00, 0x00,
+            0x01, 0xB5, 0x89, 0x13, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00, 0xC4,
+            0x8D, 0x88, 0x00, 0xCD, 0x0A, 0x04, 0x1E, 0x14, 0x43, 0x00, 0x00, 0x01, 0xB2, 0x4C,
+            0x61, 0x76, 0x63, 0x36, 0x32, 0x2E, 0x31, 0x31, 0x2E, 0x31, 0x30, 0x30, 0x06, 0x80,
+            0x80, 0x80, 0x01, 0x02,
+        ];
+        let (oti, dsi) = esds_decoder_config(&esds).unwrap();
+        assert_eq!(oti, 0x20);
+        assert_eq!(codec_from_oti(oti), Some(Codec::Mpeg4Part2));
+        assert_eq!(dsi.len(), 0x2F);
+        assert_eq!(&esds[dsi.clone()][..4], &[0x00, 0x00, 0x01, 0xB0]);
+        // And it really does describe the picture from here.
+        let v = crate::mpeg4part2::parse_visual(&esds[dsi]).expect("VOL parses");
+        assert_eq!((v.width, v.height), (320, 240));
+        assert_eq!(v.profile_level.as_deref(), Some("Simple@L1"));
+    }
+
+    #[test]
+    fn a_truncated_decoder_specific_info_yields_no_headers_not_a_short_read() {
+        // The DecoderConfigDescriptor declares 0x11 bytes, which is long enough
+        // to reach the tag and length, and the DecoderSpecificInfo inside it
+        // then claims 0x2F bytes where only two remain. Both clamps have to
+        // fire: the range must stay inside its parent descriptor *and* inside
+        // the buffer, so the visual parse sees two bytes and declines rather
+        // than reading whatever follows the box.
+        //
+        // The declared length matters. An earlier version of this test used a
+        // DecoderConfigDescriptor length of 6, which put `p` past the
+        // descriptor's end before the tag was ever examined — so it passed on
+        // an empty range and proved nothing about the clamp it was named for.
+        let esds = esds_with(17, &[0x05, 0x2F, 0xAA, 0xBB]);
+        let (oti, dsi) = esds_decoder_config(&esds).unwrap();
+        assert_eq!(oti, 0x20);
+        // The two bytes that are actually there, not the 47 claimed.
+        assert_eq!(dsi, 26..28, "clamped to the buffer, and to the parent descriptor");
+        assert!(crate::mpeg4part2::parse_visual(&esds[dsi]).is_none());
+    }
+
+    /// An `esds` payload: FullBox header, ES_Descriptor with no optional
+    /// fields, then a DecoderConfigDescriptor declaring `config_len` whose
+    /// object type is MPEG-4 Part 2, with `tail` following its 13 fixed bytes.
+    /// The 13 are objectTypeIndication, streamType, bufferSizeDB(3),
+    /// maxBitrate(4) and avgBitrate(4).
+    fn esds_with(config_len: u8, tail: &[u8]) -> Vec<u8> {
+        let mut d = vec![0x00, 0x00, 0x00, 0x00, 0x03];
+        let body_len = 3 + 2 + 13 + tail.len();
+        d.push(body_len as u8);
+        d.extend_from_slice(&[0x00, 0x01, 0x00]); // ES_ID + flags
+        d.extend_from_slice(&[0x04, config_len, 0x20, 0x11]);
+        d.extend_from_slice(&[0u8; 11]); // bufferSizeDB + the two bitrates
+        d.extend_from_slice(tail);
+        d
+    }
+
+    #[test]
+    fn a_descriptor_shorter_than_its_fixed_fields_still_names_the_codec() {
+        // Two ways an `esds` can be cut inside the DecoderSpecificInfo, both of
+        // which used to take the whole descriptor chain down with them — and
+        // with it the codec, since `mp4v` names none by itself. A track that
+        // falls to `Codec::Other("mp4v")` loses its codec label *and* is never
+        // sampled, so this is the "unrecognized FourCC costs the whole report"
+        // failure mode reached through a one-byte truncation.
+        //
+        // 1. The tag is the last byte, so there is no length to read at all.
+        let cut_at_tag = esds_with(14, &[0x05]);
+        assert_eq!(esds_decoder_config(&cut_at_tag).unwrap().0, 0x20);
+        assert!(esds_decoder_config(&cut_at_tag).unwrap().1.is_empty());
+
+        // 2. The length is a multi-byte form that runs off the end.
+        let cut_in_len = esds_with(16, &[0x05, 0x80, 0x80]);
+        let (oti, dsi) = esds_decoder_config(&cut_in_len).unwrap();
+        assert_eq!(oti, 0x20);
+        assert!(dsi.is_empty());
+
+        // And a DecoderConfigDescriptor too short to contain its own fixed
+        // fields must not read the tag from the bytes after it: here it
+        // declares 6 bytes while a `0x05` sits well past its end.
+        let short_config = esds_with(6, &[0x05, 0x02, 0xAA, 0xBB]);
+        let (oti, dsi) = esds_decoder_config(&short_config).unwrap();
+        assert_eq!(oti, 0x20);
+        assert!(dsi.is_empty(), "a descriptor's tail is not its child");
     }
 
     /// The `codec` a one-entry stsd with this sample-entry FourCC resolves to.
@@ -1898,9 +2093,10 @@ mod tests {
         };
         assert_eq!(codec_of(b"mp4v", &[esds_with(0x61)]), Codec::Mpeg2);
         assert_eq!(codec_of(b"mp4v", &[esds_with(0x6A)]), Codec::Mpeg1);
-        // MPEG-4 Part 2 has no parser yet, so it keeps the FourCC fallback
-        // rather than being claimed as something this backend cannot describe.
-        assert_eq!(codec_of(b"mp4v", &[esds_with(0x20)]), Codec::Other("mp4v".to_string()));
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x20)]), Codec::Mpeg4Part2);
+        // An object type this backend cannot then describe keeps the FourCC
+        // fallback rather than being claimed as something it is not.
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x40)]), Codec::Other("mp4v".to_string()));
         // The refinement is gated on `mp4v`: another entry's esds must not
         // relabel it.
         assert_eq!(codec_of(b"avc1", &[esds_with(0x61)]), Codec::Avc);

@@ -270,7 +270,7 @@ errors rather than guessing.
 | `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID. Absent where no such id exists (raw elementary streams, sidecars) |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, or `"MPEG-2 Video"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, or a Matroska CodecID such as `"V_MPEG4/ISO/ASP"`), so treat the list as the recognized set rather than a closed one |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for a `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"MJPG"`), so treat the list as the recognized set rather than a closed one |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
@@ -326,6 +326,9 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 | ProRes | The profile name from the MOV/MP4 sample-entry FourCC; omitted entirely for Matroska, which carries no profile signal | `"422 HQ"`, `"4444 XQ"` |
 | MPEG-2 | `<profile>@<level>` from `profile_and_level_indication`; omitted when the byte is a reserved combination | `"Main@Main"`, `"Main@High"`, `"High@High 1440"`, `"4:2:2@High"` |
 | MPEG-1 | Always omitted: ISO/IEC 11172-2 has no profile or level field | |
+| MPEG-4 Visual | `<profile>@L<level>` from `profile_and_level_indication`; omitted when the byte is reserved, and omitted entirely when the stream carries no VisualObjectSequence header, which many muxes drop | `"Simple@L1"`, `"Simple@L0b"`, `"Advanced Simple@L3b"`, `"Simple Studio@L4"` |
+| VC-1 | `Advanced@L<level>` from the sequence header for Advanced Profile; the bare profile name (`"Simple"`, `"Main"`, `"Complex"`) for the others, whose STRUCT_C carries no level | `"Advanced@L3"`, `"Main"` |
+| MS-MPEG-4 | Always omitted: the pre-standard Microsoft variants signal no profile | |
 
 ### `Bitrate`
 
@@ -371,9 +374,9 @@ when `ColorInfo` carries a value for it, so the two objects always have the same
 | Value | Meaning |
 |---|---|
 | `"container"` | A container colour box or element: MP4 `colr` or `vpcC`, MKV `Colour` |
-| `"stream"` | The coded stream's own signalling: an SPS/sequence-header VUI, read in band or from the parameter set embedded in an `hvcC`/`avcC`/`av1C` record, or a VP9/ProRes frame header |
+| `"stream"` | The coded stream's own signalling: an SPS/sequence-header VUI, read in band or from the parameter set embedded in an `hvcC`/`avcC`/`av1C`/`dvc1` record, or a VP9/ProRes/MPEG frame or visual-object header |
 | `"sei"` | An SEI message overriding the above; today only the HLG/PQ alternative-transfer-characteristics message |
-| `"spec"` | Not signalled anywhere: defined by the Dolby Vision profile and compatibility id |
+| `"spec"` | Not signalled anywhere, and supplied by a specification that defines what an absent signal means: the Dolby Vision profile and compatibility id, MPEG-4 Part 2's defaults for an absent `video_signal_type()`, and VC-1's defaults for a clear `COLOR_FORMAT_FLAG` |
 
 The sources genuinely differ within one track, which is why this is per field and not a single
 flag: a Dolby Vision Profile 5 stream signals its range and nothing else, so `range` reads
@@ -783,6 +786,21 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   real one: an MP4 `mp4v` sample entry whose `esds` names an MPEG-2 object type, and a Matroska
   `V_MPEG1`/`V_MPEG2` CodecID. A transport stream whose only video PID is `stream_type` `0x01`
   or `0x02` produced no report at all before and now produces a full one.
+  Also additive: **MPEG-4 Part 2 and VC-1 are now recognized**, so `"MPEG-4 Visual"`, `"VC-1"`
+  and `"MS-MPEG-4 v1"`/`"v2"`/`"v3"` join the `codec` set, each with its own `codec_profile`
+  format (`"Simple@L1"`, `"Advanced@L3"`, `"Main@High"`). The tracks that reach them previously
+  reported a container identifier verbatim as their codec: an MP4 `mp4v` sample entry whose
+  `esds` names object type `0x20`, an MP4 `vc-1` sample entry, and the Matroska CodecIDs
+  `V_MPEG4/ISO/SP`, `/ASP`, `/AP` and `V_MPEG4/MS/V3`. A transport stream whose only video PID
+  is `stream_type` `0x10` produced no report at all before and now produces a full one.
+  **One presence condition changes**: `color` and `color_source` now appear on MPEG-4 Part 2 and
+  VC-1 tracks that signal no colour at all, because both formats *define* what an absent signal
+  means — Part 2 fills BT.709 primaries, transfer and matrix plus limited range, and VC-1 fills
+  BT.709 primaries and transfer over a **BT.601** matrix. Every such field is tagged `"spec"`,
+  so a consumer that needs "actually signalled" should read `color_source` rather than testing
+  `color` for presence. A Matroska `V_MS/VFW/FOURCC` track also reports the four-character code
+  from inside its `BITMAPINFOHEADER` (`"WVC1"`, `"MJPG"`) where it previously reported the
+  literal string `"V_MS/VFW/FOURCC"`.
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
