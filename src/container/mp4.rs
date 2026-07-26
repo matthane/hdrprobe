@@ -934,7 +934,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                 }
             }
             b"vpcC" => {
-                if let Some(v) = parse_vpcc(data, c) {
+                if let Some(v) = super::parse_vpcc_record(&data[c.payload..c.end]) {
                     bit_depth = Some(v.bit_depth);
                     chroma = Some(v.chroma.to_string());
                     codec_profile = Some(v.profile_str);
@@ -1124,49 +1124,6 @@ fn parse_av1c(data: &[u8], b: &BoxHdr) -> Option<(u8, &'static str, String)> {
 /// What the `vpcC` (VPCodecConfigurationBox, FullBox version 1) declares: the
 /// stream's profile/level/depth/chroma plus its CICP colour + range — VP9 has
 /// no parameter set to embed, so the record carries the values directly.
-struct VpccInfo {
-    bit_depth: u8,
-    chroma: &'static str,
-    profile_str: String,
-    color: (ColorInfo, ColorSources),
-}
-
-/// Parse a `vpcC` box: version(1)+flags(3), then profile u8, level u8,
-/// bitDepth(4)+chromaSubsamplingIdc(3)+videoFullRangeFlag(1), and the CICP
-/// colourPrimaries / transferCharacteristics / matrixCoefficients bytes.
-fn parse_vpcc(data: &[u8], b: &BoxHdr) -> Option<VpccInfo> {
-    let p = b.payload;
-    if b.end < p + 10 || data[p] != 1 {
-        return None; // only version 1 has this layout
-    }
-    let profile = data[p + 4];
-    let level = data[p + 5];
-    let packed = data[p + 6];
-    let bit_depth = packed >> 4;
-    let chroma = match (packed >> 1) & 0x07 {
-        0 | 1 => "4:2:0",
-        2 => "4:2:2",
-        3 => "4:4:4",
-        _ => "?",
-    };
-    let full_range = packed & 1 == 1;
-    // `vpcC` is a container record carrying the CICP triplet and range flag
-    // directly, so it is Container-sourced rather than stream-sourced.
-    let color = super::color_from_cicp(
-        data[p + 7] as u16,
-        data[p + 8] as u16,
-        data[p + 9] as u16,
-        Some(full_range),
-        ColorSource::Container,
-    );
-    Some(VpccInfo {
-        bit_depth,
-        chroma,
-        profile_str: crate::vp9::profile_label(profile, (level > 0).then_some(level)),
-        color,
-    })
-}
-
 fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<(ColorInfo, ColorSources)> {
     let p = b.payload;
     if b.end < p + 4 {

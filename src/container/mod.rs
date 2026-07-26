@@ -3,9 +3,11 @@
 //! read-only; never decodes pictures.
 
 pub mod annexb;
+pub mod asf;
 pub mod av1;
 pub mod avi;
 pub mod bmih;
+pub mod flv;
 pub mod mkv;
 pub mod mp4;
 pub mod mpegv;
@@ -277,14 +279,23 @@ impl TrackDemux {
     }
 }
 
-/// Which raw-stream walk `sample::scan` must drive under `--full`. The walkers
+/// Which whole-file walk `sample::scan` must drive under `--full`. The walkers
 /// themselves live with their formats (`annexb::walk_aus`, `av1::walk_obu_tus`,
-/// `av1::walk_ivf_frames`); this only carries what demux already parsed and the
-/// walk cannot cheaply rediscover.
+/// `av1::walk_ivf_frames`, `flv::walk_tags`); this only carries what demux
+/// already parsed and the walk cannot cheaply rediscover.
+///
+/// Named for the raw elementary streams it was introduced for, and FLV joins
+/// them because it has the same shape: one video track, no index, and a walk
+/// that is the index — so demux keeps its bounded head window and the scan
+/// fuses discovery with extraction in one pass.
 #[derive(Debug, Clone, Copy)]
 pub enum RawFullStream {
     HevcAnnexB,
     Av1Obu,
+    /// FLV tag walk. `data_start` is the first tag's offset (past the file
+    /// header and `PreviousTagSize0`), which demux resolved from the header's
+    /// declared length.
+    Flv { data_start: usize },
     /// IVF frame walk, shared by AV1 and VP9 (the wrapper is codec-agnostic;
     /// extraction dispatches on the track's codec). `data_start` is the first
     /// frame header's offset (past the IVF file header); `ticks_per_sec` is
@@ -325,6 +336,11 @@ pub fn demux(
         // range reports normally.
         "mpg" | "mpeg" | "vob" | "m2p" | "evo" => Some(ps::demux(data)),
         "avi" => Some(avi::demux(data)),
+        // `.wma` is here but deliberately *not* in `main::VIDEO_EXTS`: a named
+        // `.wma` that carries video reports, while a directory scan does not
+        // try to open a music library and print an error per track.
+        "wmv" | "asf" | "wma" => Some(asf::demux(data)),
+        "flv" => Some(flv::demux(data, full)),
         "ts" | "m2ts" | "mts" => Some(ts::demux(data, full, progress, frontier)),
         _ => None,
     };
@@ -370,6 +386,12 @@ fn sniff_demux(
     if avi::is_avi(data) {
         return Some(avi::demux(data));
     }
+    if asf::is_asf(data) {
+        return Some(asf::demux(data));
+    }
+    if flv::is_flv(data) {
+        return Some(flv::demux(data, full));
+    }
     if av1::is_ivf(data) || av1::is_obu_stream(data) {
         return Some(av1::demux(data, full, progress, frontier));
     }
@@ -396,6 +418,8 @@ pub(crate) fn sniffs_as_ts(data: &[u8]) -> bool {
     let earlier_check_wins = (data.len() >= 12 && &data[4..8] == b"ftyp")
         || starts_with_ebml(data)
         || avi::is_avi(data)
+        || asf::is_asf(data)
+        || flv::is_flv(data)
         || av1::is_ivf(data)
         || av1::is_obu_stream(data);
     !earlier_check_wins && ts::detect_layout(data).is_some()
@@ -703,6 +727,54 @@ pub(crate) fn parse_av1c_record(rec: &[u8]) -> Option<(u8, &'static str, String)
 /// build cannot name is tagged `UnnamedCode`, which keeps the Dolby Vision spec
 /// fill from overwriting a real signal; and "unspecified" (2), or no code at
 /// all, is left untagged, which is exactly the state the fill is *for*.
+/// What a `VPCodecConfigurationRecord` states.
+pub(crate) struct VpccInfo {
+    pub bit_depth: u8,
+    pub chroma: &'static str,
+    pub profile_str: String,
+    pub color: (ColorInfo, ColorSources),
+}
+
+/// Parse a `VPCodecConfigurationRecord`: version(1)+flags(3), then profile u8,
+/// level u8, `bitDepth(4)+chromaSubsamplingIdc(3)+videoFullRangeFlag(1)`, and
+/// the CICP colourPrimaries / transferCharacteristics / matrixCoefficients
+/// bytes.
+///
+/// Shared with the other config-record decoders here because two carriages hand
+/// one over: the MP4 `vpcC` box, and an Enhanced FLV `SequenceStart` tag whose
+/// FourCC is `vp08`/`vp09`. That second one matters more than it looks — a bare
+/// VP9 stream signals **no transfer and no primaries at all** (see
+/// [`crate::vp9`]), so this record is the only place such a track's colour
+/// exists, and a `vp09` FLV that could not reach it would classify every
+/// BT.2020/PQ stream as SDR with nothing else able to correct it.
+pub(crate) fn parse_vpcc_record(rec: &[u8]) -> Option<VpccInfo> {
+    let r = rec.get(..10)?;
+    if r[0] != 1 {
+        return None; // only version 1 has this layout
+    }
+    let packed = r[6];
+    let chroma = match (packed >> 1) & 0x07 {
+        0 | 1 => "4:2:0",
+        2 => "4:2:2",
+        3 => "4:4:4",
+        _ => "?",
+    };
+    Some(VpccInfo {
+        bit_depth: packed >> 4,
+        chroma,
+        profile_str: crate::vp9::profile_label(r[4], (r[5] > 0).then_some(r[5])),
+        // The record carries the CICP triplet and range flag directly, so it is
+        // Container-sourced rather than stream-sourced.
+        color: color_from_cicp(
+            r[7] as u16,
+            r[8] as u16,
+            r[9] as u16,
+            Some(packed & 1 == 1),
+            ColorSource::Container,
+        ),
+    })
+}
+
 pub(crate) fn cicp_source(code: u16, decoded: Option<&str>, src: ColorSource) -> Option<ColorSource> {
     match decoded {
         Some(_) => Some(src),
@@ -1040,6 +1112,61 @@ pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
 /// the first hit.
 const HEADER_SCAN_SPAN: usize = 1 << 20;
 
+/// Fill a track's fields from an `avcC`/`hvcC` decoder configuration record:
+/// the NAL length prefix, the profile, the depth and chroma, and — from the
+/// parameter set embedded in the record — the colour and the coded picture
+/// size. The same treatment MP4 gives the same bytes.
+///
+/// Shared because three carriages hand one over inside a Video for Windows
+/// wrapper, exactly as [`bmih`] describes: AVI's `strf`, ASF's Stream
+/// Properties type-specific data, and Matroska's `V_MS/VFW/FOURCC`. Callers
+/// must have decided the extradata really is a configuration record first
+/// ([`bmih::is_config_record`]) — a VfW wrapper's bytes are raw Annex-B just as
+/// often, and the FourCC does not separate them.
+///
+/// The SPS's picture size outranks the wrapper's `biWidth`/`biHeight`: those
+/// are the muxer's word and this is the bitstream's.
+pub(crate) fn fill_nal_config_fields(td: &mut TrackDemux, rec: &[u8]) {
+    match td.codec {
+        Codec::Hevc => {
+            let Some(info) = parse_hvcc_record(rec) else { return };
+            td.nal_format = NalFormat::LengthPrefixed(info.nal_len);
+            td.bit_depth = Some(info.bit_depth);
+            td.chroma = Some(info.chroma.to_string());
+            td.codec_profile = Some(info.profile_str);
+            if let Some(c) = color_from_hvcc(rec) {
+                (td.color, td.color_source) = c;
+            }
+            if let Some(sps) =
+                crate::hevc::sps::find_sps_in_hvcc(rec).and_then(crate::hevc::sps::parse_sps)
+            {
+                td.fps = sps.frame_rate;
+                if sps.width > 0 && sps.height > 0 {
+                    (td.width, td.height) = (sps.width, sps.height);
+                }
+            }
+        }
+        _ => {
+            let Some(info) = parse_avcc_record(rec) else { return };
+            td.nal_format = NalFormat::LengthPrefixed(info.nal_len);
+            td.bit_depth = Some(info.bit_depth);
+            td.chroma = Some(info.chroma.to_string());
+            td.codec_profile = Some(info.profile_str);
+            if let Some(c) = color_from_avcc(rec) {
+                (td.color, td.color_source) = c;
+            }
+            if let Some(sps) =
+                crate::avc::nal::find_sps_in_avcc(rec).and_then(crate::avc::sps::parse_sps)
+            {
+                td.fps = sps.frame_rate;
+                if sps.width > 0 && sps.height > 0 {
+                    (td.width, td.height) = (sps.width, sps.height);
+                }
+            }
+        }
+    }
+}
+
 /// Fill an MPEG-1/2 track's stream-derived fields from the sequence header at
 /// the head of its first access unit, the MPEG analogue of the ProRes and VP9
 /// fills above. [`crate::mpeg2`]'s module doc says why the bitstream is usually
@@ -1209,9 +1336,21 @@ pub(crate) fn fill_vc1_stream_fields(track: &mut TrackDemux, headers: &[u8]) {
         && track.color.transfer.is_none()
         && track.color.matrix.is_none();
     let Some(s) = crate::vc1::parse_sequence_header(headers) else {
-        // Simple/Main carry no sequence header at all, but their depth is the
-        // same format constant, so the report still says 8-bit rather than
-        // nothing.
+        // Simple/Main carry no sequence header at all — their codec-private
+        // data is a 32-bit STRUCT_C, which states the profile and nothing else
+        // this report wants. Reading it is what makes a `WMV3` track report
+        // `Main` rather than a bare `VC-1`, and it is the shape SCHEMA.md
+        // already documents for these profiles ("the bare profile name … whose
+        // STRUCT_C carries no level"). The parser validates four reserved
+        // fields, which is the only thing that makes four bytes with no magic
+        // and no length trustworthy at all.
+        if track.codec_profile.is_none() {
+            track.codec_profile = crate::vc1::parse_struct_c(headers)
+                .and_then(crate::vc1::profile_from_config)
+                .map(str::to_string);
+        }
+        // Their depth is the same format constant, so the report still says
+        // 8-bit rather than nothing.
         if track.bit_depth.is_none() {
             track.bit_depth = Some(crate::vc1::BIT_DEPTH);
         }

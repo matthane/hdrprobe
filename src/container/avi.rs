@@ -882,7 +882,7 @@ fn fourcc_label(f: &[u8; 4]) -> String {
 fn fill_from_bitstream(td: &mut TrackDemux, data: &[u8], extradata: &[u8]) {
     match td.codec {
         Codec::Avc | Codec::Hevc if bmih::is_config_record(extradata) => {
-            fill_from_config_record(td, extradata)
+            super::fill_nal_config_fields(td, extradata)
         }
         Codec::Avc | Codec::Hevc => {
             // **Bounded to the head of the index, like every sibling arm.**
@@ -922,53 +922,6 @@ fn fill_from_bitstream(td: &mut TrackDemux, data: &[u8], extradata: &[u8]) {
         // scan could only find what `extradata` already held.
         Codec::Vc1 => super::fill_vc1_stream_fields(td, extradata),
         _ => {}
-    }
-}
-
-/// The `avcC`/`hvcC` path: the record states the NAL length prefix, the profile
-/// and the depth/chroma, and its embedded SPS states the colour — the same
-/// treatment MP4 gives the same bytes.
-fn fill_from_config_record(td: &mut TrackDemux, rec: &[u8]) {
-    match td.codec {
-        Codec::Hevc => {
-            let Some(info) = super::parse_hvcc_record(rec) else { return };
-            td.nal_format = NalFormat::LengthPrefixed(info.nal_len);
-            td.bit_depth = Some(info.bit_depth);
-            td.chroma = Some(info.chroma.to_string());
-            td.codec_profile = Some(info.profile_str);
-            if let Some(c) = super::color_from_hvcc(rec) {
-                (td.color, td.color_source) = c;
-            }
-            if let Some(sps) =
-                crate::hevc::sps::find_sps_in_hvcc(rec).and_then(crate::hevc::sps::parse_sps)
-            {
-                td.fps = sps.frame_rate;
-                // The coded picture size, which outranks `strf`'s the same way
-                // the Annex-B arm's does — `biWidth`/`biHeight` are the muxer's
-                // word and the SPS is the bitstream's.
-                if sps.width > 0 && sps.height > 0 {
-                    (td.width, td.height) = (sps.width, sps.height);
-                }
-            }
-        }
-        _ => {
-            let Some(info) = super::parse_avcc_record(rec) else { return };
-            td.nal_format = NalFormat::LengthPrefixed(info.nal_len);
-            td.bit_depth = Some(info.bit_depth);
-            td.chroma = Some(info.chroma.to_string());
-            td.codec_profile = Some(info.profile_str);
-            if let Some(c) = super::color_from_avcc(rec) {
-                (td.color, td.color_source) = c;
-            }
-            if let Some(sps) =
-                crate::avc::nal::find_sps_in_avcc(rec).and_then(crate::avc::sps::parse_sps)
-            {
-                td.fps = sps.frame_rate;
-                if sps.width > 0 && sps.height > 0 {
-                    (td.width, td.height) = (sps.width, sps.height);
-                }
-            }
-        }
     }
 }
 
