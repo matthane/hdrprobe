@@ -267,7 +267,7 @@ errors rather than guessing.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number. Absent where no such id exists (raw elementary streams, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
+| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number, MPEG program stream the PES stream id (or, for HD DVD `.evo` video on the extended id 0xFD, the `stream_id_extension` substream id, 0x55..0x5F). Absent where no such id exists (raw elementary streams, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
 | `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
@@ -905,6 +905,10 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   text, so a crafted file could put an ANSI escape sequence on the terminal; every control
   character (C0, DEL, C1) now renders as the replacement character instead — the same mark
   invalid UTF-8 already produced on that path. No real file is affected.
+  Also additive: **HD DVD `.evo` video is reported.** VC-1 rides the extended PES stream id
+  0xFD with a `stream_id_extension` in 0x55..0x5F (the HD DVD assignment, as ffmpeg maps it);
+  such files previously errored with "extended stream ids are not decoded" and now report the
+  full VC-1 track, with `track_number` the substream id.
   One value change with no shape change: **TS/M2TS `duration_secs` is now the video
   presentation span** (head-minimum to tail-maximum video PTS plus one frame interval, the
   program-stream backend's rule) **with the PCR span as the fallback**, because the PCR times

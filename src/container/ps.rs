@@ -15,7 +15,7 @@
 //! has, and the reason this backend is a walker plus a router rather than a
 //! parser.
 //!
-//! Four facts shape the code, each of which a later change would otherwise undo
+//! Five facts shape the code, each of which a later change would otherwise undo
 //! silently.
 //!
 //! **The stream id names a stream number, not a codec.** Table 2-22 gives
@@ -54,6 +54,22 @@
 //! Duration comes from the video presentation timestamps ([`pts_span`]) plus the
 //! last picture's own display time ([`whole_frame_duration`]); the pack clock's
 //! role is to detect a discontinuity, never to measure.
+//!
+//! **The extended stream id 0xFD names a substream family, never video.** The
+//! real id is the PES extension's `stream_id_extension` (H.222.0 Table 2-21,
+//! read by [`pes_stream_id_extension`] with each optional field skipped at the
+//! size the table assigns), and HD DVD `.evo` puts VC-1 video in extensions
+//! 0x55..0x5F while audio codecs ride the same 0xFD under other values —
+//! admitting 0xFD wholesale would blend audio bytes into a video elementary
+//! stream. The range-to-codec assignment is the HD DVD application format's,
+//! not H.222.0's; the source here is ffmpeg (`mpeg.c` maps extended startcodes
+//! `0xfd55..=0xfd5f` to VC-1, and its probe counts `0x1fd` as video), so the
+//! substream's codec is that assignment directly and the census never runs
+//! over its bytes — handing a VC-1 stream's thousands of low-value EBDU codes
+//! to the SPS hunt is the exact hazard the census section documents for DVD
+//! slices. Validated against a fixture packetized from real VC-1 frames
+//! (`testfiles/sdr/vc1_hddvd.evo`), which ffprobe and MediaInfo read to the
+//! same codec, dimensions, rate and duration.
 
 use anyhow::{bail, Result};
 
@@ -92,6 +108,19 @@ const SID_PROGRAM_END: u8 = 0xB9;
 const SID_PACK: u8 = 0xBA;
 const SID_VIDEO_FIRST: u8 = 0xE0;
 const SID_VIDEO_LAST: u8 = 0xEF;
+
+/// `extended_stream_id`: the real substream id rides the PES extension's
+/// `stream_id_extension` field (H.222.0 Table 2-21). HD DVD `.evo` puts VC-1
+/// video here; many audio codecs ride the same id with other extension values,
+/// so 0xFD alone never says "video".
+const SID_EXTENDED: u8 = 0xFD;
+
+/// The `stream_id_extension` range that is VC-1 video. Not in H.222.0 — the
+/// assignment is the HD DVD application format's — so the source is ffmpeg's
+/// demuxer (`mpeg.c`: `startcode >= 0xfd55 && startcode <= 0xfd5f` maps to
+/// `AV_CODEC_ID_VC1`), the same single-witness convention its probe counts
+/// `0x1fd` as video under (`//VC1`).
+const EXT_VC1: std::ops::RangeInclusive<u8> = 0x55..=0x5F;
 
 /// `1110 xxxx` — Table 2-22's video range. The low nibble is the stream
 /// *number*; the row covers every video codec the standard admits, so this says
@@ -152,15 +181,10 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
 
     let head = walk(data, 0, head_end, true);
     if head.streams.is_empty() {
-        // Name the range, because the likeliest way to reach this is an HD DVD
-        // `.evo` whose video really is present but rides the extended stream id
-        // 0xFD, whose PES-extension substream layout this walker does not
-        // decode. "No video elementary stream" alone would read as a claim
-        // about the file that its bytes contradict.
         bail!(
-            "no video elementary stream in the ordinary stream-id range \
-             (0xE0..0xEF) in the program stream head window; extended stream \
-             ids such as 0xFD are not decoded"
+            "no video elementary stream in the program stream head window \
+             (ordinary stream ids 0xE0..0xEF, or the extended id 0xFD whose \
+             stream_id_extension sits in the VC-1 video range 0x55..0x5F)"
         );
     }
 
@@ -185,8 +209,18 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
     for mut es in head.streams {
         // No container box names the codec (H.222.0 Table 2-22's video row
         // covers every codec it admits), and a program stream map is almost
-        // never present, so the reassembled bytes decide.
-        let Some(codec) = classify_es(&es.buf) else { continue };
+        // never present, so the reassembled bytes decide — except for an
+        // extended substream, whose key *is* the codec assignment: the walk
+        // admits only the VC-1 `stream_id_extension` range, ffmpeg's own HD
+        // DVD mapping, and running the census over VC-1 bytes instead would
+        // hand thousands of low-value EBDU codes to the SPS hunt (the exact
+        // hazard the census section documents for DVD slices).
+        let codec = if EXT_VC1.contains(&es.sid) {
+            Codec::Vc1
+        } else {
+            let Some(codec) = classify_es(&es.buf) else { continue };
+            codec
+        };
 
         es.finish();
         let sps = crate::container::best_sps(&es.buf, &es.chunks, &codec);
@@ -220,6 +254,15 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             }
             Codec::Mpeg4Part2 => {
                 crate::container::fill_mpeg4part2_stream_fields(&mut td, &[], &es.buf)
+            }
+            // VC-1 in a program stream is the broadcast shape: the sequence
+            // header rides the elementary stream itself (there is no
+            // configuration slot anywhere in a PS), so the head of the
+            // reassembled buffer is the `headers` argument the shared fill
+            // expects — the same EBDU search the ASF extradata path runs.
+            Codec::Vc1 => {
+                let head_span = &es.buf[..es.buf.len().min(ES_CENSUS_SPAN)];
+                crate::container::fill_vc1_stream_fields(&mut td, head_span);
             }
             _ => {}
         }
@@ -566,21 +609,36 @@ fn walk(data: &[u8], start: usize, end: usize, collect_es: bool) -> Walk {
         }
         let body = pos + 6;
         let next = body.saturating_add(len);
-        if collect_es && is_video_sid(sid) && body < end {
-            let limit = next.min(end);
-            if let Some((off, pts)) = pes_payload(data, body, limit) {
-                if let Some(p) = pts {
-                    w.note_pts(p);
+        // A video candidate is an ordinary video stream id, or the extended id
+        // whose `stream_id_extension` sits in the VC-1 range — an HD DVD
+        // `.evo`'s video. The substream check runs before anything else is
+        // read from a 0xFD packet: the same id carries audio codecs under
+        // other extension values, and admitting those would blend audio bytes
+        // into a video elementary stream. The stream key for an extended
+        // substream is its extension id (0x55..0x5F — disjoint from the
+        // 0xE0..0xEF video ids, so the two families cannot collide).
+        let key = if is_video_sid(sid) {
+            Some(sid)
+        } else if sid == SID_EXTENDED {
+            pes_stream_id_extension(&data[..next.min(end)], body)
+                .filter(|e| EXT_VC1.contains(e))
+        } else {
+            None
+        };
+        if let Some(key) = key {
+            if body < end {
+                let limit = next.min(end);
+                if let Some((off, pts)) = pes_payload(data, body, limit) {
+                    if let Some(p) = pts {
+                        w.note_pts(p);
+                    }
+                    // Timestamps only on the tail walk: it needs no payload
+                    // copies.
+                    if collect_es && off < limit {
+                        let payload = &data[off..limit];
+                        w.stream(key).push(payload, pts.is_some());
+                    }
                 }
-                if off < limit {
-                    let payload = &data[off..limit];
-                    w.stream(sid).push(payload, pts.is_some());
-                }
-            }
-        } else if is_video_sid(sid) && body < end {
-            // Timestamps only: the tail window needs no payload copies.
-            if let Some((_, Some(p))) = pes_payload(data, body, next.min(end)) {
-                w.note_pts(p);
             }
         }
         pos = next;
@@ -738,6 +796,73 @@ fn parse_pack(data: &[u8], pos: usize, end: usize) -> Option<(Variant, usize, u6
 ///
 /// Two completely different layouts share this entry point, exactly as ffmpeg's
 /// `mpegps_read_pes_header` handles them, because a `.mpg` may carry either.
+/// The `stream_id_extension` of an H.222.0-form PES packet whose stream id is
+/// [`SID_EXTENDED`], or `None` when the packet declares none.
+///
+/// The walk is Table 2-21's, transcribed from the spec (10/2014, the PES
+/// syntax table): each optional field the flags bytes announce has a fixed
+/// size — PTS 5 / PTS+DTS 10, ESCR 6, ES_rate 3, DSM_trick_mode 1,
+/// additional_copy_info 1, previous_PES_packet_CRC 2 — then the PES-extension
+/// flags byte announces PES_private_data (16), pack_header_field (1 + its own
+/// length), program_packet_sequence_counter (2) and P-STD_buffer (2), and
+/// `PES_extension_flag_2` guards a marker+length byte whose field opens with
+/// `stream_id_extension_flag`; `'0'` there means the low 7 bits are the id.
+/// ffmpeg's `mpegps_read_pes_header` walks the same path to the same field.
+/// Every read is bounded by the caller's slice, which is capped at the
+/// packet's own declared extent.
+fn pes_stream_id_extension(data: &[u8], body: usize) -> Option<u8> {
+    if *data.get(body)? & 0xC0 != 0x80 {
+        return None; // the 11172-1 form has no extension at all
+    }
+    let flags = *data.get(body + 1)?;
+    if flags & 0x01 == 0 {
+        return None; // PES_extension_flag clear
+    }
+    let mut p = body + 3;
+    p += match flags & 0xC0 {
+        0xC0 => 10,
+        0x80 => 5,
+        _ => 0,
+    };
+    if flags & 0x20 != 0 {
+        p += 6; // ESCR
+    }
+    if flags & 0x10 != 0 {
+        p += 3; // ES_rate
+    }
+    if flags & 0x08 != 0 {
+        p += 1; // DSM_trick_mode
+    }
+    if flags & 0x04 != 0 {
+        p += 1; // additional_copy_info
+    }
+    if flags & 0x02 != 0 {
+        p += 2; // previous_PES_packet_CRC
+    }
+    let ext = *data.get(p)?;
+    p += 1;
+    if ext & 0x80 != 0 {
+        p += 16; // PES_private_data
+    }
+    if ext & 0x40 != 0 {
+        p += 1 + *data.get(p)? as usize; // pack_header_field
+    }
+    if ext & 0x20 != 0 {
+        p += 2; // program_packet_sequence_counter
+    }
+    if ext & 0x10 != 0 {
+        p += 2; // P-STD_buffer
+    }
+    if ext & 0x01 == 0 {
+        return None; // PES_extension_flag_2 clear
+    }
+    if *data.get(p)? & 0x7F == 0 {
+        return None; // an empty extension field holds no id
+    }
+    let id = *data.get(p + 1)?;
+    (id & 0x80 == 0).then_some(id & 0x7F)
+}
+
 fn pes_payload(data: &[u8], body: usize, end: usize) -> Option<(usize, Option<u64>)> {
     let c = *data.get(body)?;
     if c & 0xC0 == 0x80 {
@@ -1231,6 +1356,100 @@ mod tests {
         0x00, 0x00, 0x01, 0xB3, 0x14, 0x00, 0xF0, 0x23, 0xFF, 0xFF, 0xE0, 0x18, 0x00, 0x00, 0x01,
         0xB5, 0x14, 0x8A, 0x00, 0x01, 0x00, 0x00,
     ];
+
+    /// `testfiles/sdr/vc1_advanced.mkv`'s VfW extradata verbatim: the VC-1
+    /// Advanced sequence header (behind a four-byte start code) and
+    /// entry-point EBDUs, 1920×1080.
+    const VC1_HEADERS: [u8; 32] = [
+        0x00, 0x00, 0x00, 0x01, 0x0F, 0xDB, 0x7E, 0x3B, 0xF2, 0x1B, 0x8A, 0x3B, 0xF8, 0x86, 0xF1,
+        0x80, 0x49, 0x0A, 0x2C, 0x2C, 0x17, 0x27, 0x04, 0x00, 0x00, 0x01, 0x0E, 0x5A, 0xDF, 0xF8,
+        0x40, 0x00,
+    ];
+
+    /// A PES packet on the extended stream id: `stream_id_extension` in the
+    /// PES-extension tail, exactly the HD DVD `.evo` shape (with a spread of
+    /// other optional fields set, so the walk to the extension is exercised
+    /// rather than assumed).
+    fn fd_pes(pts: Option<u64>, ext_id: u8, payload: &[u8]) -> Vec<u8> {
+        let mut hdr: Vec<u8> = Vec::new();
+        let mut flags = 0x01u8; // PES_extension_flag
+        if let Some(pts) = pts {
+            flags |= 0x80;
+            hdr.extend_from_slice(&[
+                0x21 | ((((pts >> 30) & 0x7) as u8) << 1),
+                (pts >> 22) as u8,
+                ((((pts >> 15) & 0x7F) as u8) << 1) | 1,
+                (pts >> 7) as u8,
+                (((pts & 0x7F) as u8) << 1) | 1,
+            ]);
+        }
+        flags |= 0x04; // additional_copy_info, one filler field before the extension
+        hdr.push(0x80);
+        // PES-extension flags: P-STD buffer + PES_extension_flag_2.
+        hdr.push(0x11);
+        hdr.extend_from_slice(&[0x40, 0x00]); // P-STD ('01' + scale/size)
+        hdr.extend_from_slice(&[0x81, ext_id & 0x7F]); // len 1, sid-ext flag '0' + id
+        let mut p = vec![0x00, 0x00, 0x01, 0xFD, 0x00, 0x00, 0x80, flags, hdr.len() as u8];
+        p.extend_from_slice(&hdr);
+        p.extend_from_slice(payload);
+        let n = p.len() - 6;
+        p[4] = (n >> 8) as u8;
+        p[5] = n as u8;
+        p
+    }
+
+    #[test]
+    fn an_extended_substream_in_the_vc1_range_is_a_video_track() {
+        // The HD DVD `.evo` shape: video on stream id 0xFD, the substream
+        // named by `stream_id_extension` 0x55 (ffmpeg's VC-1 mapping). The
+        // sequence header rides the elementary stream, so the track fills
+        // from it; the key — and the reported track number — is the substream
+        // id.
+        let mut d = Vec::from(MPEG2_PACK);
+        d.extend(fd_pes(Some(0), 0x55, &VC1_HEADERS));
+        d.extend(fd_pes(Some(90_000), 0x55, &[0x00, 0x00, 0x01, 0x0D, 0x00, 0x00]));
+        let dm = demux(&d).expect("an EVO-shaped program stream");
+        let t = &dm.tracks[0];
+        assert_eq!(t.codec, Codec::Vc1);
+        assert_eq!(t.track_number, Some(0x55));
+        assert_eq!((t.width, t.height), (1920, 1080));
+        assert_eq!(t.codec_profile.as_deref(), Some("Advanced@L3"));
+        assert_eq!(t.bit_depth, Some(8));
+        // Two frames a second apart at the header's 23.976: span + interval.
+        let dur = dm.duration_secs.expect("PTS span");
+        assert!((dur - (1.0 + 1001.0 / 24_000.0)).abs() < 1e-9, "{dur}");
+    }
+
+    #[test]
+    fn an_extended_substream_outside_the_vc1_range_is_not_video() {
+        // 0xFD carries audio codecs under other extension values; blending
+        // one into a video elementary stream would be worse than reporting
+        // nothing. 0x71 is a common audio assignment.
+        let mut d = Vec::from(MPEG2_PACK);
+        d.extend(fd_pes(Some(0), 0x71, &VC1_HEADERS));
+        d.extend(fd_pes(Some(90_000), 0x71, &VC1_HEADERS));
+        let err = demux(&d).unwrap_err().to_string();
+        assert!(err.contains("no video elementary stream"), "{err}");
+    }
+
+    #[test]
+    fn the_stream_id_extension_walk_reads_only_a_declared_id() {
+        let p = fd_pes(Some(1234), 0x59, &[0xAA]);
+        assert_eq!(pes_stream_id_extension(&p, 6), Some(0x59));
+        // PES_extension_flag clear: nothing to read.
+        let mut no_ext = p.clone();
+        no_ext[7] &= !0x01;
+        assert_eq!(pes_stream_id_extension(&no_ext, 6), None);
+        // stream_id_extension_flag set means the field is not an id.
+        let mut flagged = p.clone();
+        let at = p.len() - 2; // the id byte sits last before payload
+        flagged[at] |= 0x80;
+        assert_eq!(pes_stream_id_extension(&flagged, 6), None);
+        // A truncated header reads as absent, never out of bounds.
+        for cut in 7..p.len() - 1 {
+            let _ = pes_stream_id_extension(&p[..cut], 6);
+        }
+    }
 
     #[test]
     fn a_program_stream_reports_its_video_track() {

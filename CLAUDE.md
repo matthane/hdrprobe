@@ -440,7 +440,15 @@ never parse bytes native-endian.
   gate, which a backend reachable by extension needs. There is deliberately **no program stream
   map parser**: it is absent from DVDs, from consumer `.mpg` and from ffmpeg's own muxer, the
   content routing above covers every case it would answer, and a mis-parsed one could only
-  override a correct verdict.
+  override a correct verdict. **HD DVD `.evo` video rides the extended stream id 0xFD** and is
+  admitted by its PES-extension `stream_id_extension` (H.222.0 Table 2-21's walk,
+  `ps::pes_stream_id_extension`): extensions 0x55..0x5F are VC-1 video — the HD DVD assignment,
+  sourced to ffmpeg's `0xfd55..0xfd5f` mapping — and become the substream's codec *and* its
+  reported track number directly, while every other 0xFD extension (the audio codecs) is
+  excluded so nothing blends into a video ES; the census never runs over a VC-1 substream's
+  bytes, whose thousands of low-value EBDU codes are exactly the SPS-hunt hazard the census
+  rules exist to avoid (open-items B8a, validated against a fixture packetized from real VC-1
+  frames that ffprobe and MediaInfo read identically).
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation),
   `ccid.rs` (the Dolby "Profiles and Levels" tables as data: profile -> admitted CCID(s),
   CCID -> the five-part base-layer VUI as **CICP code points**, the reverse lookup
