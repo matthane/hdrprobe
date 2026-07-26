@@ -19,7 +19,7 @@
 //! chromaticity block: no muxer writes V4/V5 into a video `strf`, and every
 //! demuxer reads past offset 40 as codec-private bytes.
 //!
-//! Six facts about the format are invariants a later change would otherwise
+//! Seven facts about the format are invariants a later change would otherwise
 //! undo quietly. Each is pinned by a test.
 //!
 //! **The frame rate signal is a stream *unit* rate, not a picture rate.**
@@ -98,10 +98,16 @@ use super::{bmih, Chunk, Codec, Demux, NalFormat, TrackDemux};
 
 /// How far into `movi` the fallback walk may go when a file carries no usable
 /// index. Only reached by files ffmpeg and VirtualDub do not write; a normal
-/// AVI resolves every chunk from `idx1` or `ix##` by arithmetic. Kept `<=`
-/// `prefetch::HEAD_WARM` so the generic head warm covers the whole walked span
-/// on a network volume, the same coupling `annexb`, `av1`, `mpegv` and `ps`
-/// keep.
+/// AVI resolves every chunk from `idx1` or `ix##` by arithmetic.
+///
+/// Sized to `prefetch::HEAD_WARM`, but **not** the same coupling `annexb`,
+/// `av1`, `mpegv` and `ps` keep: those walk from byte 0, so their window sits
+/// wholly inside the warm, while this one runs from the `movi` body. The last
+/// `movi_body` bytes of the walk therefore fall outside the warmed head. That
+/// is timing-only, on a path no mainstream writer produces, and raising the
+/// constant to compensate would enlarge the warm for every file to cover a case
+/// almost none reach — so the honest statement is that the overlap is partial
+/// here, not that it is complete.
 pub const HEAD_SCAN_BYTES: usize = 8 << 20; // 8 MiB
 
 /// Bound on chunks read from any one RIFF list. The walks are all
@@ -559,6 +565,27 @@ fn stream_prefix(index: usize) -> Option<[u8; 2]> {
     (index < 100).then(|| [b'0' + (index / 10) as u8, b'0' + (index % 10) as u8])
 }
 
+/// The most chunks a file of this size can physically hold: every chunk costs
+/// at least its own 8-byte header.
+///
+/// **This is what stops the two OpenDML index levels multiplying.** Each parser
+/// clamps its own `nEntriesInUse` against the bytes its own chunk holds, which
+/// is the house rule and is individually correct — but the super-index calls
+/// the standard-index parser once per entry into *one shared vector*, so N
+/// super entries each naming the same M-entry `ix##` yield N×M `Chunk` structs
+/// from a file containing one chunk. Nothing forbids the repetition: only entry
+/// 0's base is validated, and every entry may legally repeat it. Measured
+/// before this cap, on the default path with an exit code of 0: a 156 KiB file
+/// declaring 2000 × 16000 allocated 771 MB, and the growth is quadratic in file
+/// size — the same input at 78 KiB took 194 MB. A megabyte-scale file would
+/// have reached this machine's whole RAM.
+///
+/// An index claiming more chunks than the file can hold is not describing this
+/// file, so the whole index is declined and the caller falls back to walking.
+fn chunk_ceiling(data: &[u8]) -> usize {
+    data.len() / 8
+}
+
 /// Read the chunk header at `at` and check it is the chunk an index entry
 /// claims: same id, same size. This is what turns both offset-base derivations
 /// below from an assumption into a check — the `idx1` base is documented as
@@ -627,6 +654,9 @@ fn index_from_idx1(
         // video-stream rate, and on a file cut inside its own `idx1` that read
         // 331 kb/s against a true 752.
         if offset.saturating_add(size as usize) > data.len() {
+            return None;
+        }
+        if chunks.len() >= chunk_ceiling(data) {
             return None;
         }
         chunks.push(Chunk { offset: offset as u64, size });
@@ -732,6 +762,12 @@ fn index_from_standard(
         if offset.saturating_add(size as usize) > data.len() {
             return None;
         }
+        // The running total across *every* sub-index this super-index names,
+        // not just this one — see `chunk_ceiling`. Checked inside the loop so a
+        // single hostile sub-index cannot outrun it either.
+        if chunks.len() >= chunk_ceiling(data) {
+            return None;
+        }
         chunks.push(Chunk { offset: offset as u64, size });
     }
     Some(())
@@ -787,8 +823,18 @@ fn collect_movi(
         if id.get(..2) != Some(&prefix[..]) {
             continue;
         }
+        // A chunk straddling the walk's bound arrives with `body_end` already
+        // clamped, so pushing it would hand the sampler a cut access unit that
+        // parses as a complete one. The byte total is withheld in that case
+        // anyway; the chunk has to go too.
+        //
+        // The test is the chunk's own *declared* size, read back from the
+        // header four bytes behind the body — the clamped length cannot tell a
+        // truncated chunk from one that legitimately ends where the list does,
+        // which is every walk's last chunk.
         let size = body_end.saturating_sub(body);
-        if size > 0 {
+        let declared = u32le(data, body.wrapping_sub(4)) as usize;
+        if size > 0 && body.saturating_add(declared) <= end {
             out.push(Chunk { offset: body as u64, size: size as u64 });
         }
     }
@@ -938,8 +984,18 @@ pub fn index_extents(data: &[u8]) -> Vec<(u64, usize)> {
         }
     }
     let Some(hdrl) = find_list(data, first.body, first.end, b"hdrl") else { return out };
-    for s in parse_hdrl(data, hdrl.0, hdrl.1) {
-        let Some((b, e)) = s.indx else { continue };
+    for (index, s) in parse_hdrl(data, hdrl.0, hdrl.1).into_iter().enumerate() {
+        // Video streams only, and only a super-index `index_from_super` would
+        // itself accept. Without both tests this warms the audio track's
+        // sub-indexes and any placeholder that happens to sit here — bytes the
+        // demux never reads, which on a network volume is pure transfer time.
+        let Some((b, e)) = s.indx.filter(|_| &s.kind == b"vids") else { continue };
+        if u16le(data, b) != 4 || data.get(b + 3) != Some(&0) {
+            continue;
+        }
+        if stream_prefix(index).is_none_or(|p| fourcc(data, b + 8).get(..2) != Some(&p[..])) {
+            continue;
+        }
         let avail = e.saturating_sub(b.saturating_add(24)) / 16;
         let n = (u32le(data, b + 4) as usize).min(avail);
         for k in 0..n {
@@ -1168,34 +1224,56 @@ mod tests {
         assert_eq!(demux(&built).unwrap().duration_secs, Some(2.0));
     }
 
+    /// Locate a built fixture's `movi` body and `idx1` body, so a test can call
+    /// an index parser directly instead of through `demux`.
+    ///
+    /// **Going through `demux` is what made two earlier versions of these tests
+    /// untestable**: `build_index` falls back to `walk_movi`, and on a fixture
+    /// small enough to fit inside the walk's 8 MiB bound the walk returns a
+    /// byte-identical chunk list and byte total. So an index parser could be
+    /// deleted outright and the assertions would still pass, rescued by the
+    /// fallback. These are the two parsers with no real-file fixture anywhere,
+    /// which makes their unit tests the only thing holding them up.
+    fn index_regions(built: &[u8]) -> (usize, (usize, usize)) {
+        let movi = built.windows(4).position(|w| w == b"movi").expect("movi") + 4;
+        let at = built.windows(4).position(|w| w == b"idx1").expect("idx1");
+        let size = u32le(built, at + 4) as usize;
+        (movi, (at + 8, at + 8 + size))
+    }
+
     #[test]
     fn the_idx1_offset_base_is_derived_from_entry_zero_not_assumed() {
         let f = frames(b"00dc", &[1000, 500]);
         let hdrl = video_hdrl(b"XVID", 1, 25, 2, &[]);
         // Both conventions occur — Microsoft's own reference says so, and
-        // VirtualDub wrote absolute offsets before build 4936 — and both must
-        // produce the same index.
-        let rel = demux(&build(&hdrl, &f, Idx1::Relative)).unwrap();
-        let abs = demux(&build(&hdrl, &f, Idx1::Absolute)).unwrap();
-        let ro: Vec<u64> = rel.tracks[0].chunks.iter().map(|c| c.offset).collect();
-        let ao: Vec<u64> = abs.tracks[0].chunks.iter().map(|c| c.offset).collect();
-        assert_eq!(ro, ao);
-        assert_eq!(rel.tracks[0].chunks.len(), 2);
-        // And the chunks really point at the payload: the fixture fills every
-        // frame with 0xAA.
-        let built = build(&hdrl, &f, Idx1::Relative);
-        for c in &rel.tracks[0].chunks {
-            let s = c.offset as usize;
-            assert!(built[s..s + c.size as usize].iter().all(|&b| b == 0xAA));
+        // VirtualDub wrote absolute offsets before build 4936 — and the parser
+        // must accept both. Called directly, because the fallback walk would
+        // otherwise supply the same answer whatever this parser did.
+        let mut got = Vec::new();
+        for mode in [Idx1::Relative, Idx1::Absolute] {
+            let built = build(&hdrl, &f, mode);
+            let (movi, (b, e)) = index_regions(&built);
+            let (chunks, bytes, units) = index_from_idx1(&built, b, e, movi, *b"00")
+                .unwrap_or_else(|| panic!("{:?} base must resolve", mode as u8));
+            assert_eq!((chunks.len(), bytes, units), (2, Some(1500), 2));
+            // The offsets really name payload: the fixture fills frames 0xAA,
+            // so a base off by even the 8-byte chunk header lands on a header.
+            for c in &chunks {
+                let s = c.offset as usize;
+                assert!(built[s..s + c.size as usize].iter().all(|&b| b == 0xAA));
+            }
+            got.push(chunks.iter().map(|c| c.offset as usize - movi).collect::<Vec<_>>());
         }
+        // Both conventions describe the same chunks, relative to `movi`.
+        assert_eq!(got[0], got[1]);
     }
 
     /// Every chunk in `t` covers payload the fixtures fill with `0xAA` — which
     /// an offset shifted by so much as the 8-byte chunk header would break,
     /// since the byte before a payload is the last of `00dc`'s size field.
-    fn chunks_point_at_payload(file: &[u8], t: &TrackDemux) {
-        assert!(!t.chunks.is_empty());
-        for c in &t.chunks {
+    fn chunks_point_at_payload(file: &[u8], chunks: &[Chunk]) {
+        assert!(!chunks.is_empty());
+        for c in chunks {
             let s = c.offset as usize;
             let e = s + c.size as usize;
             assert!(
@@ -1216,7 +1294,7 @@ mod tests {
         // at whatever entry 0's bogus 0xDEAD offset addressed. Remove the
         // `chunk_matches` check in `index_from_idx1` and the offsets shift.
         assert_eq!(t.chunks.len(), 2);
-        chunks_point_at_payload(&built, t);
+        chunks_point_at_payload(&built, &t.chunks);
         // This file is small enough that the walk provably finished, so its own
         // sum is exact — and it is the walk's 1500 bytes, never the broken
         // index's.
@@ -1227,14 +1305,24 @@ mod tests {
     #[test]
     fn a_walk_that_ran_past_its_bound_states_no_byte_total() {
         // Neither index form present and a `movi` larger than the walk's window,
-        // so the walk cannot show it finished. The chunks it did find are still
+        // so the walk cannot show it finished. Three chunks of 3 MiB: two fit
+        // inside the 8 MiB bound, the third straddles it. The two that fit are
         // usable, but a sum over them would describe the window rather than the
         // stream, so the rate falls to the whole-container one and the index is
         // marked bounded — which is what keeps `--full`'s sampled marks on.
-        let f = frames(b"00dc", &[HEAD_SCAN_BYTES + 4096]);
-        let d = demux(&build(&video_hdrl(b"XVID", 1, 25, 1, &[]), &f, Idx1::None)).unwrap();
+        let span = 3 << 20;
+        let f = frames(b"00dc", &[span, span, span]);
+        let built = build(&video_hdrl(b"XVID", 1, 25, 3, &[]), &f, Idx1::None);
+        let d = demux(&built).unwrap();
         let t = &d.tracks[0];
-        assert_eq!(t.chunks.len(), 1);
+        // **The straddling chunk is dropped, not truncated.** `chunks_in`
+        // clamps a chunk that runs past the bound, so indexing it would hand
+        // the sampler a cut access unit that parses as a whole one.
+        assert_eq!(t.chunks.len(), 2, "the third chunk crosses the bound and is not indexed");
+        for c in &t.chunks {
+            assert_eq!(c.size, span as u64, "and the two kept are whole");
+        }
+        chunks_point_at_payload(&built, &t.chunks);
         assert_eq!(t.bitrate.map(|b| b.scope), Some(crate::model::BitrateScope::Overall));
         assert!(d.bounded_index, "a bounded walk keeps the report's sampled marks on");
     }
@@ -1374,14 +1462,24 @@ mod tests {
 
     #[test]
     fn an_opendml_super_index_spans_every_riff_segment() {
-        let d = demux(&build_opendml(&[1000, 1000], &[500], true)).expect("demuxes");
-        let t = &d.tracks[0];
+        let built = build_opendml(&[1000, 1000], &[500], true);
+        // Called directly: through `demux` the fallback walk covers both
+        // segments of a fixture this small and returns the same three chunks
+        // and the same 2500 bytes, so every assertion below would pass with
+        // `index_from_super` deleted outright.
+        let at = built.windows(4).position(|w| w == b"indx").expect("indx") + 8;
+        let end = at + u32le(&built, at - 4) as usize;
+        let (chunks, bytes, units) =
+            index_from_super(&built, at, end, *b"00").expect("the super-index must resolve");
         // Three chunks across two RIFF segments — the second of which `idx1`
-        // could never have covered.
-        assert_eq!(t.chunks.len(), 3);
+        // could never have covered — with bit 31 of every size masked off.
+        assert_eq!((chunks.len(), bytes, units), (3, Some(2500), 3));
+        chunks_point_at_payload(&built, &chunks);
+
+        // And the whole report agrees.
+        let d = demux(&built).expect("demuxes");
         assert_eq!(d.duration_secs, Some(0.12));
-        // 2500 bytes, with bit 31 of every size masked off.
-        let b = t.bitrate.expect("exact rate");
+        let b = d.tracks[0].bitrate.expect("exact rate");
         assert_eq!(b.scope, crate::model::BitrateScope::VideoStream);
         assert!((b.bits_per_sec - 2500.0 * 8.0 / 0.12).abs() < 1e-6, "{b:?}");
         assert!(!d.bounded_index);
@@ -1396,13 +1494,13 @@ mod tests {
         // and index the whole stream off by a header.
         let right = build_opendml(&[1000], &[500], true);
         let d = demux(&right).unwrap();
-        chunks_point_at_payload(&right, &d.tracks[0]);
+        chunks_point_at_payload(&right, &d.tracks[0].chunks);
 
         let wrong = build_opendml(&[1000], &[500], false);
         let d = demux(&wrong).unwrap();
         // Drop the `checked_sub(8)` in `index_from_standard` and this file's
         // index validates, every chunk lands on a header, and this fails.
-        chunks_point_at_payload(&wrong, &d.tracks[0]);
+        chunks_point_at_payload(&wrong, &d.tracks[0].chunks);
     }
 
     #[test]
@@ -1582,11 +1680,16 @@ mod tests {
                 let mut d = good.clone();
                 d[at..at + 4].copy_from_slice(&v.to_le_bytes());
                 let _ = demux(&d);
+                // `index_extents` runs inside `prefetch::warm_metadata`, on the
+                // same untrusted bytes and before any of `demux`'s checks, so
+                // it is swept here too.
+                let _ = index_extents(&d);
             }
         }
         // And a truncation at every length.
         for n in 0..good.len() {
             let _ = demux(&good[..n]);
+            let _ = index_extents(&good[..n]);
         }
     }
 
@@ -1612,6 +1715,102 @@ mod tests {
         // `dvc ` and friends are padded with spaces, which are printable.
         assert_eq!(fourcc_label(b"dvc "), "dvc");
         assert_eq!(fourcc_label(b"    "), "0x20202020");
+    }
+
+    #[test]
+    fn repeated_super_index_entries_cannot_multiply_into_an_unbounded_index() {
+        // Each index level clamps its own `nEntriesInUse` against the bytes its
+        // own chunk holds, which is the house rule and is individually correct.
+        // But the super-index calls the standard-index parser once per entry
+        // into one shared vector, so N super entries all naming the same
+        // M-entry `ix##` describe N x M chunks in a file that holds one. Only
+        // entry 0's base is validated, so the repetition is legal.
+        //
+        // Measured before the ceiling, on the default path with exit 0: a
+        // 156 KiB file declaring 2000 x 16000 allocated 771 MB, growing
+        // quadratically with file size.
+        // Purpose-built so the declared product genuinely exceeds the ceiling:
+        // 200 super entries all naming one 200-entry sub-index, in a file of a
+        // few KB. 40,000 chunks claimed, a few hundred physically possible.
+        let (n_super, n_std) = (200usize, 200usize);
+        let mut ix = vec![0u8; 24 + 8 * n_std];
+        ix[0..2].copy_from_slice(&2u16.to_le_bytes());
+        ix[3] = 1;
+        ix[4..8].copy_from_slice(&(n_std as u32).to_le_bytes());
+        ix[8..12].copy_from_slice(b"00dc");
+        let mut sup = vec![0u8; 24 + 16 * n_super];
+        sup[0..2].copy_from_slice(&4u16.to_le_bytes());
+        sup[4..8].copy_from_slice(&(n_super as u32).to_le_bytes());
+        sup[8..12].copy_from_slice(b"00dc");
+
+        let mut strl = strh(b"vids", b"XVID", 1, 25, 1);
+        strl.extend_from_slice(&strf(320, 240, b"XVID", &[]));
+        strl.extend_from_slice(&chunk(b"indx", &sup));
+        let mut hdrl_body = chunk(b"avih", &[0u8; 56]);
+        hdrl_body.extend_from_slice(&list(b"strl", &strl));
+        let hdrl = list(b"hdrl", &hdrl_body);
+        let movi = list(b"movi", &chunk(b"00dc", &[0xAA]));
+        let movi_fourcc = 12 + hdrl.len() + 8;
+        let ix_pos = 12 + hdrl.len() + movi.len();
+        ix[12..20].copy_from_slice(&(movi_fourcc as u64).to_le_bytes());
+        for k in 0..n_std {
+            let e = 24 + k * 8;
+            ix[e..e + 4].copy_from_slice(&12u32.to_le_bytes()); // the one chunk's data
+            ix[e + 4..e + 8].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let ixc = chunk(b"ix00", &ix);
+        let mut body = b"AVI ".to_vec();
+        body.extend_from_slice(&hdrl);
+        body.extend_from_slice(&movi);
+        body.extend_from_slice(&ixc);
+        let mut f = chunk(b"RIFF", &body);
+        let sup_at = f.windows(4).position(|w| w == b"indx").unwrap() + 8;
+        for k in 0..n_super {
+            let e = sup_at + 24 + k * 16;
+            f[e..e + 8].copy_from_slice(&(ix_pos as u64).to_le_bytes());
+            f[e + 8..e + 12].copy_from_slice(&(ixc.len() as u32).to_le_bytes());
+        }
+        let end = sup_at + u32le(&f, sup_at - 4) as usize;
+        let ceiling = chunk_ceiling(&f);
+        assert!(
+            n_super * n_std > ceiling * 4,
+            "the fixture must claim far more than the file can hold: {} vs {}",
+            n_super * n_std,
+            ceiling
+        );
+        // Declined outright: an index naming more chunks than the file can
+        // physically hold — one per 8 bytes, its own header — is not
+        // describing this file.
+        match index_from_super(&f, sup_at, end, *b"00") {
+            None => {}
+            Some((chunks, ..)) => {
+                assert!(chunks.len() <= ceiling, "{} chunks from {} bytes", chunks.len(), f.len())
+            }
+        }
+        // And the whole path still terminates and reports, via the walk.
+        let d = demux(&f).expect("still reports");
+        assert!(d.tracks[0].chunks.len() <= ceiling);
+    }
+
+    #[test]
+    fn a_size_zero_segment_chain_terminates() {
+        // `riff_segments` advances by the declared size, so a segment declaring
+        // zero would sit still without the count bound. `MAX_RIFF_SEGMENTS`
+        // stops it; this pins that it is bounded at all, since nothing else
+        // reaches the constant.
+        let mut f = b"RIFF".to_vec();
+        f.extend_from_slice(&0u32.to_le_bytes());
+        f.extend_from_slice(b"AVI ");
+        for _ in 0..64 {
+            f.extend_from_slice(b"RIFF");
+            f.extend_from_slice(&0u32.to_le_bytes());
+            f.extend_from_slice(b"AVIX");
+        }
+        let (segs, complete) = riff_segments(&f);
+        assert!(segs.len() <= MAX_RIFF_SEGMENTS);
+        assert!(complete, "a zero size declares nothing missing");
+        // And the whole path declines rather than hanging or panicking.
+        assert!(demux(&f).is_err());
     }
 
     #[test]

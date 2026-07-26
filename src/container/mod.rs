@@ -852,6 +852,15 @@ fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         if e > buf.len() {
             continue;
         }
+        // Bounded per chunk, not just per chunk *count*. A caller's cap on how
+        // many access units to try says nothing about how big each one claims
+        // to be: an AVI index may declare 32 chunks each spanning the whole
+        // file, which read 32x the file on the *default* path (measured at
+        // 2.09 s for 45 MB). Parameter sets ride the head of an access unit by
+        // construction, so scanning past this span could only find a set that
+        // is not the AU's own. Same constant and same reasoning as the MPEG and
+        // Part 2 gap-fillers, which have always capped this way.
+        let e = e.min(s.saturating_add(HEADER_SCAN_SPAN));
         nals.clear();
         nal::split_annexb(&buf[s..e], &mut nals);
         for n in &nals {
@@ -889,6 +898,8 @@ fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         if e > buf.len() {
             continue;
         }
+        // Capped exactly as the HEVC scan above is, and for the same reason.
+        let e = e.min(s.saturating_add(HEADER_SCAN_SPAN));
         nals.clear();
         avc_nal::split_annexb(&buf[s..e], &mut nals);
         for n in &nals {
@@ -914,6 +925,59 @@ fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         frame_rate: sps.frame_rate,
         chunk,
     })
+}
+
+#[cfg(test)]
+mod sps_scan_tests {
+    use super::*;
+
+    /// A chunk's declared size is validated only against the buffer end, so a
+    /// container index may claim an access unit spanning the whole file — and
+    /// an AVI one legitimately can, 32 times over. The scan is therefore capped
+    /// per chunk as well as per chunk count; the observable consequence is that
+    /// a parameter set placed beyond the cap is not found, which is exactly
+    /// right, since parameter sets ride the head of an access unit.
+    #[test]
+    fn the_parameter_set_scan_is_bounded_per_chunk_not_only_per_chunk_count() {
+        // `testfiles/sdr/h264_odml.avi`'s SPS, in Annex-B framing.
+        const SPS: [u8; 31] = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0xF0, 0x11, 0x7E,
+            0xE6, 0xA0, 0xC0, 0xC0, 0xC8, 0x00, 0x00, 0x1F, 0x48, 0x00, 0x07, 0x53, 0x00, 0x78,
+            0xC1, 0x8C, 0xB0,
+        ];
+        // At the head of the chunk it is found, which is the real-file case.
+        let mut near = SPS.to_vec();
+        near.extend(std::iter::repeat_n(0xAAu8, 4096));
+        let one = [Chunk { offset: 0, size: near.len() as u64 }];
+        assert_eq!(best_avc_sps(&near, &one).map(|s| s.width), Some(960));
+
+        // Past the cap it is not — and, decisively, the bytes before it are
+        // never walked either: this buffer is larger than the cap, and the run
+        // completes in the time a bounded scan takes rather than a full one.
+        let mut far = vec![0xAAu8; HEADER_SCAN_SPAN + 4096];
+        far.extend_from_slice(&SPS);
+        let big = [Chunk { offset: 0, size: far.len() as u64 }];
+        assert_eq!(best_avc_sps(&far, &big).map(|s| s.width), None, "beyond the cap");
+
+        // The HEVC scan is capped the same way, and needs its own SPS to show
+        // it — `testfiles/sdr/hevc.avi`'s, NAL type 33.
+        const HSPS: [u8; 42] = [
+            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x3C, 0xA0, 0x0A, 0x08, 0x0F, 0x16, 0x59, 0x59, 0xA4, 0x93, 0x2B,
+            0xC0, 0x5A, 0x02, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x32, 0x10,
+        ];
+        let mut hnear = vec![0x00, 0x00, 0x00, 0x01];
+        hnear.extend_from_slice(&HSPS);
+        hnear.extend(std::iter::repeat_n(0xAAu8, 4096));
+        let h1 = [Chunk { offset: 0, size: hnear.len() as u64 }];
+        assert_eq!(best_hevc_sps(&hnear, &h1).map(|s| s.width), Some(320), "at the head");
+
+        let mut hfar = vec![0xAAu8; HEADER_SCAN_SPAN + 4096];
+        hfar.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        hfar.extend_from_slice(&HSPS);
+        let h2 = [Chunk { offset: 0, size: hfar.len() as u64 }];
+        assert!(best_hevc_sps(&hfar, &h2).is_none(), "beyond the cap");
+    }
 }
 
 /// Fill a ProRes track's config/colour gaps from the first frame's header

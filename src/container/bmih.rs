@@ -35,9 +35,9 @@ pub(crate) struct BitmapInfoHeader {
 
 // Codec extradata — an `avcC` record, a VC-1 sequence header, an MPEG-4 Part 2
 // header set, or nothing — is whatever follows [`HEADER_LEN`]. It is not
-// returned as a slice because the one caller today needs its position inside the
-// file rather than its bytes; a backend holding the buffer can take the tail
-// directly.
+// returned as a slice because a caller may need its position inside the file
+// rather than its bytes; the ones that want the bytes take the tail from the
+// buffer they already hold, which is what the AVI and Matroska backends do.
 
 /// Decode a `BITMAPINFOHEADER` from the head of `data`.
 ///
@@ -73,7 +73,7 @@ pub(crate) fn parse(data: &[u8]) -> Option<BitmapInfoHeader> {
 /// unknown codec costs the codec name and nothing else.
 ///
 /// Deliberately much narrower than ffmpeg's `ff_codec_bmp_tags`, and narrower
-/// than "every codec this build understands". Three groups are held back on
+/// than "every codec this build understands". Two groups are held back on
 /// purpose:
 ///
 /// - **MJPEG, DV, H.263 and the raw-bitmap families** have no parser here at

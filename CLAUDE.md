@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 386 unit tests
+cargo test                     # 392 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -958,7 +958,7 @@ never parse bytes native-endian.
   AU faults arrive warm — it skips ranges inside `warm_metadata`'s return, the *coalesced*
   contiguous warmed prefix from byte 0 (an MKV head that merges into its block span counts
   whole). The chunk warm is skipped under `--full` (every chunk is read anyway; its `--full`
-  counterpart is the `Frontier` below), under `--no-rpu` (no chunk is read), and for TS
+  counterpart is the `Frontier` below), under `--no-rpu` (no chunk is *sampled* — the demux-time gap-fillers still read up to 32 chunks for the codec's own headers, which is where an AVI's whole cost lives), and for TS
   (chunks index into `reassembled`, not the file). **`--full` on a strict-remote volume
   tailgates `prefetch::Frontier`**, a bounded look-ahead warm riding the progress-tick sites:
   each whole-file walk calls `ensure(pos)`/`ensure_to(end)` so the file crosses the wire once,

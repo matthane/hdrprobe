@@ -1069,8 +1069,16 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
         // `parse_hvcc_record`'s length gate.
         let rec = codec_private.get(cc.extradata_offset..).unwrap_or_default();
         let stream_color = match cc.codec {
-            Codec::Hevc => super::color_from_hvcc(rec),
-            Codec::Avc => super::color_from_avcc(rec),
+            // The AVC and HEVC record readers start at a fixed offset and walk
+            // declared-length arrays without checking `configurationVersion`,
+            // so raw Annex-B extradata — which a `V_MS/VFW/FOURCC` track may
+            // legitimately carry — could be walked as a record and yield a
+            // false SPS, reported as colour tagged `stream`. `classify_codec`
+            // already gates on this; the gate has to hold here too, and an
+            // `av1C` is deliberately not subject to it (its first byte is the
+            // marker/version 0x81, not 1).
+            Codec::Hevc if super::bmih::is_config_record(rec) => super::color_from_hvcc(rec),
+            Codec::Avc if super::bmih::is_config_record(rec) => super::color_from_avcc(rec),
             Codec::Av1 => super::color_from_av1c(rec),
             _ => None,
         };
@@ -1144,13 +1152,26 @@ impl CodecConfig {
 /// `BITMAPINFOHEADER` for a Video for Windows wrapper — so the colour fallback
 /// in `parse_track_entry` re-slices to the same bytes.
 ///
-/// A record that fails to parse keeps the codec and the conventional 4-byte
-/// prefix rather than dropping the track, which is what the two native arms did
-/// before this was shared.
-fn nal_config(codec: Codec, rec: &[u8], extradata_offset: usize) -> CodecConfig {
+/// `on_failure` is the framing to keep when the record does not parse, and the
+/// two carriages need different answers. For the native CodecIDs CodecPrivate
+/// *is* definitionally an `avcC`/`hvcC`, so a failed parse means a damaged
+/// record and the conventional 4-byte prefix stands — which is what those arms
+/// did before this was shared. For a Video for Windows wrapper only the first
+/// byte was ever tested, so a failed parse is positive evidence the extradata
+/// was **not** a configuration record, and the blocks are far more likely
+/// Annex-B; keeping a length prefix there would hand `split_length_prefixed` —
+/// which deliberately has no `forbidden_zero_bit` guard — bytes that are not
+/// NAL units, the exact route by which a stream once grew a signalled mastering
+/// display it did not carry.
+fn nal_config(
+    codec: Codec,
+    rec: &[u8],
+    extradata_offset: usize,
+    on_failure: NalFormat,
+) -> CodecConfig {
     let mut cfg = CodecConfig {
         codec,
-        nal_format: NalFormat::LengthPrefixed(4),
+        nal_format: on_failure,
         bit_depth: None,
         chroma: None,
         codec_profile: None,
@@ -1177,13 +1198,13 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
     if codec_id.starts_with(b"V_MPEGH/ISO/HEVC") {
         // CodecPrivate is an HEVCDecoderConfigurationRecord; blocks are
         // length-prefixed NAL units per its lengthSizeMinusOne.
-        nal_config(Codec::Hevc, codec_private, 0)
+        nal_config(Codec::Hevc, codec_private, 0, NalFormat::LengthPrefixed(4))
     } else if codec_id.starts_with(b"V_MPEG4/ISO/AVC") {
         // CodecPrivate is an AVCDecoderConfigurationRecord; depth/chroma/profile
         // come from its embedded SPS (not fixed header fields — see
         // `parse_avcc_record`). Covers SDR AVC muxes (8-bit, or 10-bit Hi10P)
         // and DV Profile 9, whose RPU the sampler finds by content.
-        nal_config(Codec::Avc, codec_private, 0)
+        nal_config(Codec::Avc, codec_private, 0, NalFormat::LengthPrefixed(4))
     } else if codec_id.starts_with(b"V_VP9") {
         // CodecPrivate is the WebM VP9 feature list (profile/level/depth/
         // chroma) — optional, and colour-less by definition; whatever it
@@ -1274,7 +1295,7 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
         match fourcc.as_ref().and_then(super::bmih::codec_from_fourcc) {
             Some(c @ (Codec::Avc | Codec::Hevc)) => {
                 if super::bmih::is_config_record(extradata) {
-                    nal_config(c, extradata, super::bmih::HEADER_LEN)
+                    nal_config(c, extradata, super::bmih::HEADER_LEN, NalFormat::AnnexB)
                 } else {
                     // Raw Annex-B parameter sets, or no extradata at all: the
                     // blocks are Annex-B access units, and nothing in the
@@ -1723,6 +1744,128 @@ mod tests {
             classify_codec(b"V_MPEG4/ISO/XYZ", &[]).codec,
             Codec::Other("V_MPEG4/ISO/XYZ".to_string())
         );
+    }
+
+    /// A `V_MS/VFW/FOURCC` CodecPrivate: 40-byte `BITMAPINFOHEADER` naming
+    /// `fourcc`, then `extradata`.
+    fn vfw_private(fourcc: &[u8; 4], extradata: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; super::super::bmih::HEADER_LEN];
+        b[0..4].copy_from_slice(&40u32.to_le_bytes());
+        b[4..8].copy_from_slice(&640i32.to_le_bytes());
+        b[8..12].copy_from_slice(&360i32.to_le_bytes());
+        b[16..20].copy_from_slice(fourcc);
+        b.extend_from_slice(extradata);
+        b
+    }
+
+    #[test]
+    fn a_vfw_wrapped_h264_takes_its_framing_from_the_extradata() {
+        // Both framings are common and the FourCC does not separate them, so
+        // the first extradata byte decides. Guessing wrong hands
+        // `split_length_prefixed` — which has no `forbidden_zero_bit` guard —
+        // bytes that are not NAL units.
+        let annexb = classify_codec(
+            b"V_MS/VFW/FOURCC",
+            &vfw_private(b"H264", &[0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0D]),
+        );
+        assert_eq!(annexb.codec, Codec::Avc);
+        assert!(matches!(annexb.nal_format, NalFormat::AnnexB), "{:?}", annexb.nal_format);
+        // Empty extradata is the fresh-encode case and is Annex-B too.
+        let bare = classify_codec(b"V_MS/VFW/FOURCC", &vfw_private(b"H264", &[]));
+        assert!(matches!(bare.nal_format, NalFormat::AnnexB));
+
+        // A real `avcC` (from `testfiles/sdr/h264_avcc.avi`) takes the record
+        // path and states its own prefix size, profile and depth.
+        let rec: [u8; 46] = [
+            0x01, 0x64, 0x00, 0x0D, 0xFF, 0xE1, 0x00, 0x19, 0x67, 0x64, 0x00, 0x0D, 0xAC, 0xD9,
+            0x41, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03,
+            0x20, 0xF1, 0x42, 0x99, 0x60, 0x01, 0x00, 0x06, 0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0,
+            0xFD, 0xF8, 0xF8, 0x00,
+        ];
+        let cfg = classify_codec(b"V_MS/VFW/FOURCC", &vfw_private(b"avc1", &rec));
+        assert!(matches!(cfg.nal_format, NalFormat::LengthPrefixed(4)));
+        assert_eq!(cfg.codec_profile.as_deref(), Some("High @ L1.3"));
+        assert_eq!(cfg.bit_depth, Some(8));
+        assert_eq!(cfg.extradata_offset, super::super::bmih::HEADER_LEN);
+
+        // **Extradata whose first byte is 0x01 but which is not a valid record
+        // must not keep a length prefix.** Only that one byte was ever tested,
+        // so a failed parse is evidence it was never a record — unlike the
+        // native `V_MPEG4/ISO/AVC` id, where CodecPrivate is definitionally one
+        // and a damaged record keeps the conventional 4-byte prefix.
+        let junk = classify_codec(b"V_MS/VFW/FOURCC", &vfw_private(b"H264", &[0x01, 0x02, 0x03]));
+        assert!(matches!(junk.nal_format, NalFormat::AnnexB), "{:?}", junk.nal_format);
+        let native = classify_codec(b"V_MPEG4/ISO/AVC", &[0x01, 0x02, 0x03]);
+        assert!(matches!(native.nal_format, NalFormat::LengthPrefixed(4)));
+    }
+
+    /// `testfiles/sdr/h264_odml.avi`'s SPS verbatim (27 bytes, NAL type 7). Its
+    /// VUI carries a full colour description — BT.601 NTSC, limited range —
+    /// which is what makes it usable as *evidence* below: if it is ever read,
+    /// colour appears where none was signalled.
+    const SPS_WITH_COLOUR: [u8; 27] = [
+        0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0xF0, 0x11, 0x7E, 0xE6, 0xA0, 0xC0, 0xC0, 0xC8,
+        0x00, 0x00, 0x1F, 0x48, 0x00, 0x07, 0x53, 0x00, 0x78, 0xC1, 0x8C, 0xB0,
+    ];
+
+    /// Wrap `SPS_WITH_COLOUR` in an `avcC` record.
+    fn avcc_with_colour() -> Vec<u8> {
+        let mut r = vec![0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
+        r.extend_from_slice(&(SPS_WITH_COLOUR.len() as u16).to_be_bytes());
+        r.extend_from_slice(&SPS_WITH_COLOUR);
+        r.extend_from_slice(&[0x01, 0x00, 0x00]); // zero-length PPS
+        r
+    }
+
+    /// Build a one-video-track TrackEntry with the given CodecID and
+    /// CodecPrivate, and parse it.
+    fn track_from(codec_id: &[u8], codec_private: &[u8]) -> TrackInfo {
+        let mut e = el(&[0xD7], &[1]);
+        e.extend_from_slice(&el(&[0x83], &[1]));
+        e.extend_from_slice(&el(&[0x86], codec_id));
+        e.extend_from_slice(&el(&[0x63, 0xA2], codec_private));
+        parse_track_entry(&e, 0, e.len()).expect("a video track")
+    }
+
+    #[test]
+    fn a_vfw_config_record_is_found_past_the_bitmap_header() {
+        // The positive half of the pair below: the colour fallback must slice
+        // CodecPrivate at the codec's own `extradata_offset`, or a VfW-wrapped
+        // `avcC` is never seen at all and a real signal is lost. Feed it the
+        // whole blob and byte 0 is `biSize`, not `configurationVersion`.
+        let t = track_from(b"V_MS/VFW/FOURCC", &vfw_private(b"avc1", &avcc_with_colour()));
+        assert_eq!(t.codec, Codec::Avc);
+        assert_eq!(t.color.primaries.as_deref(), Some("BT.601 (NTSC)"));
+        assert_eq!(t.color.transfer.as_deref(), Some("BT.601"));
+        assert_eq!(t.color.range.as_deref(), Some("limited"));
+    }
+
+    #[test]
+    fn annex_b_vfw_extradata_is_never_read_as_a_configuration_record() {
+        // The colour fallback recovers a stream's VUI from the SPS inside an
+        // `avcC`/`hvcC`. Those readers start at a fixed offset and walk
+        // declared-length arrays **without checking `configurationVersion`**,
+        // so handing them raw Annex-B bytes — which a Video for Windows wrapper
+        // may legitimately carry — could yield a false SPS reported as colour
+        // tagged `stream`, i.e. a fabricated signal. `classify_codec` gates on
+        // the first byte; this asserts the fallback does too.
+        // Extradata that is *not* a record — byte 0 is a start code's `0x00` —
+        // but whose bytes 5..8 happen to read as an `avcC`'s SPS count and
+        // length, so an unguarded reader finds `SPS_WITH_COLOUR` and reports
+        // its BT.601 description. Nothing here signalled any colour.
+        let mut annexb = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0xE1];
+        annexb.extend_from_slice(&(SPS_WITH_COLOUR.len() as u16).to_be_bytes());
+        annexb.extend_from_slice(&SPS_WITH_COLOUR);
+        let t = track_from(b"V_MS/VFW/FOURCC", &vfw_private(b"H264", &annexb));
+        assert_eq!(t.codec, Codec::Avc, "the FourCC still names the codec");
+        assert!(matches!(t.nal_format, NalFormat::AnnexB));
+        // Nothing signalled colour, so nothing may be reported. Drop the
+        // `is_config_record` guard on the fallback and these bytes are walked
+        // as a record.
+        assert!(t.color.primaries.is_none(), "{:?}", t.color);
+        assert!(t.color.transfer.is_none(), "{:?}", t.color);
+        assert!(t.color.matrix.is_none(), "{:?}", t.color);
+        assert!(t.color_source.primaries.is_none(), "{:?}", t.color_source);
     }
 
     #[test]
