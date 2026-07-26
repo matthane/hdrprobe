@@ -216,7 +216,7 @@ hdrprobe reads both video files and standalone metadata sidecar files:
 | Raw HEVC (Annex-B) | Video | HEVC | Elementary stream; profile inferred from the RPU |
 | Raw AV1 (IVF or low-overhead OBU) | Video | AV1 | Elementary stream; the RPU rides an in-band metadata OBU |
 | Raw VP9 (IVF) | Video | VP9 | Elementary stream; a bare VP9 stream carries no HDR signalling of its own, so colour beyond matrix and range comes only from a container |
-| Legacy containers | Video | MPEG-1/2, MPEG-4 Visual, VC-1, Theora, VP8, and the above | AVI, ASF/WMV, FLV, MPEG program stream (`.mpg`, `.vob`), Ogg, and raw MPEG elementary streams. These formats predate HDR and record little, so hdrprobe reports the general facts they do carry rather than an HDR section; the point is that an older file in a mixed library is described rather than skipped |
+| Legacy containers | Video | MPEG-1/2, MPEG-4 Visual, VC-1, Theora, VP8, RealVideo, DV, and the above | AVI, ASF/WMV, FLV, MPEG program stream (`.mpg`, `.vob`), Ogg, RealMedia (`.rm`, `.rmvb`), raw DV tape streams (`.dv`), and raw MPEG elementary streams. These formats predate HDR and record little, so hdrprobe reports the general facts they do carry rather than an HDR section; the point is that an older file in a mixed library is described rather than skipped |
 | Dolby Vision RPU (`.bin`, `.rpu`) | Sidecar | – | Raw RPU stream (for example from `dovi_tool extract-rpu`), aggregated across every frame |
 | Dolby Vision CM XML (`.xml`) | Sidecar | – | Dolby CM metadata (DolbyLabsMDF), aggregated per shot |
 | HDR10+ JSON (`.json`) | Sidecar | – | hdr10plus_tool metadata; reports the file-level profile and the first scene from a bounded head read |

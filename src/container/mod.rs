@@ -14,6 +14,7 @@ pub mod mp4;
 pub mod mpegv;
 pub mod ogg;
 pub mod ps;
+pub mod rm;
 pub mod ts;
 
 use std::path::Path;
@@ -391,6 +392,7 @@ pub fn demux(
         "ivf" | "obu" => Some(av1::demux(data, full, progress, frontier)),
         "m2v" | "m1v" | "mpv" => Some(mpegv::demux(data, full)),
         "dv" | "dif" => Some(dif::demux(data)),
+        "rm" | "rmvb" => Some(rm::demux(data)),
         // `.evo` (HD DVD) is a program stream too. Its video often rides the
         // extended stream id `0xFD`, which this walker treats as non-video, so
         // such a file declines with the backend's own message rather than
@@ -466,6 +468,9 @@ fn sniff_demux(
     if dif::is_dif(data) {
         return Some(dif::demux(data));
     }
+    if rm::is_rm(data) {
+        return Some(rm::demux(data));
+    }
     if av1::is_ivf(data) || av1::is_obu_stream(data) {
         return Some(av1::demux(data, full, progress, frontier));
     }
@@ -496,6 +501,7 @@ pub(crate) fn sniffs_as_ts(data: &[u8]) -> bool {
         || flv::is_flv(data)
         || ogg::is_ogg(data)
         || dif::is_dif(data)
+        || rm::is_rm(data)
         || av1::is_ivf(data)
         || av1::is_obu_stream(data);
     !earlier_check_wins && ts::detect_layout(data).is_some()

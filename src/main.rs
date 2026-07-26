@@ -689,9 +689,17 @@ fn suppress_prefix_derived_facts(demux: &mut container::Demux) {
     {
         demux.duration_secs = None;
     }
-    let mp4 = matches!(demux.container, "MP4 (ISOBMFF)" | "QuickTime (MOV)");
+    // Two containers keep a video-stream rate over a prefix: MP4/MOV, whose
+    // stsz/trun table sums are exact regardless of truncation, and RealMedia,
+    // whose MDPR rate is a header *declaration* — both are facts the buffered
+    // head carries whole, unlike MKV's summed block index.
+    let declared_rate = matches!(
+        demux.container,
+        "MP4 (ISOBMFF)" | "QuickTime (MOV)" | container::rm::CONTAINER_LABEL
+    );
     for t in &mut demux.tracks {
-        t.bitrate = t.bitrate.filter(|b| mp4 && b.scope == model::BitrateScope::VideoStream);
+        t.bitrate =
+            t.bitrate.filter(|b| declared_rate && b.scope == model::BitrateScope::VideoStream);
     }
 }
 
@@ -1012,7 +1020,7 @@ fn assemble_report(
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts", "mts", "hevc", "h265", "265", "ivf", "obu",
     "iso", "mpg", "mpeg", "vob", "m2p", "evo", "m2v", "m1v", "mpv", "avi", "wmv", "asf", "flv",
-    "ogv", "dv", "dif",
+    "ogv", "dv", "dif", "rm", "rmvb",
 ];
 
 fn collect_paths(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
@@ -1190,6 +1198,14 @@ mod tests {
         suppress_prefix_derived_facts(&mut d);
         assert_eq!(d.duration_secs, None);
         assert!(d.tracks[0].bitrate.is_none());
+
+        // RealMedia: the duration and the stream rate are both header
+        // declarations the buffered prefix carries whole, so both stand —
+        // matching the file-probe path, where a declared-short .rm keeps them.
+        let mut d = demux_with(container::rm::CONTAINER_LABEL, Some(7286.037), stream);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, Some(7286.037));
+        assert!(d.tracks[0].bitrate.is_some(), "a declared rate survives a prefix");
 
         // And the label match is a constant pattern, not a catch-all binding:
         // a container not in the list keeps its declared duration.

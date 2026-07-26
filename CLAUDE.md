@@ -232,6 +232,26 @@ never parse bytes native-endian.
   head probe nor ffmpeg's own raw-.dv demuxer ever passes. `chunks` stays empty (the
   mpegv/asf contract — DV has no SEI/RPU/T.35 side channel) and `--full` changes nothing,
   every fact being exact on the default path.
+- `container/rm.rs` — RealMedia (`.rm`/`.rmvb`), read against ffmpeg's `rmdec.c` (the only
+  complete public description) and verified on encoded RV10/RV20 fixtures plus a real-world
+  RV40 `.rmvb`. The ASF shape: big-endian chunks (FourCC + u32 size + u16 version) walked
+  from the head, every fact declared before `DATA`, `chunks` empty by design (packets
+  interleave like ASF's; RealVideo has no bitstream side channel), colour honestly absent.
+  Facts that are easy to get wrong: **the `VIDO` fps field is 16.16 fixed point**
+  (`fps/65536` — ffmpeg's `av_reduce(..., 0x10000, fps, ...)`; the real RV40 sample declares
+  1,571,294 = 23.976, so an integer or two-u16 reading corrupts every non-integer rate);
+  **the video `MDPR`'s own duration wins over `PROP`'s** (ffmpeg discards the file duration
+  the moment a stream declares one — the two differ by 7 ms on the real sample and ffprobe
+  reports the MDPR value); the reported rate is the `MDPR` declared average at
+  `video_stream` scope (MediaInfo's Video `BitRate` and ffprobe's stream `bit_rate`), never
+  `PROP`'s whole-file average; depth/chroma are the family constants 8-bit 4:2:0 (normative
+  for the H.263-design RV10/RV20, single-witness for the proprietary RV30/RV40 — ffmpeg's
+  decoders emit yuv420p alone, MediaInfo abstains); and **complete ffmpeg muxes declare the
+  `DATA` chunk exactly 10 bytes past EOF** (measured on both fixtures), so the
+  `declared_short` comparison carries a small slack or every remux reads as a partial
+  download — a real cut misses by megabytes. `MLTI` multirate blocks are unwrapped
+  (rule table, then u32-sized nested codec-data blocks); RealAudio-only files and the
+  ancient `.ra\xfd` format error honestly rather than reporting no video.
 - `container/bmih.rs` — `BITMAPINFOHEADER`, the Video for Windows description block, plus the
   FourCC-to-codec table. It lives in `container/` rather than a backend because three carriages
   hand one over: AVI's `strf`, ASF's type-specific data, and **Matroska's `V_MS/VFW/FOURCC`**,

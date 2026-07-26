@@ -218,11 +218,11 @@ section.
 | `hdrprobe_schema_version` | string | always | Version of hdrprobe's own output schema, `"<major>.<minor>"`; see Schema versioning above. Not related to the inspected file's metadata (contrast `format_version` and `video_tracks[].dolby_vision.cm_version`) |
 | `file` | string | always | The input path as given on the command line (or as found during a directory scan); `"-"` for a stdin probe |
 | `size_bytes` | integer | always | File size in bytes. For a truncated stdin probe (`input_truncated` present) this is the bytes actually probed, not the source's size |
-| `input_truncated` | boolean | when true | Only part of the input was (or could be) probed. For a **stdin** probe: the piped stream exceeded the head budget, so only a leading window was probed — `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (TS `duration_secs`, non-MP4 `bitrate`) are withheld; see the stdin paragraph under "How input kind and flags affect presence". For a **file** probe: the container itself declares more bytes than the file holds (AVI's RIFF segment sizes, ASF's `File Properties.File Size`, FLV's `onMetaData.filesize`) — a partial download or a capture that never closed; the backend has already withheld what a prefix cannot support (any `"overall"` bitrate; ASF also its duration), and the flag names why. Never set from a merely absent declaration. Absent for whole files and for stdin streams that ended within the budget |
+| `input_truncated` | boolean | when true | Only part of the input was (or could be) probed. For a **stdin** probe: the piped stream exceeded the head budget, so only a leading window was probed — `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (TS `duration_secs`, non-MP4 `bitrate`) are withheld; see the stdin paragraph under "How input kind and flags affect presence". For a **file** probe: the container itself declares more bytes than the file holds (AVI's RIFF segment sizes, ASF's `File Properties.File Size`, FLV's `onMetaData.filesize`, RealMedia's `DATA` chunk extent) — a partial download or a capture that never closed; the backend has already withheld what a prefix cannot support (any `"overall"` bitrate; ASF also its duration), and the flag names why (RealMedia's declared duration and stream bitrate are header facts and stand). Never set from a merely absent declaration. Absent for whole files and for stdin streams that ended within the budget |
 
 **`input_truncated` on file probes ships in 3.0** (it was stdin-only through 2.x, and the
-file-side detections existed without surfacing): a truncated AVI/ASF/FLV now names why its
-report withholds what it withholds. The three declarations above are the only ones consulted;
+file-side detections existed without surfacing): a truncated AVI/ASF/FLV/RealMedia now names
+why its report withholds what it withholds. The four declarations above are the only ones consulted;
 a format with no self-declared length (TS, raw streams, Ogg) cannot set the flag from a file
 probe, and a short file of such a format still reports without it.
 
@@ -270,7 +270,7 @@ errors rather than guessing.
 | `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number, MPEG program stream the PES stream id (or, for HD DVD `.evo` video on the extended id 0xFD, the `stream_id_extension` substream id, 0x55..0x5F). Absent where no such id exists (raw elementary streams, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, `"DV"` (raw `.dv`/`.dif` input; DV inside AVI/MOV still reports its carriage FourCC), or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, `"DV"` (raw `.dv`/`.dif` input; DV inside AVI/MOV still reports its carriage FourCC), `"RealVideo 1"`/`"2"`/`"3"`/`"4"` (RealMedia `VIDO` FourCCs `RV10`..`RV40`; an unrecognized `VIDO` FourCC reports verbatim), or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
@@ -315,6 +315,7 @@ Video inputs:
 | `"ASF (Windows Media)"` | Advanced Systems Format (`.wmv`, `.asf`, and a `.wma` carrying video) |
 | `"FLV (Flash Video)"` | Flash Video (`.flv`), legacy and Enhanced/E-RTMP alike — the label does not distinguish them, since the header form changes what the report reads and not what it reports |
 | `"Ogg"` | Ogg (`.ogv`, `.ogg`, `.oga`, `.ogm`, `.ogx`) carrying a Theora or VP8 video logical bitstream |
+| `"RealMedia"` | RealNetworks RealMedia (`.rm`, `.rmvb`) with at least one video stream; RealAudio-only files error honestly |
 | `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
@@ -711,7 +712,8 @@ what a prefix cannot honestly state: `duration_secs` for the formats that derive
 payload rather than a declared header — TS and program streams (either clock's span would
 describe the cut, not the stream), Ogg (the tail granule is the cut point), raw DV (frame
 count is the prefix's length ÷ the frame size) — and every `bitrate` except MP4/MOV's
-`video_stream` rate (whose sample-table sums are exact regardless of truncation). Declared header facts (MP4 `mvhd` and
+`video_stream` rate (whose sample-table sums are exact regardless of truncation) and
+RealMedia's (a header declaration the buffered head carries whole). Declared header facts (MP4 `mvhd` and
 MKV Segment-Info durations, resolution, color, HDR and Dolby Vision metadata from the sampled
 head) report normally. The sampled union fields (`l5_active_areas`, `trim_targets`) draw only
 on head frames: `dolby_vision.sampled` is `true` exactly as on a default file probe, but a
@@ -904,7 +906,7 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   MediaInfo's derivation byte-exactly; the default bounded probe still reports neither.
   One presence widening: **`input_truncated` now also appears on file probes** whose container
   declares more bytes than the file holds (AVI RIFF segment sizes, ASF `File Properties`, FLV
-  `onMetaData.filesize`). The detections shipped in the backends already — withholding overall
+  `onMetaData.filesize`, RealMedia's `DATA` chunk extent). The detections shipped in the backends already — withholding overall
   rates and, for ASF, the duration — and the flag now names why. A 2.x consumer treating the
   field as stdin-only should treat it as "partial input" generally.
   One hardening with a value-space edge: **control characters in fallback `codec` labels
@@ -939,6 +941,17 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   absent (the reference tools disagree and the candidate bits have no primary spec on hand).
   `"4:1:1"` also joins the documented `chroma` value set (it was already emitted for
   QuickTime DV FourCCs and MJPEG), with `"4:4:0"` (MJPEG).
+  Also additive: **RealMedia is reported** — `"RealMedia"` joins the `container` set (`.rm`,
+  `.rmvb`, also recognized by the `.RMF` magic) and `"RealVideo 1"` through `"RealVideo 4"`
+  join the `codec` set (the `MDPR` `VIDO` FourCCs `RV10`..`RV40`; anything else reports its
+  FourCC verbatim). Dimensions, the 16.16 fixed-point frame rate, the stream's declared
+  duration (`PROP`'s as fallback) and its declared average `bitrate` (`"video_stream"` scope)
+  come from the header chunks; depth/chroma are the family constants 8-bit 4:2:0 (normative
+  for the H.263-design RV10/RV20, witnessed for RV30/RV40); colour is honestly absent — the
+  container records none. `input_truncated` fires when the `DATA` chunk declares more bytes
+  than the file holds (with slack for ffmpeg's muxer, which systematically declares 10 bytes
+  past EOF on complete files); RealAudio-only files error rather than reporting an empty
+  track.
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
