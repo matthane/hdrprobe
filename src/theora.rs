@@ -11,9 +11,7 @@
 //! except that here there is no gap: Ogg records no colour, no dimensions and
 //! no frame rate of its own, so this header is the *only* source for every
 //! field the report carries about the picture. Four facts are invariants, each
-//! pinned by a test naming its source. (The paragraph on ffprobe's disagreement
-//! is not one of them — it records an open question, not a rule to preserve, so
-//! counting bold paragraphs here gives five.)
+//! pinned by a test naming its source.
 //!
 //! **The header is big-endian while the Ogg page around it is little-endian.**
 //! The spec calls the flip out itself (Vorbis, the other Xiph codec in the same
@@ -22,23 +20,22 @@
 //!
 //! **`CS` is not CICP.** It is a three-value enum — 0 undefined, 1 Rec. 470M,
 //! 2 Rec. 470BG — and the reserved values above it must stay unfilled rather
-//! than pass through as codes. Its primaries and matrix do map onto CICP code
-//! points, but **its transfer does not**: Theora overrides both Rec. 470
-//! display gammas with the Rec. 709 opto-electronic function while keeping the
-//! Rec. 470 *display* gamma, a pairing no single CICP transfer code names. So
-//! the transfer stays `None` — synthesising one would launder an approximation
-//! into a field the report reads as signalled.
-//!
-//! **There is a reference behaviour here, and it disagrees.** ffprobe reads
-//! `CS` and fills all three fields, giving transfer `bt709` for both defined
-//! values (measured against `testfiles/sdr/theora_cs1.ogv` and `theora_cs2.ogv`;
-//! the table is in the format reference). It reports the *capture* function,
-//! which Theora's is exactly, and drops the display gamma — which is either the
-//! approximation this module refuses to make, or evidence that H.273's
-//! definition of `transfer_characteristics` as the source's opto-electronic
-//! characteristic makes code 1 simply correct. That question is open and
-//! recorded as such; the unset field is the reversible answer, since adding a
-//! value later is additive and publishing a wrong one is not.
+//! than pass through as codes. Its primaries and matrix map onto CICP code
+//! points, and so does its transfer, **by the field's definition rather than by
+//! a table row**: Theora overrides both Rec. 470 display gammas with the
+//! Rec. 709 opto-electronic function for encoding (§4.3), and H.273 defines
+//! `transfer_characteristics` as exactly that encoding-side function of the
+//! source picture, so code 1 names Theora's curve verbatim. The Rec. 470
+//! *display* gammas the spec also states (2.2 and 2.67) are EOTF-side facts no
+//! SDR CICP code has ever carried — BT.601/709 content signals code 1/6 and
+//! leaves the display side to BT.1886 the same way — so they are not evidence
+//! against the fill. ffprobe reads the field to the same three values,
+//! transfer `bt709` for both defined `CS` codes (measured against
+//! `testfiles/sdr/theora_cs1.ogv` and `theora_cs2.ogv`; the table is in the
+//! format reference), and MediaInfo reports no colour for Theora at all. An
+//! earlier revision recorded the transfer as an open question and shipped it
+//! unset (plan decision D8); settled 2026-07-26, with sign-off, on the reading
+//! above.
 //!
 //! **The display size is not the coded size.** `FMBW`/`FMBH` count macroblocks,
 //! so the coded frame is `FMBW*16 x FMBH*16` and an 854-wide video is coded 864
@@ -188,14 +185,18 @@ pub fn parse_id_header(p: &[u8]) -> Option<IdHeader> {
     })
 }
 
-/// Translate `CS` into the CICP code points its chromaticities and matrix
-/// coefficients match, leaving the transfer unsignalled.
+/// Translate `CS` into the CICP code points its chromaticities, transfer
+/// function and matrix coefficients match.
 ///
 /// The primaries map cleanly — `CS` 1 is Rec. 470M's R/G/B and Illuminant C,
 /// `CS` 2 is Rec. 470BG's and D65 — and both colour spaces state the same
 /// Kr/Kb (0.299/0.114), which CICP 5 and CICP 6 share exactly. Since the two
 /// matrix codes are numerically identical and differ only in which 601 system
 /// they name, each `CS` takes the one whose system its primaries already named.
+/// The transfer is CICP 1 for both: H.273's `transfer_characteristics` is the
+/// source's opto-electronic function, and Theora §4.3 fixes that at Rec. 709's
+/// curve for both defined colour spaces (their differing *display* gammas are
+/// EOTF-side facts the code point does not carry — see the module doc).
 /// The range is limited for both: the spec fixes offset 16 and excursion 219
 /// inside each colour space definition, so it is known exactly where `CS` is
 /// and unknown where it is not.
@@ -205,11 +206,9 @@ fn color_from_cs(cs: u8) -> Option<(ColorInfo, ColorSources)> {
         2 => (5, 5), // Rec. 470BG primaries, the 625-line matrix
         _ => return None,
     };
-    // Transfer code 2 is CICP's "unspecified", which `cicp_source` reads as
-    // nothing having been signalled — the intended result, since Theora's
-    // curve is a pairing no code names. Routing through the shared decoder
-    // keeps these labels the same objects the container-signalled ones are.
-    Some(color_from_cicp(primaries, 2, matrix, Some(false), ColorSource::Stream))
+    // Routing through the shared decoder keeps these labels the same objects
+    // the container-signalled ones are.
+    Some(color_from_cicp(primaries, 1, matrix, Some(false), ColorSource::Stream))
 }
 
 /// Frames finished by a granule position, or `None` for the "no packet
@@ -291,23 +290,26 @@ mod tests {
     }
 
     #[test]
-    fn cs_1_and_2_map_to_their_cicp_code_points_with_no_transfer() {
+    fn cs_1_and_2_map_to_their_cicp_code_points_with_bt709_transfer() {
         let (c1, s1) = parse_id_header(&patched(36, 1)).unwrap().color.expect("CS 1 maps");
         assert_eq!(c1.primaries.as_deref(), Some("BT.470M"));
         assert_eq!(c1.matrix.as_deref(), Some("BT.601 (NTSC)"));
         assert_eq!(c1.range.as_deref(), Some("limited"));
-        // The load-bearing half: Theora's transfer is Rec. 709's curve over a
-        // Rec. 470 display gamma, which no CICP code names, so it stays absent
-        // and carries no provenance either.
-        assert_eq!(c1.transfer, None);
-        assert_eq!(s1.transfer, None);
+        // The load-bearing half: Theora fixes the encoding-side function at
+        // Rec. 709's curve for both colour spaces, which is what H.273's
+        // `transfer_characteristics` describes, so CICP 1 names it verbatim
+        // (ffprobe answers `bt709` for both; the display gammas are EOTF-side
+        // and not the code point's business). Plan decision D8, reversed with
+        // sign-off 2026-07-26.
+        assert_eq!(c1.transfer.as_deref(), Some("BT.709"));
+        assert_eq!(s1.transfer, Some(ColorSource::Stream));
         assert_eq!(s1.primaries, Some(ColorSource::Stream));
         assert_eq!(s1.matrix, Some(ColorSource::Stream));
 
         let (c2, _) = parse_id_header(&patched(36, 2)).unwrap().color.expect("CS 2 maps");
         assert_eq!(c2.primaries.as_deref(), Some("BT.601 (PAL)"));
         assert_eq!(c2.matrix.as_deref(), Some("BT.601 (PAL)"));
-        assert_eq!(c2.transfer, None);
+        assert_eq!(c2.transfer.as_deref(), Some("BT.709"));
     }
 
     #[test]
