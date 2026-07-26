@@ -48,6 +48,9 @@ pub enum Codec {
     /// standard and their frame headers differ, so they get an honest name and
     /// no parser — they signal no colour, depth or profile in any case.
     MsMpeg4(u8),
+    /// Motion JPEG: a sequence of ITU-T T.81 images. Depth and chroma come
+    /// from the first frame's own `SOF` header ([`crate::mjpeg`]).
+    Mjpeg,
     Other(String),
 }
 
@@ -65,6 +68,7 @@ impl Codec {
             Codec::Vc1 => "VC-1".to_string(),
             Codec::Theora => "Theora".to_string(),
             Codec::MsMpeg4(v) => format!("MS-MPEG-4 v{v}"),
+            Codec::Mjpeg => "MJPEG".to_string(),
             Codec::Other(s) => s.clone(),
         }
     }
@@ -1285,6 +1289,63 @@ pub(crate) fn fill_mpeg2_stream_fields(track: &mut TrackDemux, source: &[u8]) {
     }
 }
 
+/// Fill an MJPEG track's depth and chroma from the first readable frame's
+/// `SOF` header, the plainest of the stream-derived fills: every frame is a
+/// whole JPEG image carrying one, and nothing else in the format states either
+/// value ([`crate::mjpeg`]'s module doc has the two facts). No colour arm on
+/// purpose — MJPEG records none anywhere this tree reads.
+pub(crate) fn fill_mjpeg_stream_fields(track: &mut TrackDemux, source: &[u8]) {
+    if track.bit_depth.is_some() && track.chroma.is_some() {
+        return;
+    }
+    // Same first-chunks bound as the MPEG-2 fill beside this: the SOF opens
+    // every chunk in an ordinary file, and 32 tries cover a mux whose head
+    // chunks are damaged without walking the whole index.
+    let sof = track.chunks.iter().take(32).find_map(|c| {
+        let start = c.offset as usize;
+        let end = ((c.offset + c.size) as usize)
+            .min(source.len())
+            .min(start.saturating_add(HEADER_SCAN_SPAN));
+        (start < end).then(|| crate::mjpeg::parse_frame_header(&source[start..end])).flatten()
+    });
+    let Some(s) = sof else { return };
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(s.precision);
+    }
+    if track.chroma.is_none() {
+        track.chroma = s.chroma.map(str::to_string);
+    }
+}
+
+/// Fill depth and chroma for the VfW-carried families whose values are format
+/// constants rather than coded fields, where the track still carries neither.
+///
+/// Two provenances, both stated at their arm. VC-1's is normative: SMPTE
+/// ST 421 defines exactly one chroma format (`COLORDIFF_FORMAT` 1, 4:2:0) and
+/// 8-bit samples for every profile — the same pair [`crate::vc1`]'s
+/// Advanced-profile parse fills from the sequence header, which is why this
+/// arm only ever completes Simple/Main (`WMV3`), whose `STRUCT_C` states
+/// neither. The WMV1/WMV2 and MS-MPEG-4 arm is a witnessed constant, not a
+/// spec row: they are H.263-lineage designs with no other pixel format,
+/// ffmpeg's decoders emit `yuv420p` alone, and MediaInfo states 8 bits for
+/// WMV2 — single-witness and labelled, the studio-VOL convention.
+pub(crate) fn fill_constant_depth_chroma(track: &mut TrackDemux) {
+    let constant = match &track.codec {
+        Codec::Vc1 | Codec::MsMpeg4(_) => true,
+        Codec::Other(l) => l.eq_ignore_ascii_case("WMV1") || l.eq_ignore_ascii_case("WMV2"),
+        _ => false,
+    };
+    if !constant {
+        return;
+    }
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(8);
+    }
+    if track.chroma.is_none() {
+        track.chroma = Some("4:2:0".to_string());
+    }
+}
+
 /// Fill an MPEG-4 Part 2 track's stream-derived fields, the Part 2 analogue of
 /// [`fill_mpeg2_stream_fields`].
 ///
@@ -1975,5 +2036,29 @@ mod tests {
         let mut unspecified = av1c;
         unspecified[16] = 0x81;
         assert!(color_from_av1c(&unspecified).is_none());
+    }
+
+    #[test]
+    fn constant_depth_chroma_fills_only_its_families_and_only_gaps() {
+        // The MS-MPEG-4 family and VC-1 by codec, WMV1/WMV2 by their label —
+        // no fixture can pin the VC-1 arm (Simple/Main has no encoder
+        // anywhere), so this test is that arm's only guard.
+        for codec in [Codec::MsMpeg4(2), Codec::Vc1, Codec::Other("WMV1".into())] {
+            let mut t = TrackDemux::new(codec.clone(), NalFormat::AnnexB);
+            fill_constant_depth_chroma(&mut t);
+            assert_eq!((t.bit_depth, t.chroma.as_deref()), (Some(8), Some("4:2:0")), "{codec:?}");
+        }
+        // A value a real parse already filled is never overwritten.
+        let mut t = TrackDemux::new(Codec::Vc1, NalFormat::AnnexB);
+        t.chroma = Some("4:2:2".to_string());
+        fill_constant_depth_chroma(&mut t);
+        assert_eq!(t.chroma.as_deref(), Some("4:2:2"));
+        // Every other codec — including an unrelated FourCC label — is
+        // untouched: these constants are family facts, not defaults.
+        for codec in [Codec::Hevc, Codec::Mjpeg, Codec::Other("dvsd".into())] {
+            let mut t = TrackDemux::new(codec.clone(), NalFormat::AnnexB);
+            fill_constant_depth_chroma(&mut t);
+            assert_eq!((t.bit_depth, t.chroma), (None, None), "{codec:?}");
+        }
     }
 }

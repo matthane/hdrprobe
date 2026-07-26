@@ -555,6 +555,11 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         if matches!(t.codec, Codec::Mpeg1 | Codec::Mpeg2) {
             super::fill_mpeg2_stream_fields(t, data);
         }
+        // MJPEG the same way again: depth and chroma exist only in each
+        // frame's own SOF header.
+        if t.codec == Codec::Mjpeg {
+            super::fill_mjpeg_stream_fields(t, data);
+        }
     }
     // MPEG-4 Part 2 the same way, but with the `esds` DecoderSpecificInfo tried
     // first: a muxer that wrote one has already handed over the visual headers,
@@ -771,6 +776,9 @@ fn codec_from_oti(oti: u8) -> Option<Codec> {
         0x20 => Codec::Mpeg4Part2,
         0x60..=0x65 => Codec::Mpeg2,
         0x6A => Codec::Mpeg1,
+        // "Visual ISO/IEC 10918-1" — JPEG, i.e. MJPEG when it is a video
+        // track. ffmpeg's MP4 muxer writes exactly this pairing.
+        0x6C => Codec::Mjpeg,
         _ => return None,
     })
 }
@@ -829,6 +837,10 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         // File Format": the sample entry is `vc-1` and always contains a `dvc1`
         // config box, VC-1's analogue of `avcC`.
         b"vc-1" => Codec::Vc1,
+        // QuickTime MJPEG (what `ffmpeg -c:v mjpeg out.mov` writes). Apple's
+        // `mjpa`/`mjpb` field-split variants alter the frame layout and keep
+        // their FourCC.
+        b"jpeg" => Codec::Mjpeg,
         other => Codec::Other(String::from_utf8_lossy(other).to_string()),
     };
 

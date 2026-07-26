@@ -232,6 +232,12 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             .or_else(|| {
                 file_size_ok.then(|| Bitrate::overall(data.len() as u64, duration_secs)).flatten()
             });
+        // The families whose depth and chroma are format constants (WMV3's
+        // ST 421 pair, the WMV1/WMV2 and MS-MPEG-4 witnessed constants),
+        // filled only where the extradata read above left both absent. ASF
+        // indexes no payload, so this is also the only depth/chroma source a
+        // `WMV1`/`WMV2` track can ever have here.
+        super::fill_constant_depth_chroma(&mut td);
         tracks.push(td);
     }
 

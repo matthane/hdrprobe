@@ -196,6 +196,20 @@ never parse bytes native-endian.
   own `th_granule_frame` adjustment). Bit depth is the spec constant 8 (§1.2 says wider "is not
   planned"), like MPEG-2's and ProRes's family depth; `NOMBR` is a stated hint and is never a
   bitrate (MediaInfo reports it as one — 200000 on every corpus file against a measured 198868).
+- `mjpeg.rs` — Motion JPEG (ITU-T T.81), the plainest gap-filler: depth and chroma from the
+  first frame's own `SOF` marker segment, reached by a bounded declared-length marker walk that
+  stops at `SOS` (entropy-coded data would otherwise read as markers). Two facts are invariants,
+  both pinned by tests. **Depth and chroma are signalled, not family constants** — `SOF`
+  precision is 8 only for baseline, and real capture hardware writes 4:2:2 — so they are read,
+  never assumed (unlike the WMV/MS-MPEG-4 constants in `container::fill_constant_depth_chroma`).
+  And **subsampling is the ratio of luma to chroma factors, not the factors themselves**:
+  ffmpeg's 4:4:4 encodes write a uniform `0x12` on all three components, which a raw-factor
+  table misreads as nothing. MJPEG records no colour anywhere this tree reads (JFIF's BT.601
+  full-range is an interchange-format definition, not a signal), so the Color line stays empty.
+  Carriages: VfW `MJPG` (AVI/ASF/MKV — ASF indexes no payload, so its MJPEG reports no
+  depth/chroma, honestly), Matroska `V_MJPEG`, QuickTime `jpeg`, MP4 `esds` OTI `0x6C`. Apple's
+  `mjpa`/`mjpb` field-split variants and the vendor VfW tags (`dmb1`, `AVRn`, `LJPG`) alter the
+  frame layout or lack a witness and stay on the honest-FourCC fallback.
 - `container/bmih.rs` — `BITMAPINFOHEADER`, the Video for Windows description block, plus the
   FourCC-to-codec table. It lives in `container/` rather than a backend because three carriages
   hand one over: AVI's `strf`, ASF's type-specific data, and **Matroska's `V_MS/VFW/FOURCC`**,

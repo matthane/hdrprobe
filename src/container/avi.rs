@@ -929,8 +929,13 @@ fn fill_from_bitstream(td: &mut TrackDemux, data: &[u8], extradata: &[u8]) {
         // the configuration by every carriage spec that defines one, so a chunk
         // scan could only find what `extradata` already held.
         Codec::Vc1 => super::fill_vc1_stream_fields(td, extradata),
+        Codec::Mjpeg => super::fill_mjpeg_stream_fields(td, data),
         _ => {}
     }
+    // After the header reads: the families whose depth and chroma are format
+    // constants (WMV3's ST 421 pair, the WMV1/WMV2 and MS-MPEG-4 witnessed
+    // constants — the helper's doc carries both provenances).
+    super::fill_constant_depth_chroma(td);
 }
 
 // --- prefetch support --------------------------------------------------------
@@ -1172,14 +1177,16 @@ mod tests {
 
     #[test]
     fn a_container_rate_still_applies_when_the_stream_signals_none() {
-        // MJPEG has no parser here, so nothing fills `fps` from the bitstream
-        // and the container's rate is the answer — which is the normal case for
-        // every codec whose headers state no rate.
+        // MJPEG's frame headers state depth and chroma but no rate, so the
+        // container's rate is the answer — which is the normal case for every
+        // codec whose headers state no rate. (These chunks are not JPEG
+        // images, so the SOF fill also finds nothing and fills nothing.)
         let f = frames(b"00dc", &[100, 100]);
         let d =
             demux(&build(&video_hdrl(b"MJPG", 1, 25, 2, &[]), &f, Idx1::Relative)).expect("demuxes");
         assert_eq!(d.tracks[0].fps, Some(25.0));
-        assert_eq!(d.tracks[0].codec, Codec::Other("MJPG".to_string()));
+        assert_eq!(d.tracks[0].codec, Codec::Mjpeg);
+        assert_eq!(d.tracks[0].bit_depth, None, "junk chunks fill no depth");
     }
 
     #[test]

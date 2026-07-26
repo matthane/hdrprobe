@@ -511,6 +511,16 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         if td.codec == Codec::Vc1 {
             super::fill_vc1_stream_fields(&mut td, headers);
         }
+        // MJPEG is the VP9/ProRes shape once more: nothing but the frames
+        // themselves states depth or chroma, and the first block's SOF sits in
+        // the warmed head window.
+        if td.codec == Codec::Mjpeg {
+            super::fill_mjpeg_stream_fields(&mut td, data);
+        }
+        // Then the families whose depth and chroma are format constants
+        // (WMV3's ST 421 pair, the WMV1/WMV2 and MS-MPEG-4 witnessed
+        // constants), filled only where the reads above left both absent.
+        super::fill_constant_depth_chroma(&mut td);
         tracks.push(td);
     }
 
@@ -1274,6 +1284,11 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
         // which is why one arm serves all three. `V_MPEG4/ISO/AVC` is checked
         // above and cannot reach here.
         CodecConfig::bare(Codec::Mpeg4Part2)
+    } else if codec_id.starts_with(b"V_MJPEG") {
+        // Registry MJPEG: no CodecPrivate; every block is a whole JPEG image,
+        // so depth and chroma come from the first block's SOF header via
+        // `fill_mjpeg_stream_fields` after the blocks are indexed.
+        CodecConfig::bare(Codec::Mjpeg)
     } else if codec_id.starts_with(b"V_MPEG4/MS/V3") {
         // Microsoft's pre-standard v3. Its CodecPrivate is a `BITMAPINFOHEADER`
         // in some muxes and empty in others, and either way the bitstream
@@ -1313,7 +1328,7 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
                     }
                 }
             }
-            Some(c @ (Codec::Mpeg4Part2 | Codec::Vc1 | Codec::MsMpeg4(_))) => {
+            Some(c @ (Codec::Mpeg4Part2 | Codec::Vc1 | Codec::MsMpeg4(_) | Codec::Mjpeg)) => {
                 CodecConfig { extradata_offset: super::bmih::HEADER_LEN, ..CodecConfig::bare(c) }
             }
             // The FourCC is the identifier a user recognises; the CodecID is the

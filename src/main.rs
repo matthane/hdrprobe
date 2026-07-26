@@ -9,6 +9,7 @@ mod dv;
 mod hdr;
 mod hevc;
 mod model;
+mod mjpeg;
 mod mpeg2;
 mod mpeg4part2;
 mod prefetch;

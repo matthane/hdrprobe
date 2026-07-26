@@ -623,11 +623,15 @@ fn extract_chunk(data: &[u8], chunk: Chunk, fmt: NalFormat, codec: &Codec) -> Ch
         // index, so this arm is unreachable through Ogg — it exists because the
         // codec must be named somewhere, and naming it here is what keeps a
         // future carriage from silently falling into `Other`.
+        // MJPEG is one more of the same: independent JPEG images with no
+        // side-channel slot anywhere in T.81's marker space that any HDR
+        // system uses.
         Codec::Mpeg1
         | Codec::Mpeg2
         | Codec::Mpeg4Part2
         | Codec::Vc1
         | Codec::MsMpeg4(_)
+        | Codec::Mjpeg
         | Codec::Theora => {}
         Codec::Other(_) => {}
     }

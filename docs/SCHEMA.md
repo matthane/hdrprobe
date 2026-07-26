@@ -281,7 +281,7 @@ errors rather than guessing.
 | `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number. Absent where no such id exists (raw elementary streams, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"MJPG"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
@@ -347,6 +347,7 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 | MPEG-4 Visual | `<profile>@L<level>` from `profile_and_level_indication`; omitted when the byte is reserved, and omitted entirely when the stream carries no VisualObjectSequence header, which many muxes drop | `"Simple@L1"`, `"Simple@L0b"`, `"Advanced Simple@L3b"`, `"Simple Studio@L4"` |
 | VC-1 | `Advanced@L<level>` from the sequence header for Advanced Profile; the bare profile name (`"Simple"`, `"Main"`, `"Complex"`) for the others, whose STRUCT_C carries no level | `"Advanced@L3"`, `"Main"` |
 | MS-MPEG-4 | Always omitted: the pre-standard Microsoft variants signal no profile | |
+| MJPEG | Always omitted: T.81 defines processes, not signalled profiles | |
 
 ### `Bitrate`
 
@@ -893,6 +894,15 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   `profile_idc` 66 with `constraint_set1_flag` set (H.264 §A.2.1.1) on every AVC carriage —
   streams that previously reported the less specific `"Baseline"`, which both reference tools
   already refine.
+  Also additive: **`"MJPEG"` joins the `codec` set** — the `MJPG` VfW tag (AVI, ASF, Matroska
+  `V_MS/VFW/FOURCC`), the Matroska `V_MJPEG` CodecID, the QuickTime `jpeg` sample entry and the
+  MP4 `esds` object type 0x6C all resolve to it, where such tracks previously reported their
+  container identifier verbatim (`"MJPG"`, `"V_MJPEG"`, `"jpeg"`). An MJPEG track reports
+  `bit_depth` and `chroma` read from the frame's own JPEG `SOF` header wherever the carriage
+  indexes payload. And `bit_depth`/`chroma` now appear for three families whose values are
+  format constants: VC-1 Simple/Main (`WMV3` — ST 421 defines 8-bit 4:2:0 for every profile,
+  completing what the Advanced-profile sequence-header parse already reported), WMV1/WMV2, and
+  MS-MPEG-4 v1/v2/v3 (H.263-lineage designs with no other pixel format).
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional

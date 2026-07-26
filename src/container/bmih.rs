@@ -76,8 +76,10 @@ pub(crate) fn parse(data: &[u8]) -> Option<BitmapInfoHeader> {
 /// than "every codec this build understands". Two groups are held back on
 /// purpose:
 ///
-/// - **MJPEG, DV, H.263 and the raw-bitmap families** have no parser here at
-///   all, so naming them would add a label without adding a fact.
+/// - **DV, H.263 and the raw-bitmap families** have no parser here at all, so
+///   naming them would add a label without adding a fact. (MJPEG left this
+///   group when [`crate::mjpeg`] gained its `SOF` read — the name now comes
+///   with the frame's own depth and chroma.)
 /// - **The bare FourCC `MPEG`**, which different tools claim for MPEG-1 and for
 ///   MPEG-2 and which nothing here can separate — unlike the version-bearing
 ///   spellings beside it, which are unambiguous and are mapped.
@@ -127,6 +129,10 @@ pub(crate) fn codec_from_fourcc(fourcc: &[u8; 4]) -> Option<Codec> {
         // `MPEG` does.
         b"MPG1" | b"PIM1" => Codec::Mpeg1,
         b"MPG2" | b"PIM2" | b"EM2V" | b"LMP2" => Codec::Mpeg2,
+        // ITU-T T.81 images in sequence. Only the ubiquitous tag: the vendor
+        // variants (`dmb1`, `AVRn`, `LJPG`…) alter the frame layout or lack a
+        // witness here, so they keep their FourCC.
+        b"MJPG" => Codec::Mjpeg,
         _ => return None,
     })
 }
@@ -232,9 +238,14 @@ mod tests {
     fn an_unmapped_fourcc_declines_rather_than_guessing() {
         // Codecs with no parser in this build, and one that is not a codec at
         // all.
-        for f in [b"MJPG", b"dvsd", b"H263", b"\0\0\0\0"] {
+        for f in [b"dvsd", b"H263", b"\0\0\0\0"] {
             assert_eq!(codec_from_fourcc(f), None, "{:?}", f);
         }
+        // MJPEG has a frame-header read now, so its tag maps — but only the
+        // ubiquitous spelling; the vendor variants alter the layout or lack a
+        // witness and keep their FourCC.
+        assert_eq!(codec_from_fourcc(b"MJPG"), Some(Codec::Mjpeg));
+        assert_eq!(codec_from_fourcc(b"dmb1"), None);
     }
 
     #[test]
