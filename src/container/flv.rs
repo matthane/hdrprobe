@@ -441,12 +441,15 @@ fn apply_video_tag(data: &[u8], body: usize, end: usize, w: &mut HeadWalk) {
         // named and not indexed.
         return;
     }
-    // `AVCPacketType` then a 3-byte composition time, then the payload.
-    let Some(&packet_type) = data.get(body + 1) else { return };
+    // `AVCPacketType` then a 3-byte composition time, then the payload. The
+    // whole five-byte header is checked against the tag's end before any of it
+    // is read, so a short tag cannot take its packet type from the following
+    // back-pointer.
     let payload = body + 5;
     if payload > end {
         return;
     }
+    let packet_type = data[body + 1];
     match packet_type {
         // "This contains the same information that would be stored in an avcC
         // box in an MP4/FLV file" — Adobe's spec, verbatim.
@@ -512,8 +515,10 @@ fn apply_enhanced_tag(data: &[u8], body: usize, end: usize, w: &mut HeadWalk) {
     }
     let multitrack = packet_type == PKT_MULTITRACK;
     if multitrack {
-        let Some(&b) = data.get(pos) else { return };
-        packet_type = b & 0x0F;
+        if pos >= end {
+            return;
+        }
+        packet_type = data[pos] & 0x0F;
         pos += 1;
     }
     // Bounded by the *tag*, not the buffer: every other read in this function
