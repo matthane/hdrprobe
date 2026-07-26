@@ -78,15 +78,16 @@ pub(crate) fn parse(data: &[u8]) -> Option<BitmapInfoHeader> {
 ///
 /// - **MJPEG, DV, H.263 and the raw-bitmap families** have no parser here at
 ///   all, so naming them would add a label without adding a fact.
-/// - **AVC and HEVC** do have parsers, but a VfW-wrapped one also needs its NAL
-///   framing decided — the extradata is an `avcC` record in some muxes and raw
-///   Annex-B in others — and feeding the sampler a wrong guess is worse than
-///   reporting the FourCC. No fixture here settles it; the AVI backend, which
-///   owns that rule (`dev/sdr-format-reference.md` §5), should add them with a
-///   real file in hand.
-/// - **MPEG-1/2**, because `MPEG` is claimed for both by different tools, no
-///   fixture settles it, and Matroska carries those codecs natively rather than
-///   through this wrapper.
+/// - **The bare FourCC `MPEG`**, which different tools claim for MPEG-1 and for
+///   MPEG-2 and which nothing here can separate — unlike the version-bearing
+///   spellings beside it, which are unambiguous and are mapped.
+///
+/// AVC and HEVC *are* here, and were the late addition. They need their NAL
+/// framing decided as well as their identity — VfW extradata is a configuration
+/// record in some muxes and raw Annex-B in others — so every caller must pair
+/// this with [`is_config_record`]. That rule is settled by real files now
+/// (`dev/sdr-format-reference.md` §5, and `testfiles/sdr/h264.avi` against
+/// `h264_avcc.avi`), which is what unblocked them.
 pub(crate) fn codec_from_fourcc(fourcc: &[u8; 4]) -> Option<Codec> {
     let mut upper = *fourcc;
     upper.make_ascii_uppercase();
@@ -106,8 +107,51 @@ pub(crate) fn codec_from_fourcc(fourcc: &[u8; 4]) -> Option<Codec> {
         b"MP42" | b"DIV2" => Codec::MsMpeg4(2),
         // `MPG4` is v1, and is not `MP4V`, which is ISO Part 2 above.
         b"MPG4" | b"MP41" => Codec::MsMpeg4(1),
+        // ITU-T H.264. `AVC1` is the tag an `ffmpeg -c:v copy` remux out of MP4
+        // writes, and it is the one that comes with a configuration record;
+        // `H264` is a fresh encode's, carrying Annex-B in the chunks. The
+        // framing is decided by [`is_config_record`], never by the FourCC.
+        b"H264" | b"X264" | b"AVC1" | b"DAVC" | b"VSSH" | b"SMV2" | b"Q264" | b"V264"
+        | b"GAVC" | b"UMSV" | b"INMC" | b"TSHD" => Codec::Avc,
+        // ITU-T H.265.
+        b"H265" | b"HEVC" | b"HVC1" | b"HEV1" => Codec::Hevc,
+        // ISO/IEC 11172-2 and ITU-T H.262. Only the spellings that name their
+        // own version are here: `ffmpeg -c:v mpeg2video out.avi` writes `mpg2`,
+        // and both reference tools read it as MPEG-2 without hesitating. The
+        // bare `MPEG` is excluded because it is genuinely ambiguous (see the
+        // table's doc); a stream wearing it keeps the FourCC and its picture
+        // facts, which is the honest outcome rather than a coin flip on the
+        // codec name.
+        // `VCR2`, `DVR ` and `slif` share the family row in the reference's
+        // table without a stated version, so they stay out for the same reason
+        // `MPEG` does.
+        b"MPG1" | b"PIM1" => Codec::Mpeg1,
+        b"MPG2" | b"PIM2" | b"EM2V" | b"LMP2" => Codec::Mpeg2,
         _ => return None,
     })
+}
+
+/// Whether VfW codec extradata is a decoder configuration record rather than
+/// raw Annex-B bytes, which is the only thing that decides an AVC or HEVC
+/// track's NAL framing.
+///
+/// **Both framings are common and the FourCC does not separate them.** A fresh
+/// `ffmpeg` encode to AVI writes tag `H264` with no extradata at all and
+/// Annex-B start codes in the chunks; `ffmpeg -i x.mp4 -c:v copy out.avi`
+/// writes tag `avc1`, a 46-byte `avcC` in `strf`, and 4-byte length-prefixed
+/// NALs. The muxer's own start-code guard is tag-gated (`avienc.c` runs
+/// `ff_check_h264_startcode` only for `MKTAG('H','2','6','4')`), so the second
+/// form is emitted without a warning.
+///
+/// The test is the first byte: `AVCDecoderConfigurationRecord` and
+/// `HEVCDecoderConfigurationRecord` both open with `configurationVersion == 1`,
+/// while Annex-B opens with a start code, whose first byte is `0x00`. This is
+/// exactly ffmpeg's discriminator in `ff_h264_decode_extradata`. The length
+/// prefix size is *not* read here — it sits at a different offset in each
+/// record (byte 4 for `avcC`, byte 21 for `hvcC`), so it comes from that
+/// record's own parser.
+pub(crate) fn is_config_record(extradata: &[u8]) -> bool {
+    extradata.first() == Some(&0x01)
 }
 
 #[cfg(test)]
@@ -186,11 +230,45 @@ mod tests {
 
     #[test]
     fn an_unmapped_fourcc_declines_rather_than_guessing() {
-        // Codecs with no parser in this build, two this build *can* parse but
-        // deliberately holds back (see the table's doc), and one that is not a
-        // codec at all.
-        for f in [b"MJPG", b"dvsd", b"H263", b"mpg2", b"H264", b"HEVC", b"\0\0\0\0"] {
+        // Codecs with no parser in this build, and one that is not a codec at
+        // all.
+        for f in [b"MJPG", b"dvsd", b"H263", b"\0\0\0\0"] {
             assert_eq!(codec_from_fourcc(f), None, "{:?}", f);
         }
+    }
+
+    #[test]
+    fn the_mpeg_family_maps_only_where_the_fourcc_names_its_version() {
+        // `ffmpeg -c:v mpeg2video out.avi` writes `mpg2`, and both reference
+        // tools read it as MPEG-2 — the parser for it has been wired since
+        // Phase 1, so declining here cost the whole codec identity.
+        assert_eq!(codec_from_fourcc(b"mpg2"), Some(Codec::Mpeg2));
+        assert_eq!(codec_from_fourcc(b"mpg1"), Some(Codec::Mpeg1));
+        assert_eq!(codec_from_fourcc(b"PIM2"), Some(Codec::Mpeg2));
+        // The bare family tag is claimed for both versions by different tools
+        // and nothing here separates them, so it keeps the FourCC rather than
+        // flipping a coin on the codec name.
+        assert_eq!(codec_from_fourcc(b"MPEG"), None);
+    }
+
+    #[test]
+    fn the_two_h264_avi_tags_map_to_one_codec_and_differ_only_in_framing() {
+        // `testfiles/sdr/h264.avi` (fresh encode) and `h264_avcc.avi` (an
+        // `-c:v copy` remux out of MP4) carry the same codec under different
+        // tags, and the tag is *not* what decides the framing.
+        assert_eq!(codec_from_fourcc(b"H264"), Some(Codec::Avc));
+        assert_eq!(codec_from_fourcc(b"avc1"), Some(Codec::Avc));
+        assert_eq!(codec_from_fourcc(b"HEVC"), Some(Codec::Hevc));
+    }
+
+    #[test]
+    fn the_framing_test_reads_the_extradata_not_the_fourcc() {
+        // `h264_avcc.avi`'s `strf` extradata, first bytes: an avcC opens with
+        // configurationVersion 1.
+        assert!(is_config_record(&[0x01, 0x64, 0x00, 0x0D, 0xFF, 0xE1]));
+        // `h264.avi` carries no extradata at all, and the Annex-B variant that
+        // does carry some opens with a start code.
+        assert!(!is_config_record(&[]));
+        assert!(!is_config_record(&[0x00, 0x00, 0x00, 0x01, 0x67, 0x64]));
     }
 }

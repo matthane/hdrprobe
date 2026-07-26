@@ -1062,10 +1062,16 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     // the container's authority over primaries/transfer/matrix — the MP4
     // nclc-colr treatment.
     if color.transfer.is_none() || color.range.is_none() {
+        // Past the `BITMAPINFOHEADER` for a `V_MS/VFW/FOURCC` track, and the
+        // whole blob for every CodecID that stores its record directly. Handing
+        // the record parsers a VfW-prefixed buffer would have them read the
+        // bitmap header as a configuration record — `biSize` 40 even clears
+        // `parse_hvcc_record`'s length gate.
+        let rec = codec_private.get(cc.extradata_offset..).unwrap_or_default();
         let stream_color = match cc.codec {
-            Codec::Hevc => super::color_from_hvcc(codec_private),
-            Codec::Avc => super::color_from_avcc(codec_private),
-            Codec::Av1 => super::color_from_av1c(codec_private),
+            Codec::Hevc => super::color_from_hvcc(rec),
+            Codec::Avc => super::color_from_avcc(rec),
+            Codec::Av1 => super::color_from_av1c(rec),
             _ => None,
         };
         if let Some((c, c_src)) = stream_color {
@@ -1131,46 +1137,53 @@ impl CodecConfig {
     }
 }
 
+/// Config for a track whose parameters live in an `avcC`/`hvcC` decoder
+/// configuration record: the NAL length prefix, profile, depth and chroma all
+/// come out of it. `rec` is the record itself and `extradata_offset` says where
+/// it began inside CodecPrivate — zero for the native CodecIDs, past the
+/// `BITMAPINFOHEADER` for a Video for Windows wrapper — so the colour fallback
+/// in `parse_track_entry` re-slices to the same bytes.
+///
+/// A record that fails to parse keeps the codec and the conventional 4-byte
+/// prefix rather than dropping the track, which is what the two native arms did
+/// before this was shared.
+fn nal_config(codec: Codec, rec: &[u8], extradata_offset: usize) -> CodecConfig {
+    let mut cfg = CodecConfig {
+        codec,
+        nal_format: NalFormat::LengthPrefixed(4),
+        bit_depth: None,
+        chroma: None,
+        codec_profile: None,
+        extradata_offset,
+    };
+    let parsed = match cfg.codec {
+        Codec::Hevc => super::parse_hvcc_record(rec).map(|h| {
+            (h.nal_len, h.bit_depth, h.chroma.to_string(), h.profile_str)
+        }),
+        _ => super::parse_avcc_record(rec)
+            .map(|a| (a.nal_len, a.bit_depth, a.chroma.to_string(), a.profile_str)),
+    };
+    if let Some((nal_len, bit_depth, chroma, profile)) = parsed {
+        cfg.nal_format = NalFormat::LengthPrefixed(nal_len);
+        cfg.bit_depth = Some(bit_depth);
+        cfg.chroma = Some(chroma);
+        cfg.codec_profile = Some(profile);
+    }
+    cfg
+}
+
 /// Map a Matroska CodecID (+ CodecPrivate) to codec, NAL framing and codec config.
 fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
     if codec_id.starts_with(b"V_MPEGH/ISO/HEVC") {
         // CodecPrivate is an HEVCDecoderConfigurationRecord; blocks are
         // length-prefixed NAL units per its lengthSizeMinusOne.
-        let mut cfg = CodecConfig {
-            codec: Codec::Hevc,
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-            extradata_offset: 0,
-        };
-        if let Some(h) = super::parse_hvcc_record(codec_private) {
-            cfg.nal_format = NalFormat::LengthPrefixed(h.nal_len);
-            cfg.bit_depth = Some(h.bit_depth);
-            cfg.chroma = Some(h.chroma.to_string());
-            cfg.codec_profile = Some(h.profile_str);
-        }
-        cfg
+        nal_config(Codec::Hevc, codec_private, 0)
     } else if codec_id.starts_with(b"V_MPEG4/ISO/AVC") {
         // CodecPrivate is an AVCDecoderConfigurationRecord; depth/chroma/profile
         // come from its embedded SPS (not fixed header fields — see
         // `parse_avcc_record`). Covers SDR AVC muxes (8-bit, or 10-bit Hi10P)
         // and DV Profile 9, whose RPU the sampler finds by content.
-        let mut cfg = CodecConfig {
-            codec: Codec::Avc,
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-            extradata_offset: 0,
-        };
-        if let Some(a) = super::parse_avcc_record(codec_private) {
-            cfg.nal_format = NalFormat::LengthPrefixed(a.nal_len);
-            cfg.bit_depth = Some(a.bit_depth);
-            cfg.chroma = Some(a.chroma.to_string());
-            cfg.codec_profile = Some(a.profile_str);
-        }
-        cfg
+        nal_config(Codec::Avc, codec_private, 0)
     } else if codec_id.starts_with(b"V_VP9") {
         // CodecPrivate is the WebM VP9 feature list (profile/level/depth/
         // chroma) — optional, and colour-less by definition; whatever it
@@ -1248,15 +1261,33 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
         // headers as trailing extradata. It is the only carriage VC-1 has in
         // Matroska.
         //
-        // Only codecs this build never *samples* are adopted. An AVC or HEVC
-        // FourCC would also need its NAL framing decided — VfW extradata is an
-        // `avcC` record in some muxes and raw Annex-B in others — and guessing
-        // wrong feeds the sampler bytes that are not NAL units. No fixture
-        // exists here to settle that, so those keep the identifier fallback
-        // until the AVI backend, which owns the rule, has one.
+        // AVC and HEVC additionally need their NAL framing decided, because VfW
+        // extradata is a configuration record in some muxes and raw Annex-B in
+        // others and the FourCC does not separate them
+        // (`bmih::is_config_record`). A record also states the length prefix,
+        // profile and depth outright, so it is parsed here exactly as an MP4
+        // `avcC`/`hvcC` would be; Annex-B extradata leaves those to the
+        // bitstream, where `codec_headers` already points.
         let bmih = super::bmih::parse(codec_private);
         let fourcc = bmih.as_ref().map(|b| b.compression);
+        let extradata = codec_private.get(super::bmih::HEADER_LEN..).unwrap_or_default();
         match fourcc.as_ref().and_then(super::bmih::codec_from_fourcc) {
+            Some(c @ (Codec::Avc | Codec::Hevc)) => {
+                if super::bmih::is_config_record(extradata) {
+                    nal_config(c, extradata, super::bmih::HEADER_LEN)
+                } else {
+                    // Raw Annex-B parameter sets, or no extradata at all: the
+                    // blocks are Annex-B access units, and nothing in the
+                    // wrapper states depth, chroma or profile. Naming the codec
+                    // is the whole gain, and it is a real one — such a track
+                    // used to report the bare FourCC.
+                    CodecConfig {
+                        nal_format: NalFormat::AnnexB,
+                        extradata_offset: super::bmih::HEADER_LEN,
+                        ..CodecConfig::bare(c)
+                    }
+                }
+            }
             Some(c @ (Codec::Mpeg4Part2 | Codec::Vc1 | Codec::MsMpeg4(_))) => {
                 CodecConfig { extradata_offset: super::bmih::HEADER_LEN, ..CodecConfig::bare(c) }
             }
