@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 392 unit tests
+cargo test                     # 451 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -79,7 +79,9 @@ never parse bytes native-endian.
   `VP80` → an honest error, else AV1), `mpegv.rs` (raw MPEG-1/2 video elementary stream, the
   thinnest backend in the tree: a bounded head read fills the General fields and `chunks` stays
   empty, per the metadata-only contract on `TrackDemux::chunks`), `ps.rs` (below); `mod.rs` holds
-  `Demux`/`Chunk`/`DvConfig`, the shared dvcC/hvcC/CICP decoders, and — since TS and PS both
+  `Demux`/`Chunk`/`DvConfig`, the shared dvcC/hvcC/CICP decoders, `fill_nal_config_fields` (an
+  `avcC`/`hvcC` record to a `TrackDemux`, shared because AVI, ASF and FLV all hand one over and
+  each reaches it through a different carriage's framing test), and — since TS and PS both
   reassemble an elementary stream out of packet payloads and then have to read the picture out
   of the bitstream — the shared in-band SPS search (`SpsCommon`, `best_sps`, `sps_fields`).
 - `hevc/` — `nal.rs` (Annex-B + length-prefixed NAL split), `sps.rs` (dims + VUI colour + VUI
@@ -219,6 +221,94 @@ never parse bytes native-endian.
   rate is 12.5% high). Deliberately not parsed: `vprp` (it carries only display aspect ratio and
   field order, both out of scope plan-wide, plus a refresh rate and geometry that duplicate
   `strh`/`strf`), `dwMaxBytesPerSec` (a whole-file maximum including audio) and `biBitCount`.
+- `container/asf.rs` — ASF / Windows Media (`.wmv`, `.asf`, and a `.wma` carrying video), a flat
+  tree of `GUID` + `u64 size` objects walked from byte 0. The Header Object declares its own size
+  and holds every reported field, so the parse is a bounded head read and **`chunks` stays empty
+  by design**, not by omission: ASF Data Packets carry a length-encoded payload header with
+  several payloads per packet and payloads split across packets, so a video access unit is not a
+  byte range in the file, and nothing in the report needs one (VC-1 publishes its sequence header
+  into codec-private data by every carriage spec that defines one, the Windows Media codecs signal
+  nothing in band, and the bitrate and duration are stated outright). Five facts are invariants.
+  **GUIDs are mixed-endian and are generated, never hand-typed** (`guid()` does
+  `struct.pack('<IHH', d1, d2, d3) + bytes[8:16]` at compile time) — the reference records three
+  being mistyped while it was written, each reporting an object as absent from a file that plainly
+  contains it. **The tree must be walked, never searched**: real files are multi-stream and the
+  audio stream is routinely first, so the first `Stream Properties Object` is the wrong one, and
+  there is one `Extended Stream Properties Object` *per stream*, correlated by `Stream Number`.
+  **Play Duration is offset by Preroll and the units differ** (100-nanosecond ticks against
+  milliseconds); Microsoft's encoder writes a 5000 ms preroll and ffmpeg 3100 ms, so skipping the
+  subtraction overstates a 2-second clip by 155%. **`Maximum Bitrate` is a whole-file ceiling and
+  is never read**; the per-video-stream rate is the ESP `Data Bitrate` (the leak rate "excluding
+  all ASF Data Packet overhead"), with `Stream Bitrate Properties` as the ~1%-higher fallback that
+  the spec says *should* include that overhead — MediaInfo prefers the same one. And **ASF records
+  no colour anywhere**, so a WVC1 track's colour comes from the VC-1 sequence header in the
+  extradata and `WMV1`/`WMV2`/`WMV3` correctly report none. Two smaller traps: the object walk is
+  *recursive* (into the Header Extension) and a Header Extension costs 46 bytes, so it is
+  depth-bounded — a stack overflow is an abort, outside the 0/1/2 exit contract and outside
+  `catch_unwind`; and the WVC1 extradata does **not** begin at its start code (both
+  Microsoft-authored corpus files write one leading byte before `00 00 01 0F`), which is why
+  `vc1::parse_sequence_header` locates the EBDU instead of reading from offset 0, exactly as
+  ffmpeg's `vc1_decode_init` does.
+- `container/flv.rs` — FLV (Adobe Flash Video) and Enhanced FLV / E-RTMP, `.flv`: a 9-byte header
+  then a flat chain of `11-byte header + DataSize payload + 4-byte back-pointer` tags, so the walk
+  is declared-size arithmetic like AVI's, without an index. **Big-endian throughout**, the
+  opposite of every other byte-oriented container here. Seven facts are invariants.
+  **`TimestampExtended` is the high byte** (`(byte 7 << 24) | u24(bytes 1..4)`), not a fourth low
+  byte, and **`TagType` is `byte & 0x1F`** (the top bits are reserved plus the `Filter` encrypted
+  flag, whose payload must not be handed to a parser). **`onMetaData` is a hint**: FLV's habitat is
+  RTMP ingest, its `duration` is routinely absent or zero, and ffmpeg gates width/height/codec from
+  it behind a `trust_metadata` option — so the coded stream wins every field it states and the
+  metadata fills what is left. Its `filesize`, when declared, is what tells a truncated file from a
+  complete one. **The ecma-array count is documented as approximate and must never bound the
+  parse** — writers emit 0 over a populated array — so the property list ends on its `00 00 09`
+  terminator with the tag's `DataSize` as the outer bound, and the AMF reader additionally carries
+  a *node budget*, because a property list costs three bytes per entry while each entry allocates a
+  `String`: that product is the bounded quantity, the same shape as the AVI index defect.
+  **`videodatarate` is in units of 1024 bits/s, not 1000** (7812.5 and 29296.875 on the two real
+  corpus files recover exactly 8 and 30 Mbit/s; x1000 is 2.4% low and not round), and it is
+  muxer-declared rather than measured, which is why a `--full` walk's exact sum replaces it.
+  **The Enhanced header must be detected before the CodecID is read** (bit 7 of the first payload
+  byte), a **`ModEx` packet type prefixes a variable-length block and re-states the type** so the
+  FourCC is not at a fixed offset, and **the 3-byte composition time is present only on
+  `CodedFrames` (1) *and* only for `avc1`/`hvc1`/`vvc1`** — `CodedFramesX` (3) never has it and
+  `av01`/`vp08`/`vp09` never have it, so a fixed payload start shifts an access unit by three
+  bytes, which for AV1 lands past the metadata OBUs that open the unit and costs the entire
+  dynamic report (RPU, HDR10+ T.35, CLL/MDCV). Reference §6 describes packet type 1 as "with s24
+  CTS" without the codec gate and is wrong. A **`videoFrameType` of 5 (Command) carries a command
+  byte where the FourCC would be**, except inside a Metadata packet — which is exactly the
+  combination the corpus's own `colorInfo` tag uses, so the two conditions must be tested
+  together. And **Enhanced `colorInfo` luminance is in nits where ST.2086's is 0.0001 cd/m²**, a
+  deliberate departure the E-RTMP spec calls out; reading it as ST.2086 misreports min luminance by
+  10000x. That last one has **no real-bytes fixture** — ffmpeg's muxer writes only
+  `colorConfig.matrixCoefficients`, by two independent routes — so it is spec-derived and pinned by
+  a unit test alone. Unlike ASF a video access unit *is* a byte range, so the chunk index is real
+  and the sampler runs: the corpus's Enhanced FLV reports a mastering display and MaxCLL that exist
+  only in the HEVC bitstream's SEI messages. E-RTMP **multitrack** (packet type 6) is detected and
+  confined — the first track's FourCC still names the codec, and nothing from such a tag is
+  indexed, because what follows the FourCC depends on the multitrack type and blending several
+  tracks' access units would be worse than reporting fewer facts. A `vp08`/`vp09` `SequenceStart`
+  body is a `VPCodecConfigurationRecord` — the same bytes MP4 puts in a `vpcC` — and reaching it
+  is not optional: VP9's bitstream names no transfer and no primaries at all, so that record is
+  the only place such a track's colour exists and a BT.2020/PQ stream would otherwise classify
+  SDR with nothing able to correct it (hence `container::parse_vpcc_record`, shared with MP4).
+  A file whose tag chain names no codec anywhere falls back to `onMetaData.videocodecid` — a
+  legacy id as a small integer, an Enhanced FourCC as a big-endian `u32` — which covers an
+  encrypted chain, whose `onMetaData` the spec guarantees stays in the clear; with neither, the
+  file is refused rather than reporting a placeholder track.
+  Three bounding rules earn their own mention because each was a live defect.
+  **Every read in a tag header is bounded by the tag, not the buffer**: a `DataSize` of 0 puts the
+  video header exactly on the following 4-byte `PreviousTagSize`, and a *well-formed* empty video
+  tag writes `00 00 00 0B` there — read as legacy codec id 0. Since the codec gate is first-wins
+  and `Codec::Other` has no sampler arm, one such tag makes every later real video tag inert and
+  silently costs the whole dynamic report (reproduced on the corpus Enhanced FLV: its mastering
+  display and MaxCLL vanished). **The `vpcC` arm names its codecs exactly rather than matching
+  `Other(_)`**, because `parse_vpcc_record`'s only structural test is a leading `0x01` — which is
+  `configurationVersion` in an `avcC` and an `hvcC` too, so a wildcard reads those records'
+  constraint bytes as VP9 fields and fabricates a full CICP description tagged `Container`, i.e.
+  an HDR10 verdict invented from an unrelated record. And **`videodatarate` is range-checked
+  after it is scaled, not before**: a declared rate above `f64::MAX / 1024` multiplies to
+  infinity, which serialises as JSON `null` and breaks the schema's "always a float" guarantee for
+  `bits_per_sec` — the same product-versus-factor shape as the AVI index defect, a third time.
 - `container/ps.rs` — MPEG program stream / MPEG-1 system stream (`.mpg`, `.mpeg`, `.vob`,
   `.m2p`, `.evo`), read against **ITU-T H.222.0 (10/2014) | ISO/IEC 13818-1**, which is free
   from ITU and is the normative source for the pack header (Table 2-39), the PES packet
@@ -616,8 +706,11 @@ never parse bytes native-endian.
   mode. `shell.rs` builds the Windows context-menu verb's file-type list from the same constant
   (plus `SIDECAR_EXTS`), so every addition also registers those extensions in the user's registry
   on the next `--install-shell`; that is intended, and worth naming in a commit message rather
-  than discovering later. `.bin` is the one deliberate omission: the raw-HEVC dispatch accepts it
-  and it is far too generic a name to claim in a directory of mixed files.
+  than discovering later. Two deliberate omissions, both because the extension is claimed by
+  something a directory of mixed files is full of: `.bin`, which the raw-HEVC dispatch accepts,
+  and **`.wma`**, which the ASF backend accepts because a `.wma` may legitimately carry video —
+  putting it in `VIDEO_EXTS` would make a scan of a music library open every track and print an
+  error per file.
 - **Extension dispatch falls back to content sniffing only on error.** `container::demux` picks a
   backend by extension and returns immediately on success — sniffing never runs on the happy path
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),
@@ -967,7 +1060,7 @@ never parse bytes native-endian.
   known spans — an MKV cluster, a scan batch, a TS window — warmed whole since they're consumed
   immediately), and the frontier is monotonic per file. Every container is single-pass under
   `--full` (fused or moov-indexed) — MKV/TS stream in windows, MP4 scans its moov-indexed
-  chunks in file order, and raw HEVC/AV1 fuse their whole-stream walk with extraction in
+  chunks in file order, and raw HEVC/AV1 *and FLV* fuse their whole-stream walk with extraction in
   `sample::scan_raw_full` — so one transfer covers any file size; the only whole-file demux
   walks left are the rare metadata rescues (no SPS / no sequence header in the head window).
   Gating is `is_remote_strict`, not `is_remote`: the plain verdict errs remote off-Windows
@@ -989,7 +1082,11 @@ never parse bytes native-endian.
   walk, no branch needed) and the warmed tail exactly `ps::TAIL_SCAN_BYTES` for the last-PTS
   read, routed by a `looks_like_ps` whose content half is **byte 0 only** — a pack start code
   plus a valid discriminator, never the head census `ps::demux` runs, because faulting a
-  megabyte in *before* the warm is the round-trip storm warming exists to prevent; **MKV without a
+  megabyte in *before* the warm is the round-trip storm warming exists to prevent; **FLV** —
+  the same shape again, `flv::HEAD_SCAN_BYTES` <= `HEAD_WARM` so the generic head covers the
+  bounded tag walk, plus exactly `flv::TAIL_SCAN_BYTES` for the duration fallback that follows
+  the file's final `PreviousTagSize` back to the last tag; **ASF** needs no entry at all, its
+  Header Object being at byte 0 and tens of KiB at most; **MKV without a
   Cluster SeekHead entry** falls back to the old handshake, `prefetch::HEAD_WARM` >= the first
   block's offset + `mkv::HEAD_SPAN_BYTES` (with a resolved cluster the coupling is structural:
   `MKV_HEAD_WARM` holds only the front metadata, and the block span is warmed by exact extent).

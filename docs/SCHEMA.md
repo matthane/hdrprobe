@@ -219,6 +219,17 @@ section.
 | `file` | string | always | The input path as given on the command line (or as found during a directory scan); `"-"` for a stdin probe |
 | `size_bytes` | integer | always | File size in bytes. For a truncated stdin probe (`input_truncated` present) this is the bytes actually probed, not the source's size |
 | `input_truncated` | boolean | stdin probes only, when true | The piped stream exceeded the head budget, so only a leading window was probed: `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (TS `duration_secs`, non-MP4 `bitrate`) are withheld. Absent for file probes and for stdin streams that ended within the budget; see the stdin paragraph under "How input kind and flags affect presence" |
+
+**A known limit of `input_truncated`: it says nothing about a *file* that is short.** Several
+containers state their own length — AVI's first-segment byte count, ASF's `File Properties.File
+Size`, FLV's `onMetaData.filesize` — and when the bytes on disk fall materially below it those
+backends already withhold what a prefix cannot support (any `"overall"` bitrate; for ASF, also
+`duration_secs`). But the flag stays absent, because its presence condition is stdin-only. So a
+report can legitimately show a size, a duration and a bitrate that cannot all describe the same
+file, with nothing naming the cause. Widening the flag to file probes is a presence change and so
+a **breaking** one; it is recorded for the next major bump rather than slipped into an additive
+release. Consumers that need to detect this today can compare `size_bytes` against the duration
+and bitrate themselves.
 | `container` | string | always | Container or sidecar kind; see the value table under `VideoTrack` below |
 | `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes" below |
 | `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
@@ -308,6 +319,8 @@ Video inputs:
 | `"MPEG-1 System Stream"` | Program stream with ISO/IEC 11172-1 pack headers. The system layer and the video codec version independently, so these routinely carry MPEG-2 video |
 | `"MPEG PES stream"` | Program-stream PES packets with no pack layer: a mid-file cut, or a bare PES stream |
 | `"AVI (RIFF)"` | AVI (`.avi`), including OpenDML multi-segment files — the label does not distinguish them, since OpenDML changes how the file is indexed and no fact the report carries |
+| `"ASF (Windows Media)"` | Advanced Systems Format (`.wmv`, `.asf`, and a `.wma` carrying video) |
+| `"FLV (Flash Video)"` | Flash Video (`.flv`), legacy and Enhanced/E-RTMP alike — the label does not distinguish them, since the header form changes what the report reads and not what it reports |
 | `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
@@ -340,6 +353,16 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 |---|---|---|---|
 | `bits_per_sec` | float | always | Average rate in bits per second |
 | `scope` | string | always | `"video_stream"` (exact encoded video byte count or a container-stated per-stream rate) or `"overall"` (file length divided by duration, which also counts audio and container overhead) |
+
+A `"video_stream"` rate is always about the video track alone, but it is not always a
+measurement. On MP4/MOV it is an exact sum of the sample-size table; on Matroska it is
+mkvmerge's own measured `BPS` statistic; on AVI it is the file's index summed. On **ASF and
+FLV** it may instead be a per-stream average the muxer *declared* — ASF's Extended Stream
+Properties `Data Bitrate`, FLV's `onMetaData.videodatarate` — which is what both reference
+tools report for those formats and is the only per-stream figure those containers carry. A
+declared value can differ from the encoded reality by a percent or two. Running `--full` on an
+FLV replaces it with the exact summed video payload; ASF has no such upgrade, because its
+payload is not addressable without a full demux.
 
 ### `ColorInfo`
 
@@ -817,6 +840,26 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   `duration_secs` is the longest stream's declared runtime, audio included. A Video for Windows
   FourCC naming AVC or HEVC now resolves to that codec rather than being reported verbatim,
   which also affects Matroska `V_MS/VFW/FOURCC` tracks carrying those codes.
+  Also additive: **ASF and FLV are now recognized**, so `"ASF (Windows Media)"` and
+  `"FLV (Flash Video)"` join the `container` set. `.wmv`, `.asf`, `.wma` and `.flv` produced no
+  report at all before and now produce a full one, as does any file whose bytes open with the
+  ASF Header Object GUID or the `FLV` signature. On ASF, one reported track per video
+  `Stream Properties Object`, ordered by the stream number the file itself assigns, which is
+  also `track_number`; `duration_secs` is `Play Duration` with `Preroll` subtracted, and is
+  absent for a broadcast header or a file holding materially fewer bytes than it declares;
+  `bitrate` is `"video_stream"` scope from the Extended Stream Properties `Data Bitrate` (or
+  `Stream Bitrate Properties`, which includes packet overhead), falling back to `"overall"`.
+  FLV is single-video by format definition, so `track_number` is absent; `duration_secs` comes
+  from `onMetaData` and falls back to the tag timestamps; `bitrate` is `"video_stream"` scope
+  from `onMetaData.videodatarate` (see the note under `bitrate`) or, under `--full`, the exact
+  summed video payload, falling back to `"overall"` and absent entirely over a file shorter
+  than it declares. Both may report `codec` values not seen before — the Windows Media and
+  Flash codec identifiers this build has no parser for keep their names verbatim (`"WMV2"`,
+  `"On2 VP6"`, `"Sorenson H.263"`, `"VP8"`, `"VVC"`, and the rest), which is the existing
+  unrecognized-codec convention rather than a new value space. One shape inside that convention
+  is new and worth stating: an Enhanced FLV four-character code whose bytes are not printable
+  renders as `"0x…"` hex, the same rendering AVI already applies to an unprintable
+  `biCompression`.
   **One presence condition changes**: `color` and `color_source` now appear on MPEG-4 Part 2 and
   VC-1 tracks that signal no colour at all, because both formats *define* what an absent signal
   means — Part 2 fills BT.709 primaries, transfer and matrix plus limited range, and VC-1 fills
