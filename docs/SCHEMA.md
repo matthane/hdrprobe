@@ -338,7 +338,7 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 |---|---|---|
 | HEVC | `<profile>, <tier> tier @ L<level>` | `"Main 10, High tier @ L5.1"`, `"Main, Main tier @ L4"` |
 | MV-HEVC | The HEVC label prefixed with `Multiview ` | `"Multiview Main 10, High tier @ L5"` |
-| AVC | `<profile> @ L<level>` | `"High @ L4.2"`, `"Constrained High @ L4"`, `"Baseline @ L3.1"` |
+| AVC | `<profile> @ L<level>` | `"High @ L4.2"`, `"Constrained High @ L4"`, `"Constrained Baseline @ L3.1"` |
 | AV1 | `<profile> profile, <tier> tier @ L<level>` (level omitted when unset) | `"Main profile, Main tier @ L5.1"`, `"Main profile, Main tier"` |
 | VP9 | `Profile <n> @ L<level>` (level omitted when the mux states none; only WebM CodecPrivate and MP4 `vpcC` carry one) | `"Profile 2 @ L4.0"`, `"Profile 2"` |
 | ProRes | The profile name from the MOV/MP4 sample-entry FourCC; omitted entirely for Matroska, which carries no profile signal | `"422 HQ"`, `"4444 XQ"` |
@@ -882,11 +882,17 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   duration describe the final link only). `bitrate` is `"overall"` scope by default and, under
   `--full`, the exactly summed video payload at `"video_stream"` scope, with the header packets
   excluded. `codec_profile` is always absent for Theora, which defines no profiles. Colour comes
-  from Theora's `CS` field, which is not CICP: it fills primaries and matrix plus limited range,
-  all tagged `"stream"`, and **never fills transfer**, because Theora pairs Rec.709's
-  opto-electronic function with a Rec.470 display gamma and no single transfer code names that
-  combination. VP8 reports no colour at all — its only colour signal is one bit inside each frame's
+  from Theora's `CS` field, which is not CICP: it fills primaries, transfer and matrix plus
+  limited range, all tagged `"stream"`. The transfer is `"BT.709"` for both defined `CS` values,
+  because Theora specifies Rec.709's opto-electronic function for encoding and that function is
+  exactly what a CICP transfer code states (ffprobe reads the field to the same value; the
+  Rec.470 *display* gammas Theora also states are outside what the code point carries).
+  VP8 reports no colour at all — its only colour signal is one bit inside each frame's
   payload, which no container-level parse reaches.
+  Also additive: AVC `codec_profile` gains `"Constrained Baseline"`, reported for
+  `profile_idc` 66 with `constraint_set1_flag` set (H.264 §A.2.1.1) on every AVC carriage —
+  streams that previously reported the less specific `"Baseline"`, which both reference tools
+  already refine.
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional

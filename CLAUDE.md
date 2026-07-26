@@ -177,16 +177,18 @@ never parse bytes native-endian.
   its logical stream's first page, so the whole parse is one page. Ogg records no colour, no
   dimensions and no frame rate of its own, which makes this header the *only* source for every
   picture fact the report carries — a gap-filler with no gap. **`CS` is not CICP**: three values
-  (0 undefined, 1 Rec.470M, 2 Rec.470BG) whose primaries and matrix map onto code points but whose
-  **transfer does not**, because Theora pairs Rec.709's opto-electronic function with the Rec.470
-  *display* gamma and no single code names that combination, so the transfer stays `None` (plan
-  decision D8; the reserved values above 2 fill nothing at all, since passing them through as CICP
-  would read 5 as "BT.601 (PAL)" and 9 as "BT.2020"). CS 1 takes matrix code **6** and CS 2 code
+  (0 undefined, 1 Rec.470M, 2 Rec.470BG) whose primaries and matrix map onto code points, and whose
+  **transfer fills as CICP 1 by the field's own definition** — H.273's `transfer_characteristics`
+  is the source's opto-electronic function, which Theora fixes at Rec.709's curve for both colour
+  spaces; the Rec.470 *display* gammas it also states (2.2 and 2.67) are EOTF-side facts no SDR
+  CICP code carries, so they are not evidence against the fill. ffprobe reads the field to the same
+  value (bt709 for both defined codes) and MediaInfo reports no Theora colour at all. Plan decision
+  D8 originally shipped the transfer unset as the open question's reversible answer; settled and
+  reversed with sign-off 2026-07-26. The reserved values above 2 still fill nothing at all, since
+  passing them through as CICP would read 5 as "BT.601 (PAL)" and 9 as "BT.2020". CS 1 takes
+  matrix code **6** and CS 2 code
   **5** — numerically identical coefficients, so only the label is at stake, and each takes the one
-  naming the system its own primaries name. ffmpeg *does* read `CS` (an earlier note here said it
-  did not; measured, and the format reference carries the correction with ffprobe's mapping) and
-  fills the transfer as BT.709, which is the live open question recorded in the plan rather than a
-  settled divergence. **Display size is not coded size**: `FMBW`/`FMBH` count macroblocks, so an
+  naming the system its own primaries name. **Display size is not coded size**: `FMBW`/`FMBH` count macroblocks, so an
   854-wide video is coded 864 wide, and `PICW`/`PICH` are used only within 16 pixels of the coded
   size — the spec's own construction rule and ffmpeg's guard. **The granule position is two fields,
   not a shift**: `KFGSHIFT` splits it into a keyframe index and an offset, and the frame count is
