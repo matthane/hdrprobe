@@ -69,7 +69,16 @@ impl Codec {
             Codec::Theora => "Theora".to_string(),
             Codec::MsMpeg4(v) => format!("MS-MPEG-4 v{v}"),
             Codec::Mjpeg => "MJPEG".to_string(),
-            Codec::Other(s) => s.clone(),
+            // The one arm whose text comes from the file: a Matroska CodecID
+            // or an MP4 sample-entry FourCC prints verbatim (the VfW path is
+            // already printable-gated), so an ANSI escape in a crafted file
+            // would otherwise reach the terminal as a control sequence. Every
+            // control character — C0, DEL, C1, all of which can open an
+            // escape — renders as U+FFFD, the same mark `from_utf8_lossy`
+            // already uses for invalid bytes on this path.
+            Codec::Other(s) => {
+                s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
+            }
         }
     }
 }
@@ -2118,6 +2127,17 @@ mod tests {
         let mut unspecified = av1c;
         unspecified[16] = 0x81;
         assert!(color_from_av1c(&unspecified).is_none());
+    }
+
+    #[test]
+    fn a_control_character_in_a_fallback_label_never_reaches_the_terminal() {
+        // A crafted Matroska CodecID or MP4 FourCC can carry an ANSI escape;
+        // rendered verbatim it executes in the user's terminal. Every control
+        // class — C0 escape, DEL, C1 CSI — renders as U+FFFD instead.
+        let evil = Codec::Other("\u{1b}[31mV_EVIL\u{7f}\u{9b}0m".to_string());
+        assert_eq!(evil.label(), "\u{FFFD}[31mV_EVIL\u{FFFD}\u{FFFD}0m");
+        // Ordinary fallback labels are untouched.
+        assert_eq!(Codec::Other("V_MPEG4/ISO/SQ".to_string()).label(), "V_MPEG4/ISO/SQ");
     }
 
     #[test]

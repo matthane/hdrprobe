@@ -900,6 +900,11 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   `onMetaData.filesize`). The detections shipped in the backends already — withholding overall
   rates and, for ASF, the duration — and the flag now names why. A 2.x consumer treating the
   field as stdin-only should treat it as "partial input" generally.
+  One hardening with a value-space edge: **control characters in fallback `codec` labels
+  render as U+FFFD**. The Matroska CodecID and MP4 sample-entry fallbacks print the file's own
+  text, so a crafted file could put an ANSI escape sequence on the terminal; every control
+  character (C0, DEL, C1) now renders as the replacement character instead — the same mark
+  invalid UTF-8 already produced on that path. No real file is affected.
   One value change with no shape change: **TS/M2TS `duration_secs` is now the video
   presentation span** (head-minimum to tail-maximum video PTS plus one frame interval, the
   program-stream backend's rule) **with the PCR span as the fallback**, because the PCR times
