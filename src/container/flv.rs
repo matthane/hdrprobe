@@ -7,7 +7,11 @@
 //! every other byte-oriented container in this tree.
 //!
 //! Seven facts about the format are invariants a later change would otherwise
-//! undo quietly. Each is pinned by a test.
+//! undo quietly. Each is pinned by a test. (The closing paragraph, on why a
+//! video access unit *is* a byte range here, is a note on the chunk-index
+//! design rather than one of the seven — the same shape as [`super::asf`]'s
+//! "no payload index" note. Counting bold paragraphs will therefore not give
+//! seven; counting the ones between here and that note will.)
 //!
 //! **`TimestampExtended` is the high byte, not a fourth low byte.** A tag's
 //! time is `(byte 7 << 24) | u24(bytes 1..4)`. Reading bytes 4..8 as one
