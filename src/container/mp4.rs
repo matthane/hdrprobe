@@ -339,12 +339,18 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
                 );
             }
             // fps: prefer the summed sample durations (exact, media timescale);
-            // fall back to sample count over the container duration.
+            // fall back to sample count over the container duration. Every term
+            // is a file-supplied integer, so both quotients take the shared
+            // plausibility bound.
             if t.fps.is_none() && !t.chunks.is_empty() {
                 t.fps = if duration_ticks > 0 && t.media_timescale > 0 {
-                    Some(t.chunks.len() as f64 * t.media_timescale as f64 / duration_ticks as f64)
+                    super::plausible_fps(
+                        t.chunks.len() as f64 * t.media_timescale as f64 / duration_ticks as f64,
+                    )
                 } else {
-                    t.duration_secs.filter(|d| *d > 0.0).map(|d| t.chunks.len() as f64 / d)
+                    t.duration_secs
+                        .filter(|d| *d > 0.0)
+                        .and_then(|d| super::plausible_fps(t.chunks.len() as f64 / d))
                 };
             }
         }
@@ -1217,7 +1223,9 @@ fn stts_uniform_fps(data: &[u8], stbl: &[BoxHdr], media_timescale: u32) -> Optio
     if d == 0 || media_timescale == 0 {
         return None;
     }
-    Some(media_timescale as f64 / d as f64)
+    // Two unvalidated 32-bit fields; the shared bound keeps a misread pair
+    // from stating a timescale's worth of frames per second.
+    super::plausible_fps(media_timescale as f64 / d as f64)
 }
 
 fn build_sample_index(data: &[u8], stbl: &[BoxHdr], _codec: Codec) -> Result<Vec<Chunk>> {
@@ -1749,6 +1757,10 @@ mod tests {
         assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
         let (buf, boxes) = mk(&[]);
         assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
+        // A delta of 1 tick under a 1 MHz timescale states a million fps — a
+        // misread pair, dropped by the shared plausibility bound.
+        let (buf, boxes) = mk(&[(10, 1)]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 1_000_000), None);
         let (buf, boxes) = mk(&[(10, 256)]);
         assert_eq!(stts_uniform_fps(&buf, &boxes, 0), None);
         // A lying entry count is clamped to the box payload (one real entry).

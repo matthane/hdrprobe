@@ -277,11 +277,13 @@ fn parse_vui_inner(
         if num_units_in_tick > 0 && time_scale > 0 {
             let mut fps = time_scale as f64 / num_units_in_tick as f64;
             // When each coded picture is a field, the tick is a field period, so
-            // the frame rate is half the tick rate.
+            // the frame rate is half the tick rate. Both terms are unvalidated
+            // 32-bit fields; the shared bound keeps a misread pair from
+            // stating millions of fps.
             if field_seq {
                 fps /= 2.0;
             }
-            out.frame_rate = Some(fps);
+            out.frame_rate = crate::container::plausible_fps(fps);
         }
     }
     Some(())

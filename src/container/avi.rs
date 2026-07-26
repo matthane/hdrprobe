@@ -426,11 +426,19 @@ impl Stream {
     /// whole-file average that says nothing about a second stream, so it is
     /// reached only when there is nothing else and only for video.
     fn fps(&self, usec_per_frame: u32) -> Option<f64> {
+        // Both quotients are unvalidated 32-bit integers and take the shared
+        // plausibility bound: a `dwRate` of `0xFFFFFFFF` over scale 1 is four
+        // billion fps, and a 1 µs frame period is a million. The *duration*
+        // deliberately does not route through this — its own
+        // `MAX_DURATION_SECS` bound covers it, and both halves of
+        // `dwLength / (dwRate/dwScale)` count the same units even when that
+        // unit rate is no picture rate.
         if self.rate > 0 && self.scale > 0 {
-            return Some(self.rate as f64 / self.scale as f64);
+            return super::plausible_fps(self.rate as f64 / self.scale as f64);
         }
         (&self.kind == b"vids" && usec_per_frame > 0)
             .then(|| 1_000_000.0 / usec_per_frame as f64)
+            .and_then(super::plausible_fps)
     }
 
     /// `dwLength * dwScale / dwRate`, the stream's own playback duration.
@@ -1587,6 +1595,32 @@ mod tests {
         two.extend_from_slice(&list(b"strl", &audio));
         let d = demux(&build(&two, &frames(b"00dc", &[1000, 1000]), Idx1::Relative)).unwrap();
         assert_eq!(d.duration_secs, Some(0.08), "not 900 units of the video's period");
+    }
+
+    #[test]
+    fn implausible_unit_rates_yield_no_fps() {
+        // `dwRate` 0xFFFFFFFF over scale 1 states four billion fps — a misread
+        // field, never a rate; the shared `plausible_fps` bound drops it. The
+        // duration is separate arithmetic under its own `MAX_DURATION_SECS`
+        // bound and is not asserted here.
+        let d = demux(&build(
+            &video_hdrl(b"XVID", 1, u32::MAX, 2, &[]),
+            &frames(b"00dc", &[100]),
+            Idx1::Relative,
+        ))
+        .expect("still demuxes");
+        assert_eq!(d.tracks[0].fps, None);
+
+        // The `dwMicroSecPerFrame` fallback takes the same bound: a 1 µs
+        // frame period states a million fps.
+        let mut hdrl = strh(b"vids", b"XVID", 0, 0, 2);
+        hdrl.extend_from_slice(&strf(320, 240, b"XVID", &[]));
+        let mut avih = [0u8; 56];
+        avih[0..4].copy_from_slice(&1u32.to_le_bytes());
+        let mut full = chunk(b"avih", &avih);
+        full.extend_from_slice(&list(b"strl", &hdrl));
+        let d = demux(&build(&full, &frames(b"00dc", &[100]), Idx1::Relative)).expect("demuxes");
+        assert_eq!(d.tracks[0].fps, None);
     }
 
     #[test]

@@ -404,12 +404,16 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     let mut tracks = Vec::with_capacity(groups.len());
     for ((g, chunks), t35_chunks) in groups.into_iter().zip(outs).zip(t35_outs) {
         let track = g.info;
+        // Both derivations divide file-supplied integers and take the shared
+        // plausibility bound: a `DefaultDuration` of 1 ns is a billion fps.
         let fps = match (track.default_duration_ns, duration_secs, chunks.len()) {
-            (Some(dd), _, _) if dd > 0 => Some(1_000_000_000.0 / dd as f64),
+            (Some(dd), _, _) if dd > 0 => super::plausible_fps(1_000_000_000.0 / dd as f64),
             // Frame-count / duration fallback is only valid when we indexed every
             // block; a bounded head window would divide a partial count by the full
             // runtime and report a nonsensically low fps.
-            (_, Some(d), n) if d > 0.0 && n > 0 && !stopped_early => Some(n as f64 / d),
+            (_, Some(d), n) if d > 0.0 && n > 0 && !stopped_early => {
+                super::plausible_fps(n as f64 / d)
+            }
             _ => None,
         };
 
@@ -2065,6 +2069,28 @@ mod tests {
         video.extend(el(&[0xBA], &h.to_be_bytes()));
         b.extend(el(&[0xE0], &video));
         el(&[0xAE], &b)
+    }
+
+    #[test]
+    fn implausible_default_duration_yields_no_fps() {
+        // A `DefaultDuration` of 1 ns states a billion fps; the shared
+        // `plausible_fps` bound drops it, while an ordinary 40 ms frame
+        // period still reads 25 fps through the same arithmetic.
+        for (dd, want) in [(1u32, None), (40_000_000, Some(25.0))] {
+            let mut b = el(&[0xD7], &[1]); // TrackNumber
+            b.extend(el(&[0x73, 0xC5], &[0x11])); // TrackUID
+            b.extend(el(&[0x83], &[1])); // TrackType = video
+            b.extend(el(&[0x86], b"V_MPEGH/ISO/HEVC")); // CodecID
+            b.extend(el(&[0x23, 0xE3, 0x83], &dd.to_be_bytes())); // DefaultDuration
+            let mut video = el(&[0xB0], &1920u16.to_be_bytes());
+            video.extend(el(&[0xBA], &1080u16.to_be_bytes()));
+            b.extend(el(&[0xE0], &video));
+            let entry = el(&[0xAE], &b);
+            let seg = el_wide(&ID_TRACKS.to_be_bytes(), &entry);
+            let data = el_wide(&ID_SEGMENT.to_be_bytes(), &seg);
+            let d = demux(&data, false).expect("demuxes");
+            assert_eq!(d.tracks[0].fps, want, "DefaultDuration {dd}");
+        }
     }
 
     /// A statistics `Tag` (Targets>TagTrackUID + BPS SimpleTag) for one track.

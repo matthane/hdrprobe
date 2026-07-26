@@ -281,7 +281,11 @@ fn parse_vol(body: &[u8]) -> Option<VolInfo> {
     marker(&mut r)?;
     let fps = if r.read_bit()? == 1 {
         let increment = r.read_bits(time_increment_bits(resolution))?;
-        (increment > 0).then(|| resolution as f64 / increment as f64)
+        // A 16-bit resolution over increment 1 can state 65535 fps; the
+        // shared bound applies like every other declared ratio.
+        (increment > 0)
+            .then(|| resolution as f64 / increment as f64)
+            .and_then(crate::container::plausible_fps)
     } else {
         None
     };

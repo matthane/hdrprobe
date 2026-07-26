@@ -207,9 +207,9 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         }
     }
     if td.fps.is_none() {
-        td.fps = meta
-            .and_then(|m| m.number("framerate"))
-            .filter(|f| *f > 0.0 && f.is_finite());
+        // A muxer-declared double; the shared bound subsumes the old
+        // positive-and-finite check.
+        td.fps = meta.and_then(|m| m.number("framerate")).and_then(super::plausible_fps);
     }
 
     td.bitrate = if full && complete {

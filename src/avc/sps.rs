@@ -254,9 +254,13 @@ fn parse_vui(r: &mut BitReader, info: &mut SpsInfo) -> Option<()> {
         let num_units_in_tick = r.read_bits(32)?;
         let time_scale = r.read_bits(32)?;
         // AVC: a clock tick is num_units_in_tick/time_scale and a frame spans two
-        // ticks (fields), so the frame rate is time_scale / (2 * tick).
+        // ticks (fields), so the frame rate is time_scale / (2 * tick). Both
+        // terms are unvalidated 32-bit fields; the shared bound keeps a
+        // misread pair from stating millions of fps.
         if num_units_in_tick > 0 && time_scale > 0 {
-            info.frame_rate = Some(time_scale as f64 / (2.0 * num_units_in_tick as f64));
+            info.frame_rate = crate::container::plausible_fps(
+                time_scale as f64 / (2.0 * num_units_in_tick as f64),
+            );
         }
     }
     Some(())

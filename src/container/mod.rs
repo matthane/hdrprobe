@@ -815,16 +815,15 @@ const MIN_FPS: f64 = 0.001;
 ///
 /// Shared rather than re-derived per backend: ASF computes it from
 /// `Average Time Per Frame`, Theora and the OggVP8 mapping from their own
-/// numerator/denominator pairs, and each arrived at the same two bounds for the
-/// same reason.
-///
-/// Those three are the current callers, not the whole set of backends that
-/// divide two file-supplied integers — `avi::Stream::fps` (`dwRate/dwScale`)
-/// and the Matroska `DefaultDuration` reciprocal do the same and are still
-/// unbounded. Widening to them is a change to shipped backends with its own
-/// corpus check, so it is recorded in the plan rather than done in passing;
-/// this doc is scoped to what actually routes here so it cannot read as a
-/// guarantee the tree does not make.
+/// numerator/denominator pairs, `avi::Stream::fps` from `dwRate/dwScale` (and
+/// its `dwMicroSecPerFrame` fallback), and Matroska from the `DefaultDuration`
+/// reciprocal and its whole-index count ÷ duration fallback — every backend
+/// that divides two file-supplied integers into a frame rate now routes here
+/// (open-items B5, closed 2026-07-26, widened past the plan's five container
+/// sites to the AVC/HEVC VUI timing pair, the MP4 `stts`/count fallbacks, the
+/// FLV `onMetaData.framerate` double and Part 2's `fixed_vop_rate` quotient).
+/// The one deliberate exception is AV1 (`av1::seq` and the IVF header), whose
+/// sites carry their own tighter 480 fps bound, pinned by their own tests.
 pub(crate) fn plausible_fps(fps: f64) -> Option<f64> {
     (MIN_FPS..=MAX_FPS).contains(&fps).then_some(fps)
 }
