@@ -4,6 +4,7 @@
 
 pub mod annexb;
 pub mod av1;
+pub mod avi;
 pub mod bmih;
 pub mod mkv;
 pub mod mp4;
@@ -323,6 +324,7 @@ pub fn demux(
         // "unrecognized container" — and one whose video sits in the ordinary
         // range reports normally.
         "mpg" | "mpeg" | "vob" | "m2p" | "evo" => Some(ps::demux(data)),
+        "avi" => Some(avi::demux(data)),
         "ts" | "m2ts" | "mts" => Some(ts::demux(data, full, progress, frontier)),
         _ => None,
     };
@@ -365,6 +367,9 @@ fn sniff_demux(
     if starts_with_ebml(data) {
         return Some(mkv::demux(data, full));
     }
+    if avi::is_avi(data) {
+        return Some(avi::demux(data));
+    }
     if av1::is_ivf(data) || av1::is_obu_stream(data) {
         return Some(av1::demux(data, full, progress, frontier));
     }
@@ -390,6 +395,7 @@ fn sniff_demux(
 pub(crate) fn sniffs_as_ts(data: &[u8]) -> bool {
     let earlier_check_wins = (data.len() >= 12 && &data[4..8] == b"ftyp")
         || starts_with_ebml(data)
+        || avi::is_avi(data)
         || av1::is_ivf(data)
         || av1::is_obu_stream(data);
     !earlier_check_wins && ts::detect_layout(data).is_some()

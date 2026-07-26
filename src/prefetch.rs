@@ -332,6 +332,17 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
         ranges.push((start as u64, size - start));
     }
 
+    // AVI resolves every chunk position from an index rather than by walking, so
+    // what it needs warmed past the head is the index itself: `idx1` sits after
+    // all the data, and an OpenDML file's `ix##` sub-indexes sit one per RIFF
+    // segment. Both are located by arithmetic on the head's declared sizes, so
+    // the exact extents are known before a byte of them is faulted — the same
+    // shape as the MKV `Tags` warm below. The `hdrl` the arithmetic reads is
+    // inside the generic head window, so no head branch is needed.
+    if !is_iso && looks_like_avi(path, data) {
+        ranges.extend(crate::container::avi::index_extents(data));
+    }
+
     // The `moov` is warmed by its exact extent, wherever it sits (front-placed
     // merges into the head range; tail-placed is the one common metadata
     // region a head window could never cover).
@@ -603,6 +614,14 @@ fn looks_like_mp4(path: &Path, data: &[u8]) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     matches!(ext.as_str(), "mp4" | "m4v" | "mov" | "m4a")
         || (data.len() >= 8 && &data[4..8] == b"ftyp")
+}
+
+/// Unlike the TS and program-stream probes, the content half here costs
+/// nothing: `RIFF....AVI ` is twelve bytes at offset 0, inside the head warm
+/// the caller is about to request anyway.
+fn looks_like_avi(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    ext == "avi" || crate::container::avi::is_avi(data)
 }
 
 fn looks_like_ts(path: &Path, data: &[u8]) -> bool {
