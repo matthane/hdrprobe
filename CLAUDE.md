@@ -806,7 +806,13 @@ never parse bytes native-endian.
   `Mmap::advise` (memmap2's advise is `#[cfg(unix)]`, a no-op on the Windows/SMB target).
 - **Malformed-input safety in `mp4.rs`.** `read_u32/u16/u64` are bounds-safe (return 0 on OOB);
   any box-declared count fed to a loop/alloc must go through `clamp_count`. Apply the same
-  discipline to new table parsing.
+  discipline to new table parsing. **`iter_boxes` additionally rejects a box whose declared size
+  undercuts its own header** (a 32-bit `size` of 2..=7, or a 64-bit `largesize` under 16), which
+  would make `payload > end`: every consumer slices `payload..end`, so admitting one *panics*
+  rather than erroring, and a panic is exit 101, outside the tool's 0/1/2 contract, which in a
+  directory scan aborts the whole run and prints nothing at all. The guard belongs in the walk,
+  not at the call sites: it was originally spot-checked at two of seven and the other five were
+  live crashes. Keep new sample-entry children on the walk rather than re-deriving extents.
 - `split_annexb` treats the buffer start as an implicit NAL boundary (chunks begin at a NAL
   header, not a start code) — relied upon by the length-prefixed and head-window paths.
 - **Average bitrate is per-backend and correct-or-labelled, never a wrong number.** Each backend
@@ -864,6 +870,16 @@ never parse bytes native-endian.
   is emitted only for a file that produced a report. The hot `nal::split_annexb` stays
   tick-free: the no-op-closure monomorphization of `split_annexb_impl` compiles the gate out;
   only `split_annexb_streamed` (the raw-HEVC `--full` fused walk) pays for it.
+- **The Color line suppresses the matrix, except when the matrix is all there is.**
+  `render::build_color_line` prints primaries and transfer but drops `color.matrix`, because every
+  matrix except Dolby's IPT-PQ-C2 restates what the primaries already said. That reasoning assumes
+  there are primaries to restate: with primaries *and* transfer both absent, suppressing the matrix
+  empties the line, and the report then reads "nothing was signalled" over a stream that signalled
+  something. So a lone matrix prints. This is not an MPEG special case even though MPEG-2 is where
+  it became ordinary (ffmpeg's encoder writes `colour_description` set with primaries and transfer
+  at the explicit "unspecified" code 2, matrix real): it applies to any track whose only colour
+  signal is a matrix, VP9 and ProRes included. The JSON always carried the matrix; only the text
+  line changed. No corpus file is affected, which is why the byte-identity gate did not move.
 - **Value-line reflow is terminal-only and byte-neutral everywhere else.** kv rows longer than
   the terminal wrap at their part separators (trailing ` ·`/`,`/` +`, or the unstyled double
   space before a warning chip — never mid-part, never inside a chip) with continuations
