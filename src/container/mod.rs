@@ -7,6 +7,7 @@ pub mod asf;
 pub mod av1;
 pub mod avi;
 pub mod bmih;
+pub mod dif;
 pub mod flv;
 pub mod mkv;
 pub mod mp4;
@@ -389,6 +390,7 @@ pub fn demux(
         "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full, progress, frontier)),
         "ivf" | "obu" => Some(av1::demux(data, full, progress, frontier)),
         "m2v" | "m1v" | "mpv" => Some(mpegv::demux(data, full)),
+        "dv" | "dif" => Some(dif::demux(data)),
         // `.evo` (HD DVD) is a program stream too. Its video often rides the
         // extended stream id `0xFD`, which this walker treats as non-video, so
         // such a file declines with the backend's own message rather than
@@ -461,6 +463,9 @@ fn sniff_demux(
     if ogg::is_ogg(data) {
         return Some(ogg::demux(data, full));
     }
+    if dif::is_dif(data) {
+        return Some(dif::demux(data));
+    }
     if av1::is_ivf(data) || av1::is_obu_stream(data) {
         return Some(av1::demux(data, full, progress, frontier));
     }
@@ -490,6 +495,7 @@ pub(crate) fn sniffs_as_ts(data: &[u8]) -> bool {
         || asf::is_asf(data)
         || flv::is_flv(data)
         || ogg::is_ogg(data)
+        || dif::is_dif(data)
         || av1::is_ivf(data)
         || av1::is_obu_stream(data);
     !earlier_check_wins && ts::detect_layout(data).is_some()

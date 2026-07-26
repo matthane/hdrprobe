@@ -129,7 +129,9 @@ Notes for Kodi specifically:
 
 These require the end of the file and are unavailable from any prefix, no matter the size:
 
-- The runtime of a TS/M2TS stream (measured from timestamps at both ends of the file).
+- The runtime of a TS/M2TS or program stream (measured from timestamps at both ends of the
+  file), of an Ogg stream (the tail page's granule position), or of a raw DV stream (the
+  whole file's frame count).
 - MKV bitrate statistics tags (written after the clusters).
 - An MP4 whose index (`moov`) was written at the end of the file rather than the front; such
   a stream fails honestly with exit code 2.

@@ -213,6 +213,25 @@ never parse bytes native-endian.
   depth/chroma, honestly), Matroska `V_MJPEG`, QuickTime `jpeg`, MP4 `esds` OTI `0x6C`. Apple's
   `mjpa`/`mjpb` field-split variants and the vendor VfW tags (`dmb1`, `AVRn`, `LJPG`) alter the
   frame layout or lack a witness and stay on the honest-FourCC fallback.
+- `container/dif.rs` — raw DV (DIF) tape streams (`.dv`/`.dif`), IEC 61834 / SMPTE 314M/370M:
+  fixed-size frames of 80-byte DIF blocks, so every fact is a system constant keyed by two
+  header discriminators (the DSF bit, byte 3 bit 7; the VAUX video-source `stype`, byte 451 low
+  5 bits) through the table transcribed from ffmpeg's `dv_profile.c` and verified against
+  encoded fixtures. Duration and bitrate are exact arithmetic on the file length (whole frames
+  ÷ system rate; **`overall` scope, because DV interleaves audio inside the video frame** —
+  ffprobe's stream rate and MediaInfo's `OverallBitRate` are this same number, and MediaInfo's
+  separate video-only rate is an internal constant nothing here reproduces). Three traps:
+  **APT is not IEC-vs-DVCPRO evidence on 525-60** (ffmpeg writes APT=1 on its own IEC NTSC
+  encodes and both families are 4:1:1 there; APT decides exactly one thing — 625-50 DV25
+  4:2:0 IEC vs 4:1:1 DVCPRO), **the 16:9 flag is searched at two per-sequence VAUX
+  video-control positions** (even and odd DIF sequences place the pack differently, and code
+  `0x07` counts as 16:9 only under APT 0), and **scan type is deliberately unreported**
+  (ffprobe abstains with `field_order=unknown`, MediaInfo asserts Interlaced/BFF from VSC bits
+  with no primary spec on hand — signalled-only says abstain). ffmpeg's wrong-DSF PAL hack is
+  declined structurally: it fires only on a caller-supplied whole-frame buffer that neither a
+  head probe nor ffmpeg's own raw-.dv demuxer ever passes. `chunks` stays empty (the
+  mpegv/asf contract — DV has no SEI/RPU/T.35 side channel) and `--full` changes nothing,
+  every fact being exact on the default path.
 - `container/bmih.rs` — `BITMAPINFOHEADER`, the Video for Windows description block, plus the
   FourCC-to-codec table. It lives in `container/` rather than a backend because three carriages
   hand one over: AVI's `strf`, ASF's type-specific data, and **Matroska's `V_MS/VFW/FOURCC`**,

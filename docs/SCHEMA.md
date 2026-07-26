@@ -270,14 +270,14 @@ errors rather than guessing.
 | `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number, MPEG program stream the PES stream id (or, for HD DVD `.evo` video on the extended id 0xFD, the `stream_id_extension` substream id, 0x55..0x5F). Absent where no such id exists (raw elementary streams, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, `"DV"` (raw `.dv`/`.dif` input; DV inside AVI/MOV still reports its carriage FourCC), or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
 | `fps` | float | optional | Frame rate. From container timing (MP4/MKV), the SPS VUI (TS, raw HEVC), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>`. Absent when the input carries no rate signal; never guessed |
 | `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists. The `"overall"` (file-length) fallback rate appears only when this is the file's sole video track (an overall rate attributed to one of several tracks would be a wrong number) |
 | `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
-| `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"` (a reserved signalling value renders `"?"`) |
+| `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"`, `"4:1:1"` (DV, MJPEG), `"4:4:0"` (MJPEG) (a reserved signalling value renders `"?"`) |
 | `pixel_aspect_ratio` | float | optional | Pixel (sample) aspect ratio, width of one pixel over its height (1.0 = square). Signalled by the coded stream (H.264/HEVC VUI `aspect_ratio_idc`/Extended_SAR, MPEG-4 Part 2 and MPEG-1 aspect codes, Theora `PARN`:`PARD`, VC-1 `ASPECT_RATIO`) or the container (MP4 `pasp` — which wins over the stream, like colour), or derived exactly from a signalled display ratio and the coded size (MPEG-2's DAR codes, MKV `DisplayWidth`:`DisplayHeight`, AVI `vprp`). Absent when nothing signals either ratio — never a guessed square |
 | `display_aspect_ratio` | float | optional | Display aspect ratio of the presented picture. Signalled directly or derived exactly from the pixel ratio and the coded size; present exactly when `pixel_aspect_ratio` is. The text report shows it (as `DAR 16:9` etc.) only when the pixels are not square; the JSON always carries both |
 | `scan_type` | string | optional | `"progressive"` or `"interlaced"`, from a sequence-level signal of the coded stream (AVC `frame_mbs_only_flag`, HEVC PTL source flags / `field_seq_flag`, MPEG-2 `progressive_sequence` — affirmative only, since a clear flag merely permits interlaced pictures and film-sourced DVDs are progressive under it, MPEG-4 Part 2 and VC-1 interlace flags, MKV `FlagInterlaced`, AVI `vprp` fields-per-frame; MPEG-1, Theora and MJPEG-free formats that structurally cannot interlace state `"progressive"`). Absent when unsignalled — absence never means progressive. The text report marks only `interlaced` |
@@ -307,6 +307,7 @@ Video inputs:
 | `"raw VP9 (IVF)"` | VP9 in an IVF wrapper (`VP90` FourCC) |
 | `"raw MPEG-1 Video (ES)"` | MPEG-1 video elementary stream (`.m1v`, `.mpv`) |
 | `"raw MPEG-2 Video (ES)"` | MPEG-2 video elementary stream (`.m2v`, `.mpv`) |
+| `"raw DV (DIF)"` | Raw DV tape stream (`.dv`, `.dif`): IEC 61834 / SMPTE 314M/370M DIF frames with no container |
 | `"MPEG-2 Program Stream"` | Program stream with ITU-T H.222.0 pack headers (`.vob`, `.mpg`, `.mpeg`, `.m2p`, `.evo`) |
 | `"MPEG-1 System Stream"` | Program stream with ISO/IEC 11172-1 pack headers. The system layer and the video codec version independently, so these routinely carry MPEG-2 video |
 | `"MPEG PES stream"` | Program-stream PES packets with no pack layer: a mid-file cut, or a bare PES stream |
@@ -333,6 +334,7 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 | AVC | `<profile> @ L<level>` | `"High @ L4.2"`, `"Constrained High @ L4"`, `"Constrained Baseline @ L3.1"` |
 | AV1 | `<profile> profile, <tier> tier @ L<level>` (level omitted when unset) | `"Main profile, Main tier @ L5.1"`, `"Main profile, Main tier"` |
 | VP9 | `Profile <n> @ L<level>` (level omitted when the mux states none; only WebM CodecPrivate and MP4 `vpcC` carry one) | `"Profile 2 @ L4.0"`, `"Profile 2"` |
+| DV | The SMPTE variant name, raw `.dv`/`.dif` input only; absent for consumer DV25, which has none | `"DVCPRO"`, `"DVCPRO50"`, `"DVCPRO HD"` |
 | ProRes | The profile name from the MOV/MP4 sample-entry FourCC; omitted entirely for Matroska, which carries no profile signal | `"422 HQ"`, `"4444 XQ"` |
 | MPEG-2 | `<profile>@<level>` from `profile_and_level_indication`; omitted when the byte is a reserved combination | `"Main@Main"`, `"Main@High"`, `"High@High 1440"`, `"4:2:2@High"` |
 | MPEG-1 | Always omitted: ISO/IEC 11172-2 has no profile or level field | |
@@ -705,9 +707,11 @@ about a GOP in), 16 MiB otherwise. When it stops reading, a pipe writer sees a b
 that is the normal success signal, not an error. A stream that ends within the budget is
 complete and reports exactly like a file probe. A stream that exceeds it reports
 `input_truncated: true`, `size_bytes` as the bytes probed, and `file` as `"-"`, and withholds
-what a prefix cannot honestly state: a TS input's `duration_secs` (either clock's span would describe
-the cut, not the stream) and every `bitrate` except MP4/MOV's `video_stream` rate (whose
-sample-table sums are exact regardless of truncation). Declared header facts (MP4 `mvhd` and
+what a prefix cannot honestly state: `duration_secs` for the formats that derive it from the
+payload rather than a declared header — TS and program streams (either clock's span would
+describe the cut, not the stream), Ogg (the tail granule is the cut point), raw DV (frame
+count is the prefix's length ÷ the frame size) — and every `bitrate` except MP4/MOV's
+`video_stream` rate (whose sample-table sums are exact regardless of truncation). Declared header facts (MP4 `mvhd` and
 MKV Segment-Info durations, resolution, color, HDR and Dolby Vision metadata from the sampled
 head) report normally. The sampled union fields (`l5_active_areas`, `trim_targets`) draw only
 on head frames: `dolby_vision.sampled` is `true` exactly as on a default file probe, but a
@@ -924,6 +928,17 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   a true 2.000, and its `overall` bitrate divided by the short denominator ran 4.2% high. On
   ordinary content the change is within a frame or two; a consumer that specifically wants the
   arrival span should read the PCRs itself.
+  Also additive: **raw DV (DIF) tape streams are reported** — `"raw DV (DIF)"` joins the
+  `container` set (`.dv`, `.dif`, also recognized by magic), `"DV"` the `codec` set, and
+  `codec_profile` carries the SMPTE variant (`"DVCPRO"`, `"DVCPRO50"`, `"DVCPRO HD"`) where one
+  is signalled. Everything is system constants keyed by the header DIF block's discriminators:
+  dimensions, frame rate, 8-bit depth, chroma (4:1:1 / 4:2:0 / 4:2:2 by system), an exact
+  whole-frame `duration_secs` and an exact `"overall"` `bitrate` (audio rides inside the DIF
+  frame, so there is no separate video-stream rate), and `display_aspect_ratio` from the
+  VAUX video-control pack's 16:9 flag when the pack is present. `scan_type` is deliberately
+  absent (the reference tools disagree and the candidate bits have no primary spec on hand).
+  `"4:1:1"` also joins the documented `chroma` value set (it was already emitted for
+  QuickTime DV FourCCs and MJPEG), with `"4:4:0"` (MJPEG).
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional

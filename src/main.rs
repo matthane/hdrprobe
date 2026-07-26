@@ -675,10 +675,16 @@ fn suppress_prefix_derived_facts(demux: &mut container::Demux) {
     // number comes from the last granule position a bounded tail window holds,
     // and a prefix's "tail" is the cut point rather than the end of the stream.
     use container::ps::{MPEG1_SYSTEM_LABEL, MPEG2_PROGRAM_LABEL, PES_ONLY_LABEL};
+    // Raw DV's duration is the payload length ÷ the frame size, so over a
+    // stdin prefix it would describe the buffered bytes rather than the file.
     if demux.container.starts_with("MPEG-2 TS")
         || matches!(
             demux.container,
-            MPEG2_PROGRAM_LABEL | MPEG1_SYSTEM_LABEL | PES_ONLY_LABEL | container::ogg::CONTAINER_LABEL
+            MPEG2_PROGRAM_LABEL
+                | MPEG1_SYSTEM_LABEL
+                | PES_ONLY_LABEL
+                | container::ogg::CONTAINER_LABEL
+                | container::dif::CONTAINER_LABEL
         )
     {
         demux.duration_secs = None;
@@ -1006,7 +1012,7 @@ fn assemble_report(
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts", "mts", "hevc", "h265", "265", "ivf", "obu",
     "iso", "mpg", "mpeg", "vob", "m2p", "evo", "m2v", "m1v", "mpv", "avi", "wmv", "asf", "flv",
-    "ogv",
+    "ogv", "dv", "dif",
 ];
 
 fn collect_paths(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
