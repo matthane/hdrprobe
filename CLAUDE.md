@@ -569,6 +569,16 @@ never parse bytes native-endian.
   `TAIL_SCAN_BYTES` like the byte-0 TS branch). The report keeps the ISO's `size_bytes` and
   the clip's PCR `duration_secs`; the playlist's own edit duration renders on the
   `Main feature` line, never on the Duration line.
+- **Adding a backend means adding its extensions to `main::VIDEO_EXTS`, and that is outward-facing.**
+  `container::demux`'s extension map decides what a *named* file dispatches to; `VIDEO_EXTS`
+  decides what a **directory scan** picks up, and they are separate lists that have silently
+  disagreed before — Phase 1 shipped `.m2v`/`.m1v`/`.mpv` support that worked when a file was
+  named and was invisible to `hdrprobe rips/`, which is precisely the goal statement's failure
+  mode. `shell.rs` builds the Windows context-menu verb's file-type list from the same constant
+  (plus `SIDECAR_EXTS`), so every addition also registers those extensions in the user's registry
+  on the next `--install-shell`; that is intended, and worth naming in a commit message rather
+  than discovering later. `.bin` is the one deliberate omission: the raw-HEVC dispatch accepts it
+  and it is far too generic a name to claim in a directory of mixed files.
 - **Extension dispatch falls back to content sniffing only on error.** `container::demux` picks a
   backend by extension and returns immediately on success — sniffing never runs on the happy path
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),
