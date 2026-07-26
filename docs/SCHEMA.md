@@ -270,7 +270,7 @@ errors rather than guessing.
 | `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID. Absent where no such id exists (raw elementary streams, sidecars) |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for a `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"MJPG"`), so treat the list as the recognized set rather than a closed one |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"MJPG"`), so treat the list as the recognized set rather than a closed one. A Video for Windows code that is not printable ASCII is rendered as `"0x"` plus its eight hex digits instead, little-endian, matching what MediaInfo shows as CodecID: uncompressed video declares the integer 0 and reports `"0x00000000"` |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
@@ -307,6 +307,7 @@ Video inputs:
 | `"MPEG-2 Program Stream"` | Program stream with ITU-T H.222.0 pack headers (`.vob`, `.mpg`, `.mpeg`, `.m2p`, `.evo`) |
 | `"MPEG-1 System Stream"` | Program stream with ISO/IEC 11172-1 pack headers. The system layer and the video codec version independently, so these routinely carry MPEG-2 video |
 | `"MPEG PES stream"` | Program-stream PES packets with no pack layer: a mid-file cut, or a bare PES stream |
+| `"AVI (RIFF)"` | AVI (`.avi`), including OpenDML multi-segment files — the label does not distinguish them, since OpenDML changes how the file is indexed and no fact the report carries |
 | `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
@@ -805,6 +806,17 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   approximated when the stream's clock is discontinuous or carries no timestamps; `bitrate` is
   `"overall"` scope, because a program stream's byte count includes audio and packet overhead,
   and is absent when more than one video stream shares the file.
+  Also additive: **AVI is now recognized**, so `"AVI (RIFF)"` joins the `container` set. `.avi`
+  produced no report at all before and now produces a full one, as does any file whose bytes
+  open `RIFF....AVI `. One reported track per `strh` of type `vids`, with `track_number` the
+  stream's position in the header list (`0` for the usual single-video file). `bitrate` is
+  `"video_stream"` scope and exact, summed from the file's own index — `idx1` on a single-segment
+  file, the OpenDML `ix##` chunks otherwise — over that stream's own declared duration; it falls
+  back to `"overall"` when neither index is usable, and is **absent entirely on a file that
+  declares more bytes than it holds**, where every byte count describes data that is not there.
+  `duration_secs` is the longest stream's declared runtime, audio included. A Video for Windows
+  FourCC naming AVC or HEVC now resolves to that codec rather than being reported verbatim,
+  which also affects Matroska `V_MS/VFW/FOURCC` tracks carrying those codes.
   **One presence condition changes**: `color` and `color_source` now appear on MPEG-4 Part 2 and
   VC-1 tracks that signal no colour at all, because both formats *define* what an absent signal
   means — Part 2 fills BT.709 primaries, transfer and matrix plus limited range, and VC-1 fills

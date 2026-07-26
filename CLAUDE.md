@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 361 unit tests
+cargo test                     # 386 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -179,7 +179,46 @@ never parse bytes native-endian.
   exposed at all; and **`biHeight` is signed**, negative meaning top-down, so the absolute value
   is the height (`unsigned_abs`, because `i32::MIN.abs()` panics). Extradata is bounded by the
   *caller's* slice, never by `biSize`, which real muxers write inconsistently — the corpus VC-1
-  MKV declares 71 over a 72-byte CodecPrivate.
+  MKV declares 71 over a 72-byte CodecPrivate. The FourCC table names AVC and HEVC, so **every
+  caller must pair it with `is_config_record`**: a VfW-wrapped H.264 is length-prefixed with an
+  `avcC` in the extradata in one common mux and raw Annex-B in another, the FourCC does not
+  separate them (`ffmpeg -c:v copy` from MP4 writes `avc1`, a fresh encode writes `H264`), and
+  handing the sampler the wrong framing feeds it bytes that are not NAL units. The test is the
+  first extradata byte — a configuration record opens with `configurationVersion == 1`, Annex-B
+  with a start code's `0x00` — which is ffmpeg's own discriminator. The length prefix size is
+  *not* read there: it lives at a different offset in each record (byte 4 of an `avcC`, byte 21
+  of an `hvcC`), so it comes from `parse_avcc_record`/`parse_hvcc_record`, which both MKV arms
+  and the AVI backend reach through `mkv::nal_config`'s shape.
+- `container/avi.rs` — AVI (RIFF / OpenDML), `.avi`. Everything is a `ckID`/`ckSize` pair, so
+  every position is arithmetic on declared sizes and the default path **scans nothing**: the
+  `hdrl` is structurally at the head and both index forms are seek-addressable from it (a 1.07 GiB
+  two-segment file reports in 29 ms). Six facts are invariants, each pinned by a test.
+  **The frame-rate signal is a stream *unit* rate, not a picture rate** — `strh.dwRate/dwScale`
+  counts whatever `dwLength` counts, and an `ffmpeg -i x.mp4 -c:v copy out.avi` remux (a very
+  common operation) declares 1200 units at 600/1 for a 2 s 25 fps clip, 1150 of them zero-length
+  padding chunks. MediaInfo reports 600.000 fps for it. So the *coded stream's* own rate wins
+  where it has one and the container's is the fallback, which is why `demux` fills `fps` only
+  `if td.fps.is_none()` after the bitstream parsers have run; the duration is unaffected either
+  way, since both halves of `dwLength / (dwRate/dwScale)` count the same units.
+  **`avih.dwTotalFrames` is wrong on every OpenDML file** and is never read; `strh.dwLength` is
+  the whole-file count on both ffmpeg and VirtualDub. **The `odml` LIST is written as a `JUNK`
+  chunk with a zero frame count on a single-RIFF file** — ffmpeg reserves the block and rewrites
+  the id to `LIST` only on rollover, so all ten corpus AVIs (including the one *named*
+  `h264_odml.avi`) carry a `JUNK`-wrapped `dmlh` reading 0 while a real two-segment file reads
+  5000. `dmlh` must therefore be reached by descending a genuine `LIST odml`, never by searching
+  for its FourCC. **The two index forms use opposite offset conventions**: `idx1` entries address
+  the chunk *header* relative to the `movi` FOURCC (so entry 0 reads 4), while OpenDML `ix##`
+  entries address the chunk *data* relative to `qwBaseOffset`; both bases are derived and then
+  *validated* against the chunk actually at that position, because Microsoft documents an
+  absolute-offset `idx1` variant (VirtualDub before build 4936) and nothing else would catch a
+  misread. **`idx1` covers only the first RIFF segment**, a 22% byte undercount on a real
+  two-segment file, so summing it is gated on the file being single-segment; multi-segment files
+  sum the `ix##` chunks the `indx` super-index points at. **`idx1` entry 0 need not be video** —
+  it is `01wb` on the corpus's video+MP3 file — so entries are filtered by the two-digit
+  stream-index prefix and the base comes from entry 0's own chunk id (unfiltered, that file's
+  rate is 12.5% high). Deliberately not parsed: `vprp` (it carries only display aspect ratio and
+  field order, both out of scope plan-wide, plus a refresh rate and geometry that duplicate
+  `strh`/`strf`), `dwMaxBytesPerSec` (a whole-file maximum including audio) and `biBitCount`.
 - `container/ps.rs` — MPEG program stream / MPEG-1 system stream (`.mpg`, `.mpeg`, `.vob`,
   `.m2p`, `.evo`), read against **ITU-T H.222.0 (10/2014) | ISO/IEC 13818-1**, which is free
   from ITU and is the normative source for the pack header (Table 2-39), the PES packet
@@ -979,7 +1018,16 @@ never parse bytes native-endian.
   streamed completed-AU bytes (`sample::Scan::es_bytes`, applied as the report's rate in `main.rs`
   since the total exists only after the streaming scan — demux leaves `bitrate` unset on that
   path, and `Some(0)` bytes still yields `None`, never 0 b/s; `--full --no-rpu` still walks the
-  stream count-only so the exact rate survives). Otherwise an *overall* rate (file length ÷
+  stream count-only so the exact rate survives). **AVI sums its own index** — `idx1` on a
+  single-segment file, the OpenDML `ix##` chunks otherwise — over the *video stream's* declared
+  duration, which reproduces MediaInfo's video rate byte-for-byte on eight of the nine corpus
+  files; and it emits **no rate at all when the first RIFF segment declares more bytes than the
+  file holds**, because a truncated AVI's numerator is the bytes present while its denominator is
+  the whole declared runtime. That case is not theoretical or cosmetic: a 5 MiB file cut inside
+  its own `idx1` reported 331 kb/s *labelled as an exact video-stream rate* against a true 752,
+  since a cut index reads as a shorter well-formed one. MediaInfo reports the same wrong number;
+  ffmpeg instead rescales the *duration*, which is a guess about where the cut landed. The
+  declared duration is a header fact and stands. Otherwise an *overall* rate (file length ÷
   duration, labelled distinctly because it
   counts audio + overhead) or `None` (no duration: raw HEVC/AV1). Never divide a bounded head-window
   index by the full runtime. **MKV reads the statistics `Tags` via one bounded tail seek**: mkvmerge
