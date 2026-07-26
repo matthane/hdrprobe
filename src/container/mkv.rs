@@ -532,6 +532,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         mkv_stream,
         raw_stream: None,
         bounded_index: false,
+        declared_short: false,
     })
 }
 

@@ -147,6 +147,16 @@ pub struct Demux {
     /// program-stream backend is the one case that needs it, until D7's
     /// whole-file walk lands.
     pub bounded_index: bool,
+    /// True when the container itself declares more bytes than the file holds
+    /// — AVI's RIFF segment sizes, ASF's `File Properties.File Size`, FLV's
+    /// `onMetaData.filesize` — i.e. a partial download or a capture that never
+    /// closed. The backends already withhold what a prefix cannot support
+    /// (overall rates; ASF also its duration); this surfaces the *why* as the
+    /// report's `input_truncated`, which used to be a stdin-only fact
+    /// (open-items B6). Never set from a mere absence of a declaration, and
+    /// never triggers the stdin prefix-suppression table in `main.rs` — the
+    /// backend's own withholding is already format-aware.
+    pub declared_short: bool,
 }
 
 impl Demux {
@@ -160,6 +170,7 @@ impl Demux {
             mkv_stream: None,
             raw_stream: None,
             bounded_index: false,
+            declared_short: false,
         }
     }
 }

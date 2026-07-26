@@ -253,6 +253,10 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         mkv_stream: None,
         raw_stream: None,
         bounded_index: false,
+        // A present File Properties size the bytes fall materially short of
+        // is a partial download; an absent or broadcast-flagged one is not
+        // evidence of anything and must not read as truncation.
+        declared_short: h.file.as_ref().is_some_and(|f| !f.size_plausible(data.len() as u64)),
     })
 }
 
@@ -816,6 +820,8 @@ mod tests {
         let d = demux(&asf_file(&children, 2, 4096)).expect("demuxes");
         assert_eq!(d.duration_secs, None);
         assert!(d.tracks[0].bitrate.is_none());
+        // The report's own truncation flag names why (open-items B6).
+        assert!(d.declared_short);
     }
 
     #[test]
@@ -828,6 +834,9 @@ mod tests {
         children.extend_from_slice(&stream_properties(VIDEO_MEDIA, 1, &strf));
         let d = demux(&asf_file(&children, 2, 4096)).expect("demuxes");
         assert_eq!(d.duration_secs, None);
+        // A live header's meaningless size is not truncation evidence: only a
+        // *present, plausible-format* declaration the bytes fall short of is.
+        assert!(!d.declared_short, "broadcast headers must not read as truncation");
     }
 
     #[test]

@@ -254,6 +254,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         ts_stream: None,
         mkv_stream: None,
         raw_stream: None,
+        declared_short: false,
         // The chunks above index the bounded head window and there is no
         // streaming plan behind them, so `--full` reads every chunk that exists
         // without having seen the whole stream. Saying so keeps the report's

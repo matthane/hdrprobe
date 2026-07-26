@@ -263,6 +263,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         mkv_stream: None,
         raw_stream: None,
         bounded_index: false,
+        declared_short: false,
     })
 }
 

@@ -218,24 +218,13 @@ section.
 | `hdrprobe_schema_version` | string | always | Version of hdrprobe's own output schema, `"<major>.<minor>"`; see Schema versioning above. Not related to the inspected file's metadata (contrast `format_version` and `video_tracks[].dolby_vision.cm_version`) |
 | `file` | string | always | The input path as given on the command line (or as found during a directory scan); `"-"` for a stdin probe |
 | `size_bytes` | integer | always | File size in bytes. For a truncated stdin probe (`input_truncated` present) this is the bytes actually probed, not the source's size |
-| `input_truncated` | boolean | stdin probes only, when true | The piped stream exceeded the head budget, so only a leading window was probed: `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (TS `duration_secs`, non-MP4 `bitrate`) are withheld. Absent for file probes and for stdin streams that ended within the budget; see the stdin paragraph under "How input kind and flags affect presence" |
+| `input_truncated` | boolean | when true | Only part of the input was (or could be) probed. For a **stdin** probe: the piped stream exceeded the head budget, so only a leading window was probed — `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (TS `duration_secs`, non-MP4 `bitrate`) are withheld; see the stdin paragraph under "How input kind and flags affect presence". For a **file** probe: the container itself declares more bytes than the file holds (AVI's RIFF segment sizes, ASF's `File Properties.File Size`, FLV's `onMetaData.filesize`) — a partial download or a capture that never closed; the backend has already withheld what a prefix cannot support (any `"overall"` bitrate; ASF also its duration), and the flag names why. Never set from a merely absent declaration. Absent for whole files and for stdin streams that ended within the budget |
 
-**A known limit of `input_truncated`: it says nothing about a *file* that is short.** Several
-containers state their own length — AVI's first-segment byte count, ASF's `File Properties.File
-Size`, FLV's `onMetaData.filesize` — and when the bytes on disk fall materially below it those
-backends already withhold what a prefix cannot support (any `"overall"` bitrate; for ASF, also
-`duration_secs`). But the flag stays absent, because its presence condition is stdin-only. So a
-report can legitimately show a size, a duration and a bitrate that cannot all describe the same
-file, with nothing naming the cause. Widening the flag to file probes is a presence change and so
-a **breaking** one; it is recorded for the next major bump rather than slipped into an additive
-release. Consumers that need to detect this today can compare `size_bytes` against the duration
-and bitrate themselves.
-| `container` | string | always | Container or sidecar kind; see the value table under `VideoTrack` below |
-| `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes" below |
-| `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
-| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a TS/M2TS reports the video presentation span — head-minimum to tail-maximum video PTS plus one frame interval, matching MediaInfo's per-video-track duration; the PCR arrival span is the fallback when the PTS route is not credible, and a multi-program TS shares one mux timeline; an Ogg file's is its *video* stream's — audio that outlasts the video is not counted, since measuring it would mean decoding audio granule positions). Absent when the input has no duration source (raw HEVC; raw AV1 OBU and raw MPEG-1/2 ES without a full scan — under `--full` both derive frames ÷ rate, and the raw MPEG ES then also reports the `video_stream` bitrate the derivation enables; all sidecars; a truncated stdin TS probe, whose PCR span would describe the prefix, not the stream) |
-| `video_tracks` | array of `VideoTrack` | always, at least one entry | One entry per video track; see "Multiple video tracks" below |
-| `elapsed_ms` | float | always | Wall-clock parse time in milliseconds |
+**`input_truncated` on file probes ships in 3.0** (it was stdin-only through 2.x, and the
+file-side detections existed without surfacing): a truncated AVI/ASF/FLV now names why its
+report withholds what it withholds. The three declarations above are the only ones consulted;
+a format with no self-declared length (TS, raw streams, Ogg) cannot set the flag from a file
+probe, and a short file of such a format still reports without it.
 
 ### Multiple video tracks
 
@@ -906,6 +895,11 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   Also additive: a raw MPEG-1/2 elementary stream under `--full` now reports `duration_secs`
   (picture count ÷ the sequence header's rate) and a `video_stream`-scope `bitrate`, matching
   MediaInfo's derivation byte-exactly; the default bounded probe still reports neither.
+  One presence widening: **`input_truncated` now also appears on file probes** whose container
+  declares more bytes than the file holds (AVI RIFF segment sizes, ASF `File Properties`, FLV
+  `onMetaData.filesize`). The detections shipped in the backends already — withholding overall
+  rates and, for ASF, the duration — and the flag now names why. A 2.x consumer treating the
+  field as stdin-only should treat it as "partial input" generally.
   One value change with no shape change: **TS/M2TS `duration_secs` is now the video
   presentation span** (head-minimum to tail-maximum video PTS plus one frame interval, the
   program-stream backend's rule) **with the PCR span as the fallback**, because the PCR times

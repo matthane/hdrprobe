@@ -280,6 +280,10 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         mkv_stream: None,
         raw_stream: None,
         bounded_index: bounded,
+        // A RIFF segment declaring more bytes than the file holds: the writer
+        // patches sizes at close, so a shortfall is a cut file, exactly the
+        // evidence the exact-bitrate path already withholds on.
+        declared_short: !complete,
     })
 }
 
@@ -1530,9 +1534,13 @@ mod tests {
         // *declared* runtime.
         let d = demux(&full[..full.len() / 2]).expect("still reports what it can");
         assert!(d.tracks[0].bitrate.is_none());
+        // The report's own truncation flag names why (open-items B6).
+        assert!(d.declared_short);
         // A complete file is unaffected — this is the control that stops the
         // guard from simply switching the rate off everywhere.
-        assert!(demux(&full).unwrap().tracks[0].bitrate.is_some());
+        let whole = demux(&full).unwrap();
+        assert!(whole.tracks[0].bitrate.is_some());
+        assert!(!whole.declared_short);
     }
 
     #[test]

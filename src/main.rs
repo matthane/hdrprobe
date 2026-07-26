@@ -952,7 +952,13 @@ fn assemble_report(
         hdrprobe_schema_version: model::SCHEMA_VERSION,
         file,
         size_bytes,
-        input_truncated: truncated,
+        // A stdin stream cut by the head budget, or a *file* whose container
+        // declares more bytes than it holds (`Demux::declared_short`) — the
+        // flag names why an AVI/ASF/FLV prefix's numbers cannot all describe
+        // one file. Only the stdin case feeds the prefix-suppression table
+        // (`suppress_prefix_derived_facts`); the backends behind
+        // `declared_short` already withheld their own prefix-invalid facts.
+        input_truncated: truncated || demux.declared_short,
         container,
         bd_iso,
         format_version: None,

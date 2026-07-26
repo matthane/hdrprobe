@@ -261,6 +261,10 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         mkv_stream: None,
         raw_stream,
         bounded_index,
+        // `onMetaData.filesize` declaring more than the bytes present — the
+        // partial-download / still-recording case the overall rate is already
+        // withheld for.
+        declared_short: !complete,
     })
 }
 
@@ -1895,8 +1899,11 @@ mod tests {
         let f = flv_file(&[tag(TAG_SCRIPT, 0, &p), tag(TAG_VIDEO, 0, &legacy_avc_config())]);
         // Demux must not hand the rate over to the walk here: the walk would
         // measure the prefix. The declared value describes the whole title.
-        let b = demux(&f, true).unwrap().tracks[0].bitrate.expect("the declared rate");
+        let d = demux(&f, true).unwrap();
+        let b = d.tracks[0].bitrate.as_ref().expect("the declared rate");
         assert_eq!(b.bits_per_sec, 30_000_000.0);
+        // The report's own truncation flag names why (open-items B6).
+        assert!(d.declared_short);
     }
 
     #[test]
@@ -1916,5 +1923,6 @@ mod tests {
         let d = demux(&f, true).unwrap();
         assert!(d.tracks[0].bitrate.is_none(), "left for the walk's exact sum");
         assert!(matches!(d.raw_stream, Some(RawFullStream::Flv { .. })));
+        assert!(!d.declared_short, "a file matching its declaration is whole");
     }
 }

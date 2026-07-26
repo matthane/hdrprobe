@@ -27,12 +27,17 @@ pub struct Report {
     pub hdrprobe_schema_version: &'static str,
     pub file: String,
     pub size_bytes: u64,
-    /// Stdin input (`hdrprobe -`) only: true when the stream exceeded the
-    /// head budget and only a leading window was probed. When present,
-    /// `size_bytes` is the bytes actually probed (not the source's size) and
-    /// facts derived from the payload span rather than a declared header
-    /// (TS duration, non-MP4 bitrates) are withheld. File probes, and stdin
-    /// streams that ended within the budget, omit it.
+    /// True when only part of the input was (or could be) probed. Two cases
+    /// share the flag. **Stdin** (`hdrprobe -`): the stream exceeded the head
+    /// budget, only a leading window was probed, `size_bytes` is the bytes
+    /// actually probed, and facts derived from the payload span rather than a
+    /// declared header (TS duration, non-MP4 bitrates) are withheld. **File
+    /// probes** (open-items B6): the container itself declares more bytes
+    /// than the file holds (AVI RIFF segment sizes, ASF `File Properties`,
+    /// FLV `onMetaData.filesize`) — a partial download or a capture that
+    /// never closed; the backend has already withheld what a prefix cannot
+    /// support, and this names why. Absent for whole files and for stdin
+    /// streams that ended within the budget.
     #[serde(skip_serializing_if = "is_false")]
     pub input_truncated: bool,
     pub container: String,
