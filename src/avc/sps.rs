@@ -21,6 +21,8 @@ pub struct SpsInfo {
     pub profile_idc: u8,
     /// `level_idc` (level × 10, e.g. 42 = 4.2).
     pub level_idc: u8,
+    /// `constraint_set1_flag` — Constrained Baseline when set on Baseline (66).
+    pub constraint_set1: bool,
     /// `constraint_set4_flag` — frame-only (Progressive High when set on High).
     pub constraint_set4: bool,
     /// `constraint_set5_flag` — Constrained High when set on High.
@@ -44,17 +46,31 @@ impl SpsInfo {
 
     /// Codec-profile label, e.g. `"High @ L4.2"`.
     pub fn profile_label(&self) -> String {
-        avc_profile_label(self.profile_idc, self.level_idc, self.constraint_set4, self.constraint_set5)
+        avc_profile_label(
+            self.profile_idc,
+            self.level_idc,
+            self.constraint_set1,
+            self.constraint_set4,
+            self.constraint_set5,
+        )
     }
 }
 
 /// Human label for an AVC profile_idc + level_idc. AVC has no Main/High *tier*
 /// (that is a Dolby-level concept), so unlike HEVC the label carries only the
-/// coding profile and the level. High profile refines to Progressive High
-/// (frame-only, `constraint_set4`) or Constrained High (also `constraint_set5`),
-/// the three High variants Dolby Vision profile 9 allows.
-pub fn avc_profile_label(profile_idc: u8, level_idc: u8, cs4: bool, cs5: bool) -> String {
+/// coding profile and the level. Baseline refines to Constrained Baseline
+/// (`constraint_set1`); High refines to Progressive High (frame-only,
+/// `constraint_set4`) or Constrained High (also `constraint_set5`), the three
+/// High variants Dolby Vision profile 9 allows.
+pub fn avc_profile_label(profile_idc: u8, level_idc: u8, cs1: bool, cs4: bool, cs5: bool) -> String {
     let profile = match profile_idc {
+        // "Conformance of a bitstream to the Constrained Baseline profile is
+        // indicated by profile_idc being equal to 66 with constraint_set1_flag
+        // being equal to 1" — H.264 (06/2019) §A.2.1.1. The gate is 66's
+        // alone: Main encodes routinely set cs1 too (x264 writes it, measured
+        // constraints 0x40 on a Main mux), where it states Main-constraint
+        // conformance, and ffprobe and MediaInfo both keep "Main" for it.
+        66 if cs1 => "Constrained Baseline".to_string(),
         66 => "Baseline".to_string(),
         77 => "Main".to_string(),
         88 => "Extended".to_string(),
@@ -84,6 +100,7 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
     let profile_idc = r.read_bits(8)? as u8;
     // constraint_set0..5_flags (6) + reserved_zero_2bits (2).
     let constraints = r.read_bits(8)?;
+    let constraint_set1 = (constraints >> 6) & 1 == 1;
     let constraint_set4 = (constraints >> 3) & 1 == 1;
     let constraint_set5 = (constraints >> 2) & 1 == 1;
     let level_idc = r.read_bits(8)? as u8;
@@ -180,6 +197,7 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
         chroma_format_idc: chroma_format_idc as u8,
         profile_idc,
         level_idc,
+        constraint_set1,
         constraint_set4,
         constraint_set5,
         color: None,
@@ -263,11 +281,21 @@ mod tests {
 
     #[test]
     fn profile_label_high_variants() {
-        assert_eq!(avc_profile_label(100, 42, false, false), "High @ L4.2");
-        assert_eq!(avc_profile_label(100, 42, true, false), "Progressive High @ L4.2");
-        assert_eq!(avc_profile_label(100, 42, true, true), "Constrained High @ L4.2");
-        assert_eq!(avc_profile_label(77, 40, false, false), "Main @ L4");
-        assert_eq!(avc_profile_label(66, 31, false, false), "Baseline @ L3.1");
+        assert_eq!(avc_profile_label(100, 42, false, false, false), "High @ L4.2");
+        assert_eq!(avc_profile_label(100, 42, false, true, false), "Progressive High @ L4.2");
+        assert_eq!(avc_profile_label(100, 42, false, true, true), "Constrained High @ L4.2");
+        assert_eq!(avc_profile_label(77, 40, false, false, false), "Main @ L4");
+        assert_eq!(avc_profile_label(66, 31, false, false, false), "Baseline @ L3.1");
+    }
+
+    #[test]
+    fn constrained_baseline_is_66_gated() {
+        // H.264 (06/2019) §A.2.1.1: profile_idc 66 + constraint_set1_flag is
+        // Constrained Baseline. cs1 on Main must NOT relabel it: x264 writes
+        // constraints 0x40 on ordinary Main encodes (measured), and ffprobe
+        // and MediaInfo both keep "Main" for them.
+        assert_eq!(avc_profile_label(66, 13, true, false, false), "Constrained Baseline @ L1.3");
+        assert_eq!(avc_profile_label(77, 13, true, false, false), "Main @ L1.3");
     }
 
     #[test]
