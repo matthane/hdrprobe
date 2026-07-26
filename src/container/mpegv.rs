@@ -4,17 +4,24 @@
 //! streams record about themselves is at the head ([`crate::mpeg2`]), so this
 //! fills the General fields from a bounded head read and leaves `chunks` empty,
 //! which `sample::scan` reads as "nothing to sample" (see the contract on
-//! `TrackDemux::chunks`). No chunk index, no sampler arm, no progress or
-//! frontier plumbing.
+//! `TrackDemux::chunks`). No chunk index and no sampler extraction arm.
 //!
-//! Duration and bitrate are absent for the same reason they are absent from a
-//! raw HEVC stream: the format records neither, and the frame count needed to
-//! derive one would take a walk over the whole file. `None` is the honest
-//! answer, and it is what ffprobe reports for these files too.
+//! Duration and bitrate are absent on the default path for the same reason
+//! they are absent from a raw HEVC stream: the format records neither, and the
+//! frame count needed to derive one takes a walk over the whole file. Under
+//! `--full` that walk runs ([`walk_pictures`], the raw-AV1 contract): the
+//! picture start codes are counted, duration is count ÷ the sequence header's
+//! frame rate, and the rate is the file's bytes over that duration — a raw ES
+//! is video payload end to end, so the scope is `video_stream` and the number
+//! reproduces MediaInfo's exactly (its 388048 b/s for the corpus `mpeg2.m2v`
+//! equals the same encode's MP4 `stsz` sum). The count is sound rather than
+//! heuristic: MPEG video start codes are unique in a conforming bitstream —
+//! the VLC tables cannot emit the start-code prefix — which is the property
+//! hardware start-code pickers rely on.
 
 use anyhow::{Context, Result};
 
-use crate::container::{Codec, Demux, NalFormat, TrackDemux};
+use crate::container::{Codec, Demux, NalFormat, RawFullStream, TrackDemux};
 
 /// Bytes read to find the sequence header. It opens the stream in every mux
 /// observed, so this is slack for a capture cut mid-GOP rather than a budget
@@ -23,7 +30,7 @@ use crate::container::{Codec, Demux, NalFormat, TrackDemux};
 /// same coupling `annexb::HEAD_SCAN_BYTES` and `av1::HEAD_SCAN_BYTES` keep.
 pub const HEAD_SCAN_BYTES: usize = 8 << 20; // 8 MiB
 
-pub fn demux(data: &[u8]) -> Result<Demux> {
+pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     // The stream must *open* on an MPEG video start code. This is a stricter
     // rule than `annexb::demux`'s (which only refuses a head positively
     // identified as another family) and it has to be, because the search below
@@ -70,7 +77,42 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         // delimited but are not NAL units, and the sampler's arm is a no-op.
         ..TrackDemux::new(codec, NalFormat::AnnexB)
     };
-    Ok(Demux::single(container, None, track))
+    let mut d = Demux::single(container, None, track);
+    // `--full`: the fused count-only walk (`sample::scan_raw_full`) — the
+    // demux itself stays a bounded head read on every path.
+    d.raw_stream = full.then_some(RawFullStream::Mpegv);
+    Ok(d)
+}
+
+/// Count picture start codes (`00 00 01 00`) across the whole stream — the
+/// `--full` frame count, per the module doc. `tick` receives the walk
+/// position for progress and the remote-read frontier.
+pub(crate) fn walk_pictures(data: &[u8], mut tick: impl FnMut(usize)) -> u64 {
+    const TICK_STEP: usize = 4 << 20;
+    let mut count = 0u64;
+    let mut next_tick = TICK_STEP;
+    let mut i = 0usize;
+    while i + 3 < data.len() {
+        // The byte at i+2 decides how far the window can move: anything above
+        // 1 there rules out a prefix ending on it.
+        let b2 = data[i + 2];
+        if b2 > 1 {
+            i += 3;
+        } else if b2 == 1 && data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 3] == 0x00 {
+                count += 1;
+            }
+            // Advance to the code byte: it may itself open the next prefix.
+            i += 3;
+        } else {
+            i += 1;
+        }
+        if i >= next_tick {
+            tick(i);
+            next_tick += TICK_STEP;
+        }
+    }
+    count
 }
 
 #[cfg(test)]
@@ -86,7 +128,7 @@ mod tests {
 
     #[test]
     fn mpeg2_elementary_stream_reports_its_sequence_header() {
-        let d = demux(&M2V_HEAD).expect("sequence header");
+        let d = demux(&M2V_HEAD, false).expect("sequence header");
         assert_eq!(d.container, "raw MPEG-2 Video (ES)");
         let t = &d.tracks[0];
         assert_eq!(t.codec, Codec::Mpeg2);
@@ -109,18 +151,43 @@ mod tests {
         let mut d = Vec::from(&M2V_HEAD[..12]);
         d[7] = 0x13;
         d.extend_from_slice(&[0x00, 0x00, 0x01, 0xB8, 0x00, 0x08, 0x00, 0x40]);
-        let dm = demux(&d).expect("sequence header");
+        let dm = demux(&d, false).expect("sequence header");
         assert_eq!(dm.container, "raw MPEG-1 Video (ES)");
         assert_eq!(dm.tracks[0].codec, Codec::Mpeg1);
         assert_eq!(dm.tracks[0].codec_profile, None, "MPEG-1 has no profile field");
     }
 
     #[test]
+    fn full_sets_the_count_only_walk_plan_and_the_default_does_not() {
+        assert!(demux(&M2V_HEAD, false).unwrap().raw_stream.is_none());
+        assert!(matches!(demux(&M2V_HEAD, true).unwrap().raw_stream, Some(RawFullStream::Mpegv)));
+    }
+
+    #[test]
+    fn walk_pictures_counts_picture_start_codes_alone() {
+        // Sequence, GOP, three pictures, a slice and a zero run: only the
+        // three `00 00 01 00` codes count, including one whose prefix rides a
+        // longer zero run and one immediately after another code's byte.
+        let mut s = Vec::new();
+        s.extend_from_slice(&[0x00, 0x00, 0x01, 0xB3, 0x14, 0x00, 0xF0]);
+        s.extend_from_slice(&[0x00, 0x00, 0x01, 0xB8, 0x00, 0x08]);
+        s.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02]); // picture, long zero run
+        s.extend_from_slice(&[0x00, 0x00, 0x01, 0x01, 0xAA]); // slice 1: not a picture
+        s.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]); // picture at the tail window's edge
+        s.push(0x55);
+        s.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0xFF]); // and one more
+        assert_eq!(walk_pictures(&s, |_| {}), 3);
+        // Degenerate inputs: nothing to count, nothing to panic over.
+        assert_eq!(walk_pictures(&[], |_| {}), 0);
+        assert_eq!(walk_pictures(&[0x00, 0x00, 0x01], |_| {}), 0);
+    }
+
+    #[test]
     fn bytes_without_a_sequence_header_error_rather_than_report() {
-        assert!(demux(&[]).is_err());
-        assert!(demux(&[0u8; 4096]).is_err());
+        assert!(demux(&[], false).is_err());
+        assert!(demux(&[0u8; 4096], false).is_err());
         // An HEVC Annex-B head must not be claimed by this backend.
-        assert!(demux(&[0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF]).is_err());
+        assert!(demux(&[0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF], false).is_err());
     }
 
     #[test]
@@ -135,20 +202,20 @@ mod tests {
         let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3];
         mkv.extend_from_slice(&[0xAA; 64]);
         mkv.extend_from_slice(&M2V_HEAD); // a plausible header further in
-        assert!(demux(&mkv).is_err(), "an EBML head must not reach the scan");
+        assert!(demux(&mkv, false).is_err(), "an EBML head must not reach the scan");
 
         let mut mp4 = vec![0x00, 0x00, 0x00, 0x18];
         mp4.extend_from_slice(b"ftypisom");
         mp4.extend_from_slice(&M2V_HEAD);
-        assert!(demux(&mp4).is_err(), "an ISOBMFF head must not reach the scan");
+        assert!(demux(&mp4, false).is_err(), "an ISOBMFF head must not reach the scan");
 
         // A pack header is the program stream's, not this backend's.
-        assert!(demux(&[0, 0, 1, 0xBA, 0x44, 0x00, 0x04, 0x00]).is_err());
+        assert!(demux(&[0, 0, 1, 0xBA, 0x44, 0x00, 0x04, 0x00], false).is_err());
 
         // A stream cut at a GOP boundary still opens on an MPEG start code and
         // is accepted, with the sequence header found by the scan.
         let mut cut = Vec::from(&[0x00, 0x00, 0x01, 0xB8, 0x00, 0x08, 0x00, 0x40][..]);
         cut.extend_from_slice(&M2V_HEAD);
-        assert!(demux(&cut).is_ok(), "a GOP-boundary cut is legitimate");
+        assert!(demux(&cut, false).is_ok(), "a GOP-boundary cut is legitimate");
     }
 }

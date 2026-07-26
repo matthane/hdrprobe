@@ -78,7 +78,10 @@ never parse bytes native-endian.
   `av1.rs` (which also owns the IVF wrapper's FourCC dispatch: `VP90` → the VP9 IVF demux,
   `VP80` → an honest error, else AV1), `mpegv.rs` (raw MPEG-1/2 video elementary stream, the
   thinnest backend in the tree: a bounded head read fills the General fields and `chunks` stays
-  empty, per the metadata-only contract on `TrackDemux::chunks`), `ps.rs` (below); `mod.rs` holds
+  empty, per the metadata-only contract on `TrackDemux::chunks`; under `--full` a count-only
+  fused walk — `RawFullStream::Mpegv`, the Ogg shape — counts picture start codes so duration
+  is frames ÷ the sequence header's rate and the bitrate is the file's bytes over it, at
+  `video_stream` scope, reproducing MediaInfo byte-exactly on both corpus raw streams), `ps.rs` (below); `mod.rs` holds
   `Demux`/`Chunk`/`DvConfig`, the shared dvcC/hvcC/CICP decoders, `fill_nal_config_fields` (an
   `avcC`/`hvcC` record to a `TrackDemux`, shared because AVI, ASF and FLV all hand one over and
   each reaches it through a different carriage's framing test), and — since TS and PS both

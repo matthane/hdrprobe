@@ -317,6 +317,11 @@ pub enum RawFullStream {
     /// the header's rate/scale time base, needed to turn the walk's timestamp
     /// span into the stream's true average fps.
     Ivf { data_start: usize, ticks_per_sec: f64 },
+    /// Raw MPEG-1/2 elementary stream: a count-only picture-start-code walk
+    /// (`mpegv::walk_pictures`) — nothing to extract, like the Ogg walk. The
+    /// count feeds duration (÷ the sequence header's rate) and the file's own
+    /// length is the byte sum, a raw ES being video payload end to end.
+    Mpegv,
 }
 
 /// Detect the container type and demux it. `full` requests an exhaustive scan
@@ -343,7 +348,7 @@ pub fn demux(
         "mkv" | "webm" | "mka" => Some(mkv::demux(data, full)),
         "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full, progress, frontier)),
         "ivf" | "obu" => Some(av1::demux(data, full, progress, frontier)),
-        "m2v" | "m1v" | "mpv" => Some(mpegv::demux(data)),
+        "m2v" | "m1v" | "mpv" => Some(mpegv::demux(data, full)),
         // `.evo` (HD DVD) is a program stream too. Its video often rides the
         // extended stream id `0xFD`, which this walker treats as non-video, so
         // such a file declines with the backend's own message rather than
@@ -428,7 +433,7 @@ fn sniff_demux(
         // when it finds no sequence header, which is what an MPEG-4 Part 2
         // stream gets today: Part 2 shares this family (`0xB0`/`0xB6` are its
         // own start codes) and has no backend yet.
-        Some(StreamFamily::MpegVideoEs) => Some(mpegv::demux(data)),
+        Some(StreamFamily::MpegVideoEs) => Some(mpegv::demux(data, full)),
         Some(StreamFamily::ProgramStream) => Some(ps::demux(data)),
         None => None,
     }

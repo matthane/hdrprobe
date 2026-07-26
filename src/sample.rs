@@ -511,6 +511,15 @@ fn scan_raw_full(
             // applies this).
             (None, None, flv::walk_tags(data, *data_start, tick, push_au!()))
         }
+        RawFullStream::Mpegv => {
+            // Count-only like Ogg: MPEG-1/2 has no side channel to extract,
+            // so the walk counts picture start codes for the frame count —
+            // duration falls out below via the sequence header's rate already
+            // on the demux — and the byte sum is the whole file, a raw ES
+            // being video payload end to end.
+            let frames = crate::container::mpegv::walk_pictures(data, tick);
+            ((frames > 0).then_some(frames), None, Some(data.len() as u64))
+        }
     };
     flush_raw_batch(data, &mut pending, demux, opts.no_rpu, &mut dv, &mut sei, frontier);
     progress.update(data.len() as u64);

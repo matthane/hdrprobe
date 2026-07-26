@@ -233,7 +233,7 @@ and bitrate themselves.
 | `container` | string | always | Container or sidecar kind; see the value table under `VideoTrack` below |
 | `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes" below |
 | `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
-| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a multi-program TS shares one mux timeline). Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; all sidecars; a truncated stdin TS probe, whose PCR span would describe the prefix, not the stream) |
+| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a multi-program TS shares one mux timeline; an Ogg file's is its *video* stream's — audio that outlasts the video is not counted, since measuring it would mean decoding audio granule positions). Absent when the input has no duration source (raw HEVC; raw AV1 OBU and raw MPEG-1/2 ES without a full scan — under `--full` both derive frames ÷ rate, and the raw MPEG ES then also reports the `video_stream` bitrate the derivation enables; all sidecars; a truncated stdin TS probe, whose PCR span would describe the prefix, not the stream) |
 | `video_tracks` | array of `VideoTrack` | always, at least one entry | One entry per video track; see "Multiple video tracks" below |
 | `elapsed_ms` | float | always | Wall-clock parse time in milliseconds |
 
@@ -903,6 +903,9 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   format constants: VC-1 Simple/Main (`WMV3` — ST 421 defines 8-bit 4:2:0 for every profile,
   completing what the Advanced-profile sequence-header parse already reported), WMV1/WMV2, and
   MS-MPEG-4 v1/v2/v3 (H.263-lineage designs with no other pixel format).
+  Also additive: a raw MPEG-1/2 elementary stream under `--full` now reports `duration_secs`
+  (picture count ÷ the sequence header's rate) and a `video_stream`-scope `bitrate`, matching
+  MediaInfo's derivation byte-exactly; the default bounded probe still reports neither.
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
