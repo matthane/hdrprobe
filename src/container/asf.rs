@@ -139,21 +139,6 @@ const MAX_BITRATE_RECORDS: usize = 128;
 /// generous for a streaming container.
 const MAX_DURATION_SECS: f64 = 48.0 * 3600.0;
 
-/// Highest frame rate accepted from `Average Time Per Frame`. The field is
-/// 100-nanosecond ticks per frame, so a value of 1 computes ten million frames
-/// per second; anything past a high-speed camera's range is a misread field
-/// rather than a fast stream.
-const MAX_FPS: f64 = 1000.0;
-
-/// Lowest frame rate accepted from the same field, and the bound is not
-/// symmetric decoration: `fps > 0.0` is no bound at all against a `u64`
-/// divisor, because `10_000_000 / 2^63` is a positive float. A declared
-/// `Average Time Per Frame` of `2^63` renders as **`0.000 fps`**, which reads
-/// as a stated rate of zero rather than as the misread field it is. This is the
-/// finest rate the report's own three decimals can distinguish from zero, so
-/// anything below it could only ever print a lie.
-const MIN_FPS: f64 = 0.001;
-
 /// How far the declared `File Size` may exceed the bytes actually present
 /// before the file is treated as short. ffmpeg applies the same 5% test before
 /// trusting `Play Duration`, and it is what catches a partial download: a
@@ -357,8 +342,11 @@ impl StreamRate {
         if self.avg_time_per_frame == 0 {
             return None;
         }
-        let fps = 10_000_000.0 / self.avg_time_per_frame as f64;
-        (MIN_FPS..=MAX_FPS).contains(&fps).then_some(fps)
+        // `Average Time Per Frame` is 100-nanosecond ticks per frame, so a
+        // value of 1 computes ten million frames per second and a value of
+        // `2^63` computes a positive float that renders `0.000 fps`. Both ends
+        // are the shared bound's business (`container::plausible_fps`).
+        super::plausible_fps(10_000_000.0 / self.avg_time_per_frame as f64)
     }
 }
 

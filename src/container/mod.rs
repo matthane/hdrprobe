@@ -11,6 +11,7 @@ pub mod flv;
 pub mod mkv;
 pub mod mp4;
 pub mod mpegv;
+pub mod ogg;
 pub mod ps;
 pub mod ts;
 
@@ -40,6 +41,8 @@ pub enum Codec {
     Mpeg4Part2,
     /// SMPTE ST 421 (VC-1), all three profiles.
     Vc1,
+    /// Xiph.Org Theora, whose only carriage is Ogg.
+    Theora,
     /// Microsoft's pre-standard MPEG-4 variants, carrying their version (1, 2 or
     /// 3). Not [`Codec::Mpeg4Part2`]: DivX 3 and its relatives predate the
     /// standard and their frame headers differ, so they get an honest name and
@@ -60,6 +63,7 @@ impl Codec {
             Codec::Mpeg2 => "MPEG-2 Video".to_string(),
             Codec::Mpeg4Part2 => "MPEG-4 Visual".to_string(),
             Codec::Vc1 => "VC-1".to_string(),
+            Codec::Theora => "Theora".to_string(),
             Codec::MsMpeg4(v) => format!("MS-MPEG-4 v{v}"),
             Codec::Other(s) => s.clone(),
         }
@@ -296,6 +300,13 @@ pub enum RawFullStream {
     /// header and `PreviousTagSize0`), which demux resolved from the header's
     /// declared length.
     Flv { data_start: usize },
+    /// Ogg page walk. `serial` names the video logical bitstream whose payload
+    /// bytes are summed, and `header_packets` is how many of its leading
+    /// packets are metadata rather than video (Theora's three, VP8's two).
+    /// Set only for a single-video file — `sample::scan` produces one
+    /// `TrackScan` per raw-stream walk, which `main.rs` zips against the
+    /// demuxed tracks, so a plan on a two-video file would drop the second.
+    Ogg { serial: u32, header_packets: u8 },
     /// IVF frame walk, shared by AV1 and VP9 (the wrapper is codec-agnostic;
     /// extraction dispatches on the track's codec). `data_start` is the first
     /// frame header's offset (past the IVF file header); `ticks_per_sec` is
@@ -341,6 +352,12 @@ pub fn demux(
         // try to open a music library and print an error per track.
         "wmv" | "asf" | "wma" => Some(asf::demux(data)),
         "flv" => Some(flv::demux(data, full)),
+        // Only `.ogv` is in `main::VIDEO_EXTS`, for the same reason `.wma` is
+        // not: `.ogg` and `.oga` are overwhelmingly Vorbis or Opus audio, so a
+        // music library scanned as a directory would print an error per track.
+        // Named individually they still report, because `.ogg` carried Theora
+        // video for years before `.ogv` existed.
+        "ogv" | "ogg" | "oga" | "ogm" | "ogx" => Some(ogg::demux(data, full)),
         "ts" | "m2ts" | "mts" => Some(ts::demux(data, full, progress, frontier)),
         _ => None,
     };
@@ -392,6 +409,9 @@ fn sniff_demux(
     if flv::is_flv(data) {
         return Some(flv::demux(data, full));
     }
+    if ogg::is_ogg(data) {
+        return Some(ogg::demux(data, full));
+    }
     if av1::is_ivf(data) || av1::is_obu_stream(data) {
         return Some(av1::demux(data, full, progress, frontier));
     }
@@ -420,6 +440,7 @@ pub(crate) fn sniffs_as_ts(data: &[u8]) -> bool {
         || avi::is_avi(data)
         || asf::is_asf(data)
         || flv::is_flv(data)
+        || ogg::is_ogg(data)
         || av1::is_ivf(data)
         || av1::is_obu_stream(data);
     !earlier_check_wins && ts::detect_layout(data).is_some()
@@ -773,6 +794,39 @@ pub(crate) fn parse_vpcc_record(rec: &[u8]) -> Option<VpccInfo> {
             ColorSource::Container,
         ),
     })
+}
+
+/// Highest frame rate any backend accepts from a declared field. Every carriage
+/// that states a rate states it as a ratio of unvalidated integers, so a single
+/// misread byte computes millions of frames per second; anything past a
+/// high-speed camera's range is a misread field rather than a fast stream.
+const MAX_FPS: f64 = 1000.0;
+
+/// Lowest frame rate accepted, and the bound is not symmetric decoration:
+/// `fps > 0.0` is no bound at all against a 32- or 64-bit divisor, because
+/// `1 / 2^32` is a positive float. Such a value renders as **`0.000 fps`**,
+/// which reads as a stated rate of zero rather than as the misread field it is.
+/// This is the finest rate the report's own three decimals can tell from zero,
+/// so anything below it could only ever print a lie.
+const MIN_FPS: f64 = 0.001;
+
+/// A declared frame rate, or `None` when it is outside the range any real
+/// stream occupies.
+///
+/// Shared rather than re-derived per backend: ASF computes it from
+/// `Average Time Per Frame`, Theora and the OggVP8 mapping from their own
+/// numerator/denominator pairs, and each arrived at the same two bounds for the
+/// same reason.
+///
+/// Those three are the current callers, not the whole set of backends that
+/// divide two file-supplied integers — `avi::Stream::fps` (`dwRate/dwScale`)
+/// and the Matroska `DefaultDuration` reciprocal do the same and are still
+/// unbounded. Widening to them is a change to shipped backends with its own
+/// corpus check, so it is recorded in the plan rather than done in passing;
+/// this doc is scoped to what actually routes here so it cannot read as a
+/// guarantee the tree does not make.
+pub(crate) fn plausible_fps(fps: f64) -> Option<f64> {
+    (MIN_FPS..=MAX_FPS).contains(&fps).then_some(fps)
 }
 
 pub(crate) fn cicp_source(code: u16, decoded: Option<&str>, src: ColorSource) -> Option<ColorSource> {
