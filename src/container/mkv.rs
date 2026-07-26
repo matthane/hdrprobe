@@ -486,6 +486,13 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         if td.codec == Codec::ProRes {
             super::fill_prores_stream_fields(&mut td, data);
         }
+        // MPEG-1/2 is the same shape again, and the most dependent on it: a
+        // `V_MPEG1`/`V_MPEG2` track has no CodecPrivate at all, so dimensions
+        // aside, the sequence header in the first block is the only thing that
+        // describes the video.
+        if matches!(td.codec, Codec::Mpeg1 | Codec::Mpeg2) {
+            super::fill_mpeg2_stream_fields(&mut td, data);
+        }
         tracks.push(td);
     }
 
@@ -1127,6 +1134,22 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             chroma: None,
             codec_profile: None,
         }
+    } else if codec_id.starts_with(b"V_MPEG1") || codec_id.starts_with(b"V_MPEG2") {
+        // Neither CodecID carries a CodecPrivate: the Matroska codec spec says
+        // the sequence header rides the blocks themselves. So everything comes
+        // from `fill_mpeg2_stream_fields` after the blocks are indexed, which
+        // is also the only colour source, since ffmpeg writes no Colour element
+        // for these tracks. The nal_format is a placeholder: blocks are raw
+        // MPEG access units, never NAL streams, and the sampler's arm is a
+        // no-op. Match on `V_MPEG1`/`V_MPEG2` rather than a `V_MPEG` prefix,
+        // which would also swallow `V_MPEG4/*`.
+        CodecConfig {
+            codec: if codec_id.starts_with(b"V_MPEG1") { Codec::Mpeg1 } else { Codec::Mpeg2 },
+            nal_format: NalFormat::LengthPrefixed(4),
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+        }
     } else if codec_id.starts_with(b"V_AV1") {
         // CodecPrivate is an AV1CodecConfigurationRecord (same layout as `av1C`),
         // which carries profile/tier/level and bit depth.
@@ -1535,6 +1558,32 @@ mod tests {
         assert_eq!(read_size(&[0xFF], 0), Some((None, 1)));
         // 2-byte unknown size 0x7F 0xFF.
         assert_eq!(read_size(&[0x7F, 0xFF], 0), Some((None, 2)));
+    }
+
+    #[test]
+    fn classify_codec_mpeg_video() {
+        // `V_MPEG1`/`V_MPEG2` carry no CodecPrivate: the sequence header rides
+        // the blocks, so classification settles the codec and leaves every
+        // other field for `fill_mpeg2_stream_fields`.
+        for (id, want) in [
+            (b"V_MPEG1".as_slice(), Codec::Mpeg1),
+            (b"V_MPEG2".as_slice(), Codec::Mpeg2),
+        ] {
+            let cc = classify_codec(id, &[]);
+            assert_eq!(cc.codec, want, "{}", String::from_utf8_lossy(id));
+            assert_eq!(cc.bit_depth, None);
+            assert_eq!(cc.chroma, None);
+            assert_eq!(cc.codec_profile, None);
+        }
+        // The match is on `V_MPEG1`/`V_MPEG2`, not a `V_MPEG` prefix, which
+        // would swallow every `V_MPEG4/*` id. Those must keep their own arms.
+        assert_eq!(classify_codec(b"V_MPEG4/ISO/AVC", &[]).codec, Codec::Avc);
+        assert_eq!(classify_codec(b"V_MPEGH/ISO/HEVC", &[]).codec, Codec::Hevc);
+        // And an unrecognized MPEG-4 id still falls through verbatim.
+        assert_eq!(
+            classify_codec(b"V_MPEG4/ISO/ASP", &[]).codec,
+            Codec::Other("V_MPEG4/ISO/ASP".to_string())
+        );
     }
 
     #[test]

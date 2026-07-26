@@ -36,11 +36,11 @@ use crate::container::Demux;
 /// extent-resolved MKV with smaller ones (`MP4_HEAD_WARM` / `MKV_HEAD_WARM`)
 /// since their real regions are warmed by exact extent.
 ///
-/// The raw bounded head walks (`av1::HEAD_SCAN_BYTES`, `annexb::HEAD_SCAN_BYTES`)
-/// are deliberately kept `<=` this so the warm covers them whole; shrink this
-/// below them and those windows' tails fault in one page at a time on the NAS
-/// again. The MKV fallback relies on this covering the first block offset +
-/// `mkv::HEAD_SPAN_BYTES`.
+/// The raw bounded head walks (`av1::HEAD_SCAN_BYTES`, `annexb::HEAD_SCAN_BYTES`,
+/// `mpegv::HEAD_SCAN_BYTES`) are deliberately kept `<=` this so the warm covers
+/// them whole; shrink this below them and those windows' tails fault in one page
+/// at a time on the NAS again. The MKV fallback relies on this covering the
+/// first block offset + `mkv::HEAD_SPAN_BYTES`.
 const HEAD_WARM: usize = 8 << 20; // 8 MiB
 
 /// Head window for ISOBMFF (a `moov` was found): everything the MP4 path reads

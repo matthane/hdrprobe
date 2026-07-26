@@ -76,8 +76,10 @@ never parse bytes native-endian.
   then the video pipeline), exit codes (0 ok / 1 usage / 2 unreadable).
 - `container/` — one hand-rolled demuxer per format: `mp4.rs`, `mkv.rs`, `ts.rs`, `annexb.rs`,
   `av1.rs` (which also owns the IVF wrapper's FourCC dispatch: `VP90` → the VP9 IVF demux,
-  `VP80` → an honest error, else AV1); `mod.rs` holds `Demux`/`Chunk`/`DvConfig` and the shared
-  dvcC/hvcC/CICP decoders.
+  `VP80` → an honest error, else AV1), `mpegv.rs` (raw MPEG-1/2 video elementary stream, the
+  thinnest backend in the tree: a bounded head read fills the General fields and `chunks` stays
+  empty, per the metadata-only contract on `TrackDemux::chunks`); `mod.rs` holds
+  `Demux`/`Chunk`/`DvConfig` and the shared dvcC/hvcC/CICP decoders.
 - `hevc/` — `nal.rs` (Annex-B + length-prefixed NAL split), `sps.rs` (dims + VUI colour + VUI
   timing/frame rate).
 - `avc/` — the H.264 analogue, for Dolby Vision **Profile 9** (`dvav.09`: 8-bit AVC, single-layer,
@@ -113,6 +115,25 @@ never parse bytes native-endian.
   carries no `colr` box at all, leaving the frame header's CICP as the only colour signal
   (verified: without the fill such a PQ master classifies SDR). ProRes RAW (`aprn`/`aprh`)
   is a different codec family and stays on the `Other` fallback.
+- `mpeg2.rs` — MPEG-1 (ISO/IEC 11172-2) and MPEG-2 (ITU-T H.262 | ISO/IEC 13818-2) video, read
+  from the `sequence_header` and its two sequence extensions through the same gap-filler shape
+  (`container::fill_mpeg2_stream_fields`). The module doc carries the carriage details; four
+  facts are invariants a later change would otherwise undo silently, each pinned by a test naming
+  its spec table. **Colour has no defaults**: H.262 leaves an absent `sequence_display_extension`
+  "implicitly defined by the application", so nothing is filled and the fields stay genuinely
+  unsignalled (D4 of `dev/sdr-coverage-plan.md`); filling BT.601 would fabricate. **Colour value
+  0 is Forbidden, not CICP 0**, so a stray 0 reads as unsignalled rather than decoding to
+  "RGB"/"Identity". **Bit depth is not signalled** and is the spec constant 8 for every defined
+  profile, like ProRes's family depth; `intra_dc_precision` is *not* a depth field (values 8..11,
+  DC inverse-quantisation scaling) and reporting it would print "11-bit" on an 8-bit stream. And
+  **frame-rate codes 9..15 are reserved**, yielding `None`; ffmpeg's `ff_mpeg12_frame_rate_tab`
+  fills 9..13 with Xing and libmpeg3 economy rates, so mirroring it invents a frame rate. Codec
+  identity in a raw stream comes from the *absence* of a `sequence_extension`, which is what makes
+  a stream 11172-2; in a container the container says. Two carriage gates are load-bearing
+  elsewhere: the TS descriptor-less multi-PID merge is **HEVC-only** (it is the Dolby Vision
+  Profile 7 shape, and MPEG has no enhancement layer, so two MPEG-2 video PIDs are two tracks),
+  and MPEG groups are excluded from `ts::sps_rescue` (no SPS exists to find, and hunting one runs
+  the walk to EOF, making `--full` two passes over the file).
 - `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation),
   `ccid.rs` (the Dolby "Profiles and Levels" tables as data: profile -> admitted CCID(s),
   CCID -> the five-part base-layer VUI as **CICP code points**, the reverse lookup

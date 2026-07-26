@@ -991,8 +991,19 @@ fn build_color_line(cc: &ColorInfo) -> String {
     // that identifies a colour space the primaries and transfer alone do not
     // describe — Profile 5 and Profile 20 both ride it — where every other
     // matrix restates what the primaries already said.
-    if cc.matrix.as_deref() == Some(crate::container::IPT_PQ_C2) {
-        parts.push(crate::container::IPT_PQ_C2.to_string());
+    //
+    // The one other case worth naming is a matrix with nothing beside it. That
+    // rationale assumes primaries to restate; when they and the transfer are
+    // both absent, suppressing the matrix empties the line entirely and the
+    // report reads as "nothing was signalled" over a stream that signalled
+    // something. MPEG-2 makes this ordinary rather than exotic: ffmpeg's
+    // encoder writes a `sequence_display_extension` whose primaries and
+    // transfer are the explicit "unspecified" code 2 and whose matrix is real.
+    let matrix_alone = cc.primaries.is_none() && cc.transfer.is_none();
+    if cc.matrix.as_deref() == Some(crate::container::IPT_PQ_C2) || matrix_alone {
+        if let Some(m) = &cc.matrix {
+            parts.push(m.clone());
+        }
     }
     // Colour space (primaries) and encoding (transfer). When the two carry the
     // same name (Rec.709 SDR: a BT.709 gamut with a BT.709 transfer), collapse
@@ -1386,6 +1397,44 @@ mod tests {
     fn an_empty_colour_description_renders_nothing() {
         assert_eq!(build_color_line(&ColorInfo::default()), "");
         assert_eq!(build_color_line(&range_only()), "full");
+    }
+
+    /// A matrix is normally suppressed because it restates what the primaries
+    /// already said. With no primaries and no transfer beside it there is
+    /// nothing to restate, and suppressing it empties the line entirely, so the
+    /// report would read as "nothing was signalled" over a stream that
+    /// signalled something. MPEG-2 makes this ordinary: ffmpeg's encoder writes
+    /// a display extension whose primaries and transfer are the explicit
+    /// "unspecified" code 2 and whose matrix is real.
+    #[test]
+    fn a_matrix_with_nothing_beside_it_is_the_whole_line() {
+        let matrix_only = |m: &str| ColorInfo {
+            matrix: Some(m.to_string()),
+            ..ColorInfo::default()
+        };
+        assert_eq!(build_color_line(&matrix_only("BT.709")), "BT.709");
+        assert_eq!(build_color_line(&matrix_only("BT.601 (PAL)")), "BT.601 (PAL)");
+        // With a range beside it, both show.
+        let cc = ColorInfo {
+            matrix: Some("BT.709".to_string()),
+            range: Some("limited".to_string()),
+            ..ColorInfo::default()
+        };
+        assert_eq!(build_color_line(&cc), "BT.709 · limited");
+        // But as soon as either primaries or transfer is present, the matrix
+        // goes back to being suppressed as a restatement.
+        let cc = ColorInfo {
+            primaries: Some("BT.2020".to_string()),
+            matrix: Some("BT.2020 NCL".to_string()),
+            ..ColorInfo::default()
+        };
+        assert_eq!(build_color_line(&cc), "BT.2020");
+        let cc = ColorInfo {
+            transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+            matrix: Some("BT.2020 NCL".to_string()),
+            ..ColorInfo::default()
+        };
+        assert_eq!(build_color_line(&cc), "PQ (SMPTE ST 2084)");
     }
 
     fn opts(color: bool, file_index: usize, file_count: usize) -> RenderOpts {

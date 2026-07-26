@@ -64,7 +64,14 @@ fn iter_boxes(d: &[u8], start: usize, end: usize) -> Vec<BoxHdr> {
         } else {
             (p + 8, p + size32)
         };
-        if box_end > end || box_end <= p {
+        // `box_end < payload` means the declared size does not even cover the
+        // box header it was read from (a 32-bit `size` of 2..=7, or a 64-bit
+        // `largesize` under 16). Every consumer below slices `payload..end`, so
+        // admitting such a box turns a malformed file into a *panic* rather
+        // than an error: an out-of-contract exit 101 that, in a directory scan,
+        // takes every remaining file with it. Two call sites already spot-check
+        // this individually; making it the walk's rule closes the class.
+        if box_end > end || box_end <= p || box_end < payload {
             break;
         }
         out.push(BoxHdr { typ, start: p, payload, end: box_end });
@@ -530,6 +537,13 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         if t.codec == Codec::ProRes {
             super::fill_prores_stream_fields(t, data);
         }
+        // MPEG-1/2 the same way: an `mp4v` entry carries no decoder-config box
+        // describing the picture (ffmpeg writes no DecoderSpecificInfo for
+        // these), so chroma, profile@level, frame rate and colour all come from
+        // the sequence header in the first sample.
+        if matches!(t.codec, Codec::Mpeg1 | Codec::Mpeg2) {
+            super::fill_mpeg2_stream_fields(t, data);
+        }
     }
 
     Demux {
@@ -630,6 +644,75 @@ struct SampleDesc {
     cuvv_version_map: Option<u16>,
 }
 
+/// Read an ISO/IEC 14496-1 §8.3.3 expandable class length at `*p`, advancing
+/// past it. Up to four bytes, each contributing seven bits, with the high bit
+/// set on every byte but the last. `None` on truncation.
+fn read_descriptor_len(data: &[u8], p: &mut usize) -> Option<u32> {
+    let mut len = 0u32;
+    for _ in 0..4 {
+        let b = *data.get(*p)?;
+        *p += 1;
+        len = (len << 7) | (b & 0x7F) as u32;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    Some(len)
+}
+
+/// The `objectTypeIndication` inside an `esds` box: the byte that says which
+/// codec a generic `mp4v` sample entry actually carries.
+///
+/// Walks ES_Descriptor (tag 3) to DecoderConfigDescriptor (tag 4), whose first
+/// byte it is. The three optional ES_Descriptor fields are each gated on a flag
+/// bit and must be skipped in order, or the tag check lands mid-field and the
+/// whole thing reads as malformed rather than as the codec it names.
+fn esds_object_type(payload: &[u8]) -> Option<u8> {
+    // FullBox header: version(8) + flags(24).
+    let mut p = 4usize;
+    if *payload.get(p)? != 0x03 {
+        return None;
+    }
+    p += 1;
+    read_descriptor_len(payload, &mut p)?;
+    // ES_ID(16), then streamDependenceFlag(1) URL_Flag(1) OCRstreamFlag(1)
+    // streamPriority(5).
+    let flags = *payload.get(p + 2)?;
+    p += 3;
+    if flags & 0x80 != 0 {
+        p += 2; // dependsOn_ES_ID
+    }
+    if flags & 0x40 != 0 {
+        p += 1 + *payload.get(p)? as usize; // URLlength + URLstring
+    }
+    if flags & 0x20 != 0 {
+        p += 2; // OCR_ES_Id
+    }
+    if *payload.get(p)? != 0x04 {
+        return None;
+    }
+    p += 1;
+    read_descriptor_len(payload, &mut p)?;
+    payload.get(p).copied()
+}
+
+/// Map an `esds` `objectTypeIndication` to a codec, per the MP4 Registration
+/// Authority's object-type list (the registry ISO/IEC 14496-1 Table 5 defers
+/// to). Only the values this backend can then describe are mapped; anything
+/// else leaves the entry on its FourCC fallback rather than claiming a codec
+/// nothing downstream can parse.
+///
+/// `0x60`..=`0x65` are the six 13818-2 rows, one per profile. The profile is
+/// read from the sequence header itself, which is both more reliable and the
+/// only source in every other container, so they collapse to one codec here.
+fn codec_from_oti(oti: u8) -> Option<Codec> {
+    Some(match oti {
+        0x60..=0x65 => Codec::Mpeg2,
+        0x6A => Codec::Mpeg1,
+        _ => return None,
+    })
+}
+
 /// The pre-encryption sample-entry FourCC of a protected entry: `encv` →
 /// `sinf` → `frma` → the original format. `None` for an ordinary unprotected
 /// entry, whose own FourCC already is the format.
@@ -666,7 +749,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     // NAL length fields, the nal_unit_type bytes, and the whole Dolby Vision
     // RPU to be left unencrypted; only slice payload is ciphertext.
     let format = original_format(data, entry).unwrap_or(entry.typ);
-    let codec = match &format {
+    let mut codec = match &format {
         b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => Codec::Hevc,
         // `avc2`/`avc4` are AVC2SampleEntry, which *Dolby Vision Streams Within
         // the ISO Base Media File Format* lists alongside `avc1`/`avc3` as a
@@ -688,6 +771,21 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let width = read_u16(data, entry_box_start + 32) as u32;
     let height = read_u16(data, entry_box_start + 34) as u32;
     let children = iter_boxes(data, entry_box_start + 86, entry.end);
+
+    // `mp4v` is the generic MPEG-4 visual sample entry and names no codec by
+    // itself: the `esds` descriptor's `objectTypeIndication` says what is
+    // actually inside. Without this the entry falls to `Codec::Other("mp4v")`,
+    // which reports the FourCC as the codec and skips the sampler entirely.
+    if &format == b"mp4v" {
+        if let Some(c) = children
+            .iter()
+            .find(|c| &c.typ == b"esds")
+            .and_then(|c| esds_object_type(&data[c.payload..c.end]))
+            .and_then(codec_from_oti)
+        {
+            codec = c;
+        }
+    }
 
     let mut bit_depth = None;
     let mut chroma = None;
@@ -1662,6 +1760,80 @@ mod tests {
         boxed(*b"stsd", &stsd_payload)
     }
 
+    #[test]
+    fn a_box_whose_size_undercuts_its_own_header_is_skipped() {
+        // A 32-bit `size` of 2..=7, or a 64-bit `largesize` under 16, declares
+        // a box shorter than the header it was read from, so `payload > end`.
+        // Every consumer slices `payload..end`, so admitting one turns a
+        // malformed file into a panic: exit 101, outside the tool's contract,
+        // and in a directory scan it takes every remaining file with it.
+        for size in 0u32..8 {
+            let mut d = size.to_be_bytes().to_vec();
+            d.extend_from_slice(b"esds");
+            d.extend_from_slice(&[0xAA; 16]);
+            for b in iter_boxes(&d, 0, d.len()) {
+                assert!(b.payload <= b.end, "size {size} yielded payload > end");
+                let _ = &d[b.payload..b.end]; // must not panic
+            }
+        }
+        // The 64-bit form.
+        let mut d = 1u32.to_be_bytes().to_vec();
+        d.extend_from_slice(b"esds");
+        d.extend_from_slice(&8u64.to_be_bytes());
+        d.extend_from_slice(&[0xAA; 16]);
+        for b in iter_boxes(&d, 0, d.len()) {
+            assert!(b.payload <= b.end);
+            let _ = &d[b.payload..b.end];
+        }
+        // A well-formed box still parses, so the guard costs nothing real.
+        let good = boxed(*b"esds", &[0xAA; 8]);
+        let boxes = iter_boxes(&good, 0, good.len());
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].end - boxes[0].payload, 8);
+    }
+
+    #[test]
+    fn esds_object_type_reads_the_real_descriptor_chain() {
+        // `testfiles/sdr/mpeg2.mp4`'s esds payload verbatim: FullBox header,
+        // ES_Descriptor (tag 3, four-byte expandable length `80 80 80 1b`),
+        // ES_ID 1, flags 0, then DecoderConfigDescriptor (tag 4) whose first
+        // byte is objectTypeIndication 0x61, MPEG-2 Main Profile.
+        let esds = [
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x1B, 0x00, 0x01, 0x00, 0x04, 0x80,
+            0x80, 0x80, 0x0D, 0x61, 0x11, 0x00, 0x00, 0x00, 0x00, 0x05, 0xEB, 0xD0, 0x00, 0x05,
+            0xEB, 0xD0, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02,
+        ];
+        assert_eq!(esds_object_type(&esds), Some(0x61));
+        assert_eq!(codec_from_oti(0x61), Some(Codec::Mpeg2));
+
+        // The single-byte length form, and the three optional ES_Descriptor
+        // fields that must be skipped in order. Flags 0xE0 sets all three:
+        // dependsOn_ES_ID(16), a URL, and OCR_ES_Id(16).
+        let mut d = vec![0x00, 0x00, 0x00, 0x00, 0x03, 0x0C, 0x00, 0x01, 0xE0];
+        d.extend_from_slice(&[0x00, 0x02]); // dependsOn_ES_ID
+        d.extend_from_slice(&[0x03, b'a', b'b', b'c']); // URLlength + URLstring
+        d.extend_from_slice(&[0x00, 0x04]); // OCR_ES_Id
+        d.extend_from_slice(&[0x04, 0x05, 0x6A]); // DecoderConfig, OTI 0x6A
+        assert_eq!(esds_object_type(&d), Some(0x6A));
+        assert_eq!(codec_from_oti(0x6A), Some(Codec::Mpeg1));
+
+        // All six 13818-2 profile rows collapse to one codec; the profile comes
+        // from the sequence header instead.
+        for oti in 0x60..=0x65u8 {
+            assert_eq!(codec_from_oti(oti), Some(Codec::Mpeg2), "OTI {oti:#04x}");
+        }
+        // Anything this backend cannot then describe stays unmapped, so the
+        // entry keeps its FourCC fallback rather than claiming a codec.
+        assert_eq!(codec_from_oti(0x20), None, "MPEG-4 Part 2 is not wired yet");
+        assert_eq!(codec_from_oti(0x40), None);
+        assert_eq!(codec_from_oti(0x00), None);
+
+        // Truncation and a wrong tag both decline rather than reading garbage.
+        assert_eq!(esds_object_type(&esds[..16]), None);
+        assert_eq!(esds_object_type(&[0, 0, 0, 0, 0x05, 0x01, 0x61]), None);
+        assert_eq!(esds_object_type(&[]), None);
+    }
+
     /// The `codec` a one-entry stsd with this sample-entry FourCC resolves to.
     fn codec_of(fourcc: &[u8; 4], children: &[Vec<u8>]) -> Codec {
         let data = stsd_with_fourcc(*fourcc, children);
@@ -1706,8 +1878,32 @@ mod tests {
         for f in [b"hvc1", b"hev1", b"dvh1", b"dvhe"] {
             assert_eq!(codec_of(f, &[]), Codec::Hevc, "{}", String::from_utf8_lossy(f));
         }
-        // An unrelated FourCC still falls through, reported verbatim.
+        // `mp4v` names no codec by itself and falls through verbatim when
+        // nothing resolves it.
         assert_eq!(codec_of(b"mp4v", &[]), Codec::Other("mp4v".to_string()));
+
+        // With an `esds`, the objectTypeIndication does resolve it. Same
+        // descriptor chain as the real `testfiles/sdr/mpeg2.mp4`, OTI byte
+        // swapped per case. Without the refinement this whole block reports
+        // `Other("mp4v")`, which skips the sampler and prints the FourCC.
+        let esds_with = |oti: u8| {
+            boxed(
+                *b"esds",
+                &[
+                    0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x1B, 0x00, 0x01, 0x00, 0x04,
+                    0x80, 0x80, 0x80, 0x0D, oti, 0x11, 0x00, 0x00, 0x00, 0x00, 0x05, 0xEB, 0xD0,
+                    0x00, 0x05, 0xEB, 0xD0,
+                ],
+            )
+        };
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x61)]), Codec::Mpeg2);
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x6A)]), Codec::Mpeg1);
+        // MPEG-4 Part 2 has no parser yet, so it keeps the FourCC fallback
+        // rather than being claimed as something this backend cannot describe.
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x20)]), Codec::Other("mp4v".to_string()));
+        // The refinement is gated on `mp4v`: another entry's esds must not
+        // relabel it.
+        assert_eq!(codec_of(b"avc1", &[esds_with(0x61)]), Codec::Avc);
     }
 
     #[test]

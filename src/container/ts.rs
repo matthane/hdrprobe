@@ -37,6 +37,8 @@ use crate::progress::{Phase, Progress};
 const SYNC: u8 = 0x47;
 const TS_UNIT: usize = 188;
 const PID_PAT: u16 = 0x0000;
+const STREAM_TYPE_MPEG1: u8 = 0x01;
+const STREAM_TYPE_MPEG2: u8 = 0x02;
 const STREAM_TYPE_AVC: u8 = 0x1B;
 const STREAM_TYPE_HEVC: u8 = 0x24;
 
@@ -93,7 +95,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
     let programs = parse_psi(data, layout).context("no PMT / program map found")?;
     let groups = group_video_pids(&programs);
     if groups.is_empty() {
-        bail!("no HEVC/AVC/Dolby Vision video PID in the program map");
+        bail!("no MPEG-1/2, AVC, HEVC or Dolby Vision video PID in the program map");
     }
 
     // Metadata always comes from the bounded head pass — even under `--full`,
@@ -116,7 +118,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         outs.iter().zip(&codecs).map(|(o, c)| best_sps(&o.buf, &o.chunks, c)).collect();
     let mut sps_chunks: Vec<Option<usize>> =
         bests.iter().map(|b| b.as_ref().map(|c| c.chunk)).collect();
-    if full && bests.iter().any(|b| b.is_none()) {
+    if full {
         // A group's head window held no SPS at all (first IDR beyond the
         // budget — atypical captures): under `--full` keep looking through the
         // whole stream rather than losing the resolution the old whole-stream
@@ -124,15 +126,23 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         // hit's chunk index is window-relative, meaningless against the head
         // chunks — and unneeded: the `--full` scan covers every AU, so nothing
         // must be pinned.
+        //
+        // MPEG-1/2 groups are excluded: they have no SPS to find, so their
+        // `None` is not a miss, and hunting one would run the walk to EOF for a
+        // structure that cannot exist. That would make `--full` two passes over
+        // an MPEG transport stream against the single-pass invariant, and two
+        // wire transfers of a capture on a network volume.
         let targets: Vec<(usize, Vec<u16>, Codec)> = bests
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.is_none())
+            .filter(|(i, b)| b.is_none() && !matches!(codecs[*i], Codec::Mpeg1 | Codec::Mpeg2))
             .map(|(i, _)| (i, group_pids[i].clone(), codecs[i].clone()))
             .collect();
-        for (i, rescued) in sps_rescue(data, layout, &targets, progress, frontier) {
-            bests[i] = rescued;
-            sps_chunks[i] = None;
+        if !targets.is_empty() {
+            for (i, rescued) in sps_rescue(data, layout, &targets, progress, frontier) {
+                bests[i] = rescued;
+                sps_chunks[i] = None;
+            }
         }
     }
 
@@ -180,7 +190,12 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             Bitrate::overall(data.len() as u64, duration_secs)
         };
 
-        tracks.push(TrackDemux {
+        // MPEG-1/2 has no SPS, so `best_sps` left every field unset and the
+        // sequence header supplies them. It rides the reassembled elementary
+        // stream this track's chunks index into, not the mmap, so the buffer is
+        // bound out here rather than reached through the half-built track.
+        let buf = out.buf;
+        let mut td = TrackDemux {
             track_number: Some(g.primary_pid() as u64),
             program: multi_program.then_some(g.program_number),
             width,
@@ -197,9 +212,14 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             bitrate,
             chunks: out.chunks,
             sps_chunk,
-            reassembled: Some(out.buf),
+            reassembled: None,
             ..TrackDemux::new(codec, NalFormat::AnnexB)
-        });
+        };
+        if matches!(td.codec, Codec::Mpeg1 | Codec::Mpeg2) {
+            super::fill_mpeg2_stream_fields(&mut td, &buf);
+        }
+        td.reassembled = Some(buf);
+        tracks.push(td);
     }
 
     Ok(Demux {
@@ -230,7 +250,12 @@ fn group_codec(streams: &[Es]) -> Codec {
         || streams.iter().find_map(|e| e.dv_config.as_ref()).map(|c| c.profile) == Some(9)
     {
         Codec::Avc
+    } else if has(STREAM_TYPE_MPEG2) {
+        Codec::Mpeg2
+    } else if has(STREAM_TYPE_MPEG1) {
+        Codec::Mpeg1
     } else {
+        // No video stream type at all: a bare DV EL/RPU PID, which is HEVC.
         Codec::Hevc
     }
 }
@@ -284,7 +309,7 @@ impl PidGroup {
 }
 
 fn is_video_type(t: u8) -> bool {
-    t == STREAM_TYPE_HEVC || t == STREAM_TYPE_AVC
+    matches!(t, STREAM_TYPE_MPEG1 | STREAM_TYPE_MPEG2 | STREAM_TYPE_AVC | STREAM_TYPE_HEVC)
 }
 
 /// A Dolby Vision enhancement-layer stream.
@@ -317,8 +342,13 @@ fn is_el_stream(e: &Es) -> bool {
 /// PIDs carry **no DV descriptor at all** keeps the historical rule: more
 /// than one video PID means a descriptor-less BDMV Profile-7 BL+EL pair (an
 /// untouched Blu-ray M2TS signals DV via the playlist, not the PMT), so they
-/// form one dual-track group rather than independent tracks. Groups come back
-/// in program order, then PID order.
+/// form one dual-track group rather than independent tracks. That rule is
+/// **gated on the PIDs being HEVC**: Dolby Vision Profile 7 is an HEVC BL+EL
+/// pair by definition, and MPEG-1/2 has no enhancement-layer concept at all, so
+/// without the gate two ordinary MPEG-2 video PIDs in one program (a mosaic,
+/// a picture-in-picture feed, a multi-feed mux) would merge into a single
+/// bogus "dual track" whose chunk list interleaves two unrelated streams.
+/// Groups come back in program order, then PID order.
 fn group_video_pids(programs: &[Program]) -> Vec<PidGroup> {
     let mut groups: Vec<PidGroup> = Vec::new();
     for prog in programs {
@@ -331,7 +361,9 @@ fn group_video_pids(programs: &[Program]) -> Vec<PidGroup> {
             continue;
         }
         let any_dv_desc = vids.iter().any(|e| e.has_dovi);
-        if !any_dv_desc && vids.len() > 1 {
+        // Only HEVC PIDs can be a descriptor-less DV Profile 7 pair.
+        let all_hevc = vids.iter().all(|e| e.stream_type == STREAM_TYPE_HEVC);
+        if !any_dv_desc && all_hevc && vids.len() > 1 {
             // Descriptor-less multi-PID program: the BDMV P7 shape.
             groups.push(PidGroup {
                 program_number: prog.program_number,
@@ -888,6 +920,12 @@ struct SpsCommon {
 fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<SpsCommon> {
     match codec {
         Codec::Avc => best_avc_sps(buf, chunks),
+        // MPEG-1/2 has no SPS at all: its metadata rides the sequence header,
+        // which `container::fill_mpeg2_stream_fields` reads from the same
+        // reassembled buffer once the track exists. Running an Annex-B NAL
+        // search over MPEG bytes would find nothing at best and something
+        // invented at worst.
+        Codec::Mpeg1 | Codec::Mpeg2 => None,
         _ => best_hevc_sps(buf, chunks),
     }
 }
@@ -1332,6 +1370,41 @@ mod tests {
 
     fn prog(n: u16, streams: Vec<Es>) -> Program {
         Program { program_number: n, pcr_pid: PID_NONE, streams }
+    }
+
+    #[test]
+    fn mpeg_video_stream_types_are_recognized_and_never_merged() {
+        // 0x01 and 0x02 are MPEG-1 and MPEG-2 video. Before they were video
+        // types at all, a transport stream carrying only these produced no
+        // report; HEVC and AVC still win when both are present, because a mux
+        // carrying both describes the same programme twice.
+        assert!(is_video_type(STREAM_TYPE_MPEG1) && is_video_type(STREAM_TYPE_MPEG2));
+        assert_eq!(group_codec(&[es(0x100, STREAM_TYPE_MPEG2, None)]), Codec::Mpeg2);
+        assert_eq!(group_codec(&[es(0x100, STREAM_TYPE_MPEG1, None)]), Codec::Mpeg1);
+        assert_eq!(
+            group_codec(&[es(0x100, STREAM_TYPE_MPEG2, None), es(0x101, STREAM_TYPE_HEVC, None)]),
+            Codec::Hevc
+        );
+
+        // The descriptor-less multi-PID rule is the BDMV Dolby Vision Profile 7
+        // shape and must stay HEVC-only. MPEG-1/2 has no enhancement layer, so
+        // two MPEG-2 video PIDs in one program are two independent tracks;
+        // merging them would report one "dual track" whose chunks interleave
+        // two unrelated streams.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![es(0x100, STREAM_TYPE_MPEG2, None), es(0x200, STREAM_TYPE_MPEG2, None)],
+        )]);
+        assert_eq!(g.len(), 2, "two MPEG-2 video PIDs are two tracks");
+        assert!(!g[0].dv_dual_track && !g[1].dv_dual_track);
+
+        // The HEVC pair still merges, which is the behaviour the gate protects.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![es(0x100, STREAM_TYPE_HEVC, None), es(0x200, STREAM_TYPE_HEVC, None)],
+        )]);
+        assert_eq!(g.len(), 1);
+        assert!(g[0].dv_dual_track);
     }
 
     #[test]

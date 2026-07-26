@@ -9,6 +9,7 @@ mod dv;
 mod hdr;
 mod hevc;
 mod model;
+mod mpeg2;
 mod prefetch;
 mod progress;
 mod prores;

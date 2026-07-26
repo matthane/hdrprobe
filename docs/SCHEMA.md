@@ -270,7 +270,7 @@ errors rather than guessing.
 | `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID. Absent where no such id exists (raw elementary streams, sidecars) |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, or `"ProRes"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"`, or a Matroska CodecID such as `"V_MPEG2"`), so treat the list as the recognized set rather than a closed one |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, or `"MPEG-2 Video"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, or a Matroska CodecID such as `"V_MPEG4/ISO/ASP"`), so treat the list as the recognized set rather than a closed one |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
@@ -302,6 +302,8 @@ Video inputs:
 | `"raw AV1 (IVF)"` | AV1 in an IVF wrapper |
 | `"raw AV1 (OBU)"` | AV1 low-overhead OBU stream |
 | `"raw VP9 (IVF)"` | VP9 in an IVF wrapper (`VP90` FourCC) |
+| `"raw MPEG-1 Video (ES)"` | MPEG-1 video elementary stream (`.m1v`, `.mpv`) |
+| `"raw MPEG-2 Video (ES)"` | MPEG-2 video elementary stream (`.m2v`, `.mpv`) |
 | `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
@@ -322,6 +324,8 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 | AV1 | `<profile> profile, <tier> tier @ L<level>` (level omitted when unset) | `"Main profile, Main tier @ L5.1"`, `"Main profile, Main tier"` |
 | VP9 | `Profile <n> @ L<level>` (level omitted when the mux states none; only WebM CodecPrivate and MP4 `vpcC` carry one) | `"Profile 2 @ L4.0"`, `"Profile 2"` |
 | ProRes | The profile name from the MOV/MP4 sample-entry FourCC; omitted entirely for Matroska, which carries no profile signal | `"422 HQ"`, `"4444 XQ"` |
+| MPEG-2 | `<profile>@<level>` from `profile_and_level_indication`; omitted when the byte is a reserved combination | `"Main@Main"`, `"Main@High"`, `"High@High 1440"`, `"4:2:2@High"` |
+| MPEG-1 | Always omitted: ISO/IEC 11172-2 has no profile or level field | |
 
 ### `Bitrate`
 
@@ -771,6 +775,14 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   Inputs with no Dolby Vision metadata see only the new `color_source` object, with one
   unreachable-in-practice exception: a non-DV stream signalling CICP matrix 15 previously
   classified as `SDR` and now classifies on its transfer like any other stream.
+  Also additive, and unrelated to Dolby Vision: **MPEG-1 and MPEG-2 video are now recognized**,
+  so `"MPEG-1 Video"` and `"MPEG-2 Video"` join the `codec` set and `"raw MPEG-1 Video (ES)"`
+  and `"raw MPEG-2 Video (ES)"` join the `container` set. `codec_profile` for these is
+  `Profile@Level` (`"Main@Main"`, `"4:2:2@High"`), absent for MPEG-1, which has no such field.
+  Tracks that previously reported a container identifier verbatim as their codec now report a
+  real one: an MP4 `mp4v` sample entry whose `esds` names an MPEG-2 object type, and a Matroska
+  `V_MPEG1`/`V_MPEG2` CodecID. A transport stream whose only video PID is `stream_type` `0x01`
+  or `0x02` produced no report at all before and now produces a full one.
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional

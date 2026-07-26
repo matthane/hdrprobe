@@ -6,6 +6,7 @@ pub mod annexb;
 pub mod av1;
 pub mod mkv;
 pub mod mp4;
+pub mod mpegv;
 pub mod ts;
 
 use std::path::Path;
@@ -24,6 +25,12 @@ pub enum Codec {
     Av1,
     Vp9,
     ProRes,
+    /// ISO/IEC 11172-2. Told apart from MPEG-2 by the container's own codec id
+    /// where there is one, and otherwise by the absence of a
+    /// `sequence_extension`, which 11172-2 does not define at all.
+    Mpeg1,
+    /// ITU-T H.262 | ISO/IEC 13818-2.
+    Mpeg2,
     Other(String),
 }
 
@@ -35,6 +42,8 @@ impl Codec {
             Codec::Av1 => "AV1".to_string(),
             Codec::Vp9 => "VP9".to_string(),
             Codec::ProRes => "ProRes".to_string(),
+            Codec::Mpeg1 => "MPEG-1 Video".to_string(),
+            Codec::Mpeg2 => "MPEG-2 Video".to_string(),
             Codec::Other(s) => s.clone(),
         }
     }
@@ -280,6 +289,7 @@ pub fn demux(
         "mkv" | "webm" | "mka" => Some(mkv::demux(data, full)),
         "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full, progress, frontier)),
         "ivf" | "obu" => Some(av1::demux(data, full, progress, frontier)),
+        "m2v" | "m1v" | "mpv" => Some(mpegv::demux(data)),
         "ts" | "m2ts" | "mts" => Some(ts::demux(data, full, progress, frontier)),
         _ => None,
     };
@@ -330,9 +340,14 @@ fn sniff_demux(
     }
     match classify_start_code(data) {
         Some(StreamFamily::AnnexB) => Some(annexb::demux(data, full, progress, frontier)),
-        // Routed away from the Annex-B backend, which used to claim both and
-        // invent metadata from them (see `hevc::nal::emit_nal`), but with no
-        // backend of their own yet, so they land on an honest error.
+        // A raw MPEG video elementary stream. `mpegv::demux` errors honestly
+        // when it finds no sequence header, which is what an MPEG-4 Part 2
+        // stream gets today: Part 2 shares this family (`0xB0`/`0xB6` are its
+        // own start codes) and has no backend yet.
+        Some(StreamFamily::MpegVideoEs) => Some(mpegv::demux(data)),
+        // Routed away from the Annex-B backend, which used to claim it and
+        // invent metadata from it (see `hevc::nal::emit_nal`), but with no
+        // backend of its own yet, so it lands on an honest error.
         Some(f) => Some(Err(anyhow!("unsupported container: {}", f.label()))),
         None => None,
     }
@@ -772,6 +787,79 @@ pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
     }
 }
 
+/// Fill an MPEG-1/2 track's stream-derived fields from the sequence header at
+/// the head of its first access unit, the MPEG analogue of the ProRes and VP9
+/// fills above. [`crate::mpeg2`]'s module doc says why the bitstream is usually
+/// the only source these codecs have.
+///
+/// `source` is the buffer the track's chunks index into: the mmap for MKV, MP4
+/// and raw streams, the reassembled elementary stream for TS.
+///
+/// Container signalling still wins field by field. Colour is all-or-nothing on
+/// the same `signalled_nothing` gate ProRes uses, so a container that described
+/// the picture keeps its own values and provenance rather than having three
+/// fields half-replaced from a second source.
+pub(crate) fn fill_mpeg2_stream_fields(track: &mut TrackDemux, source: &[u8]) {
+    let signalled_nothing = track.color.primaries.is_none()
+        && track.color.transfer.is_none()
+        && track.color.matrix.is_none();
+    let missing_cfg = track.width == 0
+        || track.height == 0
+        || track.fps.is_none()
+        || track.bit_depth.is_none()
+        || track.chroma.is_none()
+        || track.codec_profile.is_none();
+    if !missing_cfg && !signalled_nothing {
+        return;
+    }
+    // The sequence header opens the first access unit in every mux observed,
+    // but a capture cut mid-GOP puts it further in, so try a few chunks. The
+    // parse scans within each for the header rather than assuming its offset.
+    // Each chunk's scanned span is capped as well as clamped. Unlike the ProRes
+    // and VP9 fills, whose parsers read a header at the chunk's own head and
+    // bail, `parse_sequence` *scans* for a start code, so a chunk whose
+    // declared size is huge and whose bytes hold no sequence header would read
+    // to EOF, up to 32 times over. That turns a malformed file into a
+    // whole-mmap read on the *default* path, which on a network volume is a
+    // whole-file transfer where the point of the bounded head walks is to avoid
+    // exactly that. A well-formed file never pays: the header sits at the first
+    // chunk's offset 0 and the search stops on the first hit.
+    const SPAN: usize = 1 << 20;
+    let s = track.chunks.iter().take(32).find_map(|c| {
+        let start = c.offset as usize;
+        let end = ((c.offset + c.size) as usize).min(source.len()).min(start.saturating_add(SPAN));
+        (start < end).then(|| crate::mpeg2::parse_sequence(&source[start..end])).flatten()
+    });
+    let Some(s) = s else { return };
+    if track.width == 0 || track.height == 0 {
+        track.width = s.width;
+        track.height = s.height;
+    }
+    if track.fps.is_none() {
+        track.fps = s.fps;
+    }
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(s.bit_depth);
+    }
+    if track.chroma.is_none() {
+        track.chroma = s.chroma.map(str::to_string);
+    }
+    if track.codec_profile.is_none() {
+        track.codec_profile = s.profile_level;
+    }
+    if signalled_nothing {
+        // Field by field, and never `range`: MPEG-2 signals none, so a
+        // container-supplied range keeps its own value and provenance.
+        let (sc, ss) = s.color;
+        track.color.primaries = sc.primaries;
+        track.color.transfer = sc.transfer;
+        track.color.matrix = sc.matrix;
+        track.color_source.primaries = ss.primaries;
+        track.color_source.transfer = ss.transfer;
+        track.color_source.matrix = ss.matrix;
+    }
+}
+
 /// ITU-T H.273 `colour_primaries`. Every code the standard defines is named:
 /// an unnamed code is indistinguishable in `ColorInfo` from an unsignalled one,
 /// which is a distinction the report should not have to make often. 2 stays
@@ -895,6 +983,88 @@ mod tests {
         assert!(!sniffs_as_ts(&[0u8; 1024]));
     }
 
+    /// `testfiles/sdr/mpeg2.m2v` bytes 0..22, plus a display extension carrying
+    /// the corpus's own colour description (primaries and transfer at the
+    /// explicit "unspecified" code 2, matrix 1).
+    fn mpeg2_au() -> Vec<u8> {
+        let mut d = vec![
+            0x00, 0x00, 0x01, 0xB3, 0x14, 0x00, 0xF0, 0x23, 0xFF, 0xFF, 0xE0, 0x18, 0x00, 0x00,
+            0x01, 0xB5, 0x14, 0x8A, 0x00, 0x01, 0x00, 0x00,
+        ];
+        d.extend_from_slice(&[0x00, 0x00, 0x01, 0xB5, 0x2B, 0x02, 0x02, 0x01, 0x14, 0x01, 0xE0]);
+        d.extend_from_slice(&[0x00, 0x00, 0x01, 0xB8, 0x00, 0x08, 0x00, 0x40]);
+        d
+    }
+
+    fn mpeg2_track(chunks: Vec<Chunk>) -> TrackDemux {
+        TrackDemux { chunks, ..TrackDemux::new(Codec::Mpeg2, NalFormat::AnnexB) }
+    }
+
+    #[test]
+    fn mpeg2_fill_supplies_what_the_container_left_absent() {
+        let data = mpeg2_au();
+        let mut t = mpeg2_track(vec![Chunk { offset: 0, size: data.len() as u64 }]);
+        fill_mpeg2_stream_fields(&mut t, &data);
+        assert_eq!((t.width, t.height), (320, 240));
+        assert_eq!(t.fps, Some(25.0));
+        assert_eq!(t.bit_depth, Some(8));
+        assert_eq!(t.chroma.as_deref(), Some("4:2:0"));
+        assert_eq!(t.codec_profile.as_deref(), Some("Main@Main"));
+        assert_eq!(t.color.matrix.as_deref(), Some("BT.709"));
+        assert_eq!(t.color_source.matrix, Some(ColorSource::Stream));
+        // MPEG-2 signals no range, so the field stays for the container.
+        assert!(t.color.range.is_none());
+        assert_eq!(t.color_source.range, None);
+        // The "unspecified" pair is not filled and not tagged.
+        assert!(t.color.primaries.is_none() && t.color.transfer.is_none());
+        assert_eq!(t.color_source.primaries, None);
+    }
+
+    #[test]
+    fn mpeg2_fill_never_overwrites_container_signalling() {
+        // Every field the container already stated keeps its own value and
+        // provenance. Colour is all-or-nothing: a container that described the
+        // picture at all keeps all three of its fields rather than having them
+        // half-replaced from a second source.
+        let data = mpeg2_au();
+        let mut t = mpeg2_track(vec![Chunk { offset: 0, size: data.len() as u64 }]);
+        t.width = 720;
+        t.height = 576;
+        t.fps = Some(50.0);
+        t.chroma = Some("4:2:2".to_string());
+        t.codec_profile = Some("declared".to_string());
+        t.color.matrix = Some("BT.2020 NCL".to_string());
+        t.color_source.matrix = Some(ColorSource::Container);
+        fill_mpeg2_stream_fields(&mut t, &data);
+        assert_eq!((t.width, t.height), (720, 576));
+        assert_eq!(t.fps, Some(50.0));
+        assert_eq!(t.chroma.as_deref(), Some("4:2:2"));
+        assert_eq!(t.codec_profile.as_deref(), Some("declared"));
+        assert_eq!(t.color.matrix.as_deref(), Some("BT.2020 NCL"));
+        assert_eq!(t.color_source.matrix, Some(ColorSource::Container));
+        // Bit depth was absent, so it still fills.
+        assert_eq!(t.bit_depth, Some(8));
+    }
+
+    #[test]
+    fn mpeg2_fill_declines_rather_than_guessing() {
+        let data = mpeg2_au();
+        // No chunks at all: nothing to read, nothing filled.
+        let mut t = mpeg2_track(Vec::new());
+        fill_mpeg2_stream_fields(&mut t, &data);
+        assert_eq!((t.width, t.bit_depth), (0, None));
+
+        // A chunk pointing past the buffer is skipped, not indexed.
+        let mut t = mpeg2_track(vec![Chunk { offset: 9_000, size: 100 }]);
+        fill_mpeg2_stream_fields(&mut t, &data);
+        assert_eq!(t.bit_depth, None);
+
+        // Bytes holding no sequence header fill nothing.
+        let mut t = mpeg2_track(vec![Chunk { offset: 0, size: 64 }]);
+        fill_mpeg2_stream_fields(&mut t, &[0xAAu8; 64]);
+        assert_eq!(t.bit_depth, None);
+    }
+
     #[test]
     fn start_code_discriminator_routes_on_the_byte_after_the_prefix() {
         use StreamFamily::{AnnexB, MpegVideoEs, ProgramStream};
@@ -950,23 +1120,41 @@ mod tests {
     }
 
     #[test]
-    fn sniffer_errors_on_mpeg_heads_and_still_dispatches_annexb() {
-        // A program stream pack head and a raw MPEG-2 elementary stream head
-        // both used to be demuxed as `raw HEVC (Annex-B)`. The messages are the
-        // whole user-visible product of the routing, so pin them, not just the
-        // fact that some error came back.
-        for (head, want) in [
-            ([0, 0, 1, 0xBA, 0x44, 0x00, 0x04, 0x00].as_slice(), "MPEG program stream"),
-            ([0, 0, 1, 0xB3, 0x02, 0xD0, 0x21, 0x00].as_slice(), "video elementary stream"),
-        ] {
-            match sniff_demux(head, false, &Progress::off(), &Frontier::off()) {
-                Some(Err(e)) => assert!(
-                    e.to_string().contains(want),
-                    "expected an error naming {want}, got {e}"
-                ),
-                other => panic!("MPEG head must not produce a report: {other:?}"),
-            }
+    fn sniffer_routes_each_start_code_family_to_its_own_backend() {
+        // All three heads used to be demuxed as `raw HEVC (Annex-B)`.
+
+        // A program stream still has no backend, and its error names the
+        // format rather than shrugging. The message is the whole user-visible
+        // product of that routing, so pin it, not just that some error came.
+        let pack = [0, 0, 1, 0xBA, 0x44, 0x00, 0x04, 0x00];
+        match sniff_demux(&pack, false, &Progress::off(), &Frontier::off()) {
+            Some(Err(e)) => assert!(
+                e.to_string().contains("MPEG program stream"),
+                "expected an error naming the program stream, got {e}"
+            ),
+            other => panic!("a pack header must not produce a report: {other:?}"),
         }
+
+        // A raw MPEG video elementary stream now reaches its own backend and
+        // reports. These bytes are `testfiles/sdr/mpeg2.m2v` bytes 0..22.
+        let m2v = [
+            0x00, 0x00, 0x01, 0xB3, 0x14, 0x00, 0xF0, 0x23, 0xFF, 0xFF, 0xE0, 0x18, 0x00, 0x00,
+            0x01, 0xB5, 0x14, 0x8A, 0x00, 0x01, 0x00, 0x00,
+        ];
+        match sniff_demux(&m2v, false, &Progress::off(), &Frontier::off()) {
+            Some(Ok(d)) => {
+                assert_eq!(d.container, "raw MPEG-2 Video (ES)");
+                assert_eq!(d.tracks[0].width, 320);
+            }
+            other => panic!("an MPEG-2 sequence header must report: {other:?}"),
+        }
+        // Truncated to less than a sequence header, it declines honestly rather
+        // than reporting an empty video section.
+        let cut = &m2v[..8];
+        assert!(matches!(
+            sniff_demux(cut, false, &Progress::off(), &Frontier::off()),
+            Some(Err(_))
+        ));
 
         // A genuine Annex-B head still dispatches to the raw HEVC backend.
         let hevc = [0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];

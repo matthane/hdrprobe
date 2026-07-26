@@ -600,6 +600,12 @@ fn extract_chunk(data: &[u8], chunk: Chunk, fmt: NalFormat, codec: &Codec) -> Ch
         // for ProRes carriage, and DV masters pair with CM XML sidecars (the
         // sidecar path). Nothing to extract from the frame bytes.
         Codec::ProRes => {}
+        // MPEG-1/2 video has no bitstream side channel either: everything it
+        // records about itself is in the sequence header and its two sequence
+        // extensions, which `container::fill_mpeg2_stream_fields` reads at
+        // demux time. There is no SEI, no OBU metadata, and no dynamic HDR
+        // carriage for these codecs at all.
+        Codec::Mpeg1 | Codec::Mpeg2 => {}
         Codec::Other(_) => {}
     }
     ChunkScan { rpus, sei: sei_findings }
