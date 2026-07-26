@@ -538,9 +538,10 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     let remote = prefetch::is_remote(&file);
     let warmed_head = prefetch::warm_metadata(remote, &file, path, &mmap);
 
-    // A Blu-ray ISO is probed through its BDMV main feature: locate the
-    // playlist-selected clip's contiguous byte range, then run the ordinary
-    // TS/M2TS pipeline over that *subslice*, so every slice-relative
+    // A video disc ISO is probed through its main feature: locate the
+    // feature's contiguous byte range (the playlist-selected clip on a
+    // Blu-ray, the byte-largest title VOB set on a DVD), then run the
+    // ordinary pipeline over that *subslice*, so every slice-relative
     // mechanism (head/tail windows, streaming positions, bitrate
     // denominators, progress) is correct by construction. Extension-gated: a
     // UDF image under another name takes the ordinary demux path below.
@@ -549,17 +550,24 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("iso"));
     let feature = if is_iso && bdiso::is_udf_iso(&mmap) {
-        let f = bdiso::locate_main_feature(&mmap, remote.then_some(&file))
-            .context("locating the BDMV main feature")?;
-        // The clip's TS head/tail windows, translated to its range in the
-        // image: the ISO counterpart of `warm_metadata`'s TS branch.
-        prefetch::warm_ts_windows(remote, &file, f.clip_start, f.clip_len);
+        let f = bdiso::locate_feature(&mmap, remote.then_some(&file))
+            .context("locating the disc's main feature")?;
+        // The feature's head/tail windows, translated to its range in the
+        // image: the ISO counterpart of `warm_metadata`'s TS and PS branches.
+        let (start, len) = f.clip_range();
+        match &f {
+            bdiso::DiscFeature::Bd(_) => prefetch::warm_ts_windows(remote, &file, start, len),
+            bdiso::DiscFeature::Dvd(_) => prefetch::warm_ps_windows(remote, &file, start, len),
+        }
         Some(f)
     } else {
         None
     };
     let data: &[u8] = match &feature {
-        Some(f) => &mmap[f.clip_start as usize..(f.clip_start + f.clip_len) as usize],
+        Some(f) => {
+            let (start, len) = f.clip_range();
+            &mmap[start as usize..(start + len) as usize]
+        }
         None => &mmap,
     };
 
@@ -573,7 +581,10 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     // relative and the reads must land at `clip_start + pos` in the image.
     let frontier = if cli.full && prefetch::is_remote_strict(&file, path) {
         match &feature {
-            Some(f) => prefetch::Frontier::new_at(&file, f.clip_start, f.clip_len),
+            Some(f) => {
+                let (start, len) = f.clip_range();
+                prefetch::Frontier::new_at(&file, start, len)
+            }
             None => prefetch::Frontier::new(&file, size),
         }
     } else {
@@ -581,14 +592,37 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     };
 
     let demux = match &feature {
-        // The main feature is M2TS by construction (the locator's sync-lock
-        // gate); extension dispatch would misroute the `.iso` name.
-        Some(_) => container::ts::demux(data, cli.full, progress, &frontier)
+        // A BDMV feature is M2TS by construction (the locator's sync-lock
+        // gate) and a DVD feature is an MPEG program stream by the format's
+        // definition; extension dispatch would misroute the `.iso` name.
+        Some(bdiso::DiscFeature::Bd(_)) => container::ts::demux(data, cli.full, progress, &frontier)
             .context("demuxing the BDMV main-feature clip")?,
+        Some(bdiso::DiscFeature::Dvd(_)) => {
+            container::ps::demux(data).context("demuxing the DVD main-feature title set")?
+        }
         None => {
             container::demux(path, data, cli.full, progress, &frontier).context("demux failed")?
         }
     };
+    let mut demux = demux;
+
+    // A DVD ISO's duration authority is the IFO's declared runtime — the
+    // MKV/MP4 declared-duration convention, because unlike a bare program
+    // stream a DVD *does* declare one, and the PS backend's measured PTS span
+    // is structurally unreliable here: a cell or layer-break PTS reset
+    // between the head and tail windows is invisible to both (the documented
+    // concatenation limit), and the real dual-layer reference pressing
+    // measured 33 minutes of a declared 109-minute feature exactly that way.
+    // The overall bitrate divides by the duration, so it moves with it.
+    // No parsed IFO leaves the measured span standing, with its limits.
+    if let Some(bdiso::DiscFeature::Dvd(f)) = &feature {
+        if let Some(declared) = f.title_duration_secs {
+            demux.duration_secs = Some(declared);
+            if let [track] = demux.tracks.as_mut_slice() {
+                track.bitrate = model::Bitrate::overall(data.len() as u64, Some(declared));
+            }
+        }
+    }
 
     // The sampled access units are scattered across the whole file (worst for
     // MP4, whose sample index spans a multi-GB mdat), so warm exactly the
@@ -768,7 +802,7 @@ fn assemble_report(
     size_bytes: u64,
     data: &[u8],
     demux: &container::Demux,
-    feature: Option<bdiso::MainFeature>,
+    feature: Option<bdiso::DiscFeature>,
     truncated: bool,
     cli: &Cli,
     progress: &progress::Progress,
@@ -973,20 +1007,35 @@ fn assemble_report(
         });
     }
 
-    // The ISO report describes the probed clip (duration, bitrate, tracks)
-    // under the ISO's own name and size; the `Main feature` line carries the
-    // selected playlist/clip and the playlist's edit duration.
+    // The ISO report describes the probed feature (duration, bitrate, tracks)
+    // under the ISO's own name and size; the `Main feature` line carries what
+    // was selected and its own declared duration (a Blu-ray playlist's edit
+    // duration, a DVD title set's IFO runtime).
     let container = match &feature {
-        Some(_) => "Blu-ray ISO (BDMV)".to_string(),
+        Some(bdiso::DiscFeature::Bd(_)) => "Blu-ray ISO (BDMV)".to_string(),
+        Some(bdiso::DiscFeature::Dvd(_)) => "DVD-Video ISO (VIDEO_TS)".to_string(),
         None => demux.container.to_string(),
     };
-    let bd_iso = feature.map(|f| model::BdIso {
-        playlist: f.playlist,
-        playlist_duration_secs: f.playlist_duration_secs,
-        clip: f.clip,
-        clip_index: f.clip_index,
-        clip_count: f.clip_count,
-    });
+    let (mut bd_iso, mut dvd_iso) = (None, None);
+    match feature {
+        Some(bdiso::DiscFeature::Bd(f)) => {
+            bd_iso = Some(model::BdIso {
+                playlist: f.playlist,
+                playlist_duration_secs: f.playlist_duration_secs,
+                clip: f.clip,
+                clip_index: f.clip_index,
+                clip_count: f.clip_count,
+            });
+        }
+        Some(bdiso::DiscFeature::Dvd(f)) => {
+            dvd_iso = Some(model::DvdIso {
+                vts: f.vts,
+                vob_count: f.vob_count,
+                title_duration_secs: f.title_duration_secs,
+            });
+        }
+        None => {}
+    }
 
     Report {
         hdrprobe_schema_version: model::SCHEMA_VERSION,
@@ -1001,6 +1050,7 @@ fn assemble_report(
         input_truncated: truncated || demux.declared_short,
         container,
         bd_iso,
+        dvd_iso,
         format_version: None,
         duration_secs,
         video_tracks,

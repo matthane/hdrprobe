@@ -17,6 +17,7 @@ together with the conditions under which it appears.
   - [`Report` (top level)](#report-top-level)
   - [Multiple video tracks](#multiple-video-tracks)
   - [Blu-ray ISO probes and `BdIso`](#blu-ray-iso-probes-and-bdiso)
+  - [DVD-Video ISO probes and `DvdIso`](#dvd-video-iso-probes-and-dvdiso)
   - [`VideoTrack`](#videotrack)
   - [`Bitrate`](#bitrate)
   - [`ColorInfo`](#colorinfo)
@@ -186,6 +187,7 @@ object below is a single optional or always-present sub-object of its parent):
 ```
 Report
 ├─ bd_iso: BdIso                      (Blu-ray ISO probes only)
+├─ dvd_iso: DvdIso                    (DVD-Video ISO probes only)
 └─ video_tracks[]: VideoTrack         (always at least one entry)
    ├─ bitrate: Bitrate
    ├─ color: ColorInfo
@@ -259,9 +261,32 @@ HDR and Dolby Vision facts) describes **that clip**, exactly as if the mounted
 | `clip_count` | integer | always | Number of distinct clips in the selected playlist. `1` for the common single-clip feature; more for seamless-branching titles, where only the largest clip is probed |
 
 AACS-encrypted images are detected (the clip fails TS sync-lock and an `AACS` directory is
-present) and rejected with an error; hdrprobe never decrypts. DVD-Video ISOs and non-BDMV
-UDF images error distinctly. A fragmented (non-contiguous) main clip is not supported and
-errors rather than guessing.
+present) and rejected with an error; hdrprobe never decrypts. Non-disc UDF images (neither
+`BDMV` nor `VIDEO_TS`) error distinctly. A fragmented (non-contiguous) main clip is not
+supported and errors rather than guessing.
+
+### DVD-Video ISO probes and `DvdIso`
+
+A decrypted DVD-Video ISO (`.iso`, UDF image with a `VIDEO_TS` tree) is probed the same way:
+hdrprobe groups the title VOBs (`VTS_nn_1.VOB` onward — menu VOBs are excluded) by title set,
+selects the byte-largest set as the main feature, and runs the MPEG program-stream pipeline
+over the set's contiguous byte range. Track facts (codec, resolution, frame rate, aspect,
+colour) describe that title set's stream; `size_bytes` stays the whole image's size.
+`container` is `"DVD-Video ISO (VIDEO_TS)"` and `dvd_iso` records the selection:
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `vts` | integer | always | Selected title set number: the probed VOBs are `VTS_<vts>_1.VOB` onward |
+| `vob_count` | integer | always | Title VOBs in the probed set (the ≤1 GiB slices of one program stream) |
+| `title_duration_secs` | float | optional | The longest program chain's declared playback time from the set's IFO (`VTS_nn_0.IFO`) — the feature's authored runtime, shown on the text report's `Main feature` line. Absent when the IFO is missing or unparseable |
+
+**`duration_secs` for a DVD ISO is the IFO's declared runtime** when one parsed (and the
+per-track `"overall"` bitrate divides by it) — the MKV/MP4 declared-duration convention. The
+program-stream backend's measured PTS span is only the fallback, because a cell or layer-break
+timestamp reset between its head and tail windows is invisible to both: a real dual-layer
+pressing measured 33 minutes of a declared 109-minute feature exactly that way. CSS-scrambled
+images are detected per-packet (`PES_scrambling_control` on a video PES) and rejected with an
+error, the AACS rule; decrypted backups clear those bits and probe normally.
 
 ### `VideoTrack`
 
@@ -317,6 +342,7 @@ Video inputs:
 | `"Ogg"` | Ogg (`.ogv`, `.ogg`, `.oga`, `.ogm`, `.ogx`) carrying a Theora or VP8 video logical bitstream |
 | `"RealMedia"` | RealNetworks RealMedia (`.rm`, `.rmvb`) with at least one video stream; RealAudio-only files error honestly |
 | `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
+| `"DVD-Video ISO (VIDEO_TS)"` | Decrypted DVD-Video UDF image; the report describes the auto-selected main-feature title set (see "DVD-Video ISO probes" above) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
 
@@ -941,6 +967,14 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   absent (the reference tools disagree and the candidate bits have no primary spec on hand).
   `"4:1:1"` also joins the documented `chroma` value set (it was already emitted for
   QuickTime DV FourCCs and MJPEG), with `"4:4:0"` (MJPEG).
+  Also additive: **DVD-Video ISOs are probed** the way Blu-ray ISOs are —
+  `"DVD-Video ISO (VIDEO_TS)"` joins the `container` set and the new optional `dvd_iso`
+  object on `Report` records the auto-selected main feature (the byte-largest title set),
+  with the set's IFO-declared runtime as `duration_secs`' authority (see "DVD-Video ISO
+  probes and `DvdIso`"). CSS-scrambled program-stream content — inside an ISO or as a bare
+  `.vob`/`.mpg` — now errors honestly (`PES_scrambling_control` set on a video PES in the
+  head window) instead of running the codec census over ciphertext; decrypted backups are
+  unaffected, since decrypters clear those bits.
   Also additive: **RealMedia is reported** — `"RealMedia"` joins the `container` set (`.rm`,
   `.rmvb`, also recognized by the `.RMF` magic) and `"RealVideo 1"` through `"RealVideo 4"`
   join the `codec` set (the `MDPR` `VIDO` FourCCs `RV10`..`RV40`; anything else reports its

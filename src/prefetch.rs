@@ -454,6 +454,22 @@ pub fn warm_ts_windows(remote: bool, file: &File, base: u64, len: u64) {
     );
 }
 
+/// The PS analogue for a DVD ISO's main-feature title set: `ps::demux` reads
+/// a head window and a tail window from the subslice, so warm exactly those
+/// at their positions in the image. Keep in sync with `ps::HEAD_SCAN_BYTES` /
+/// `ps::TAIL_SCAN_BYTES` like the TS pair above.
+pub fn warm_ps_windows(remote: bool, file: &File, base: u64, len: u64) {
+    if !remote {
+        return;
+    }
+    let head = (crate::container::ps::HEAD_SCAN_BYTES as u64).min(len);
+    let tail_start = len.saturating_sub(crate::container::ps::TAIL_SCAN_BYTES as u64);
+    warm_ranges(
+        file,
+        vec![(base, head as usize), (base + tail_start, (len - tail_start) as usize)],
+    );
+}
+
 /// Warm already-merged `(start, end)` extents concurrently.
 fn warm_merged(file: &File, merged: &[(u64, u64)]) {
     use rayon::prelude::*;

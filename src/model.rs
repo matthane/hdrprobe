@@ -46,6 +46,10 @@ pub struct Report {
     /// that clip; `size_bytes` stays the whole image's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bd_iso: Option<BdIso>,
+    /// DVD-Video ISO probes only: which title set was auto-selected as the
+    /// main feature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dvd_iso: Option<DvdIso>,
     /// Sidecar schema version, e.g. "4.0.2" from a DV CM XML's root
     /// `<DolbyLabsMDF version=…>` attribute. `None` for video inputs and
     /// sidecars that don't declare one.
@@ -62,6 +66,28 @@ pub struct Report {
     pub video_tracks: Vec<VideoTrack>,
     /// Wall-clock parse time in milliseconds.
     pub elapsed_ms: f64,
+}
+
+/// The VIDEO_TS main feature a DVD-Video ISO probe selected (see
+/// `Report::dvd_iso`): the byte-largest title set. The report's duration,
+/// bitrate, and tracks describe that set's VOB program stream; `size_bytes`
+/// stays the whole image's.
+#[derive(Debug, Serialize)]
+pub struct DvdIso {
+    /// Title set number: the probed VOBs are `VTS_<vts>_1.VOB` onward.
+    pub vts: u16,
+    /// Title VOBs in the probed set (the ≤1 GiB slices of one program
+    /// stream; menu VOBs are excluded).
+    pub vob_count: usize,
+    /// The longest program chain's declared playback time from the set's
+    /// IFO — the feature's authored runtime, the analogue of a Blu-ray
+    /// playlist's edit duration. When present it is also the report's
+    /// `duration_secs` (the declared runtime is the DVD duration authority;
+    /// the program-stream PTS span is only the fallback, being blind to
+    /// cell/layer-break resets between its windows). Absent when the IFO is
+    /// missing or unparseable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_duration_secs: Option<f64>,
 }
 
 /// The BDMV main feature a Blu-ray ISO probe selected (see `Report::bd_iso`).
@@ -655,6 +681,7 @@ mod tests {
                 clip_index: 1,
                 clip_count: 1,
             }),
+            dvd_iso: Some(DvdIso { vts: 4, vob_count: 6, title_duration_secs: Some(6547.5) }),
             format_version: Some("4.0.2".to_string()),
             duration_secs: Some(30.0),
             video_tracks: vec![maximal_track()],
@@ -834,6 +861,9 @@ mod tests {
             "bd_iso.clip",
             "bd_iso.clip_index",
             "bd_iso.clip_count",
+            "dvd_iso.vts",
+            "dvd_iso.vob_count",
+            "dvd_iso.title_duration_secs",
             "format_version",
             "duration_secs",
             "elapsed_ms",

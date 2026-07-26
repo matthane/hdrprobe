@@ -180,6 +180,18 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
     }
 
     let head = walk(data, 0, head_end, true);
+    // CSS before anything reads payload: a scrambled disc's structure parses
+    // (CSS leaves every pack and PES header clear) but its video bytes are
+    // ciphertext, and the census would be reading noise. hdrprobe never
+    // decrypts — the AACS rule, per-packet instead of per-directory because
+    // that is where DVD signals it.
+    if head.scrambled_video > 0 {
+        bail!(
+            "CSS-scrambled DVD-Video content ({} scrambled video packets in \
+             the head window); probe a decrypted backup",
+            head.scrambled_video
+        );
+    }
     if head.streams.is_empty() {
         bail!(
             "no video elementary stream in the program stream head window \
@@ -508,6 +520,10 @@ struct Walk {
     scr_backward: bool,
     pts_min: Option<u64>,
     pts_max: Option<u64>,
+    /// Video PES packets whose H.222 optional header sets
+    /// `PES_scrambling_control` — CSS-scrambled DVD-Video content. Decrypters
+    /// clear the bits, so a decrypted backup counts zero.
+    scrambled_video: u32,
 }
 
 impl Walk {
@@ -639,6 +655,15 @@ fn walk(data: &[u8], start: usize, end: usize, collect_es: bool) -> Walk {
         if let Some(key) = key {
             if body < end {
                 let limit = next.min(end);
+                // CSS leaves the pack and PES headers in the clear and marks
+                // each scrambled sector in `PES_scrambling_control` (the two
+                // bits after the '10' marker). Counted here, judged by the
+                // caller: the payload bytes of such a packet are ciphertext,
+                // and running the start-code census over them is exactly the
+                // mint-facts-from-noise hazard the census rules exist for.
+                if data.get(body).is_some_and(|c| c & 0xC0 == 0x80 && c & 0x30 != 0) {
+                    w.scrambled_video += 1;
+                }
                 if let Some((off, pts)) = pes_payload(data, body, limit) {
                     if let Some(p) = pts {
                         w.note_pts(p);
@@ -1475,6 +1500,24 @@ mod tests {
         // Two pictures one second apart span 1 s and occupy 1 s + one 25 fps
         // frame interval, which is the number a duration means.
         assert_eq!(dm.duration_secs, Some(1.04));
+    }
+
+    #[test]
+    fn a_scrambled_video_pes_errors_as_css_rather_than_reporting() {
+        // The same stream that reports normally, with `PES_scrambling_control`
+        // set on its video packets — the CSS shape: pack and PES headers in
+        // the clear, payload ciphertext. Reporting facts read from ciphertext
+        // (or census-routing over it) is exactly what the gate prevents; a
+        // decrypted backup clears the bits and takes the ordinary path, which
+        // `a_program_stream_reports_its_video_track` pins.
+        let mut d = stream(Variant::Mpeg2Program, 0xE0, &[(0, &M2V_HEAD), (90_000, &M2V_HEAD)]);
+        for i in 0..d.len().saturating_sub(7) {
+            if d[i..i + 4] == [0x00, 0x00, 0x01, 0xE0] {
+                d[i + 6] |= 0x30;
+            }
+        }
+        let err = demux(&d).unwrap_err().to_string();
+        assert!(err.contains("CSS-scrambled"), "{err}");
     }
 
     #[test]

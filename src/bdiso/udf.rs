@@ -650,6 +650,14 @@ pub(crate) mod testimg {
                 let icb = place(img, sub, opts, phys_next, meta_next, fe_prn, data_prn);
                 fids.extend_from_slice(&fid(sub.name.as_bytes(), icb, true, false, false));
             }
+            // Two passes over the files: every file's *data* is allocated
+            // first, then every File Entry. Interleaving them (the old
+            // shape) put an FE block between consecutive files' data runs,
+            // so no two files could ever be mutually adjacent — but real
+            // mastering lays a DVD title set's VOB slices back-to-back, and
+            // the DVD locator's multi-VOB coalescing exists precisely for
+            // that adjacency, so the builder must be able to produce it.
+            let mut file_ads: Vec<Vec<u8>> = Vec::new();
             for f in &node.files {
                 // Allocate and write the file data in the physical partition.
                 let blocks = (f.data.len() as u32).div_ceil(SECTOR as u32).max(1);
@@ -684,8 +692,11 @@ pub(crate) mod testimg {
                         ads.extend_from_slice(&short_ad(byte_len, lb));
                     }
                 }
+                file_ads.push(ads);
+            }
+            for (f, ads) in node.files.iter().zip(&file_ads) {
                 let ad_form = u16::from(opts.metadata_partition); // 1 long, 0 short
-                let fe = file_entry(5, f.data.len() as u64, ad_form, &ads);
+                let fe = file_entry(5, f.data.len() as u64, ad_form, ads);
                 let fe_alloc =
                     if opts.metadata_partition { &mut *meta_next } else { &mut *phys_next };
                 let fe_lb = *fe_alloc;
@@ -749,11 +760,15 @@ pub(crate) mod testimg {
             img.write(PART_START * SECTOR, &fe);
         }
 
-        // VDS: PD + LVD + TD.
+        // VDS: PD + LVD + TD. The partition length covers everything placed
+        // (a fixed constant undercounted a fixture carrying a real feature's
+        // VOB data; the walker doesn't read the field today, but a future
+        // partition-bounds check must not invalidate shipped fixtures).
+        let part_blocks = phys_next.max(fsd_lb) + 2;
         let mut pd = vec![0u8; 484];
         pd[6..8].copy_from_slice(&0u16.to_le_bytes()); // partition_number @22
         pd[172..176].copy_from_slice(&(PART_START as u32).to_le_bytes()); // start @188
-        pd[176..180].copy_from_slice(&4096u32.to_le_bytes()); // length @192
+        pd[176..180].copy_from_slice(&part_blocks.to_le_bytes()); // length @192
         img.write(u64::from(VDS_LOC) * SECTOR, &tagged(5, &pd));
 
         let mut maps: Vec<u8> = vec![1, 6, 0, 0, 0, 0]; // type 1, vol seq 0, partition 0

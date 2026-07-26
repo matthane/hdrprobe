@@ -219,6 +219,7 @@ fn build_report(
         input_truncated: false,
         container: container.to_string(),
         bd_iso: None,
+        dvd_iso: None,
         format_version,
         duration_secs: None,
         // One `video_tracks` entry for uniformity — consumers always iterate

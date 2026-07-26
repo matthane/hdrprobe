@@ -168,11 +168,16 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         if o.show_general {
             let _ = writeln!(s, "{}", c.section("General"));
             kv(&mut s, &c, "Container", &r.container);
-            // Blu-ray ISO probes: which playlist/clip the report describes,
-            // with the playlist's own edit duration (the Duration line below
-            // stays the probed clip's transport-clock duration).
+            // Disc ISO probes: what the report describes, with its own
+            // declared duration — a Blu-ray playlist's edit duration (the
+            // Duration line below stays the probed clip's clock-derived
+            // value) or a DVD title set's IFO runtime (which, when parsed,
+            // is also the Duration line: the DVD duration authority).
             if let Some(iso) = &r.bd_iso {
                 kv(&mut s, &c, "Main feature", &bd_iso_line(iso));
+            }
+            if let Some(iso) = &r.dvd_iso {
+                kv(&mut s, &c, "Main feature", &dvd_iso_line(iso));
             }
             // Sidecar schema version (a DV XML's root `version` attribute); video
             // inputs never carry one, so the line only appears for sidecars.
@@ -202,6 +207,9 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             kv(&mut s, &c, "Container", &r.container);
             if let Some(iso) = &r.bd_iso {
                 kv(&mut s, &c, "Main feature", &bd_iso_line(iso));
+            }
+            if let Some(iso) = &r.dvd_iso {
+                kv(&mut s, &c, "Main feature", &dvd_iso_line(iso));
             }
             if let Some(v) = &r.format_version {
                 kv(&mut s, &c, "Schema version", v);
@@ -1145,6 +1153,17 @@ fn bd_iso_line(iso: &crate::model::BdIso) -> String {
     )
 }
 
+/// The Main feature line of a DVD-Video ISO report:
+/// `VTS 04 (1:49:08) · 6 VOBs` — the parenthesized runtime is the IFO's
+/// declared longest program chain and is omitted when no IFO parsed.
+fn dvd_iso_line(iso: &crate::model::DvdIso) -> String {
+    let vobs = format!("{} VOB{}", iso.vob_count, if iso.vob_count == 1 { "" } else { "s" });
+    match iso.title_duration_secs {
+        Some(d) => format!("VTS {:02} ({}) · {}", iso.vts, human_duration(d), vobs),
+        None => format!("VTS {:02} · {}", iso.vts, vobs),
+    }
+}
+
 fn human_duration(secs: f64) -> String {
     let total = secs.round() as u64;
     let h = total / 3600;
@@ -1655,6 +1674,7 @@ mod tests {
             input_truncated: false,
             container: "MP4 (ISOBMFF)".to_string(),
             bd_iso: None,
+            dvd_iso: None,
             format_version: None,
             duration_secs: None,
             video_tracks: vec![VideoTrack {
@@ -1735,6 +1755,7 @@ mod tests {
             input_truncated: false,
             container: "Matroska".to_string(),
             bd_iso: None,
+            dvd_iso: None,
             format_version: None,
             duration_secs: Some(60.0),
             video_tracks: tracks,

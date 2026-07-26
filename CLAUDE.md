@@ -476,7 +476,11 @@ never parse bytes native-endian.
   The head census (`looks_like_program_stream`) is a faithful transcription of ffmpeg's
   `mpegps_probe`, thresholds and payload-skip arithmetic included, on the reasoning that those
   thresholds encode two decades of misidentification reports; it is also the backend's own head
-  gate, which a backend reachable by extension needs. There is deliberately **no program stream
+  gate, which a backend reachable by extension needs. **A scrambled video PES in the head walk
+  errors as CSS before anything reads payload** (`PES_scrambling_control` after the `'10'`
+  marker): CSS leaves every pack and PES header clear, so a scrambled DVD rip *parses* while
+  its video bytes are ciphertext — the census would be routing on noise. Decrypters clear the
+  bits, so decrypted backups (and every ordinary file) are untouched. There is deliberately **no program stream
   map parser**: it is absent from DVDs, from consumer `.mpg` and from ffmpeg's own muxer, the
   content routing above covers every case it would answer, and a mis-parsed one could only
   override a correct verdict. **HD DVD `.evo` video rides the extended stream id 0xFD** and is
@@ -533,19 +537,37 @@ never parse bytes native-endian.
   every input kind. The XML's Level-0 primaries (tagged `[L0]`) are the
   mastering-gamut fallback for a CM v2.9 XML, which has no L9; a recognized L9 wins when present,
   so CM v4.0 output is unchanged.
-- `bdiso/` — Blu-ray ISO (`.iso`) main-feature probing: `udf.rs` (read-only ECMA-167/UDF 2.50
-  walker over the ISO mmap, both plain type-1 partition maps and the 2.50 Metadata Partition,
-  bounds-checked with `mp4.rs` discipline; UDF is little-endian, explicit LE reads), `mpls.rs`
-  (playlist header + PlayItems only, big-endian; STN tables and angle blocks are skipped by the
-  item length field), `mod.rs` (`is_udf_iso` VRS gate, `locate_main_feature`, the `select_main`
+- `bdiso/` — video disc ISO (`.iso`) main-feature probing, Blu-ray (BDMV) *and* DVD-Video
+  (VIDEO_TS); the directory keeps its historical name. `udf.rs` (read-only ECMA-167/UDF
+  walker over the ISO mmap — UDF 1.02 through 2.50, both plain type-1 partition maps and the
+  2.50 Metadata Partition, bounds-checked with `mp4.rs` discipline; UDF is little-endian,
+  explicit LE reads), `mpls.rs` (playlist header + PlayItems only, big-endian; STN tables and
+  angle blocks are skipped by the item length field), `dvd.rs` (VIDEO_TS: title VOBs
+  `VTS_nn_1..9.VOB` grouped by set, menu VOBs excluded, byte-largest set wins, slices must be
+  consecutive-from-1 and their extents coalesce to one range; the set's `VTS_nn_0.IFO` yields
+  the declared runtime — `vts_pgcit` sector pointer at 0xCC, longest PGC `playback_time`,
+  BCD with the frame-rate flag in the frame byte's top bits, layout per libdvdread and
+  validated against the reference pressing's IFO to MediaInfo's exact 6547.500), `mod.rs`
+  (`is_udf_iso` VRS gate; `locate_feature` opens the volume once, reads the root once, and
+  dispatches `DiscFeature::Bd`/`Dvd` on which directory exists; the BD `select_main`
   heuristic: longest deduped-segment duration wins, ties by referenced clip bytes, identical
   playlists collapse, missing-clip playlists drop; probe clip = the winner's largest clip,
   extents coalesced to one contiguous range). `main.rs` owns the orchestration: the extension
-  gate, the clip subslice, the based Frontier, the `"Blu-ray ISO (BDMV)"` container label, and
-  `model::BdIso` (the `Main feature` line). The synthetic UDF image builder for tests lives in
-  `udf.rs::testimg` (in-memory, path-portable; type-1 images use short_ad file data and
-  extent-recorded directories, metadata images use long_ad data and inline directories, so
-  both descriptor forms stay exercised).
+  gate, the feature subslice, the based Frontier, the container labels
+  (`"Blu-ray ISO (BDMV)"` / `"DVD-Video ISO (VIDEO_TS)"`), `model::BdIso`/`model::DvdIso`
+  (the `Main feature` line), and — DVD only — the duration authority: **a DVD ISO's
+  `duration_secs` is the IFO's declared runtime when one parsed** (the MKV/MP4
+  declared-duration convention; the overall bitrate moves with it), because the PS backend's
+  measured PTS span is structurally blind to a cell/layer-break reset between its windows —
+  the real dual-layer reference pressing measured 33 minutes of a declared 109-minute
+  feature. The synthetic UDF image builder for tests lives in `udf.rs::testimg` (in-memory,
+  path-portable; type-1 images use short_ad file data and extent-recorded directories,
+  metadata images use long_ad data and inline directories, so both descriptor forms stay
+  exercised; **all file data is allocated before any File Entry**, so consecutive files'
+  runs stay mutually adjacent — the real mastering layout the DVD multi-VOB coalescing
+  depends on, and an interleaved allocator can never produce). The `dvdiso.iso` corpus
+  fixture regenerates via the env-gated `write_dvd_fixture_image` test (see
+  `testfiles/sdr/README.md`).
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
   The JSON output is an external contract documented field-by-field in `docs/SCHEMA.md` and
   versioned by `model::SCHEMA_VERSION` (the `hdrprobe_schema_version` field on every report,
@@ -805,13 +827,24 @@ never parse bytes native-endian.
   to 10 but derives the dvvC compat id from the RPU-guessed profile (6 exactly when the guess
   is 7). The stray payload is inert for playback (a MEL residual contributes nothing), so this
   too is a provenance observation, not an error claim.
-- **A Blu-ray ISO is probed as a clip subslice, never as offset fix-ups.** The ISO path
+- **A disc ISO is probed as a feature subslice, never as offset fix-ups.** The ISO path
   (`main.rs`, gated on the `.iso` extension *and* `bdiso::is_udf_iso`) resolves the main
   feature to one contiguous byte range and hands `&mmap[clip_start..clip_start+clip_len]` to
-  `ts::demux` **and** `sample::scan`: the TS backend is fully slice-relative (packet phase
+  the feature's own pipeline — `ts::demux` for a BDMV clip, `ps::demux` for a DVD title VOB
+  set — **and** `sample::scan`: both backends are fully slice-relative (packet phase/anchor
   re-derived, head/tail windows addressed from the slice ends, chunks index the reassembled
   heap buffer), so bitrate denominators, `--full` streaming positions, and progress totals are
   all clip-correct by construction. Never pass the whole ISO mmap with offsets patched in.
+  The DVD half's own gates: menu VOBs (`VTS_nn_0.VOB`, `VIDEO_TS.VOB`) never join the title
+  set (the reference pressing's menu sits 136 MB before the feature, non-adjacent — including
+  it would kill the coalesce on every disc); the set's slices must be consecutive from 1 (a
+  missing middle VOB with adjacent survivors would splice the stream); **CSS is detected in
+  the PS backend, not the locator** (`PES_scrambling_control` on a video PES in the head walk
+  errors before the census can read ciphertext — per-packet because that is where DVD signals
+  encryption; decrypters clear the bits, so backups probe normally; this also gates bare
+  scrambled `.vob` files reached by extension); and the IFO duration authority is
+  `main.rs`-only, like the Mastering badges (no parsed IFO leaves the PS span standing with
+  its documented limits).
   The `--full` frontier is the one base-aware piece: `Frontier::new_at(file, clip_start,
   clip_len)` keeps walk positions slice-relative and translates only the reads. Related
   gates, all deliberate: the **AACS verdict** is "`ts::detect_layout` fails on the clip head
@@ -824,9 +857,11 @@ never parse bytes native-endian.
   `looks_like_iso` is extension-only on purpose (a content sniff would fault the sector-16..64
   VRS window on every remote non-ISO file), `ISO_HEAD_WARM` (1 MiB) covers VRS + front VDS +
   the anchor at byte 512 KiB, the locator warms the metadata-partition and playlist extents
-  exactly (`warm: Option<&File>`, remote only), and `prefetch::warm_ts_windows` replays the TS
-  head/tail warm at `clip_start`/clip EOF (keep it in sync with `ts::HEAD_SCAN_BYTES`/
-  `TAIL_SCAN_BYTES` like the byte-0 TS branch). The report keeps the ISO's `size_bytes` and
+  exactly (`warm: Option<&File>`, remote only), and `prefetch::warm_ts_windows` /
+  `prefetch::warm_ps_windows` replay the feature pipeline's head/tail warm at
+  `clip_start`/clip EOF — TS windows for a BDMV clip, PS windows for a DVD title set (keep
+  each in sync with its backend's `HEAD_SCAN_BYTES`/`TAIL_SCAN_BYTES` like the byte-0
+  branches). The report keeps the ISO's `size_bytes` and
   the clip's PCR `duration_secs`; the playlist's own edit duration renders on the
   `Main feature` line, never on the Duration line.
 - **Adding a backend means adding its extensions to `main::VIDEO_EXTS`, and that is outward-facing.**
