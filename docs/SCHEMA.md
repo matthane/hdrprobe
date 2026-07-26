@@ -278,10 +278,10 @@ errors rather than guessing.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID. Absent where no such id exists (raw elementary streams, sidecars) |
+| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number. Absent where no such id exists (raw elementary streams, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"MJPG"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
+| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. The empty string `""` for metadata sidecars, which carry no video. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"MJPG"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
@@ -321,6 +321,7 @@ Video inputs:
 | `"AVI (RIFF)"` | AVI (`.avi`), including OpenDML multi-segment files — the label does not distinguish them, since OpenDML changes how the file is indexed and no fact the report carries |
 | `"ASF (Windows Media)"` | Advanced Systems Format (`.wmv`, `.asf`, and a `.wma` carrying video) |
 | `"FLV (Flash Video)"` | Flash Video (`.flv`), legacy and Enhanced/E-RTMP alike — the label does not distinguish them, since the header form changes what the report reads and not what it reports |
+| `"Ogg"` | Ogg (`.ogv`, `.ogg`, `.oga`, `.ogm`, `.ogx`) carrying a Theora or VP8 video logical bitstream |
 | `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
 
 Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
@@ -868,6 +869,24 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   `color` for presence. A Matroska `V_MS/VFW/FOURCC` track also reports the four-character code
   from inside its `BITMAPINFOHEADER` (`"WVC1"`, `"MJPG"`) where it previously reported the
   literal string `"V_MS/VFW/FOURCC"`.
+  Also additive: **Ogg and Theora are now recognized**, so `"Ogg"` joins the `container` set and
+  `"Theora"` joins the `codec` set. `.ogv` produced no report at all before and now produces a
+  full one, as does `.ogg`, `.oga`, `.ogm` or `.ogx` naming a file with video in it, or any file
+  whose bytes open with an `OggS` beginning-of-stream page. VP8 carried in Ogg reports under the
+  existing unrecognized-codec convention, as `"VP8"`. One track per video logical bitstream, in
+  the order the file declares them; **`track_number` is the bitstream's serial number**, which is
+  a randomly chosen 32-bit value rather than the small ordinal the other containers supply.
+  `duration_secs` comes from the last granule position of the *video* stream — not the file's last
+  page, which in a mux with audio is routinely not the video's — and is **absent for a chained
+  file** (two or more concatenated links, which Ogg permits and which makes any tail-derived
+  duration describe the final link only). `bitrate` is `"overall"` scope by default and, under
+  `--full`, the exactly summed video payload at `"video_stream"` scope, with the header packets
+  excluded. `codec_profile` is always absent for Theora, which defines no profiles. Colour comes
+  from Theora's `CS` field, which is not CICP: it fills primaries and matrix plus limited range,
+  all tagged `"stream"`, and **never fills transfer**, because Theora pairs Rec.709's
+  opto-electronic function with a Rec.470 display gamma and no single transfer code names that
+  combination. VP8 reports no colour at all — its only colour signal is one bit inside each frame's
+  payload, which no container-level parse reaches.
   Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional

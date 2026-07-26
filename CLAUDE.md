@@ -173,6 +173,27 @@ never parse bytes native-endian.
   which reads like the bitstream field and is not. `profile_from_config` is the one place that
   numbering lives. VC-1 is also the only codec in this corner of the tree that **does** use
   emulation prevention, so the payload between start codes is unescaped before any bit is read.
+- `theora.rs` — Theora (Xiph.Org), read from the 42-byte identification header that sits alone in
+  its logical stream's first page, so the whole parse is one page. Ogg records no colour, no
+  dimensions and no frame rate of its own, which makes this header the *only* source for every
+  picture fact the report carries — a gap-filler with no gap. **`CS` is not CICP**: three values
+  (0 undefined, 1 Rec.470M, 2 Rec.470BG) whose primaries and matrix map onto code points but whose
+  **transfer does not**, because Theora pairs Rec.709's opto-electronic function with the Rec.470
+  *display* gamma and no single code names that combination, so the transfer stays `None` (plan
+  decision D8; the reserved values above 2 fill nothing at all, since passing them through as CICP
+  would read 5 as "BT.601 (PAL)" and 9 as "BT.2020"). CS 1 takes matrix code **6** and CS 2 code
+  **5** — numerically identical coefficients, so only the label is at stake, and each takes the one
+  naming the system its own primaries name. ffmpeg *does* read `CS` (an earlier note here said it
+  did not; measured, and the format reference carries the correction with ffprobe's mapping) and
+  fills the transfer as BT.709, which is the live open question recorded in the plan rather than a
+  settled divergence. **Display size is not coded size**: `FMBW`/`FMBH` count macroblocks, so an
+  854-wide video is coded 864 wide, and `PICW`/`PICH` are used only within 16 pixels of the coded
+  size — the spec's own construction rule and ffmpeg's guard. **The granule position is two fields,
+  not a shift**: `KFGSHIFT` splits it into a keyframe index and an offset, and the frame count is
+  their *sum*, with streams older than 3.2.1 storing the index rather than the count (libtheora's
+  own `th_granule_frame` adjustment). Bit depth is the spec constant 8 (§1.2 says wider "is not
+  planned"), like MPEG-2's and ProRes's family depth; `NOMBR` is a stated hint and is never a
+  bitrate (MediaInfo reports it as one — 200000 on every corpus file against a measured 198868).
 - `container/bmih.rs` — `BITMAPINFOHEADER`, the Video for Windows description block, plus the
   FourCC-to-codec table. It lives in `container/` rather than a backend because three carriages
   hand one over: AVI's `strf`, ASF's type-specific data, and **Matroska's `V_MS/VFW/FOURCC`**,
@@ -309,6 +330,50 @@ never parse bytes native-endian.
   after it is scaled, not before**: a declared rate above `f64::MAX / 1024` multiplies to
   infinity, which serialises as JSON `null` and breaks the schema's "always a float" guarantee for
   `bits_per_sec` — the same product-versus-factor shape as the AVI index defect, a third time.
+- `container/ogg.rs` — Ogg (`.ogv`, `.ogg`, `.oga`, `.ogm`, `.ogx`), read against **RFC 3533**,
+  carrying Theora ([`theora.rs`]) and VP8. A flat chain of pages each declaring its own length in a
+  segment table, so the walk is arithmetic on declared sizes, and everything the report states sits
+  in one packet alone on its stream's first page — a bounded head read plus, for the duration
+  alone, a bounded tail read. `chunks` stays **empty by design**: neither codec has a bitstream
+  side channel this project reads, so there is nothing to sample (the `mpegv`/`asf` contract).
+  Seven facts are invariants. **Endianness flips at the page/payload seam** — page headers are
+  little-endian (§6, "LSB first") while both codec mappings are big-endian and Vorbis in the same
+  file is LSb-first bit-packed, so one `.ogv` carries three conventions. **A granule position of
+  -1 means no packet finishes on that page**, ordinary mid-stream for a packet spanning pages, and
+  read as a count it makes the last page an enormous frame total. **The physically last page need
+  not be the video's** — a Theora+Vorbis mux routinely ends on audio, so the tail is scanned for
+  the last page *of the video serial*. **A chained file's tail describes only its final link**
+  (Ogg permits concatenation with fresh serials, and it is Theora's documented way to change frame
+  rate mid-file), so any serial the head's BOS run did not declare, or a BOS flag past that run,
+  yields `None` — hdrprobe is the only one of the three tools that neither invents a duration here
+  nor a bitrate from it. **The two windows must stay disjoint, and "file smaller than the window"
+  is only half of it**: a file a *little larger* starts its tail scan inside its own BOS run and
+  reads those pages as a second link, so the start is clamped past `bos_end` — the same
+  `tail_start.max(head_end)` the program-stream backend carries, and a band as wide as the last BOS
+  page's offset. **A tail anchor is believed only when its run tiles the rest of the file**: two
+  27-byte pages satisfy any fixed-depth chain check, so 54 bytes planted at the scan's start
+  position redirect it and their declared granule becomes the duration; `chain_holds` is therefore
+  only a cheap filter ahead of
+  `tiles_to_end`, whose page-parse budget is shared across candidates so their product cannot grow.
+  And **the header packets are not video payload** — a comment header may carry cover art — so
+  `--full`'s exact byte sum skips each stream's first packets by counting lacing values rather than
+  by assuming where pages divide. Two more traps in the `--full` walk: **a broken chain is not
+  truncation**, and the stream-structure-version byte is the one page-header field whose failure
+  `parse_page` reports identically to a short final page — read as truncation it returns a short sum
+  that main.rs divides by the whole file's duration, measured at 805 kb/s against a true 2.31 Mb/s
+  (a 1.7 MiB Theora file with one mid-file page's version byte flipped); and
+  the walk plan is set **only for a single-video file**, because `sample::scan` returns one
+  `TrackScan` per raw-stream walk and main.rs zips it against the tracks, so a plan on a two-video
+  file would drop the second entirely. `track_number` is the logical bitstream's **serial number**,
+  a random 32-bit value rather than a small ordinal. `duration_secs` is the **video** stream's, not
+  the longest stream's: for every ordinary file they agree, but a mux whose audio far outlasts its
+  video reports the video's length and an `overall` rate computed against it (3 s and 630 kb/s on a
+  fixture holding 3 s of video and 90 s of audio, where ffprobe says 90 s) — knowing the true
+  length means decoding audio granule positions, which is out of scope plan-wide, and risk 15 in
+  `dev/sdr-coverage-plan.md` records the alternatives and why each was declined. Only `.ogv` is in
+  `main::VIDEO_EXTS`: `.ogg`
+  and `.oga` are overwhelmingly audio (the `.wma` reasoning), and `.ogm`/`.ogx` are left out because
+  OGM video has no parser here, so a scan of them could only ever print one error per file.
 - `container/ps.rs` — MPEG program stream / MPEG-1 system stream (`.mpg`, `.mpeg`, `.vob`,
   `.m2p`, `.evo`), read against **ITU-T H.222.0 (10/2014) | ISO/IEC 13818-1**, which is free
   from ITU and is the normative source for the pack header (Table 2-39), the PES packet
