@@ -794,6 +794,29 @@ fn assemble_report(
             _ => None,
         });
 
+        // Aspect: a format signals the pixel ratio *or* the display ratio,
+        // and the missing one is arithmetic against the coded size — never a
+        // guess, so both floats exist exactly when a rational was signalled
+        // (plus the coded size where the derivation needs it).
+        let aspect: Option<(f64, f64)> = match (track.pixel_aspect, track.display_aspect) {
+            (Some((pn, pd)), Some((dn, dd))) if pn > 0 && pd > 0 && dn > 0 && dd > 0 => {
+                Some((f64::from(pn) / f64::from(pd), f64::from(dn) / f64::from(dd)))
+            }
+            (Some((pn, pd)), None)
+                if pn > 0 && pd > 0 && track.width > 0 && track.height > 0 =>
+            {
+                let par = f64::from(pn) / f64::from(pd);
+                Some((par, par * f64::from(track.width) / f64::from(track.height)))
+            }
+            (None, Some((dn, dd)))
+                if dn > 0 && dd > 0 && track.width > 0 && track.height > 0 =>
+            {
+                let dar = f64::from(dn) / f64::from(dd);
+                Some((dar * f64::from(track.height) / f64::from(track.width), dar))
+            }
+            _ => None,
+        };
+
         // The base layer's *effective* colour: what the container or coded
         // stream signalled, with the HLG/PQ alt-transfer SEI override applied.
         // Built here, before the Dolby Vision post-passes, because the
@@ -922,6 +945,9 @@ fn assemble_report(
             }),
             bit_depth: track.bit_depth,
             chroma: track.chroma.clone(),
+            pixel_aspect_ratio: aspect.map(|a| a.0),
+            display_aspect_ratio: aspect.map(|a| a.1),
+            scan_type: track.scan_type.map(str::to_string),
             stereo: track.stereo.clone(),
             color,
             color_source,

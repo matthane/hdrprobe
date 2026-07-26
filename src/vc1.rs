@@ -72,6 +72,12 @@ pub struct SeqInfo {
     pub chroma: Option<&'static str>,
     /// `Advanced@L<n>`. The header states its own level.
     pub profile_level: Option<String>,
+    /// `ASPECT_RATIO` from the display extension; `None` when the extension
+    /// or the flag is absent.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// `INTERLACE`: `"interlaced"` when field/frame-interlace coding may
+    /// occur, `"progressive"` when it cannot.
+    pub scan_type: Option<&'static str>,
     /// The colour description. Always populated: `COLOR_FORMAT_FLAG` clear means
     /// the spec's defaults apply, and those defaults are BT.709 primaries,
     /// BT.709 transfer and **BT.601 matrix** — a mixed combination, and the
@@ -137,7 +143,9 @@ fn parse_sequence_payload(rbsp: &[u8]) -> Option<SeqInfo> {
     let width = (r.read_bits(12)? + 1) * 2;
     let height = (r.read_bits(12)? + 1) * 2;
     r.read_bit()?; // PULLDOWN
-    r.read_bit()?; // INTERLACE
+    // INTERLACE set means field/frame-interlace coding may occur; clear means
+    // it cannot — a real declaration, like Part 2's VOL flag.
+    let interlace = r.read_bit()? == 1;
     r.read_bit()?; // TFCNTRFLAG
     r.read_bit()?; // FINTERPFLAG
     // RESERVED. Real content sets it — the corpus file does, and ffmpeg skips it
@@ -147,12 +155,28 @@ fn parse_sequence_payload(rbsp: &[u8]) -> Option<SeqInfo> {
 
     let mut fps = None;
     let mut color = None;
+    let mut pixel_aspect = None;
     if r.read_bit()? == 1 {
         // DISPLAY_EXT
         r.skip_bits(14)?; // DISP_HORIZ_SIZE
         r.skip_bits(14)?; // DISP_VERT_SIZE
-        if r.read_bit()? == 1 && r.read_bits(4)? == 15 {
-            r.skip_bits(16)?; // ASPECT_HORIZ_SIZE + ASPECT_VERT_SIZE
+        if r.read_bit()? == 1 {
+            // ASPECT_RATIO: codes 1..13 carry the same ratios as H.264
+            // Table E-1 (ffmpeg's `ff_vc1_pixel_aspect` table is that list
+            // verbatim; ST 421 itself is not on hand, so the witness is
+            // implementation-side and shared by every reader consulted),
+            // 14 reserved, 15 the explicit pair.
+            match r.read_bits(4)? {
+                15 => {
+                    let w = r.read_bits(8)?;
+                    let h = r.read_bits(8)?;
+                    if w > 0 && h > 0 {
+                        pixel_aspect = Some((w, h));
+                    }
+                }
+                code @ 1..=13 => pixel_aspect = crate::hevc::sps::sar_from_idc(code),
+                _ => {}
+            }
         }
         if r.read_bit()? == 1 {
             // FRAMERATE_FLAG
@@ -173,6 +197,8 @@ fn parse_sequence_payload(rbsp: &[u8]) -> Option<SeqInfo> {
         width,
         height,
         fps,
+        pixel_aspect,
+        scan_type: Some(if interlace { "interlaced" } else { "progressive" }),
         chroma: Some("4:2:0"),
         profile_level: Some(format!("Advanced@L{level}")),
         color: resolve_color(color),

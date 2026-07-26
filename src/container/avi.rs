@@ -242,6 +242,14 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         if td.fps.is_none() {
             td.fps = s.fps(usec_per_frame);
         }
+        // `vprp` is the same fallback the container rate is: the coded
+        // stream's own aspect and scan won everything they stated above.
+        if td.pixel_aspect.is_none() && td.display_aspect.is_none() {
+            td.display_aspect = s.vprp_aspect;
+        }
+        if td.scan_type.is_none() {
+            td.scan_type = s.vprp_scan;
+        }
         td.bitrate = match exact_bytes {
             Some(bytes) => Bitrate::video_stream(bytes, s.duration(usec_per_frame)),
             // No usable index: the byte count is unknown, so the honest answer
@@ -416,6 +424,13 @@ struct Stream {
     length: u32,
     /// `strf` body range (a `BITMAPINFOHEADER` plus extradata, for video).
     strf: Option<(usize, usize)>,
+    /// `vprp` facts, where the OpenDML property header is present: the frame
+    /// aspect (`dwFrameAspectRatio`, HIWORD:LOWORD = width:height — measured
+    /// 0x00040003 on the 4:3 corpus file) and `nbFieldPerFrame` (1 frame per
+    /// picture = progressive, 2 fields = interlaced). Fallback authority only,
+    /// like the container frame rate: the coded stream wins what it states.
+    vprp_aspect: Option<(u32, u32)>,
+    vprp_scan: Option<&'static str>,
     /// `indx` super-index body range, present on OpenDML files.
     indx: Option<(usize, usize)>,
 }
@@ -479,6 +494,8 @@ fn parse_hdrl(data: &[u8], start: usize, end: usize) -> Vec<Stream> {
             length: 0,
             strf: None,
             indx: None,
+            vprp_aspect: None,
+            vprp_scan: None,
         };
         let mut saw_strh = false;
         for (cid, cbody, cend) in chunks_in(data, body + 4, body_end) {
@@ -498,6 +515,18 @@ fn parse_hdrl(data: &[u8], start: usize, end: usize) -> Vec<Stream> {
                 }
                 b"strf" => s.strf = Some((cbody, cend)),
                 b"indx" => s.indx = Some((cbody, cend)),
+                b"vprp" if cend.saturating_sub(cbody) >= 36 => {
+                    let ar = u32le(data, cbody + 20);
+                    let (w, h) = (ar >> 16, ar & 0xFFFF);
+                    if w > 0 && h > 0 {
+                        s.vprp_aspect = Some((w, h));
+                    }
+                    s.vprp_scan = match u32le(data, cbody + 32) {
+                        1 => Some("progressive"),
+                        2 => Some("interlaced"),
+                        _ => None,
+                    };
+                }
                 _ => {}
             }
         }
@@ -912,7 +941,8 @@ fn fill_from_bitstream(td: &mut TrackDemux, data: &[u8], extradata: &[u8]) {
             let head = &td.chunks[..td.chunks.len().min(SPS_SCAN_CHUNKS)];
             let best = super::best_sps(data, head, &td.codec);
             td.sps_chunk = best.as_ref().map(|b| b.chunk);
-            let (w, h, depth, chroma, profile, color, fps) = super::sps_fields(best);
+            let (w, h, depth, chroma, profile, color, fps, pixel_aspect, scan_type) =
+                super::sps_fields(best);
             if w > 0 && h > 0 {
                 (td.width, td.height) = (w, h);
             }
@@ -921,6 +951,12 @@ fn fill_from_bitstream(td: &mut TrackDemux, data: &[u8], extradata: &[u8]) {
             td.codec_profile = profile;
             (td.color, td.color_source) = color;
             td.fps = fps;
+            if td.pixel_aspect.is_none() && td.display_aspect.is_none() {
+                td.pixel_aspect = pixel_aspect;
+            }
+            if td.scan_type.is_none() {
+                td.scan_type = scan_type;
+            }
         }
         Codec::Mpeg1 | Codec::Mpeg2 => super::fill_mpeg2_stream_fields(td, data),
         // Part 2 keeps the container-extradata path as well as the chunk scan:

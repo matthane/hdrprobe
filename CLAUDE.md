@@ -1274,6 +1274,26 @@ never parse bytes native-endian.
   is emitted only for a file that produced a report. The hot `nal::split_annexb` stays
   tick-free: the no-op-closure monomorphization of `split_annexb_impl` compiles the gate out;
   only `split_annexb_streamed` (the raw-HEVC `--full` fused walk) pays for it.
+- **Aspect and scan are signalled-only, and the text line shows only what would otherwise
+  mislead.** `TrackDemux` carries the signalled rational (`pixel_aspect` *or* `display_aspect` —
+  never mixed across sources, since a container DAR paired with a stream PAR derives nonsense)
+  plus `scan_type`; main.rs derives the missing ratio from the coded size, exactly, and both
+  floats appear in JSON whenever a rational was signalled. Authority mirrors colour: MP4 `pasp`
+  and MKV `DisplayWidth`:`DisplayHeight` win over the coded stream's SAR; AVI's `vprp` is the
+  *fallback* like its frame rate (its aspect field is HIWORD:LOWORD = w:h, measured `0x00040003`
+  on the 4:3 fixture; `nbFieldPerFrame` 1/2 is the scan). Sources: H.264/H.265 VUI
+  `aspect_ratio_idc` through the one shared Table E-1 (`hevc::sps::sar_from_idc`, read verbatim
+  from the spec PDFs in `dev/`; VC-1's codes 1..13 and Part 2's 1..5 are numerically the same
+  rows), MPEG-2's DAR codes vs MPEG-1's pel table (indices 8/12 = 0.9375/1.1250 per the format
+  reference §1, *not* ffmpeg's draft-era pair), Theora `PARN`:`PARD`. Scan is affirmative or
+  structural, never inferred from permission: MPEG-2's clear `progressive_sequence` fills
+  *nothing* (a film DVD is progressive under a clear flag and both reference tools say so —
+  measured, the first A3 draft got this wrong), AVC reads `frame_mbs_only_flag`, HEVC the PTL
+  source-flag pair with `field_seq_flag` overriding, MPEG-1/Theora are structural constants.
+  The text report renders `DAR <ratio>` only when pixels are non-square and an `interlaced`
+  marker only when declared — square-pixel progressive lines stay byte-identical (the whole
+  corpus moved exactly one text line, the DVD's), the same presentation policy as the Color
+  line's matrix rule below.
 - **The Color line suppresses the matrix, except where suppressing it would state something
   false.** `render::build_color_line` prints primaries and transfer but drops `color.matrix`,
   because every matrix except Dolby's IPT-PQ-C2 restates what the primaries already said. That

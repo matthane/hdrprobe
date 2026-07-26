@@ -110,6 +110,23 @@ pub struct VideoTrack {
     pub bit_depth: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chroma: Option<String>,
+    /// Pixel (sample) aspect ratio: the width of one pixel over its height,
+    /// 1.0 being square. Signalled by the coded stream or the container, or
+    /// derived exactly from a signalled display ratio and the coded size.
+    /// Absent when nothing signals either ratio; never a guessed square.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pixel_aspect_ratio: Option<f64>,
+    /// Display aspect ratio, width over height of the presented picture.
+    /// Signalled directly (MPEG-2's DAR codes, MKV display size, AVI `vprp`)
+    /// or derived exactly from the pixel aspect ratio and the coded size.
+    /// Present exactly when `pixel_aspect_ratio` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_aspect_ratio: Option<f64>,
+    /// `"progressive"` or `"interlaced"`, from a sequence-level signal of the
+    /// coded stream. Absent when the format has no such signal or the stream
+    /// states none — absence is "unsignalled", never "progressive".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_type: Option<String>,
     /// Stereoscopic/multiview view structure, e.g. "Stereoscopic 3D (2 views)",
     /// from the MP4 `vexu`/`stri` boxes of MV-HEVC (DV Profile 20). `None` for
     /// ordinary monoscopic video.
@@ -658,6 +675,9 @@ mod tests {
             bitrate: Some(Bitrate::video_stream_bps(1.0)),
             bit_depth: Some(10),
             chroma: Some("4:2:0".to_string()),
+            pixel_aspect_ratio: Some(1.0),
+            display_aspect_ratio: Some(16.0 / 9.0),
+            scan_type: Some("progressive".to_string()),
             stereo: Some("Stereoscopic 3D (2 views)".to_string()),
             color: ColorInfo {
                 primaries: Some("BT.2020".to_string()),
@@ -829,6 +849,9 @@ mod tests {
             "video_tracks[].bitrate.scope",
             "video_tracks[].bit_depth",
             "video_tracks[].chroma",
+            "video_tracks[].pixel_aspect_ratio",
+            "video_tracks[].display_aspect_ratio",
+            "video_tracks[].scan_type",
             "video_tracks[].stereo",
             "video_tracks[].color.primaries",
             "video_tracks[].color.transfer",

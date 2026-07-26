@@ -54,6 +54,9 @@ const ID_CODEC_PRIVATE: u32 = 0x63A2;
 const ID_DEFAULT_DURATION: u32 = 0x0023_E383;
 const ID_VIDEO: u32 = 0xE0;
 const ID_PIXEL_WIDTH: u32 = 0xB0;
+const ID_DISPLAY_WIDTH: u32 = 0x54B0;
+const ID_DISPLAY_HEIGHT: u32 = 0x54BA;
+const ID_FLAG_INTERLACED: u32 = 0x9A;
 const ID_PIXEL_HEIGHT: u32 = 0xBA;
 const ID_COLOUR: u32 = 0x55B0;
 const ID_MATRIX: u32 = 0x55B1;
@@ -461,6 +464,11 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
             fps,
             bit_depth: track.bit_depth,
             chroma: track.chroma,
+            // Container authority, like colour: a signalled display size wins
+            // and the coded stream's SAR fills only the gap.
+            display_aspect: track.display_aspect,
+            pixel_aspect: track.display_aspect.is_none().then_some(track.pixel_aspect).flatten(),
+            scan_type: track.scan_type,
             codec_profile: track.codec_profile,
             color: track.color,
             color_source: track.color_source,
@@ -951,6 +959,14 @@ struct TrackInfo {
     codec_profile: Option<String>,
     width: u32,
     height: u32,
+    /// DisplayWidth:DisplayHeight when both were present — the display aspect
+    /// in any DisplayUnit, since only the ratio is consumed.
+    display_aspect: Option<(u32, u32)>,
+    /// The config record's embedded-SPS sample aspect (used only when the
+    /// container states no display size).
+    pixel_aspect: Option<(u32, u32)>,
+    /// FlagInterlaced's two declarations (1/2); 0 (undetermined) is `None`.
+    scan_type: Option<&'static str>,
     color: ColorInfo,
     color_source: ColorSources,
     mastering: Option<MasteringDisplay>,
@@ -997,6 +1013,8 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     let mut default_duration_ns: Option<u64> = None;
     let mut width = 0u32;
     let mut height = 0u32;
+    let mut display = (0u32, 0u32);
+    let mut scan_type: Option<&'static str> = None;
     let mut color = ColorInfo::default();
     let mut color_source = ColorSources::default();
     let mut mastering = None;
@@ -1035,6 +1053,8 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
                 &mut color_source,
                 &mut mastering,
                 &mut content_light,
+                &mut display,
+                &mut scan_type,
             ),
             ID_BLOCK_ADDITION_MAPPING => {
                 if let Some(dv) = parse_block_addition_mapping(data, p2, cend) {
@@ -1119,6 +1139,9 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
         codec_profile: cc.codec_profile,
         width,
         height,
+        display_aspect: (display.0 > 0 && display.1 > 0).then_some(display),
+        pixel_aspect: cc.pixel_aspect,
+        scan_type: scan_type.or(cc.scan_type),
         color,
         color_source,
         mastering,
@@ -1136,6 +1159,9 @@ struct CodecConfig {
     bit_depth: Option<u8>,
     chroma: Option<String>,
     codec_profile: Option<String>,
+    /// From the config record's embedded SPS, where one exists.
+    pixel_aspect: Option<(u32, u32)>,
+    scan_type: Option<&'static str>,
     /// Where this codec's own headers begin inside CodecPrivate. Zero for every
     /// CodecID that stores them directly, and 40 for `V_MS/VFW/FOURCC`, whose
     /// CodecPrivate opens with a `BITMAPINFOHEADER`. Only the codecs whose
@@ -1155,6 +1181,8 @@ impl CodecConfig {
             bit_depth: None,
             chroma: None,
             codec_profile: None,
+            pixel_aspect: None,
+            scan_type: None,
             extradata_offset: 0,
         }
     }
@@ -1190,6 +1218,8 @@ fn nal_config(
         bit_depth: None,
         chroma: None,
         codec_profile: None,
+        pixel_aspect: None,
+        scan_type: None,
         extradata_offset,
     };
     let parsed = match cfg.codec {
@@ -1204,6 +1234,20 @@ fn nal_config(
         cfg.bit_depth = Some(bit_depth);
         cfg.chroma = Some(chroma);
         cfg.codec_profile = Some(profile);
+        // The record's embedded SPS also states the sample aspect and the
+        // scan signal, exactly as it supplies depth/chroma above.
+        let sps_aspect_scan = match cfg.codec {
+            Codec::Hevc => crate::hevc::sps::find_sps_in_hvcc(rec)
+                .and_then(crate::hevc::sps::parse_sps)
+                .map(|sps| (sps.pixel_aspect, sps.scan_type)),
+            _ => crate::avc::nal::find_sps_in_avcc(rec)
+                .and_then(crate::avc::sps::parse_sps)
+                .map(|sps| (sps.pixel_aspect, sps.scan_type)),
+        };
+        if let Some((pa, sc)) = sps_aspect_scan {
+            cfg.pixel_aspect = pa;
+            cfg.scan_type = sc;
+        }
     }
     cfg
 }
@@ -1234,6 +1278,8 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth: p.bit_depth,
             chroma: p.chroma.map(str::to_string),
             codec_profile: p.profile.map(|pr| crate::vp9::profile_label(pr, p.level)),
+            pixel_aspect: None,
+            scan_type: None,
             extradata_offset: 0,
         }
     } else if codec_id.starts_with(b"V_PRORES") {
@@ -1271,6 +1317,8 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth,
             chroma,
             codec_profile,
+            pixel_aspect: None,
+            scan_type: None,
             extradata_offset: 0,
         }
     } else if codec_id.starts_with(b"V_MPEG4/ISO/SP")
@@ -1410,6 +1458,8 @@ fn parse_video(
     color_source: &mut ColorSources,
     mastering: &mut Option<MasteringDisplay>,
     content_light: &mut Option<ContentLight>,
+    display: &mut (u32, u32),
+    scan: &mut Option<&'static str>,
 ) {
     let mut p = start;
     while p < end {
@@ -1420,6 +1470,21 @@ fn parse_video(
         match id {
             ID_PIXEL_WIDTH => *width = read_uint(data, p2, s) as u32,
             ID_PIXEL_HEIGHT => *height = read_uint(data, p2, s) as u32,
+            // Present in any DisplayUnit: the pair's *ratio* is the display
+            // aspect regardless of whether the unit is pixels, centimetres or
+            // the ratio itself. Absent elements default to the pixel size,
+            // which is why only a present pair sets anything.
+            ID_DISPLAY_WIDTH => display.0 = read_uint(data, p2, s) as u32,
+            ID_DISPLAY_HEIGHT => display.1 = read_uint(data, p2, s) as u32,
+            // 1 = interlaced, 2 = progressive, 0 = undetermined (the EBML
+            // default) — only the two declarations fill.
+            ID_FLAG_INTERLACED => {
+                *scan = match read_uint(data, p2, s) {
+                    1 => Some("interlaced"),
+                    2 => Some("progressive"),
+                    _ => None,
+                }
+            }
             ID_COLOUR => {
                 parse_colour(data, p2, cend, color, color_source, mastering, content_light)
             }
@@ -2166,6 +2231,9 @@ mod tests {
             codec_profile: None,
             width: w,
             height: w / 2,
+            display_aspect: None,
+            pixel_aspect: None,
+            scan_type: None,
             color: ColorInfo::default(),
             color_source: ColorSources::default(),
             mastering: None,

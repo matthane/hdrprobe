@@ -524,6 +524,8 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
             fps: t.fps,
             bit_depth: t.sd.bit_depth,
             chroma: t.sd.chroma.clone(),
+            pixel_aspect: t.sd.pixel_aspect,
+            scan_type: t.sd.scan_type,
             codec_profile: t.sd.codec_profile.clone(),
             stereo,
             color,
@@ -669,6 +671,11 @@ struct SampleDesc {
     mastering: Option<MasteringDisplay>,
     content_light: Option<ContentLight>,
     cuvv_version_map: Option<u16>,
+    /// `pasp` (container authority) or, failing that, the config record's
+    /// embedded-SPS sample aspect.
+    pixel_aspect: Option<(u32, u32)>,
+    /// The embedded SPS's sequence-level scan signal.
+    scan_type: Option<&'static str>,
     /// Byte range of this track's codec headers inside the file: today the
     /// `esds` `DecoderSpecificInfo` of an MPEG-4 Part 2 track. Empty for every
     /// codec whose fields come from a config record read above.
@@ -879,6 +886,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut bit_depth = None;
     let mut chroma = None;
     let mut codec_profile = None;
+    let mut pasp: Option<(u32, u32)> = None;
     // ProRes has no decoder-config child box: the sample-entry FourCC itself
     // is the profile, and the family defines chroma/depth (10-bit 4:2:2, or
     // 12-bit 4:4:4 for the 4444 pair). Colour still comes from the ordinary
@@ -982,6 +990,18 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             }
             b"lhvC" => layered = true,
             b"vexu" => stereo = parse_stereo(data, c).or(stereo),
+            // PixelAspectRatioBox: hSpacing/vSpacing, the container's own
+            // pixel-shape declaration — wins over the coded stream's SAR,
+            // like every other container-vs-stream authority here.
+            b"pasp" => {
+                if c.end - c.payload >= 8 {
+                    let h = read_u32(data, c.payload);
+                    let v = read_u32(data, c.payload + 4);
+                    if h > 0 && v > 0 {
+                        pasp = Some((h, v));
+                    }
+                }
+            }
             b"cuvv" => cuvv_version_map = parse_cuvv(&data[c.payload..c.end]),
             b"colr" => {
                 if let Some((c, src)) = parse_colr(data, c) {
@@ -1040,6 +1060,21 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         }
     }
 
+    // The coded stream's own aspect/scan, from the config record's embedded
+    // SPS — the gap-filler behind a missing `pasp`, exactly as the record
+    // supplies depth and chroma.
+    let sps_aspect_scan = if let Some(h) = hvcc_bytes {
+        crate::hevc::sps::find_sps_in_hvcc(h)
+            .and_then(crate::hevc::sps::parse_sps)
+            .map(|s| (s.pixel_aspect, s.scan_type))
+    } else if let Some(a) = avcc_bytes {
+        crate::avc::nal::find_sps_in_avcc(a)
+            .and_then(crate::avc::sps::parse_sps)
+            .map(|s| (s.pixel_aspect, s.scan_type))
+    } else {
+        None
+    };
+    let (sps_aspect, scan_type) = sps_aspect_scan.unwrap_or((None, None));
     Ok(SampleDesc {
         codec,
         codec_profile,
@@ -1055,6 +1090,8 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         mastering,
         content_light,
         cuvv_version_map,
+        pixel_aspect: pasp.or(sps_aspect),
+        scan_type,
         codec_headers,
     })
 }
@@ -1524,6 +1561,8 @@ mod tests {
                 mastering: None,
                 content_light: None,
                 cuvv_version_map: None,
+                pixel_aspect: None,
+                scan_type: None,
                 codec_headers: 0..0,
             },
             chunks: (0..chunks).map(|i| Chunk { offset: i as u64, size: 1 }).collect(),

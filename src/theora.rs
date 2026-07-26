@@ -77,6 +77,10 @@ pub struct IdHeader {
     pub chroma: &'static str,
     /// Colour from `CS`, absent when `CS` is 0 (undefined) or a reserved value.
     pub color: Option<(ColorInfo, ColorSources)>,
+    /// `PARN`:`PARD`, the pixel aspect ratio, absent when either term is 0
+    /// (the spec's "no aspect information" state, and what libtheora writes
+    /// by default).
+    pub pixel_aspect: Option<(u32, u32)>,
     /// `KFGSHIFT`, the granule position's split point.
     pub kfgshift: u8,
     /// `FRN`, kept alongside `fps` because the duration is computed as an exact
@@ -169,11 +173,13 @@ pub fn parse_id_header(p: &[u8]) -> Option<IdHeader> {
     let width = if usable(picw, picx, coded_w) { picw } else { coded_w };
     let height = if usable(pich, picy, coded_h) { pich } else { coded_h };
 
+    let (parn, pard) = (be24(p, 30), be24(p, 33));
     Some(IdHeader {
         width,
         height,
         fps,
         chroma,
+        pixel_aspect: (parn > 0 && pard > 0).then_some((parn, pard)),
         color: color_from_cs(p[36]),
         kfgshift: ((p[40] & 0x03) << 3) | (p[41] >> 5),
         frn,

@@ -278,6 +278,9 @@ errors rather than guessing.
 | `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists. The `"overall"` (file-length) fallback rate appears only when this is the file's sole video track (an overall rate attributed to one of several tracks would be a wrong number) |
 | `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
 | `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"` (a reserved signalling value renders `"?"`) |
+| `pixel_aspect_ratio` | float | optional | Pixel (sample) aspect ratio, width of one pixel over its height (1.0 = square). Signalled by the coded stream (H.264/HEVC VUI `aspect_ratio_idc`/Extended_SAR, MPEG-4 Part 2 and MPEG-1 aspect codes, Theora `PARN`:`PARD`, VC-1 `ASPECT_RATIO`) or the container (MP4 `pasp` — which wins over the stream, like colour), or derived exactly from a signalled display ratio and the coded size (MPEG-2's DAR codes, MKV `DisplayWidth`:`DisplayHeight`, AVI `vprp`). Absent when nothing signals either ratio — never a guessed square |
+| `display_aspect_ratio` | float | optional | Display aspect ratio of the presented picture. Signalled directly or derived exactly from the pixel ratio and the coded size; present exactly when `pixel_aspect_ratio` is. The text report shows it (as `DAR 16:9` etc.) only when the pixels are not square; the JSON always carries both |
+| `scan_type` | string | optional | `"progressive"` or `"interlaced"`, from a sequence-level signal of the coded stream (AVC `frame_mbs_only_flag`, HEVC PTL source flags / `field_seq_flag`, MPEG-2 `progressive_sequence` — affirmative only, since a clear flag merely permits interlaced pictures and film-sourced DVDs are progressive under it, MPEG-4 Part 2 and VC-1 interlace flags, MKV `FlagInterlaced`, AVI `vprp` fields-per-frame; MPEG-1, Theora and MJPEG-free formats that structurally cannot interlace state `"progressive"`). Absent when unsignalled — absence never means progressive. The text report marks only `interlaced` |
 | `stereo` | string | optional | Stereoscopic view structure from MP4 `vexu`/`stri` (MV-HEVC, DV Profile 20): `"Stereoscopic 3D (2 views)"`, `"Monoscopic (1 view)"`, or `"Multiview 3D (2+ views)"`. Absent for ordinary monoscopic video |
 | `color` | `ColorInfo` | always | The track's colour description; may be `{}` when nothing signalled it and nothing defines it |
 | `color_source` | `ColorSources` | always | Where each `color` field came from, field for field; `{}` when `color` is |
@@ -905,6 +908,11 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   text, so a crafted file could put an ANSI escape sequence on the terminal; every control
   character (C0, DEL, C1) now renders as the replacement character instead — the same mark
   invalid UTF-8 already produced on that path. No real file is affected.
+  Also additive: **aspect ratio and scan type are reported** (`pixel_aspect_ratio`,
+  `display_aspect_ratio`, `scan_type` — see the field rows). The text report's Video line gains
+  `DAR <ratio>` only for non-square-pixel content (a DVD's 720×480 presenting 16:9) and an
+  `interlaced` marker only when a stream declares it, so square-pixel progressive reports are
+  unchanged.
   Also additive: **HD DVD `.evo` video is reported.** VC-1 rides the extended PES stream id
   0xFD with a `stream_id_extension` in 0x55..0x5F (the HD DVD assignment, as ffmpeg maps it);
   such files previously errored with "extended stream ids are not decoded" and now report the

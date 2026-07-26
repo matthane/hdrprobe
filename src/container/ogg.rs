@@ -719,6 +719,10 @@ fn track_of(serial: u32, v: &Video, bitrate: Option<Bitrate>) -> TrackDemux {
                 fps: Some(h.fps),
                 bit_depth: Some(theora::BIT_DEPTH),
                 chroma: Some(h.chroma.to_string()),
+                pixel_aspect: h.pixel_aspect,
+                // Interlace is "not supported by the format at all" (format
+                // reference §8) — structural, like the bit depth.
+                scan_type: Some("progressive"),
                 color,
                 color_source,
                 // Theora defines no profiles; `QUAL` is an encoder quality hint,

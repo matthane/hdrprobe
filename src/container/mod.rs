@@ -205,6 +205,23 @@ pub struct TrackDemux {
     pub fps: Option<f64>,
     pub bit_depth: Option<u8>,
     pub chroma: Option<String>,
+    /// Pixel (sample) aspect ratio as the signalled rational, width:height of
+    /// one pixel. From the coded stream (H.264/HEVC VUI `aspect_ratio_idc`,
+    /// Part 2 / MPEG-1 PAR codes, Theora `PARN`/`PARD`, VC-1 `ASPECT_RATIO`)
+    /// or the container (MP4 `pasp`), whichever the authority model resolves —
+    /// container wins, stream fills gaps, like colour. `None` when nothing
+    /// signals one; never a guessed 1:1.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// Display aspect ratio as the signalled rational (MPEG-2's DAR codes,
+    /// MKV `DisplayWidth`:`DisplayHeight`, AVI `vprp`). Kept separate from
+    /// `pixel_aspect` because formats signal one *or* the other and the
+    /// missing one is derived with the coded size only at report assembly.
+    pub display_aspect: Option<(u32, u32)>,
+    /// `"progressive"` / `"interlaced"`, from a sequence-level coded-stream
+    /// signal (MPEG-2 `progressive_sequence`, AVC `frame_mbs_only_flag`, HEVC
+    /// PTL source flags / `field_seq_flag`, Part 2 and VC-1 `INTERLACE`).
+    /// `None` when the format has no such signal or the stream states none.
+    pub scan_type: Option<&'static str>,
     pub codec_profile: Option<String>,
     /// Stereoscopic/multiview view structure (MP4 `vexu`/`stri`); `None` for
     /// ordinary monoscopic video. Only MV-HEVC (DV Profile 20) sets it today.
@@ -289,6 +306,9 @@ impl TrackDemux {
             fps: None,
             bit_depth: None,
             chroma: None,
+            pixel_aspect: None,
+            display_aspect: None,
+            scan_type: None,
             codec_profile: None,
             stereo: None,
             color: ColorInfo::default(),
@@ -1022,6 +1042,8 @@ pub(crate) struct SpsCommon {
     pub profile: String,
     pub color: (ColorInfo, ColorSources),
     pub frame_rate: Option<f64>,
+    pub pixel_aspect: Option<(u32, u32)>,
+    pub scan_type: Option<&'static str>,
     /// Index of the chunk the SPS was found in — a RAP access unit, which is
     /// where the per-GOP prefix SEIs ride (see `Demux::sps_chunk`).
     pub chunk: usize,
@@ -1045,9 +1067,19 @@ pub(crate) fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<Sp
 
 /// Unpack the winning SPS into the demux metadata fields.
 #[allow(clippy::type_complexity)]
-pub(crate) fn sps_fields(
-    best: Option<SpsCommon>,
-) -> (u32, u32, Option<u8>, Option<String>, Option<String>, (ColorInfo, ColorSources), Option<f64>) {
+pub(crate) type SpsFieldsTuple = (
+    u32,
+    u32,
+    Option<u8>,
+    Option<String>,
+    Option<String>,
+    (ColorInfo, ColorSources),
+    Option<f64>,
+    Option<(u32, u32)>,
+    Option<&'static str>,
+);
+
+pub(crate) fn sps_fields(best: Option<SpsCommon>) -> SpsFieldsTuple {
     match best {
         Some(c) => (
             c.width,
@@ -1057,8 +1089,20 @@ pub(crate) fn sps_fields(
             Some(c.profile),
             c.color,
             c.frame_rate,
+            c.pixel_aspect,
+            c.scan_type,
         ),
-        None => (0, 0, None, None, None, (ColorInfo::default(), ColorSources::default()), None),
+        None => (
+            0,
+            0,
+            None,
+            None,
+            None,
+            (ColorInfo::default(), ColorSources::default()),
+            None,
+            None,
+            None,
+        ),
     }
 }
 
@@ -1104,6 +1148,8 @@ fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         profile: sps.profile_label(),
         color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
         frame_rate: sps.frame_rate,
+        pixel_aspect: sps.pixel_aspect,
+        scan_type: sps.scan_type,
         chunk,
     })
 }
@@ -1143,6 +1189,8 @@ fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         profile: sps.profile_label(),
         color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
         frame_rate: sps.frame_rate,
+        pixel_aspect: sps.pixel_aspect,
+        scan_type: sps.scan_type,
         chunk,
     })
 }
@@ -1292,6 +1340,12 @@ pub(crate) fn fill_nal_config_fields(td: &mut TrackDemux, rec: &[u8]) {
                 if sps.width > 0 && sps.height > 0 {
                     (td.width, td.height) = (sps.width, sps.height);
                 }
+                if td.pixel_aspect.is_none() && td.display_aspect.is_none() {
+                    td.pixel_aspect = sps.pixel_aspect;
+                }
+                if td.scan_type.is_none() {
+                    td.scan_type = sps.scan_type;
+                }
             }
         }
         _ => {
@@ -1309,6 +1363,12 @@ pub(crate) fn fill_nal_config_fields(td: &mut TrackDemux, rec: &[u8]) {
                 td.fps = sps.frame_rate;
                 if sps.width > 0 && sps.height > 0 {
                     (td.width, td.height) = (sps.width, sps.height);
+                }
+                if td.pixel_aspect.is_none() && td.display_aspect.is_none() {
+                    td.pixel_aspect = sps.pixel_aspect;
+                }
+                if td.scan_type.is_none() {
+                    td.scan_type = sps.scan_type;
                 }
             }
         }
@@ -1366,6 +1426,15 @@ pub(crate) fn fill_mpeg2_stream_fields(track: &mut TrackDemux, source: &[u8]) {
     }
     if track.codec_profile.is_none() {
         track.codec_profile = s.profile_level;
+    }
+    // Aspect moves as a pair: mixing a container's pixel ratio with the
+    // stream's display ratio would derive nonsense at report time.
+    if track.pixel_aspect.is_none() && track.display_aspect.is_none() {
+        track.pixel_aspect = s.pixel_aspect;
+        track.display_aspect = s.display_aspect;
+    }
+    if track.scan_type.is_none() {
+        track.scan_type = s.scan_type;
     }
     if signalled_nothing {
         // Field by field, and never `range`: MPEG-2 signals none, so a
@@ -1508,6 +1577,12 @@ pub(crate) fn fill_mpeg4part2_stream_fields(
     if track.codec_profile.is_none() {
         track.codec_profile = v.profile_level;
     }
+    if track.pixel_aspect.is_none() && track.display_aspect.is_none() {
+        track.pixel_aspect = v.pixel_aspect;
+    }
+    if track.scan_type.is_none() {
+        track.scan_type = v.scan_type;
+    }
     // The three CICP fields move together on the shared gate; `range` is its own
     // signal in Part 2 (the one codec here that has one), so it fills
     // independently and only into an empty field.
@@ -1567,6 +1642,12 @@ pub(crate) fn fill_vc1_stream_fields(track: &mut TrackDemux, headers: &[u8]) {
     }
     if track.fps.is_none() {
         track.fps = s.fps;
+    }
+    if track.pixel_aspect.is_none() && track.display_aspect.is_none() {
+        track.pixel_aspect = s.pixel_aspect;
+    }
+    if track.scan_type.is_none() {
+        track.scan_type = s.scan_type;
     }
     if track.bit_depth.is_none() {
         track.bit_depth = Some(crate::vc1::BIT_DEPTH);

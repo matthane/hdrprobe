@@ -183,8 +183,17 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         groups.iter().zip(outs).zip(bests.into_iter().zip(sps_chunks)).zip(codecs)
     {
         let (best, sps_chunk) = best;
-        let (width, height, bit_depth, chroma, codec_profile, (color, color_source), fps) =
-            sps_fields(best);
+        let (
+            width,
+            height,
+            bit_depth,
+            chroma,
+            codec_profile,
+            (color, color_source),
+            fps,
+            pixel_aspect,
+            scan_type,
+        ) = sps_fields(best);
 
         // `--full`: the exact video-stream byte total is only known after the
         // sampler's streaming walk, so leave the rate unset here — main.rs
@@ -208,6 +217,8 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             fps,
             bit_depth,
             chroma,
+            pixel_aspect,
+            scan_type,
             codec_profile,
             // TS carries no colour box: every field here is the in-band SPS VUI.
             color_source,

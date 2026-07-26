@@ -225,8 +225,17 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         es.finish();
         let sps = crate::container::best_sps(&es.buf, &es.chunks, &codec);
         let sps_chunk = sps.as_ref().map(|s| s.chunk);
-        let (width, height, bit_depth, chroma, codec_profile, (color, color_source), fps) =
-            crate::container::sps_fields(sps);
+        let (
+            width,
+            height,
+            bit_depth,
+            chroma,
+            codec_profile,
+            (color, color_source),
+            fps,
+            pixel_aspect,
+            scan_type,
+        ) = crate::container::sps_fields(sps);
 
         let mut td = TrackDemux {
             track_number: Some(es.sid as u64),
@@ -235,6 +244,8 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             fps,
             bit_depth,
             chroma,
+            pixel_aspect,
+            scan_type,
             codec_profile,
             // A program stream carries no colour description of its own: every
             // field here came from the coded stream.

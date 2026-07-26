@@ -31,6 +31,13 @@ pub struct SpsInfo {
     pub color: Option<VuiColor>,
     /// Frame rate from the VUI timing info, when present.
     pub frame_rate: Option<f64>,
+    /// Sample aspect ratio from the VUI `aspect_ratio_idc` (Table E-1, shared
+    /// with HEVC via `hevc::sps::sar_from_idc`) or its Extended_SAR pair.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// `frame_mbs_only_flag`: set means the sequence codes frames only —
+    /// `"progressive"`; clear means field/MBAFF coding — `"interlaced"`,
+    /// which is also how MediaInfo reads the flag.
+    pub scan_type: Option<&'static str>,
 }
 
 impl SpsInfo {
@@ -202,6 +209,8 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
         constraint_set5,
         color: None,
         frame_rate: None,
+        pixel_aspect: None,
+        scan_type: Some(if frame_mbs_only { "progressive" } else { "interlaced" }),
     };
 
     // The VUI is best-effort: a short read leaves colour/frame_rate as `None`
@@ -221,8 +230,14 @@ fn parse_vui(r: &mut BitReader, info: &mut SpsInfo) -> Option<()> {
         // aspect_ratio_info_present_flag
         let idc = r.read_bits(8)?;
         if idc == 255 {
-            r.skip_bits(16)?; // sar_width
-            r.skip_bits(16)?; // sar_height
+            // Extended_SAR: the pair rides the bitstream directly.
+            let w = r.read_bits(16)?;
+            let h = r.read_bits(16)?;
+            if w > 0 && h > 0 {
+                info.pixel_aspect = Some((w, h));
+            }
+        } else {
+            info.pixel_aspect = crate::hevc::sps::sar_from_idc(idc);
         }
     }
     if r.read_bit()? == 1 {

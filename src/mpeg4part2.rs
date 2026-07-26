@@ -82,6 +82,14 @@ pub struct VisualInfo {
     /// The colour description, always populated: the spec defines defaults for
     /// every field, so a Part 2 stream is never colour-silent the way MPEG-2 is.
     pub color: (ColorInfo, ColorSources),
+    /// `aspect_ratio_info` (Table 6-12: codes 1..5 are the H.264 Table E-1
+    /// values, 15 is the explicit `par_width`:`par_height` pair) — a true
+    /// pixel ratio. `None` for the reserved codes and a zero extended pair.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// The VOL's `interlaced` flag: set means field-coded macroblocks may
+    /// occur — `"interlaced"`; clear means none can — `"progressive"`, a real
+    /// declaration unlike MPEG-2's clear `progressive_sequence`.
+    pub scan_type: Option<&'static str>,
 }
 
 /// Parse the visual headers at the head of `data`.
@@ -143,6 +151,8 @@ pub fn parse_visual(data: &[u8]) -> Option<VisualInfo> {
         bit_depth: vol.bit_depth,
         profile_level: pli.and_then(profile_level_label),
         color: signal.unwrap_or_default().resolve(),
+        pixel_aspect: vol.pixel_aspect,
+        scan_type: vol.scan_type,
     })
 }
 
@@ -223,6 +233,8 @@ struct VolInfo {
     fps: Option<f64>,
     chroma: Option<&'static str>,
     bit_depth: Option<u8>,
+    pixel_aspect: Option<(u32, u32)>,
+    scan_type: Option<&'static str>,
 }
 
 /// `VideoObjectLayer()` (§6.2.3), from the byte after its start code.
@@ -250,9 +262,18 @@ fn parse_vol(body: &[u8]) -> Option<VolInfo> {
         1
     };
 
-    if r.read_bits(4)? == 0b1111 {
-        r.skip_bits(16)?; // par_width(8) + par_height(8)
-    }
+    let pixel_aspect = match r.read_bits(4)? {
+        0b1111 => {
+            // Extended PAR: the explicit pair.
+            let w = r.read_bits(8)?;
+            let h = r.read_bits(8)?;
+            (w > 0 && h > 0).then_some((w, h))
+        }
+        // Codes 1..5 are Table 6-12's defined set, numerically the same
+        // ratios as H.264 Table E-1's first five rows.
+        code @ 1..=5 => crate::hevc::sps::sar_from_idc(code),
+        _ => None,
+    };
 
     // Outside the studio profiles 4:2:0 is the only value `chroma_format` may
     // take, so it is a constant of the format in the same sense as MPEG-1's —
@@ -292,6 +313,7 @@ fn parse_vol(body: &[u8]) -> Option<VolInfo> {
 
     let (mut width, mut height) = (0, 0);
     let mut bit_depth = None;
+    let mut scan_type = None;
     if shape != SHAPE_BINARY_ONLY {
         if shape == SHAPE_RECTANGULAR {
             marker(&mut r)?;
@@ -300,7 +322,7 @@ fn parse_vol(body: &[u8]) -> Option<VolInfo> {
             height = r.read_bits(13)?;
             marker(&mut r)?;
         }
-        r.read_bit()?; // interlaced
+        scan_type = Some(if r.read_bit()? == 1 { "interlaced" } else { "progressive" });
         r.read_bit()?; // obmc_disable
         let sprite = r.read_bits(if verid == 1 { 1 } else { 2 })?;
         // A sprite-coded layer inserts a block whose exact field layout this
@@ -326,7 +348,7 @@ fn parse_vol(body: &[u8]) -> Option<VolInfo> {
         }
     }
 
-    Some(VolInfo { width, height, fps, chroma, bit_depth })
+    Some(VolInfo { width, height, fps, chroma, bit_depth, pixel_aspect, scan_type })
 }
 
 /// The studio-profile VOL layout, from the bit after `video_object_type_indication`.
@@ -371,9 +393,18 @@ fn parse_studio_vol(r: &mut BitReader) -> Option<VolInfo> {
         marker(r)?;
     }
 
-    if r.read_bits(4)? == 0b1111 {
-        r.skip_bits(16)?; // par_width(8) + par_height(8)
-    }
+    let pixel_aspect = match r.read_bits(4)? {
+        0b1111 => {
+            // Extended PAR: the explicit pair.
+            let w = r.read_bits(8)?;
+            let h = r.read_bits(8)?;
+            (w > 0 && h > 0).then_some((w, h))
+        }
+        // Codes 1..5 are Table 6-12's defined set, numerically the same
+        // ratios as H.264 Table E-1's first five rows.
+        code @ 1..=5 => crate::hevc::sps::sar_from_idc(code),
+        _ => None,
+    };
     // `frame_rate_code` follows, and is deliberately **not** decoded. The
     // obvious reading is H.262's Table 6-4 — same field name, same 4-bit width,
     // and the studio profile descends from MPEG-2 — but no reachable source
@@ -384,7 +415,7 @@ fn parse_studio_vol(r: &mut BitReader) -> Option<VolInfo> {
     // than printing none.
     r.skip_bits(4)?;
 
-    Some(VolInfo { width, height, fps: None, chroma, bit_depth })
+    Some(VolInfo { width, height, fps: None, chroma, bit_depth, pixel_aspect, scan_type: None })
 }
 
 /// Read one marker bit, failing when it is not 1.

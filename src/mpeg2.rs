@@ -57,6 +57,21 @@ pub struct SeqInfo {
     /// `range`: MPEG-2 does not signal one (limited is normative, which is not
     /// the same as signalled), so the container keeps that field.
     pub color: (ColorInfo, ColorSources),
+    /// Aspect from `aspect_ratio_information`, whose meaning flips with the
+    /// codec (H.262 Table 6-3 vs the 11172-2 `pel_aspect_ratio` table): MPEG-2
+    /// signals a **display** ratio (code 1 aside), MPEG-1 a **pixel** ratio.
+    /// Exactly one of the two is `Some` for a defined code; both stay `None`
+    /// for the reserved ones.
+    pub pixel_aspect: Option<(u32, u32)>,
+    pub display_aspect: Option<(u32, u32)>,
+    /// `"progressive"` when MPEG-2's `progressive_sequence` is set, or for
+    /// MPEG-1 structurally (11172-2 has no interlace anywhere — the same
+    /// class as its 4:2:0). A clear flag fills nothing: it means "may contain
+    /// interlaced pictures", and a film-sourced DVD codes progressive frames
+    /// under a clear flag — both reference tools read the pictures and say
+    /// Progressive there, so an "interlaced" from the flag alone would
+    /// disagree with both on the most common DVD case.
+    pub scan_type: Option<&'static str>,
     /// True once a `sequence_extension` has been read. Its presence is exactly
     /// what separates 13818-2 from 11172-2, so a raw stream's codec identity
     /// comes from this rather than from any container claim.
@@ -84,8 +99,12 @@ pub fn parse_sequence(data: &[u8]) -> Option<SeqInfo> {
         bit_depth: 8,
         profile_level: None,
         color: (ColorInfo::default(), ColorSources::default()),
+        pixel_aspect: None,
+        display_aspect: None,
+        scan_type: None,
         is_mpeg2: false,
     };
+    let aspect_code = data[h + 3] >> 4;
 
     // The quantiser matrices that may follow the fixed header are bit-packed
     // and never needed, so the end of the header is the next start code. MPEG
@@ -124,6 +143,16 @@ pub fn parse_sequence(data: &[u8]) -> Option<SeqInfo> {
                                 f * (seq.frame_rate_extension_n as f64 + 1.0)
                                     / (seq.frame_rate_extension_d as f64 + 1.0)
                             });
+                            // Affirmative only: `progressive_sequence` set is
+                            // a declaration, but clear means "may contain
+                            // interlaced pictures" (H.262 §6.3.5) — a
+                            // film-sourced DVD codes progressive frames under
+                            // a clear flag, and both reference tools read the
+                            // *pictures* and say Progressive there. Reporting
+                            // "interlaced" from the clear flag would disagree
+                            // with both on the most common DVD case, so the
+                            // clear flag fills nothing.
+                            info.scan_type = seq.progressive.then_some("progressive");
                         }
                     }
                     // Only after a sequence extension has been seen. 11172-2
@@ -155,9 +184,41 @@ pub fn parse_sequence(data: &[u8]) -> Option<SeqInfo> {
     // value from the extension above, or left it unknown if that was truncated.
     if !info.is_mpeg2 {
         info.chroma = Some("4:2:0");
+        // Frame-based by construction: 11172-2 defines no interlace anywhere,
+        // making this the structural constant the module doc groups with the
+        // bit depth and the 4:2:0.
+        info.scan_type = Some("progressive");
+    }
+    // `aspect_ratio_information` reads per codec, which is only known now.
+    // H.262 Table 6-3: 1 is square *pixels*, 2..4 are **display** ratios, the
+    // rest reserved and filled with nothing. The 11172-2 `pel_aspect_ratio`
+    // table is a **pixel** height/width (so the pixel ratio is its inverse),
+    // with the disputed indices 8 and 12 resolved to 0.9375/1.1250 — the
+    // geometry and interpolation case is in the format reference §1, against
+    // ffmpeg's draft-era 0.9157/1.0950.
+    if info.is_mpeg2 {
+        match aspect_code {
+            1 => info.pixel_aspect = Some((1, 1)),
+            2 => info.display_aspect = Some((4, 3)),
+            3 => info.display_aspect = Some((16, 9)),
+            4 => info.display_aspect = Some((221, 100)),
+            _ => {}
+        }
+    } else if let Some(&pel) = MPEG1_PEL_ASPECT.get(aspect_code as usize) {
+        if pel > 0 {
+            info.pixel_aspect = Some((10_000, pel));
+        }
     }
     Some(info)
 }
+
+/// 11172-2 `pel_aspect_ratio` × 10⁴, indexed by `aspect_ratio_information`
+/// (0 and 15 are forbidden/reserved and the leading 0 entry covers the first).
+/// The value is pel height/width, so the pixel ratio reported is its inverse.
+const MPEG1_PEL_ASPECT: [u32; 15] = [
+    0, 10_000, 6_735, 7_031, 7_615, 8_055, 8_437, 8_935, 9_375, 9_815, 10_255, 10_695, 11_250,
+    11_575, 12_015,
+];
 
 /// Offset of the first plausible `sequence_header` in `data`, as the index of
 /// its start code's first zero byte.
@@ -225,6 +286,7 @@ pub(crate) fn next_start_code(data: &[u8], from: usize) -> Option<usize> {
 /// `extension_start_code_identifier` byte.
 struct SequenceExtension {
     profile_and_level: u8,
+    progressive: bool,
     chroma_format: u8,
     horizontal_size_extension: u32,
     vertical_size_extension: u32,
@@ -243,9 +305,9 @@ fn parse_sequence_extension(data: &[u8], e: usize, elem_end: usize) -> Option<Se
     let b = data.get(e..e + 6)?;
     Some(SequenceExtension {
         profile_and_level: (b[0] & 0x0F) << 4 | b[1] >> 4,
-        // b[1] bit 3 is progressive_sequence, which the report has no field
-        // for; coded height rounds to 32 lines when it is clear, which is where
+        // Coded height rounds to 32 lines when this is clear, which is where
         // 1080 becomes 1088, but the reported size is the header's own value.
+        progressive: (b[1] >> 3) & 0x01 != 0,
         chroma_format: (b[1] >> 1) & 0x03,
         horizontal_size_extension: ((b[1] & 0x01) << 1 | b[2] >> 7) as u32,
         vertical_size_extension: ((b[2] >> 5) & 0x03) as u32,
@@ -374,6 +436,52 @@ pub fn profile_level_label(pli: u8) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aspect_codes_read_per_codec_and_reserved_fills_nothing() {
+        // MPEG-2 (a sequence extension follows): Table 6-3 — 1 is square
+        // *pixels*, 2..4 are *display* ratios, the rest reserved.
+        let mut h = M2V_HEAD.to_vec();
+        for (code, par, dar) in [
+            (0x10u8, Some((1, 1)), None),
+            (0x20, None, Some((4, 3))),
+            (0x30, None, Some((16, 9))),
+            (0x40, None, Some((221, 100))),
+            (0x50, None, None), // reserved
+        ] {
+            h[7] = code | 0x03; // keep frame_rate_code 3
+            let s = parse_sequence(&h).expect("parses");
+            assert_eq!((s.pixel_aspect, s.display_aspect), (par, dar), "{code:#x}");
+        }
+        // MPEG-2's scan is affirmative-only. The corpus header's
+        // progressive_sequence is set (byte 17 bit 3), which declares:
+        assert_eq!(parse_sequence(&M2V_HEAD).unwrap().scan_type, Some("progressive"));
+        // Cleared, it merely *permits* interlaced pictures — film-sourced
+        // DVDs are progressive under a clear flag and both reference tools
+        // say so — so it must fill nothing rather than "interlaced".
+        let mut cleared = M2V_HEAD;
+        cleared[17] &= !0x08;
+        assert_eq!(parse_sequence(&cleared).unwrap().scan_type, None);
+    }
+
+    #[test]
+    fn mpeg1_pel_aspect_is_the_reference_table_not_ffmpegs() {
+        // MPEG-1: no extension, the same 4 bits read the 11172-2 pel table
+        // (height/width — the pixel ratio is its inverse). Indices 8 and 12
+        // are the disputed pair the format reference resolves to 0.9375 and
+        // 1.1250 on geometry and interpolation grounds; ffmpeg's 0.9157 and
+        // 1.0950 would be (10000, 9157)/(10000, 10950).
+        let mut h = M2V_HEAD[..12].to_vec();
+        h.extend_from_slice(&[0x00, 0x00, 0x01, 0xB8, 0x00, 0x08, 0x00, 0x40]);
+        for (code, pel) in [(0x80u8, 9_375u32), (0xC0, 11_250), (0x10, 10_000)] {
+            h[7] = code | 0x03;
+            let s = parse_sequence(&h).expect("parses");
+            assert!(!s.is_mpeg2);
+            assert_eq!(s.pixel_aspect, Some((10_000, pel)), "{code:#x}");
+            // Structural: 11172-2 has no interlace anywhere.
+            assert_eq!(s.scan_type, Some("progressive"));
+        }
+    }
 
     /// `testfiles/sdr/mpeg2.m2v`, bytes 0..22 verbatim: a 320x240 25 fps
     /// sequence header (offsets 0..11) followed by the sequence extension

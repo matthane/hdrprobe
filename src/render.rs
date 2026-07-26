@@ -950,6 +950,16 @@ fn video_line(g: &VideoTrack) -> String {
     if let (Some(w), Some(h)) = (g.width, g.height) {
         parts.push(format!("{}×{}", w, h));
     }
+    // Presentation policy like the Color line's matrix rule: the display
+    // ratio is stated only when the pixels are not square, i.e. when the
+    // coded size alone would mislead (a DVD's 720×480 presenting as 16:9).
+    // Square-pixel content keeps its historical line byte for byte; the JSON
+    // always carries both ratios when signalled.
+    if let (Some(par), Some(dar)) = (g.pixel_aspect_ratio, g.display_aspect_ratio) {
+        if (par - 1.0).abs() > 0.01 {
+            parts.push(format!("DAR {}", dar_label(dar)));
+        }
+    }
     if let Some(f) = g.fps {
         parts.push(format!("{:.3} fps", f));
     }
@@ -967,10 +977,37 @@ fn video_line(g: &VideoTrack) -> String {
     if !depth.is_empty() {
         parts.push(depth);
     }
+    // The notable state only: progressive is the norm and stays silent, the
+    // same absence-reads-as-ordinary convention the sampled footnote uses.
+    if g.scan_type.as_deref() == Some("interlaced") {
+        parts.push("interlaced".to_string());
+    }
     if let Some(s) = &g.stereo {
         parts.push(s.clone());
     }
     parts.join(" · ")
+}
+
+/// Render a display aspect ratio with its conventional name when it has one
+/// (`16:9`, `4:3`, …), else as `x.xx:1`. The tolerance absorbs the rounding
+/// of code-point and rational signalling; it is presentation only — the JSON
+/// carries the exact float.
+fn dar_label(dar: f64) -> String {
+    const NAMED: [(f64, &str); 7] = [
+        (4.0 / 3.0, "4:3"),
+        (16.0 / 9.0, "16:9"),
+        (3.0 / 2.0, "3:2"),
+        (5.0 / 4.0, "5:4"),
+        (1.0, "1:1"),
+        (2.21, "2.21:1"),
+        (2.35, "2.35:1"),
+    ];
+    for (v, name) in NAMED {
+        if (dar - v).abs() < 0.01 {
+            return name.to_string();
+        }
+    }
+    format!("{dar:.2}:1")
 }
 
 fn color_line(t: &VideoTrack) -> String {
@@ -1632,6 +1669,9 @@ mod tests {
                 bitrate: None,
                 bit_depth: Some(10),
                 chroma: Some("4:2:0".to_string()),
+                pixel_aspect_ratio: None,
+                display_aspect_ratio: None,
+                scan_type: None,
                 stereo: Some("Stereoscopic 3D (2 views)".to_string()),
                 color: ColorInfo::default(),
                 color_source: Default::default(),
@@ -1669,6 +1709,9 @@ mod tests {
             bitrate: None,
             bit_depth: None,
             chroma: None,
+            pixel_aspect_ratio: None,
+            display_aspect_ratio: None,
+            scan_type: None,
             stereo: None,
             color: ColorInfo::default(),
             color_source: Default::default(),
