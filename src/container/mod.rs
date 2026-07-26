@@ -1490,19 +1490,53 @@ pub(crate) fn fill_mjpeg_stream_fields(track: &mut TrackDemux, source: &[u8]) {
 /// ffmpeg's decoders emit `yuv420p` alone, and MediaInfo states 8 bits for
 /// WMV2 — single-witness and labelled, the studio-VOL convention.
 pub(crate) fn fill_constant_depth_chroma(track: &mut TrackDemux) {
-    let constant = match &track.codec {
-        Codec::Vc1 | Codec::MsMpeg4(_) => true,
-        Codec::Other(l) => l.eq_ignore_ascii_case("WMV1") || l.eq_ignore_ascii_case("WMV2"),
-        _ => false,
+    let (depth, chroma, scan) = match &track.codec {
+        Codec::Vc1 | Codec::MsMpeg4(_) => (Some(8), Some("4:2:0"), None),
+        Codec::Other(l) => {
+            let l = l.as_str();
+            if l.eq_ignore_ascii_case("WMV1") || l.eq_ignore_ascii_case("WMV2") {
+                (Some(8), Some("4:2:0"), None)
+            } else if l.eq_ignore_ascii_case("H263")
+                || l.eq_ignore_ascii_case("S263")
+                || l == "Sorenson H.263"
+            {
+                // ITU-T H.263 §4.1: every source format is 4:2:0 at 8 bits,
+                // and the format has no field coding — all three are
+                // normative constants (the Sorenson variant inherits the
+                // picture model).
+                (Some(8), Some("4:2:0"), Some("progressive"))
+            } else if l.eq_ignore_ascii_case("dvsd") || l == "dv25" {
+                // DV25 is 8-bit everywhere, but its chroma differs by system
+                // (525-60 is 4:1:1; 625-50 is 4:2:0 for IEC 61834 and 4:1:1
+                // for DVCPRO) and this label names neither, so only the depth
+                // fills.
+                (Some(8), None, None)
+            } else if l == "dvc " {
+                // QuickTime's 525-60 IEC DV25: 4:1:1 (IEC 61834-2).
+                (Some(8), Some("4:1:1"), None)
+            } else if l == "dvcp" {
+                // 625-50 IEC DV25: 4:2:0.
+                (Some(8), Some("4:2:0"), None)
+            } else if l == "dvpp" || l == "dv5n" || l == "dv5p" {
+                // DVCPRO 625 (4:1:1) and DVCPRO50 (4:2:2) — SMPTE 314M.
+                (Some(8), Some(if l == "dvpp" { "4:1:1" } else { "4:2:2" }), None)
+            } else if l.starts_with("dvh") {
+                // DV100 / DVCPRO HD: 8-bit 4:2:2 (SMPTE 370M).
+                (Some(8), Some("4:2:2"), None)
+            } else {
+                (None, None, None)
+            }
+        }
+        _ => (None, None, None),
     };
-    if !constant {
-        return;
-    }
     if track.bit_depth.is_none() {
-        track.bit_depth = Some(8);
+        track.bit_depth = depth;
     }
     if track.chroma.is_none() {
-        track.chroma = Some("4:2:0".to_string());
+        track.chroma = chroma.map(str::to_string);
+    }
+    if track.scan_type.is_none() {
+        track.scan_type = scan;
     }
 }
 
@@ -2236,9 +2270,30 @@ mod tests {
         t.chroma = Some("4:2:2".to_string());
         fill_constant_depth_chroma(&mut t);
         assert_eq!(t.chroma.as_deref(), Some("4:2:2"));
+        // The H.263 and DV families (open-items A4): H.263 is normatively
+        // 8-bit 4:2:0 progressive; QuickTime's DV entries fix the chroma the
+        // bare `dvsd` cannot (its system — and so its chroma — is unknown at
+        // the label, so only the depth fills there).
+        let mut t = TrackDemux::new(Codec::Other("H263".into()), NalFormat::AnnexB);
+        fill_constant_depth_chroma(&mut t);
+        assert_eq!(
+            (t.bit_depth, t.chroma.as_deref(), t.scan_type),
+            (Some(8), Some("4:2:0"), Some("progressive"))
+        );
+        for (label, chroma) in [
+            ("dvc ", Some("4:1:1")),
+            ("dvcp", Some("4:2:0")),
+            ("dv5p", Some("4:2:2")),
+            ("dvh1", Some("4:2:2")),
+            ("dvsd", None),
+        ] {
+            let mut t = TrackDemux::new(Codec::Other(label.into()), NalFormat::AnnexB);
+            fill_constant_depth_chroma(&mut t);
+            assert_eq!((t.bit_depth, t.chroma.as_deref()), (Some(8), chroma), "{label}");
+        }
         // Every other codec — including an unrelated FourCC label — is
         // untouched: these constants are family facts, not defaults.
-        for codec in [Codec::Hevc, Codec::Mjpeg, Codec::Other("dvsd".into())] {
+        for codec in [Codec::Hevc, Codec::Mjpeg, Codec::Other("XYZW".into())] {
             let mut t = TrackDemux::new(codec.clone(), NalFormat::AnnexB);
             fill_constant_depth_chroma(&mut t);
             assert_eq!((t.bit_depth, t.chroma), (None, None), "{codec:?}");

@@ -212,6 +212,10 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         td.fps = meta.and_then(|m| m.number("framerate")).and_then(super::plausible_fps);
     }
 
+    // The families whose values are format constants (Sorenson H.263 here) —
+    // fills only what the tag chain and metadata left absent.
+    super::fill_constant_depth_chroma(&mut td);
+
     td.bitrate = if full && complete {
         // The fused `--full` walk sums the exact video payload bytes
         // (`sample::Scan::es_bytes`, applied in main.rs), which is a

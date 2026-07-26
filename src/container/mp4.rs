@@ -562,6 +562,9 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         if t.codec == Codec::Mjpeg {
             super::fill_mjpeg_stream_fields(t, data);
         }
+        // Then the families whose values are format constants (the QuickTime
+        // DV sample entries, H.263) — fills only what is still absent.
+        super::fill_constant_depth_chroma(t);
     }
     // MPEG-4 Part 2 the same way, but with the `esds` DecoderSpecificInfo tried
     // first: a muxer that wrote one has already handed over the visual headers,
