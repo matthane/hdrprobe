@@ -332,6 +332,20 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
         ranges.push((start as u64, size - start));
     }
 
+    // FLV's duration fallback follows the file's final `PreviousTagSize` back
+    // to the last tag's header, which is the only length signal a capture with
+    // no `onMetaData` duration has — the same shape as the TS tail-PCR and
+    // program-stream tail-PTS warms above, and the same exact-size coupling
+    // (`flv::TAIL_SCAN_BYTES`). Its head walk needs no branch: FLV's
+    // `HEAD_SCAN_BYTES` is `<=` `HEAD_WARM`. An ASF needs nothing here at all —
+    // its Header Object is at byte 0 and a few tens of KiB at most, so the
+    // generic head covers the whole parse.
+    if !is_iso && looks_like_flv(path, data) {
+        let tail = crate::container::flv::TAIL_SCAN_BYTES;
+        let start = size.saturating_sub(tail);
+        ranges.push((start as u64, size - start));
+    }
+
     // AVI resolves every chunk position from an index rather than by walking, so
     // what it needs warmed past the head is the index itself: `idx1` sits after
     // all the data, and an OpenDML file's `ix##` sub-indexes sit one per RIFF
@@ -622,6 +636,12 @@ fn looks_like_mp4(path: &Path, data: &[u8]) -> bool {
 fn looks_like_avi(path: &Path, data: &[u8]) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     ext == "avi" || crate::container::avi::is_avi(data)
+}
+
+/// Nine bytes at offset 0, like the AVI probe, so the content half is free.
+fn looks_like_flv(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    ext == "flv" || crate::container::flv::is_flv(data)
 }
 
 fn looks_like_ts(path: &Path, data: &[u8]) -> bool {

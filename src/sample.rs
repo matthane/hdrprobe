@@ -10,7 +10,7 @@ use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use rayon::prelude::*;
 
 use crate::avc::nal as avc_nal;
-use crate::container::{annexb, av1, ts, Chunk, Codec, Demux, NalFormat, RawFullStream};
+use crate::container::{annexb, av1, flv, ts, Chunk, Codec, Demux, NalFormat, RawFullStream};
 use crate::dv::levels::DvAggregate;
 use crate::dv::rpu::{parse_avc_rpu, parse_hevc_rpu};
 use crate::hdr::sei::{self, SeiFindings};
@@ -480,22 +480,29 @@ fn scan_raw_full(
         };
     }
 
-    let (frame_count, fps) = match plan {
+    let (frame_count, fps, es_bytes) = match plan {
         RawFullStream::HevcAnnexB => {
             annexb::walk_aus(data, tick, push_au!());
             // A raw HEVC stream has no duration source (VUI timing gives a
             // rate, not a length), so nothing beyond the extraction comes
             // back from the walk.
-            (None, None)
+            (None, None, None)
         }
         RawFullStream::Av1Obu => {
             let count = av1::walk_obu_tus(data, tick, push_au!());
-            (count, None)
+            (count, None, None)
         }
         RawFullStream::Ivf { data_start, ticks_per_sec } => {
             let walk = av1::walk_ivf_frames(data, *data_start, data.len(), tick, push_au!());
             let fps = av1::ivf_fps(walk.frames, walk.span, *ticks_per_sec);
-            ((walk.frames > 0).then_some(walk.frames as u64), fps)
+            ((walk.frames > 0).then_some(walk.frames as u64), fps, None)
+        }
+        RawFullStream::Flv { data_start } => {
+            // The exact video payload sum, which is what turns FLV's
+            // muxer-declared `videodatarate` into a measured rate under
+            // `--full` (demux leaves `bitrate` unset on this path, and main.rs
+            // applies this).
+            (None, None, flv::walk_tags(data, *data_start, tick, push_au!()))
         }
     };
     flush_raw_batch(data, &mut pending, demux, opts.no_rpu, &mut dv, &mut sei, frontier);
@@ -509,7 +516,7 @@ fn scan_raw_full(
         (Some(n), Some(f)) if f > 0.0 => Some(n as f64 / f),
         _ => None,
     };
-    Scan { tracks: vec![TrackScan { dv, sei, es_bytes: None, frame_count, fps, duration_secs }] }
+    Scan { tracks: vec![TrackScan { dv, sei, es_bytes, frame_count, fps, duration_secs }] }
 }
 
 /// Extract one accumulated batch of the raw fused walk's access units (unless
