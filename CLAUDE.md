@@ -1116,6 +1116,19 @@ never parse bytes native-endian.
 
 ## Verifying changes
 
+**Review subagents get a resource budget, in the brief, every time.** Parallel finders are worth
+their cost on this codebase — hand-rolled byte parsers over untrusted input fail in ways a green
+test suite cannot see — but four unbudgeted ones filled 64 GB of RAM and pegged the CPU at 100%,
+halting the dev machine. Three workloads stacked: six concurrent `cargo build --release` runs (each
+agent forked its own `--target-dir` to dodge the project's lock), concurrent x264/x265 encodes of
+1 GB+ fixtures, and ~250,000 process spawns for fuzzing. So: **finders never build** — build once
+and hand them the binary path, forbidding `cargo build`/`test`/`clippy` and `--target-dir`; **at
+most two at a time**; **fixtures under ~50 MB**, deleted in the step that measures them (a size
+regression shows at 50 MB as plainly as at 350 MB — what exposes an unbounded per-chunk walk is
+chunk *count*); **fuzz budgets in the low thousands**, since structure-aware enumeration of
+declared size/length fields is what finds defects and 170k random runs found nothing 20k had not.
+Watch memory while they run, not after.
+
 Cross-check against `mediainfo --Output=JSON` / `ffprobe` / `dovi_tool info` (the ground truth
 used throughout). The corpus lives in `testfiles/integration/` (the whole `testfiles/` tree is
 local-only and gitignored — nothing under it is committed). For robustness work, byte-mutation
