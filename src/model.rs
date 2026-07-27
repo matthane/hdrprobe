@@ -580,7 +580,7 @@ pub struct TrimTarget {
 pub struct ActiveArea {
     pub width: u32,
     pub height: u32,
-    /// Aspect ratio numerator:denominator presentation string, e.g. "2.39:1".
+    /// L5 crop offsets, in pixels from each canvas edge.
     pub left: u16,
     pub right: u16,
     pub top: u16,

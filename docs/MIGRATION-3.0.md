@@ -11,8 +11,8 @@ fixes its cross-compatibility id, and an id fixes the base layer's colour. hdrpr
 them, and says per field where each value came from so a derived value is never mistaken for a
 signalled one.
 
-Five changes can break a working 2.x consumer. Four are string or field changes you can grep
-for; the fifth is a presence change, which is the one worth reading carefully.
+Six changes can break a working 2.x consumer. Four are string or field changes you can grep
+for; the last two are presence changes, which are the ones worth reading carefully.
 
 ## The mechanical migration
 
@@ -72,6 +72,15 @@ for; the fifth is a presence change, which is the one worth reading carefully.
    `color_source` instead.** `spec` is the derived case; `container`, `stream` and `sei` are the
    signalled ones. For example, "did this file actually carry a transfer characteristic" is
    `.video_tracks[].color_source.transfer != "spec"`, not `has("transfer") | not`.
+
+7. **`input_truncated` now also appears on file probes.** Through 2.x it was set for stdin
+   probes only. It now also fires when a file's own container declares more bytes than the
+   file holds (AVI RIFF segment sizes, ASF `File Properties.File Size`, FLV
+   `onMetaData.filesize`, RealMedia's `DATA` chunk extent): a partial download, or a capture
+   that never closed. The backends already withheld what a prefix cannot support (any
+   `"overall"` bitrate; ASF also its duration); the flag now names why. A consumer that read
+   the field as "this was a stdin probe" should read it as "partial input" generally; the
+   stdin test is `file == "-"`.
 
 ## New, and safe to ignore
 
