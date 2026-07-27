@@ -344,7 +344,9 @@ normal quick scan, and **Full** runs the exhaustive `--full` scan of the whole
 file. On a folder, either entry scans every supported file in it, including
 subfolders. Either opens a console running the report, kept open until you
 press a key. The menu launches whichever `hdrprobe.exe` you ran the install
-from, so run it from the binary's final location.
+from, so run it from the binary's final location. After upgrading to a release
+that adds new formats, run `--install-shell` again: the menu covers only the
+file types registered at install time.
 
 Registration is per-user, so it needs no administrator rights: it writes verbs under
 `HKCU\Software\Classes\SystemFileAssociations` and touches no default file
