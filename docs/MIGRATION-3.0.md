@@ -150,8 +150,9 @@ All additive; a consumer that tolerates unknown fields needs no changes for thes
 - Inputs with no Dolby Vision metadata see the renames/removals, the new `color_source`
   object, and the wider CICP value sets; their `hdr.format` and `color` values are otherwise
   unchanged.
-- Metadata sidecars (raw RPU `.bin`, DV CM XML, HDR10+ JSON) still report no colour at all:
-  they have no base layer to describe, so the spec fill never runs for them.
+- Metadata sidecars (raw RPU `.bin`, DV CM XML, HDR10+ JSON) still report no colour values —
+  `color` and `color_source` are present-but-empty `{}` objects, as everywhere: they have no
+  base layer to describe, so the spec fill never runs for them.
 - The text report and exit codes are unchanged across the whole bump; every change here is
   JSON-only.
 
