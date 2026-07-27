@@ -312,11 +312,15 @@ error, the AACS rule; decrypted backups clear those bits and probe normally.
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
 | `fps` | float | optional | Frame rate. From container timing (MP4/MKV), the SPS VUI (TS, raw HEVC), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>`. Absent when the input carries no rate signal; never guessed |
+| `fps_rational` | object `{num, den}` | optional | The frame rate as the exact reduced ratio it was signalled as (`{"num": 24000, "den": 1001}`), where the source states one: an H.264/HEVC VUI's `time_scale`/`num_units_in_tick`, MP4's uniform `stts` delta, MKV's `DefaultDuration` against the nanosecond clock, the MPEG-1/2 and VC-1 rate tables, MPEG-4 Part 2's `fixed_vop_rate` pair, Theora `FRN`:`FRD`, an AV1 sequence header's timing info, DV's system rate, RealMedia's 16.16 field, ASF's average frame period, AVI's `dwRate`:`dwScale`. The `fps` float is the same value as a decimal (they may differ in the last binary digit). Absent when the rate was measured or averaged rather than stated as a ratio (IVF timestamps, frame-count over duration), or when `fps` is |
+| `duration_secs` | float | optional | This track's own duration, where the container states one per track: MP4's media duration (or summed fragment runs), the mkvmerge `DURATION` statistics tag, AVI's per-stream declared length, RealMedia's MDPR duration. The report-level `duration_secs` stays the file-level value (the longest stream's); on single-track files the two usually agree to within a frame |
 | `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists. The `"overall"` (file-length) fallback rate appears only when this is the file's sole video track (an overall rate attributed to one of several tracks would be a wrong number) |
 | `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
 | `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"`, `"4:1:1"` (DV, MJPEG), `"4:4:0"` (MJPEG, VP9). A reserved signalling value names no format and omits the field |
 | `pixel_aspect_ratio` | float | optional | Pixel (sample) aspect ratio, width of one pixel over its height (1.0 = square). Signalled by the coded stream (H.264/HEVC VUI `aspect_ratio_idc`/Extended_SAR, MPEG-4 Part 2 and MPEG-1 aspect codes, Theora `PARN`:`PARD`, VC-1 `ASPECT_RATIO`) or the container (MP4 `pasp` — which wins over the stream, like colour), or derived exactly from a signalled display ratio and the coded size (MPEG-2's DAR codes, MKV `DisplayWidth`:`DisplayHeight`, AVI `vprp`). Absent when nothing signals either ratio — never a guessed square |
+| `pixel_aspect_ratio_rational` | object `{num, den}` | optional | The pixel aspect ratio as an exact reduced ratio; present exactly when the float is (both derive from the same signalled rational) |
 | `display_aspect_ratio` | float | optional | Display aspect ratio of the presented picture. Signalled directly or derived exactly from the pixel ratio and the coded size; present exactly when `pixel_aspect_ratio` is. The text report shows it (as `DAR 16:9` etc.) only when the pixels are not square; the JSON always carries both |
+| `display_aspect_ratio_rational` | object `{num, den}` | optional | The display aspect ratio as an exact reduced ratio (`{"num": 16, "den": 9}`); present exactly when the float is |
 | `scan_type` | string | optional | `"progressive"` or `"interlaced"`, from a sequence-level signal of the coded stream (AVC `frame_mbs_only_flag`, HEVC PTL source flags / `field_seq_flag`, MPEG-2 `progressive_sequence` — affirmative only, since a clear flag merely permits interlaced pictures and film-sourced DVDs are progressive under it, MPEG-4 Part 2 and VC-1 interlace flags, MKV `FlagInterlaced`, AVI `vprp` fields-per-frame; MPEG-1, Theora and MJPEG-free formats that structurally cannot interlace state `"progressive"`). Absent when unsignalled — absence never means progressive. The text report marks only `interlaced` |
 | `stereo` | string | optional | Stereoscopic view structure from MP4 `vexu`/`stri` (MV-HEVC, DV Profile 20): `"Stereoscopic 3D (2 views)"`, `"Monoscopic (1 view)"`, or `"Multiview 3D (2+ views)"`. Absent for ordinary monoscopic video |
 | `color` | `ColorInfo` | always | The track's colour description; may be `{}` when nothing signalled it and nothing defines it |
@@ -867,6 +871,12 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   container's own identifier beside the resolved `codec` name, which both separates
   recognized codecs from verbatim fallbacks and surfaces identity the name cannot
   (`"hvc1"` vs `"hev1"`, an encrypted track's recovered FourCC).
+  Further additive fields, all optional: per-track `duration_secs` (the track's own stated
+  length, beside the file-level value), and the exact-ratio companions `fps_rational`,
+  `pixel_aspect_ratio_rational` and `display_aspect_ratio_rational` (`{num, den}`, reduced)
+  beside their floats — `24000/1001` instead of a repeating decimal, for consumers that need
+  the ratio itself. See each field's row for its sources; a measured or averaged rate
+  deliberately carries no ratio.
   Also additive alongside those: the new always-present `video_tracks[].color_source` object gives
   per-field provenance for `color` (`container` / `stream` / `sei` / `spec`); `dolby_vision`
   gains the optional `pq_reshaping` and `deprecated_combination` booleans; and

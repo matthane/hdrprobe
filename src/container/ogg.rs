@@ -717,6 +717,7 @@ fn track_of(serial: u32, v: &Video, bitrate: Option<Bitrate>) -> TrackDemux {
                 width: h.width,
                 height: h.height,
                 fps: Some(h.fps),
+                fps_rational: Some((u64::from(h.frn), u64::from(h.frd))),
                 bit_depth: Some(theora::BIT_DEPTH),
                 chroma: Some(h.chroma.to_string()),
                 pixel_aspect: h.pixel_aspect,
@@ -734,6 +735,7 @@ fn track_of(serial: u32, v: &Video, bitrate: Option<Bitrate>) -> TrackDemux {
             width: id.width,
             height: id.height,
             fps: Some(id.fps),
+            fps_rational: Some((u64::from(id.fpsn), u64::from(id.fpsd))),
             // RFC 6386 §2: "VP8 works exclusively with an 8-bit YUV 4:2:0 image
             // format." Both are format constants rather than fields that were
             // read, the same standing as MPEG-2's 8 bits and ProRes's

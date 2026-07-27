@@ -364,6 +364,8 @@ struct VideoTrack {
     sd: SampleDesc,
     chunks: Vec<Chunk>,
     fps: Option<f64>,
+    /// The stts-declared CFR ratio, when one exists (see `stts_uniform_fps`).
+    fps_rational: Option<(u64, u64)>,
     duration_secs: Option<f64>,
     /// The track's *own* playback duration, when it is known exactly — the mdhd
     /// media duration, or for a fragmented mux the summed trun sample durations.
@@ -520,9 +522,13 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         out.push(TrackDemux {
             track_number: Some(t.track_id as u64),
             codec_id: Some(t.sd.codec_id.clone()),
+            // The track's own media duration (or summed fragment runs) —
+            // already the bitrate denominator above.
+            duration_secs: t.stream_duration_secs,
             width: t.sd.width,
             height: t.sd.height,
             fps: t.fps,
+            fps_rational: t.fps_rational,
             bit_depth: t.sd.bit_depth,
             chroma: t.sd.chroma.clone(),
             pixel_aspect: t.sd.pixel_aspect,
@@ -642,16 +648,24 @@ fn parse_video_track(
     // report for CFR); fall back to sample count over the media duration for
     // genuinely variable tracks. Gated on a non-empty sample index so an fMP4's
     // empty stbl leaves fps to the fragment path.
-    let fps = if sample_count > 0 { stts_uniform_fps(data, &stbl_boxes, media_timescale) } else { None }
-        .or(match (duration_secs, sample_count) {
-            (Some(d), n) if d > 0.0 && n > 0 => Some(n as f64 / d),
-            _ => None,
-        });
+    let cfr = if sample_count > 0 {
+        stts_uniform_fps(data, &stbl_boxes, media_timescale)
+    } else {
+        None
+    };
+    // The stts-declared ratio is exact; the count-over-duration fallback is a
+    // measurement and carries no rational.
+    let fps_rational = cfr.map(|(_, r)| r);
+    let fps = cfr.map(|(f, _)| f).or(match (duration_secs, sample_count) {
+        (Some(d), n) if d > 0.0 && n > 0 => Some(n as f64 / d),
+        _ => None,
+    });
 
     Ok(Some(VideoTrack {
         sd,
         chunks,
         fps,
+        fps_rational,
         duration_secs,
         stream_duration_secs,
         track_id,
@@ -1260,7 +1274,11 @@ fn parse_clli(data: &[u8], b: &BoxHdr) -> Option<ContentLight> {
 /// entry covering a single sample is ignored — the common last-sample padding
 /// delta in otherwise-constant tracks — and any other delta mix (true VFR)
 /// yields `None`, keeping the averaged fallback.
-fn stts_uniform_fps(data: &[u8], stbl: &[BoxHdr], media_timescale: u32) -> Option<f64> {
+fn stts_uniform_fps(
+    data: &[u8],
+    stbl: &[BoxHdr],
+    media_timescale: u32,
+) -> Option<(f64, (u64, u64))> {
     let stts = find(stbl, b"stts")?;
     let p = stts.payload;
     let n = clamp_count(read_u32(data, p + 4) as usize, p + 8, 8, stts.end);
@@ -1283,7 +1301,8 @@ fn stts_uniform_fps(data: &[u8], stbl: &[BoxHdr], media_timescale: u32) -> Optio
     }
     // Two unvalidated 32-bit fields; the shared bound keeps a misread pair
     // from stating a timescale's worth of frames per second.
-    super::plausible_fps(media_timescale as f64 / d as f64)
+    let f = super::plausible_fps(media_timescale as f64 / d as f64)?;
+    Some((f, (u64::from(media_timescale), u64::from(d))))
 }
 
 fn build_sample_index(data: &[u8], stbl: &[BoxHdr], _codec: Codec) -> Result<Vec<Chunk>> {
@@ -1576,6 +1595,7 @@ mod tests {
             },
             chunks: (0..chunks).map(|i| Chunk { offset: i as u64, size: 1 }).collect(),
             fps: Some(24.0),
+            fps_rational: None,
             duration_secs: Some(1.0),
             stream_duration_secs: None,
             track_id: 1,
@@ -1801,18 +1821,19 @@ mod tests {
             let boxes = iter_boxes(&buf, 0, buf.len());
             (buf, boxes)
         };
-        // Uniform: 3568 samples at delta 256, timescale 15360 → exactly 60.
+        // Uniform: 3568 samples at delta 256, timescale 15360 → exactly 60,
+        // with the exact declared ratio beside the float.
         let (buf, boxes) = mk(&[(3568, 256)]);
-        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(60.0));
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some((60.0, (15360, 256))));
         // A trailing single-sample padding delta doesn't break uniformity.
         let (buf, boxes) = mk(&[(3567, 256), (1, 512)]);
-        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(60.0));
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some((60.0, (15360, 256))));
         // True VFR (mixed deltas over multiple samples) declares no rate.
         let (buf, boxes) = mk(&[(100, 256), (100, 512)]);
         assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
         // A single-entry table covering one sample is still a declared rate.
         let (buf, boxes) = mk(&[(1, 512)]);
-        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(30.0));
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some((30.0, (15360, 512))));
         // Degenerate values never divide: zero delta, empty table, timescale 0.
         let (buf, boxes) = mk(&[(10, 0)]);
         assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
@@ -1831,7 +1852,7 @@ mod tests {
         body.extend_from_slice(&1000u32.to_be_bytes());
         let buf = boxed(*b"stts", &body);
         let boxes = iter_boxes(&buf, 0, buf.len());
-        assert_eq!(stts_uniform_fps(&buf, &boxes, 24000), Some(24.0));
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 24000), Some((24.0, (24000, 1000))));
     }
 
     /// One size-prefixed ISOBMFF box.

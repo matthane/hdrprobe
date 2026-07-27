@@ -143,6 +143,21 @@ pub struct VideoTrack {
     pub height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fps: Option<f64>,
+    /// The frame rate as the exact ratio it was signalled as, where the
+    /// source states one (`{num: 24000, den: 1001}`); the `fps` float is the
+    /// same value as a decimal. Absent when the rate was measured or averaged
+    /// rather than stated as a ratio (IVF's averaged timestamps), or when
+    /// `fps` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps_rational: Option<Rational>,
+    /// This track's own duration in seconds, where the container states one
+    /// per track: MP4's media duration (or summed fragment runs), the
+    /// mkvmerge `DURATION` statistics tag, AVI's per-stream declared length,
+    /// RealMedia's MDPR duration. The report-level `duration_secs` stays the
+    /// file-level value (the longest stream's); on single-track files the two
+    /// usually agree to within a frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate: Option<Bitrate>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,12 +170,21 @@ pub struct VideoTrack {
     /// Absent when nothing signals either ratio; never a guessed square.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pixel_aspect_ratio: Option<f64>,
+    /// The pixel aspect ratio as an exact reduced ratio; present exactly when
+    /// the float is (both derive from the same signalled rational, so the
+    /// float may differ from `num/den` only in the last binary digit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pixel_aspect_ratio_rational: Option<Rational>,
     /// Display aspect ratio, width over height of the presented picture.
     /// Signalled directly (MPEG-2's DAR codes, MKV display size, AVI `vprp`)
     /// or derived exactly from the pixel aspect ratio and the coded size.
     /// Present exactly when `pixel_aspect_ratio` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_aspect_ratio: Option<f64>,
+    /// The display aspect ratio as an exact reduced ratio (`{num: 16, den: 9}`);
+    /// present exactly when the float is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_aspect_ratio_rational: Option<Rational>,
     /// `"progressive"` or `"interlaced"`, from a sequence-level signal of the
     /// coded stream. Absent when the format has no such signal or the stream
     /// states none — absence is "unsignalled", never "progressive".
@@ -188,6 +212,35 @@ pub struct VideoTrack {
     /// Present only when HDR Vivid metadata was found, same convention.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hdr_vivid: Option<HdrVivid>,
+}
+
+/// An exact ratio, reduced to lowest terms. Reported beside a float that
+/// carries the same value as a decimal, for consumers that need the ratio
+/// itself (`24000/1001` rather than `23.976023976023978`, `16:9` rather than
+/// `1.7777777777777777`).
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct Rational {
+    pub num: u64,
+    pub den: u64,
+}
+
+impl Rational {
+    /// Reduced by gcd; `None` for a zero numerator or denominator, which is
+    /// signalling noise rather than a ratio.
+    pub fn reduced(num: u64, den: u64) -> Option<Self> {
+        if num == 0 || den == 0 {
+            return None;
+        }
+        let g = gcd(num, den);
+        Some(Rational { num: num / g, den: den / g })
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 /// Average bitrate. `scope` says whether it's the video-stream rate or the
@@ -810,11 +863,15 @@ mod tests {
             width: Some(3840),
             height: Some(2160),
             fps: Some(23.976),
+            fps_rational: Some(Rational { num: 24000, den: 1001 }),
+            duration_secs: Some(30.0),
             bitrate: Some(Bitrate::video_stream_bps(1.0)),
             bit_depth: Some(10),
             chroma: Some("4:2:0".to_string()),
             pixel_aspect_ratio: Some(1.0),
+            pixel_aspect_ratio_rational: Some(Rational { num: 1, den: 1 }),
             display_aspect_ratio: Some(16.0 / 9.0),
+            display_aspect_ratio_rational: Some(Rational { num: 16, den: 9 }),
             scan_type: Some("progressive".to_string()),
             stereo: Some("Stereoscopic 3D (2 views)".to_string()),
             color: ColorInfo {
@@ -989,13 +1046,20 @@ mod tests {
             "video_tracks[].width",
             "video_tracks[].height",
             "video_tracks[].fps",
+            "video_tracks[].fps_rational.num",
+            "video_tracks[].fps_rational.den",
+            "video_tracks[].duration_secs",
             "video_tracks[].bitrate.bits_per_sec",
             "video_tracks[].bitrate.scope",
             "video_tracks[].bitrate.source",
             "video_tracks[].bit_depth",
             "video_tracks[].chroma",
             "video_tracks[].pixel_aspect_ratio",
+            "video_tracks[].pixel_aspect_ratio_rational.num",
+            "video_tracks[].pixel_aspect_ratio_rational.den",
             "video_tracks[].display_aspect_ratio",
+            "video_tracks[].display_aspect_ratio_rational.num",
+            "video_tracks[].display_aspect_ratio_rational.den",
             "video_tracks[].scan_type",
             "video_tracks[].stereo",
             "video_tracks[].color.primaries",
@@ -1107,6 +1171,17 @@ mod tests {
         assert_eq!(obj["primaries"], "container");
         assert_eq!(obj["range"], "stream");
         assert!(!v.to_string().contains("unnamed"), "the marker leaked: {v}");
+    }
+
+    /// Reduction is exact and zero is refused: a zero numerator or
+    /// denominator is signalling noise, not a ratio.
+    #[test]
+    fn rational_reduces_and_refuses_zero() {
+        assert_eq!(Rational::reduced(24000, 1001), Some(Rational { num: 24000, den: 1001 }));
+        assert_eq!(Rational::reduced(3840, 2160), Some(Rational { num: 16, den: 9 }));
+        assert_eq!(Rational::reduced(10, 10), Some(Rational { num: 1, den: 1 }));
+        assert_eq!(Rational::reduced(0, 9), None);
+        assert_eq!(Rational::reduced(16, 0), None);
     }
 
     /// The measured/declared split is baked into the constructors: a stated

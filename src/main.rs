@@ -858,6 +858,36 @@ fn assemble_report(
             }
             _ => None,
         };
+        // The same signalled rationals, exact: presence mirrors the floats
+        // (both come from the one match above — when `aspect` is Some every
+        // input below is nonzero, so `reduced` cannot refuse). The floats are
+        // untouched; a derived rational and its float can differ in the last
+        // binary digit, which is why the doc ties them loosely.
+        let (par_rational, dar_rational) = if aspect.is_some() {
+            match (track.pixel_aspect, track.display_aspect) {
+                (Some((pn, pd)), Some((dn, dd))) => (
+                    model::Rational::reduced(pn.into(), pd.into()),
+                    model::Rational::reduced(dn.into(), dd.into()),
+                ),
+                (Some((pn, pd)), None) => (
+                    model::Rational::reduced(pn.into(), pd.into()),
+                    model::Rational::reduced(
+                        u64::from(pn) * u64::from(track.width),
+                        u64::from(pd) * u64::from(track.height),
+                    ),
+                ),
+                (None, Some((dn, dd))) => (
+                    model::Rational::reduced(
+                        u64::from(dn) * u64::from(track.height),
+                        u64::from(dd) * u64::from(track.width),
+                    ),
+                    model::Rational::reduced(dn.into(), dd.into()),
+                ),
+                (None, None) => (None, None),
+            }
+        } else {
+            (None, None)
+        };
 
         // The base layer's *effective* colour: what the container or coded
         // stream signalled, with the HLG/PQ alt-transfer SEI override applied.
@@ -987,6 +1017,10 @@ fn assemble_report(
             width: if track.width > 0 { Some(track.width) } else { None },
             height: if track.height > 0 { Some(track.height) } else { None },
             fps,
+            fps_rational: track
+                .fps_rational
+                .and_then(|(n, d)| model::Rational::reduced(n, d)),
+            duration_secs: track.duration_secs,
             // A container-known rate wins (MKV statistics tags); the `--full`
             // streaming walks (TS ES bytes, MKV block bytes) fill the gap with
             // the exact per-track sum their demux could no longer compute —
@@ -999,7 +1033,9 @@ fn assemble_report(
             bit_depth: track.bit_depth,
             chroma: track.chroma.clone(),
             pixel_aspect_ratio: aspect.map(|a| a.0),
+            pixel_aspect_ratio_rational: par_rational,
             display_aspect_ratio: aspect.map(|a| a.1),
+            display_aspect_ratio_rational: dar_rational,
             scan_type: track.scan_type.map(str::to_string),
             stereo: track.stereo.clone(),
             color,

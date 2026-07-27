@@ -211,6 +211,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         let esp = h.esp.iter().find(|e| e.number == v.number);
         if td.fps.is_none() {
             td.fps = esp.and_then(|e| e.fps());
+            td.fps_rational = esp.and_then(|e| e.fps_rational());
         }
         td.bitrate = esp
             .and_then(|e| (e.data_bitrate > 0).then(|| f64::from(e.data_bitrate)))
@@ -358,6 +359,12 @@ impl StreamRate {
         // `2^63` computes a positive float that renders `0.000 fps`. Both ends
         // are the shared bound's business (`container::plausible_fps`).
         super::plausible_fps(10_000_000.0 / self.avg_time_per_frame as f64)
+    }
+
+    /// The declared per-frame period as the exact tick ratio; present exactly
+    /// when `fps()` is.
+    fn fps_rational(&self) -> Option<(u64, u64)> {
+        self.fps().map(|_| (10_000_000, self.avg_time_per_frame))
     }
 }
 

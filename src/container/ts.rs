@@ -191,6 +191,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             codec_profile,
             (color, color_source),
             fps,
+            fps_rational,
             pixel_aspect,
             scan_type,
         ) = sps_fields(best);
@@ -218,6 +219,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             width,
             height,
             fps,
+            fps_rational,
             bit_depth,
             chroma,
             pixel_aspect,

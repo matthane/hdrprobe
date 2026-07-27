@@ -44,6 +44,9 @@ pub struct SeqInfo {
     /// `frame_rate_code` through Table 6-4, scaled by the sequence extension's
     /// extension fields. `None` for the forbidden and reserved codes.
     pub fps: Option<f64>,
+    /// The same rate as the exact table ratio (extension-scaled); present
+    /// exactly when `fps` is.
+    pub fps_rational: Option<(u64, u64)>,
     /// `chroma_format` (Table 6-5). MPEG-1 has no sequence extension and is
     /// always 4:2:0.
     pub chroma: Option<&'static str>,
@@ -92,6 +95,7 @@ pub fn parse_sequence(data: &[u8]) -> Option<SeqInfo> {
         width: horizontal_size_value(data, h),
         height: vertical_size_value(data, h),
         fps: frame_rate(data[h + 3] & 0x0F),
+        fps_rational: frame_rate_ratio(data[h + 3] & 0x0F),
         // Filled at the end: 4:2:0 is *MPEG-1's* constant, and stating it up
         // front would leave it standing on an MPEG-2 stream whose sequence
         // extension was truncated, printing a chroma format nothing read.
@@ -142,6 +146,12 @@ pub fn parse_sequence(data: &[u8]) -> Option<SeqInfo> {
                             info.fps = info.fps.map(|f| {
                                 f * (seq.frame_rate_extension_n as f64 + 1.0)
                                     / (seq.frame_rate_extension_d as f64 + 1.0)
+                            });
+                            info.fps_rational = info.fps_rational.map(|(n, d)| {
+                                (
+                                    n * (seq.frame_rate_extension_n as u64 + 1),
+                                    d * (seq.frame_rate_extension_d as u64 + 1),
+                                )
                             });
                             // Affirmative only: `progressive_sequence` set is
                             // a declaration, but clear means "may contain
@@ -364,15 +374,21 @@ fn parse_display_extension(
 /// ffmpeg's `ff_mpeg12_frame_rate_tab` carries non-standard Xing and libmpeg3
 /// entries at 9..=13; mirroring it would invent a frame rate.
 fn frame_rate(code: u8) -> Option<f64> {
+    frame_rate_ratio(code).map(|(n, d)| n as f64 / d as f64)
+}
+
+/// Table 6-4 as the exact ratios it defines; the float above divides these
+/// same integers, so the two can never drift.
+fn frame_rate_ratio(code: u8) -> Option<(u64, u64)> {
     Some(match code {
-        1 => 24000.0 / 1001.0,
-        2 => 24.0,
-        3 => 25.0,
-        4 => 30000.0 / 1001.0,
-        5 => 30.0,
-        6 => 50.0,
-        7 => 60000.0 / 1001.0,
-        8 => 60.0,
+        1 => (24000, 1001),
+        2 => (24, 1),
+        3 => (25, 1),
+        4 => (30000, 1001),
+        5 => (30, 1),
+        6 => (50, 1),
+        7 => (60000, 1001),
+        8 => (60, 1),
         _ => return None,
     })
 }

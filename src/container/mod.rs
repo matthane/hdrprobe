@@ -221,6 +221,15 @@ pub struct TrackDemux {
     pub width: u32,
     pub height: u32,
     pub fps: Option<f64>,
+    /// The frame rate as the exact integer ratio it was signalled as, set
+    /// beside `fps` only where the float was computed from integers — never
+    /// reconstructed from a float. Unreduced; reduction happens at report
+    /// assembly.
+    pub fps_rational: Option<(u64, u64)>,
+    /// This track's own duration, where the container states one per track
+    /// (MP4 media duration, the mkvmerge `DURATION` statistics tag, AVI's
+    /// per-stream declared length, RealMedia's MDPR duration).
+    pub duration_secs: Option<f64>,
     pub bit_depth: Option<u8>,
     pub chroma: Option<String>,
     /// Pixel (sample) aspect ratio as the signalled rational, width:height of
@@ -323,6 +332,8 @@ impl TrackDemux {
             width: 0,
             height: 0,
             fps: None,
+            fps_rational: None,
+            duration_secs: None,
             bit_depth: None,
             chroma: None,
             pixel_aspect: None,
@@ -1076,6 +1087,8 @@ pub(crate) struct SpsCommon {
     pub height: u32,
     pub bit_depth: u8,
     pub chroma: Option<String>,
+    /// The VUI rate as the exact signalled ratio, beside `frame_rate`.
+    pub frame_rate_rational: Option<(u64, u64)>,
     pub profile: String,
     pub color: (ColorInfo, ColorSources),
     pub frame_rate: Option<f64>,
@@ -1112,6 +1125,7 @@ pub(crate) type SpsFieldsTuple = (
     Option<String>,
     (ColorInfo, ColorSources),
     Option<f64>,
+    Option<(u64, u64)>,
     Option<(u32, u32)>,
     Option<&'static str>,
 );
@@ -1126,6 +1140,7 @@ pub(crate) fn sps_fields(best: Option<SpsCommon>) -> SpsFieldsTuple {
             Some(c.profile),
             c.color,
             c.frame_rate,
+            c.frame_rate_rational,
             c.pixel_aspect,
             c.scan_type,
         ),
@@ -1136,6 +1151,7 @@ pub(crate) fn sps_fields(best: Option<SpsCommon>) -> SpsFieldsTuple {
             None,
             None,
             (ColorInfo::default(), ColorSources::default()),
+            None,
             None,
             None,
             None,
@@ -1182,6 +1198,7 @@ fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         height: sps.height,
         bit_depth: sps.bit_depth,
         chroma: sps.chroma_str().map(str::to_string),
+        frame_rate_rational: sps.frame_rate_rational,
         profile: sps.profile_label(),
         color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
         frame_rate: sps.frame_rate,
@@ -1223,6 +1240,7 @@ fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         height: sps.height,
         bit_depth: sps.bit_depth,
         chroma: sps.chroma_str().map(str::to_string),
+        frame_rate_rational: sps.frame_rate_rational,
         profile: sps.profile_label(),
         color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
         frame_rate: sps.frame_rate,
@@ -1374,6 +1392,7 @@ pub(crate) fn fill_nal_config_fields(td: &mut TrackDemux, rec: &[u8]) {
                 crate::hevc::sps::find_sps_in_hvcc(rec).and_then(crate::hevc::sps::parse_sps)
             {
                 td.fps = sps.frame_rate;
+                td.fps_rational = sps.frame_rate_rational;
                 if sps.width > 0 && sps.height > 0 {
                     (td.width, td.height) = (sps.width, sps.height);
                 }
@@ -1398,6 +1417,7 @@ pub(crate) fn fill_nal_config_fields(td: &mut TrackDemux, rec: &[u8]) {
                 crate::avc::nal::find_sps_in_avcc(rec).and_then(crate::avc::sps::parse_sps)
             {
                 td.fps = sps.frame_rate;
+                td.fps_rational = sps.frame_rate_rational;
                 if sps.width > 0 && sps.height > 0 {
                     (td.width, td.height) = (sps.width, sps.height);
                 }
@@ -1454,6 +1474,7 @@ pub(crate) fn fill_mpeg2_stream_fields(track: &mut TrackDemux, source: &[u8]) {
     }
     if track.fps.is_none() {
         track.fps = s.fps;
+        track.fps_rational = s.fps_rational;
     }
     if track.bit_depth.is_none() {
         track.bit_depth = Some(s.bit_depth);
@@ -1638,6 +1659,7 @@ pub(crate) fn fill_mpeg4part2_stream_fields(
     }
     if track.fps.is_none() {
         track.fps = v.fps;
+        track.fps_rational = v.fps_rational;
     }
     if track.bit_depth.is_none() {
         track.bit_depth = v.bit_depth;
@@ -1713,6 +1735,7 @@ pub(crate) fn fill_vc1_stream_fields(track: &mut TrackDemux, headers: &[u8]) {
     }
     if track.fps.is_none() {
         track.fps = s.fps;
+        track.fps_rational = s.fps_rational;
     }
     if track.pixel_aspect.is_none() && track.display_aspect.is_none() {
         track.pixel_aspect = s.pixel_aspect;

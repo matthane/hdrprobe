@@ -67,6 +67,9 @@ pub struct SeqInfo {
     /// `FRAMERATEIND` is set. `None` when `DISPLAY_EXT` or `FRAMERATE_FLAG` is
     /// clear, and for the reserved table rows.
     pub fps: Option<f64>,
+    /// The same rate as the exact table ratio (or FRAMERATEEXP's `(v+1)/32`);
+    /// present exactly when `fps` is.
+    pub fps_rational: Option<(u64, u64)>,
     /// Always `Some("4:2:0")` on a valid stream: `COLORDIFF_FORMAT` defines no
     /// other value.
     pub chroma: Option<&'static str>,
@@ -154,6 +157,7 @@ fn parse_sequence_payload(rbsp: &[u8]) -> Option<SeqInfo> {
     r.read_bit()?; // PSF
 
     let mut fps = None;
+    let mut fps_rational = None;
     let mut color = None;
     let mut pixel_aspect = None;
     if r.read_bit()? == 1 {
@@ -180,11 +184,13 @@ fn parse_sequence_payload(rbsp: &[u8]) -> Option<SeqInfo> {
         }
         if r.read_bit()? == 1 {
             // FRAMERATE_FLAG
-            fps = if r.read_bit()? == 0 {
-                frame_rate(r.read_bits(8)?, r.read_bits(4)?)
+            (fps, fps_rational) = if r.read_bit()? == 0 {
+                let (nr, dr) = (r.read_bits(8)?, r.read_bits(4)?);
+                (frame_rate(nr, dr), frame_rate_ratio(nr, dr))
             } else {
                 // FRAMERATEEXP, §6.1.14.4.4.
-                Some((r.read_bits(16)? + 1) as f64 / 32.0)
+                let v = r.read_bits(16)? as u64 + 1;
+                (Some(v as f64 / 32.0), Some((v, 32)))
             };
         }
         if r.read_bit()? == 1 {
@@ -197,6 +203,7 @@ fn parse_sequence_payload(rbsp: &[u8]) -> Option<SeqInfo> {
         width,
         height,
         fps,
+        fps_rational,
         pixel_aspect,
         scan_type: Some(if interlace { "interlaced" } else { "progressive" }),
         chroma: Some("4:2:0"),
@@ -294,22 +301,28 @@ fn matrix_to_cicp(v: u8) -> u16 {
 /// which stops at 5; the published standard and the 2005 pre-publication draft
 /// both carry all eight.
 fn frame_rate(nr: u32, dr: u32) -> Option<f64> {
+    frame_rate_ratio(nr, dr).map(|(n, d)| n as f64 / d as f64)
+}
+
+/// The FRAMERATENR/FRAMERATEDR tables as the exact ratios they define; the
+/// float above divides these same integers, so the two can never drift.
+fn frame_rate_ratio(nr: u32, dr: u32) -> Option<(u64, u64)> {
     let numerator = match nr {
-        1 => 24000.0,
-        2 => 25000.0,
-        3 => 30000.0,
-        4 => 50000.0,
-        5 => 60000.0,
-        6 => 48000.0,
-        7 => 72000.0,
+        1 => 24000,
+        2 => 25000,
+        3 => 30000,
+        4 => 50000,
+        5 => 60000,
+        6 => 48000,
+        7 => 72000,
         _ => return None,
     };
     let denominator = match dr {
-        1 => 1000.0,
-        2 => 1001.0,
+        1 => 1000,
+        2 => 1001,
         _ => return None,
     };
-    Some(numerator / denominator)
+    Some((numerator, denominator))
 }
 
 /// STRUCT_C (Annex J.2, Table 263/264): the 32 bits Simple and Main profile put

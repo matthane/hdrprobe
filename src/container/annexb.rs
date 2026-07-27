@@ -67,7 +67,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
 
     // No container timing box, so frame rate — like colour — comes only from
     // the SPS VUI, when the encoder signalled it.
-    let (width, height, bit_depth, chroma, codec_profile, (color, color_source), fps, sps_offset) = match &best {
+    let (width, height, bit_depth, chroma, codec_profile, (color, color_source), fps, fps_rational, sps_offset) = match &best {
         Some((sps, off)) => (
             sps.width,
             sps.height,
@@ -79,9 +79,20 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
                 .map(crate::container::color_from_vui)
                 .unwrap_or_default(),
             sps.frame_rate,
+            sps.frame_rate_rational,
             Some(*off),
         ),
-        None => (0, 0, None, None, None, (ColorInfo::default(), ColorSources::default()), None, None),
+        None => (
+            0,
+            0,
+            None,
+            None,
+            None,
+            (ColorInfo::default(), ColorSources::default()),
+            None,
+            None,
+            None,
+        ),
     };
 
     let chunks = group_into_aus(&nals);
@@ -97,6 +108,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         width,
         height,
         fps,
+        fps_rational,
         bit_depth,
         chroma,
         codec_profile,

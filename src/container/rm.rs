@@ -97,6 +97,7 @@ struct VideoStream {
     width: u32,
     height: u32,
     fps: Option<f64>,
+    fps_rational: Option<(u64, u64)>,
 }
 
 /// A decoded `VIDO` type-specific block.
@@ -105,6 +106,9 @@ struct VideoBlock {
     width: u32,
     height: u32,
     fps: Option<f64>,
+    /// The declared 16.16 fixed-point rate as its exact ratio (raw field over
+    /// 65536); present exactly when `fps` is.
+    fps_rational: Option<(u64, u64)>,
 }
 
 /// ffmpeg's rm muxer back-patches the `DATA` chunk size exactly 10 bytes
@@ -130,7 +134,8 @@ fn parse_video_block(tsd: &[u8]) -> Option<VideoBlock> {
     let fps = (fps32 > 0)
         .then(|| f64::from(fps32) / 65536.0)
         .and_then(plausible_fps);
-    Some(VideoBlock { fourcc, width, height, fps })
+    let fps_rational = fps.is_some().then_some((u64::from(fps32), 65536));
+    Some(VideoBlock { fourcc, width, height, fps, fps_rational })
 }
 
 /// The RealVideo generation names, as MediaInfo prints them. Anything else
@@ -233,6 +238,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
                                 width: vb.width,
                                 height: vb.height,
                                 fps: vb.fps,
+                                fps_rational: vb.fps_rational,
                             });
                         }
                     }
@@ -288,9 +294,12 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             TrackDemux {
                 track_number: Some(u64::from(v.stream_number)),
                 codec_id: Some(super::bmih::fourcc_label(&v.fourcc)),
+                // The MDPR's own declared duration for this stream.
+                duration_secs: (v.duration_ms > 0).then(|| f64::from(v.duration_ms) / 1000.0),
                 width: v.width,
                 height: v.height,
                 fps: v.fps,
+                fps_rational: v.fps_rational,
                 // The RealVideo family constants (module doc); an unknown
                 // FourCC states nothing.
                 bit_depth: constants.then_some(8),

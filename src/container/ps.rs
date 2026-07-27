@@ -245,6 +245,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             codec_profile,
             (color, color_source),
             fps,
+            fps_rational,
             pixel_aspect,
             scan_type,
         ) = crate::container::sps_fields(sps);
@@ -254,6 +255,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             width,
             height,
             fps,
+            fps_rational,
             bit_depth,
             chroma,
             pixel_aspect,

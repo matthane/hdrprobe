@@ -233,6 +233,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         width: sys.width,
         height: sys.height,
         fps: Some(sys.fps_num as f64 / sys.fps_den as f64),
+        fps_rational: Some((sys.fps_num as u64, sys.fps_den as u64)),
         // 8-bit is the family constant across DV25/50/100 (SMPTE 314M/370M),
         // like ProRes's and MPEG-2's family depths.
         bit_depth: Some(8),

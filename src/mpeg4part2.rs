@@ -72,6 +72,8 @@ pub struct VisualInfo {
     /// `vop_time_increment_resolution / fixed_vop_time_increment`, and `None`
     /// whenever `fixed_vop_rate` is clear — the common case. See the module doc.
     pub fps: Option<f64>,
+    /// The same rate as the exact signalled pair; present exactly when `fps` is.
+    pub fps_rational: Option<(u64, u64)>,
     pub chroma: Option<&'static str>,
     /// `bits_per_pixel` when `not_8_bit` is set, else 8. `None` when the field
     /// could not be reached (see the sprite note in [`parse_vol`]).
@@ -147,6 +149,7 @@ pub fn parse_visual(data: &[u8]) -> Option<VisualInfo> {
         width: vol.width,
         height: vol.height,
         fps: vol.fps,
+        fps_rational: vol.fps_rational,
         chroma: vol.chroma,
         bit_depth: vol.bit_depth,
         profile_level: pli.and_then(profile_level_label),
@@ -231,6 +234,9 @@ struct VolInfo {
     width: u32,
     height: u32,
     fps: Option<f64>,
+    /// The rate as the exact `vop_time_increment_resolution`:increment pair;
+    /// present exactly when `fps` is.
+    fps_rational: Option<(u64, u64)>,
     chroma: Option<&'static str>,
     bit_depth: Option<u8>,
     pixel_aspect: Option<(u32, u32)>,
@@ -300,15 +306,16 @@ fn parse_vol(body: &[u8]) -> Option<VolInfo> {
         return None; // forbidden by §6.3.3
     }
     marker(&mut r)?;
-    let fps = if r.read_bit()? == 1 {
+    let (fps, fps_rational) = if r.read_bit()? == 1 {
         let increment = r.read_bits(time_increment_bits(resolution))?;
         // A 16-bit resolution over increment 1 can state 65535 fps; the
         // shared bound applies like every other declared ratio.
-        (increment > 0)
+        let f = (increment > 0)
             .then(|| resolution as f64 / increment as f64)
-            .and_then(crate::container::plausible_fps)
+            .and_then(crate::container::plausible_fps);
+        (f, f.is_some().then_some((u64::from(resolution), u64::from(increment))))
     } else {
-        None
+        (None, None)
     };
 
     let (mut width, mut height) = (0, 0);
@@ -348,7 +355,7 @@ fn parse_vol(body: &[u8]) -> Option<VolInfo> {
         }
     }
 
-    Some(VolInfo { width, height, fps, chroma, bit_depth, pixel_aspect, scan_type })
+    Some(VolInfo { width, height, fps, fps_rational, chroma, bit_depth, pixel_aspect, scan_type })
 }
 
 /// The studio-profile VOL layout, from the bit after `video_object_type_indication`.
@@ -415,7 +422,16 @@ fn parse_studio_vol(r: &mut BitReader) -> Option<VolInfo> {
     // than printing none.
     r.skip_bits(4)?;
 
-    Some(VolInfo { width, height, fps: None, chroma, bit_depth, pixel_aspect, scan_type: None })
+    Some(VolInfo {
+        width,
+        height,
+        fps: None,
+        fps_rational: None,
+        chroma,
+        bit_depth,
+        pixel_aspect,
+        scan_type: None,
+    })
 }
 
 /// Read one marker bit, failing when it is not 1.

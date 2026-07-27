@@ -232,6 +232,9 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             codec_id: Some(fourcc_label(&bh.compression)),
             width: bh.width,
             height: bh.height,
+            // The stream's own declared length (`dwLength` over its unit
+            // rate) — already the bitrate denominator below.
+            duration_secs: s.duration(usec_per_frame),
             chunks,
             ..TrackDemux::new(codec, NalFormat::AnnexB)
         };
@@ -242,6 +245,14 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         // coded stream when the coded stream said anything.
         if td.fps.is_none() {
             td.fps = s.fps(usec_per_frame);
+            // The declared unit ratio behind that fallback, mirroring its arms.
+            td.fps_rational = td.fps.and_then(|_| {
+                if s.rate > 0 && s.scale > 0 {
+                    Some((u64::from(s.rate), u64::from(s.scale)))
+                } else {
+                    (usec_per_frame > 0).then_some((1_000_000, u64::from(usec_per_frame)))
+                }
+            });
         }
         // `vprp` is the same fallback the container rate is: the coded
         // stream's own aspect and scan won everything they stated above.
@@ -932,7 +943,7 @@ fn fill_from_bitstream(td: &mut TrackDemux, data: &[u8], extradata: &[u8]) {
             let head = &td.chunks[..td.chunks.len().min(SPS_SCAN_CHUNKS)];
             let best = super::best_sps(data, head, &td.codec);
             td.sps_chunk = best.as_ref().map(|b| b.chunk);
-            let (w, h, depth, chroma, profile, color, fps, pixel_aspect, scan_type) =
+            let (w, h, depth, chroma, profile, color, fps, fps_rational, pixel_aspect, scan_type) =
                 super::sps_fields(best);
             if w > 0 && h > 0 {
                 (td.width, td.height) = (w, h);
@@ -942,6 +953,7 @@ fn fill_from_bitstream(td: &mut TrackDemux, data: &[u8], extradata: &[u8]) {
             td.codec_profile = profile;
             (td.color, td.color_source) = color;
             td.fps = fps;
+            td.fps_rational = fps_rational;
             if td.pixel_aspect.is_none() && td.display_aspect.is_none() {
                 td.pixel_aspect = pixel_aspect;
             }

@@ -38,6 +38,9 @@ pub struct SpsInfo {
     /// when present. The only in-band frame-rate source for containers without a
     /// timing box (raw Annex-B, TS/M2TS).
     pub frame_rate: Option<f64>,
+    /// The same rate as the exact signalled ratio (denominator doubled under
+    /// `field_seq_flag`); present exactly when `frame_rate` is.
+    pub frame_rate_rational: Option<(u64, u64)>,
     /// Sample aspect ratio from the VUI `aspect_ratio_idc` (Table E.1, shared
     /// with AVC via [`sar_from_idc`]) or its Extended_SAR pair. `None` when
     /// absent, code 0, or a reserved code.
@@ -56,6 +59,7 @@ pub struct SpsInfo {
 struct SpsVui {
     color: Option<VuiColor>,
     frame_rate: Option<f64>,
+    frame_rate_rational: Option<(u64, u64)>,
     pixel_aspect: Option<(u32, u32)>,
     /// Set only by `field_seq_flag`, which outranks the PTL source flags.
     scan_type: Option<&'static str>,
@@ -177,6 +181,7 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
         chroma_format_idc: chroma_format_idc as u8,
         profile_idc,
         tier_high,
+        frame_rate_rational: None,
         level_idc,
         color: None,
         frame_rate: None,
@@ -189,6 +194,7 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
     let vui = parse_vui(&mut r, max_sub_layers_minus1, chroma_format_idc);
     info.color = vui.color;
     info.frame_rate = vui.frame_rate;
+    info.frame_rate_rational = vui.frame_rate_rational;
     info.pixel_aspect = vui.pixel_aspect;
     if vui.scan_type.is_some() {
         // `field_seq_flag` is definitive where the PTL flags are declarative.
@@ -338,13 +344,17 @@ fn parse_vui_inner(
         if num_units_in_tick > 0 && time_scale > 0 {
             let mut fps = time_scale as f64 / num_units_in_tick as f64;
             // When each coded picture is a field, the tick is a field period, so
-            // the frame rate is half the tick rate. Both terms are unvalidated
-            // 32-bit fields; the shared bound keeps a misread pair from
-            // stating millions of fps.
+            // the frame rate is half the tick rate (the exact ratio doubles its
+            // denominator). Both terms are unvalidated 32-bit fields; the
+            // shared bound keeps a misread pair from stating millions of fps.
+            let mut den = u64::from(num_units_in_tick);
             if field_seq {
                 fps /= 2.0;
+                den *= 2;
             }
             out.frame_rate = crate::container::plausible_fps(fps);
+            out.frame_rate_rational =
+                out.frame_rate.is_some().then_some((u64::from(time_scale), den));
         }
     }
     Some(())
@@ -525,6 +535,7 @@ mod tests {
             level_idc: 120,
             color: None,
             frame_rate: None,
+            frame_rate_rational: None,
             pixel_aspect: None,
             scan_type: None,
         };

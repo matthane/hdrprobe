@@ -31,6 +31,10 @@ pub struct SpsInfo {
     pub color: Option<VuiColor>,
     /// Frame rate from the VUI timing info, when present.
     pub frame_rate: Option<f64>,
+    /// The same rate as the exact signalled ratio (`time_scale` over twice
+    /// `num_units_in_tick`, the AVC frame convention); present exactly when
+    /// `frame_rate` is.
+    pub frame_rate_rational: Option<(u64, u64)>,
     /// Sample aspect ratio from the VUI `aspect_ratio_idc` (Table E-1, shared
     /// with HEVC via `hevc::sps::sar_from_idc`) or its Extended_SAR pair.
     pub pixel_aspect: Option<(u32, u32)>,
@@ -208,6 +212,7 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
         level_idc,
         constraint_set1,
         constraint_set4,
+        frame_rate_rational: None,
         constraint_set5,
         color: None,
         frame_rate: None,
@@ -278,6 +283,10 @@ fn parse_vui(r: &mut BitReader, info: &mut SpsInfo) -> Option<()> {
             info.frame_rate = crate::container::plausible_fps(
                 time_scale as f64 / (2.0 * num_units_in_tick as f64),
             );
+            info.frame_rate_rational = info
+                .frame_rate
+                .is_some()
+                .then_some((u64::from(time_scale), 2 * u64::from(num_units_in_tick)));
         }
     }
     Some(())

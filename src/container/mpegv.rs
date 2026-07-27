@@ -68,6 +68,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         width: s.width,
         height: s.height,
         fps: s.fps,
+        fps_rational: s.fps_rational,
         bit_depth: Some(s.bit_depth),
         chroma: s.chroma.map(str::to_string),
         pixel_aspect: s.pixel_aspect,

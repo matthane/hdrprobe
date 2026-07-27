@@ -409,15 +409,21 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         let track = g.info;
         // Both derivations divide file-supplied integers and take the shared
         // plausibility bound: a `DefaultDuration` of 1 ns is a billion fps.
-        let fps = match (track.default_duration_ns, duration_secs, chunks.len()) {
-            (Some(dd), _, _) if dd > 0 => super::plausible_fps(1_000_000_000.0 / dd as f64),
+        let (fps, fps_rational) = match (track.default_duration_ns, duration_secs, chunks.len())
+        {
+            (Some(dd), _, _) if dd > 0 => {
+                let f = super::plausible_fps(1_000_000_000.0 / dd as f64);
+                // The stated per-frame duration is an exact ratio of the
+                // nanosecond clock; the fallback below is a measurement.
+                (f, f.is_some().then_some((1_000_000_000u64, dd)))
+            }
             // Frame-count / duration fallback is only valid when we indexed every
             // block; a bounded head window would divide a partial count by the full
             // runtime and report a nonsensically low fps.
             (_, Some(d), n) if d > 0.0 && n > 0 && !stopped_early => {
-                super::plausible_fps(n as f64 / d)
+                (super::plausible_fps(n as f64 / d), None)
             }
-            _ => None,
+            _ => (None, None),
         };
 
         // Per-stream video bitrate, preferring the mkvmerge statistics tag for
@@ -437,6 +443,14 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
                 .iter()
                 .filter(|s| s.track_uid == Some(uid))
                 .find(|s| s.bps.is_some() || s.number_of_bytes.is_some())
+        });
+        // The track's own statistics duration, same first-usable-value rule
+        // (a `DURATION` may ride a different Tag entry than the byte stats).
+        let vstat_duration = track.track_uid.and_then(|uid| {
+            stat_tags
+                .iter()
+                .filter(|s| s.track_uid == Some(uid))
+                .find_map(|s| s.duration_secs)
         });
         let bitrate = if let Some(bps) = vstat.and_then(|s| s.bps) {
             Some(Bitrate::video_stream_bps(bps))
@@ -462,9 +476,11 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
             track_number: Some(track.track_number),
             default_flag: Some(track.default_flag),
             codec_id: Some(track.codec_id),
+            duration_secs: vstat_duration,
             width: track.width,
             height: track.height,
             fps,
+            fps_rational,
             bit_depth: track.bit_depth,
             chroma: track.chroma,
             // Container authority, like colour: a signalled display size wins
@@ -779,6 +795,28 @@ struct TrackStats {
     track_uid: Option<u64>,
     number_of_bytes: Option<u64>,
     bps: Option<f64>,
+    /// The mkvmerge statistics `DURATION` tag, parsed to seconds.
+    duration_secs: Option<f64>,
+}
+
+/// Longest statistics duration accepted; the tag is unvalidated text and a
+/// consumer divides by nothing here, but an absurd value would still be a
+/// wrong report line. Matches the FLV backend's declared-duration ceiling.
+const MAX_TAG_DURATION_SECS: f64 = 48.0 * 3600.0;
+
+/// mkvmerge's statistics `DURATION` form, `"HH:MM:SS.nnnnnnnnn"`, to seconds.
+/// Anything that does not parse as exactly that three-part shape — or that
+/// parses to zero, a negative, a non-finite, or an implausible value — yields
+/// `None` rather than a number the report would state as fact.
+fn parse_tag_duration(v: &str) -> Option<f64> {
+    let mut it = v.splitn(3, ':');
+    let h: f64 = it.next()?.parse().ok()?;
+    let m: f64 = it.next()?.parse().ok()?;
+    let s: f64 = it.next()?.parse().ok()?;
+    let secs = h * 3600.0 + m * 60.0 + s;
+    (h >= 0.0 && m >= 0.0 && s >= 0.0 && secs.is_finite() && secs > 0.0
+        && secs <= MAX_TAG_DURATION_SECS)
+        .then_some(secs)
 }
 
 /// Scan a `SeekHead`, returning the absolute offset of the `Tags` element if it
@@ -880,7 +918,8 @@ fn parse_tags(data: &[u8], start: usize, end: usize, out: &mut Vec<TrackStats>) 
 }
 
 fn parse_tag(data: &[u8], start: usize, end: usize) -> Option<TrackStats> {
-    let mut st = TrackStats { track_uid: None, number_of_bytes: None, bps: None };
+    let mut st =
+        TrackStats { track_uid: None, number_of_bytes: None, bps: None, duration_secs: None };
     let mut p = start;
     while p < end {
         let (id, p1) = read_id(data, p)?;
@@ -893,6 +932,8 @@ fn parse_tag(data: &[u8], start: usize, end: usize) -> Option<TrackStats> {
                     match name {
                         "NUMBER_OF_BYTES" => st.number_of_bytes = value.trim().parse().ok(),
                         "BPS" => st.bps = value.trim().parse().ok(),
+                        // mkvmerge's statistics duration, "HH:MM:SS.nnnnnnnnn".
+                        "DURATION" => st.duration_secs = parse_tag_duration(value.trim()),
                         _ => {}
                     }
                 }
@@ -1821,6 +1862,20 @@ mod tests {
         assert_eq!(read_size(&[0xFF], 0), Some((None, 1)));
         // 2-byte unknown size 0x7F 0xFF.
         assert_eq!(read_size(&[0x7F, 0xFF], 0), Some((None, 2)));
+    }
+
+    /// The statistics `DURATION` value is unvalidated text; only the exact
+    /// `HH:MM:SS.nnnnnnnnn` shape with a plausible positive value parses.
+    #[test]
+    fn tag_duration_parses_the_mkvmerge_form_only() {
+        assert_eq!(parse_tag_duration("00:02:00.480000000"), Some(120.48));
+        assert_eq!(parse_tag_duration("01:00:00.000000000"), Some(3600.0));
+        assert_eq!(parse_tag_duration("120.48"), None, "no colon-parts shape");
+        assert_eq!(parse_tag_duration("00:00:00.000000000"), None, "zero is no duration");
+        assert_eq!(parse_tag_duration("-1:00:00"), None);
+        assert_eq!(parse_tag_duration("00:00:1e309"), None, "non-finite");
+        assert_eq!(parse_tag_duration("99:00:00.0"), None, "past the ceiling");
+        assert_eq!(parse_tag_duration("garbage"), None);
     }
 
     /// `codec_id` is the CodecID itself; a VfW wrapper appends the inner

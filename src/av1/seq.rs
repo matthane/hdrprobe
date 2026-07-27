@@ -31,6 +31,8 @@ pub struct SeqInfo {
     /// omit `timing_info` entirely, so this is `None` far more often than for
     /// HEVC — correct-or-`None`, never a guess.
     pub fps: Option<f64>,
+    /// The same rate as the exact signalled ratio; present exactly when `fps` is.
+    pub fps_rational: Option<(u64, u64)>,
 }
 
 /// Human label for an AV1 operating point, e.g. `"Main profile, Main tier @ L5.1"`.
@@ -73,6 +75,7 @@ pub fn parse_sequence_header(p: &[u8]) -> Option<SeqInfo> {
     let mut seq_tier = 0u8;
     let mut seq_level_idx = 0u8;
     let mut fps: Option<f64> = None;
+    let mut fps_rational: Option<(u64, u64)> = None;
 
     if reduced_still_picture_header {
         seq_level_idx = r.read_bits(5)? as u8;
@@ -90,6 +93,7 @@ pub fn parse_sequence_header(p: &[u8]) -> Option<SeqInfo> {
                 let denom = num_units_in_display_tick as u64 * num_ticks_per_picture;
                 if denom > 0 && time_scale > 0 {
                     fps = Some(time_scale as f64 / denom as f64).filter(|&f| f > 0.0 && f <= 480.0);
+                    fps_rational = fps.is_some().then_some((u64::from(time_scale), denom));
                 }
             }
             decoder_model_info_present = r.read_bit()? == 1;
@@ -193,6 +197,7 @@ pub fn parse_sequence_header(p: &[u8]) -> Option<SeqInfo> {
         color,
         color_description_present,
         fps,
+        fps_rational,
     })
 }
 
