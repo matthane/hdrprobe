@@ -870,7 +870,10 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         // `mjpa`/`mjpb` field-split variants alter the frame layout and keep
         // their FourCC.
         b"jpeg" => Codec::Mjpeg,
-        other => Codec::Other(String::from_utf8_lossy(other).to_string()),
+        // The shared FourCC rendering: space padding trimmed ("dvc " reports
+        // "dvc", matching MediaInfo and the codec_id beside it) and an
+        // unprintable code as the 0x… hex form the other carriages use.
+        other => Codec::Other(super::bmih::fourcc_label(other)),
     };
 
     // VisualSampleEntry: width/height at box offset 32/34; child boxes at 86.
@@ -2128,6 +2131,9 @@ mod tests {
         // `mp4v` names no codec by itself and falls through verbatim when
         // nothing resolves it.
         assert_eq!(codec_of(b"mp4v", &[]), Codec::Other("mp4v".to_string()));
+        // The fallback trims FourCC space padding (QuickTime consumer DV is
+        // 'd','v','c',0x20), agreeing with codec_id and MediaInfo's CodecID.
+        assert_eq!(codec_of(b"dvc ", &[]), Codec::Other("dvc".to_string()));
 
         // With an `esds`, the objectTypeIndication does resolve it. Same
         // descriptor chain as the real `testfiles/sdr/mpeg2.mp4`, OTI byte

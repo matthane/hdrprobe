@@ -354,16 +354,30 @@ impl StreamRate {
         if self.avg_time_per_frame == 0 {
             return None;
         }
-        // `Average Time Per Frame` is 100-nanosecond ticks per frame, so a
-        // value of 1 computes ten million frames per second and a value of
-        // `2^63` computes a positive float that renders `0.000 fps`. Both ends
-        // are the shared bound's business (`container::plausible_fps`).
+        // A tick period that is bit-exactly the encoding of a standard rate
+        // decodes to it (`nominal_rate_from_period`, shared with MKV's
+        // nanosecond clock). Otherwise: `Average Time Per Frame` is
+        // 100-nanosecond ticks per frame, so a value of 1 computes ten
+        // million frames per second and a value of `2^63` computes a
+        // positive float that renders `0.000 fps` — both ends are the shared
+        // bound's business (`container::plausible_fps`).
+        if let Some((n, d)) = super::nominal_rate_from_period(self.avg_time_per_frame, 10_000_000)
+        {
+            return Some(n as f64 / d as f64);
+        }
         super::plausible_fps(10_000_000.0 / self.avg_time_per_frame as f64)
     }
 
-    /// The declared per-frame period as the exact tick ratio; present exactly
-    /// when `fps()` is.
+    /// The declared rate as an exact ratio: the decoded standard rate when
+    /// the period encodes one, else the raw tick ratio. Present exactly when
+    /// `fps()` is, and always the same value.
     fn fps_rational(&self) -> Option<(u64, u64)> {
+        if self.avg_time_per_frame == 0 {
+            return None;
+        }
+        if let Some(r) = super::nominal_rate_from_period(self.avg_time_per_frame, 10_000_000) {
+            return Some(r);
+        }
         self.fps().map(|_| (10_000_000, self.avg_time_per_frame))
     }
 }

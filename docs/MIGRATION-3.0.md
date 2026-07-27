@@ -87,7 +87,18 @@ are fixed here together.
    RealMedia's `DATA` chunk extent): a partial download, or a capture that never closed.
    Read it as "partial input" generally; the stdin test is `file == "-"`.
 
-8. **`sampled` became `coverage`, and reads better.** Whether the sampled-union fields
+8. **MKV and ASF frame rates now read clean.** Those containers store the *period* of the
+   authored rate quantized to a clock tick (nanoseconds / 100 ns), so 2.x reported the raw
+   quotient: `23.976024167…` for a 23.976 remux. 3.0 decodes the quantization exactly — a
+   stored period that is bit-for-bit the encoding of a standard rate reports that rate, so
+   the same file now reads `fps: 23.976023976…` with `fps_rational: 24000/1001`,
+   cross-container comparable with TS and MP4. This is a decode, not a snap: a period
+   matching no standard rate's encoding keeps the raw tick ratio. A consumer that cached
+   2.x float values will see MKV/ASF rates move in the sixth decimal place. Relatedly,
+   FourCC codec fallbacks now trim their space padding (QuickTime `"dvc "` reports
+   `"dvc"`), so `codec` agrees with `codec_id`.
+
+9. **`sampled` became `coverage`, and reads better.** Whether the sampled-union fields
    (`l5_active_areas`, `trim_targets`, `target_max_luminances`) are complete previously took
    two fields: `sampled: false` meant either a full scan *or* `--no-rpu`'s
    nothing-was-read-at-all, disambiguated by `rpu_count`. Now one value states it:

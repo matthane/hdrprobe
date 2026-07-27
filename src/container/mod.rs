@@ -893,6 +893,61 @@ pub(crate) fn parse_vpcc_record(rec: &[u8]) -> Option<VpccInfo> {
     })
 }
 
+/// The authored rate behind a clock-quantized frame period, decoded exactly.
+///
+/// Matroska's `DefaultDuration` (nanoseconds) and ASF's `Average Time Per
+/// Frame` (100 ns ticks) store the authored rate's *period* rounded to an
+/// integer tick count — a 23.976 mux writes exactly 41708333 ns — so the
+/// quantization is deterministic, which makes it invertible. If `period` is
+/// the floor or ceiling of `ticks_per_sec × den / num` for a standard
+/// broadcast/cinema rate, that rate is what the muxer encoded, and the exact
+/// `(num, den)` comes back. This is a decode of a quantized field (the
+/// CICP-code-to-name move, and the PQ-code-to-nits snap's sibling), **not**
+/// a tolerance snap: a period matching no standard rate's encoding returns
+/// `None` and the caller keeps the raw tick ratio, so genuinely nonstandard
+/// content stays honest. ffmpeg instead snaps within a tolerance band; the
+/// bit-exact test is stricter and cannot relabel an off-rate stream.
+/// (RealMedia's 16.16 field quantizes the *rate*, not the period, and real
+/// encoders write values a couple of code points off the exact encoding, so
+/// it deliberately does not route through this.)
+pub(crate) fn nominal_rate_from_period(period: u64, ticks_per_sec: u64) -> Option<(u64, u64)> {
+    /// The 1001-family pairs plus the integer rates real muxers author. No
+    /// two entries' encodings collide on either supported clock (pinned by
+    /// test); order is immaterial.
+    const STANDARD_RATES: &[(u64, u64)] = &[
+        (24000, 1001),
+        (24, 1),
+        (25, 1),
+        (30000, 1001),
+        (30, 1),
+        (48000, 1001),
+        (48, 1),
+        (50, 1),
+        (60000, 1001),
+        (60, 1),
+        (100, 1),
+        (120000, 1001),
+        (120, 1),
+        (15, 1),
+        (12, 1),
+        (10, 1),
+    ];
+    if period == 0 {
+        return None;
+    }
+    for &(num, den) in STANDARD_RATES {
+        let exact = ticks_per_sec.checked_mul(den)?;
+        let floor = exact / num;
+        // floor == ceil when the division is exact: one past an exact
+        // encoding is *not* that rate.
+        let ceil = floor + u64::from(exact % num != 0);
+        if period == floor || period == ceil {
+            return Some((num, den));
+        }
+    }
+    None
+}
+
 /// Highest frame rate any backend accepts from a declared field. Every carriage
 /// that states a rate states it as a ratio of unvalidated integers, so a single
 /// misread byte computes millions of frames per second; anything past a
@@ -1569,8 +1624,11 @@ pub(crate) fn fill_constant_depth_chroma(track: &mut TrackDemux) {
                 // for DVCPRO) and this label names neither, so only the depth
                 // fills.
                 (Some(8), None, None)
-            } else if l == "dvc " {
-                // QuickTime's 525-60 IEC DV25: 4:1:1 (IEC 61834-2).
+            } else if l == "dvc" {
+                // QuickTime's 525-60 IEC DV25: 4:1:1 (IEC 61834-2). The
+                // FourCC is space-padded ('d','v','c',0x20) and every label
+                // producer trims padding (`bmih::fourcc_label`), so the
+                // trimmed form is the one that arrives here.
                 (Some(8), Some("4:1:1"), None)
             } else if l == "dvcp" {
                 // 625-50 IEC DV25: 4:2:0.
@@ -2253,6 +2311,66 @@ mod tests {
         assert_eq!(h.bit_depth, 8);
     }
 
+    /// The decode is an exact inverse of the period quantization: the ns
+    /// encodings mkvmerge writes (floor, and the ceil twin) map back to the
+    /// authored rate, one tick past an exact encoding maps to nothing, and
+    /// a period two off a 1001-family encoding is a different rate, not a
+    /// near-miss to be snapped.
+    #[test]
+    fn quantized_periods_decode_to_their_authored_rate_or_nothing() {
+        assert_eq!(nominal_rate_from_period(41708333, 1_000_000_000), Some((24000, 1001)));
+        assert_eq!(nominal_rate_from_period(41708334, 1_000_000_000), Some((24000, 1001)));
+        assert_eq!(nominal_rate_from_period(41666666, 1_000_000_000), Some((24, 1)));
+        assert_eq!(nominal_rate_from_period(41666667, 1_000_000_000), Some((24, 1)));
+        assert_eq!(nominal_rate_from_period(40000000, 1_000_000_000), Some((25, 1)));
+        // One past an *exact* encoding is not that rate.
+        assert_eq!(nominal_rate_from_period(40000001, 1_000_000_000), None);
+        // Two off the 23.976 encoding: genuinely nonstandard, kept raw.
+        assert_eq!(nominal_rate_from_period(41708331, 1_000_000_000), None);
+        // The ASF 100 ns clock decodes through the same table.
+        assert_eq!(nominal_rate_from_period(417083, 10_000_000), Some((24000, 1001)));
+        assert_eq!(nominal_rate_from_period(417084, 10_000_000), Some((24000, 1001)));
+        assert_eq!(nominal_rate_from_period(400000, 10_000_000), Some((25, 1)));
+        assert_eq!(nominal_rate_from_period(0, 1_000_000_000), None);
+        // No two table entries' encodings collide on either clock: every
+        // decodable period names exactly one rate. (Brute-forced here so a
+        // future table addition that collides fails loudly.)
+        for ticks in [1_000_000_000u64, 10_000_000] {
+            let mut seen = std::collections::HashMap::new();
+            for &(n, d) in &[
+                (24000u64, 1001u64),
+                (24, 1),
+                (25, 1),
+                (30000, 1001),
+                (30, 1),
+                (48000, 1001),
+                (48, 1),
+                (50, 1),
+                (60000, 1001),
+                (60, 1),
+                (100, 1),
+                (120000, 1001),
+                (120, 1),
+                (15, 1),
+                (12, 1),
+                (10, 1),
+            ] {
+                let exact = ticks * d;
+                let floor = exact / n;
+                let ceil = floor + u64::from(exact % n != 0);
+                for p in [floor, ceil] {
+                    if let Some(prev) = seen.insert(p, (n, d)) {
+                        // An exact division makes floor == ceil for one rate;
+                        // only a *cross-rate* collision is a defect.
+                        if prev != (n, d) {
+                            panic!("period {p} encodes both {prev:?} and {:?}", (n, d));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A reserved `chromaSubsamplingIdc` (the 3-bit field defines 0..=3)
     /// names no format, so the field stays absent rather than a placeholder.
     #[test]
@@ -2354,7 +2472,9 @@ mod tests {
             (Some(8), Some("4:2:0"), Some("progressive"))
         );
         for (label, chroma) in [
-            ("dvc ", Some("4:1:1")),
+            // The trimmed form is what every producer emits ('dvc ' arrives
+            // through `fourcc_label`); the padded raw form matches nothing.
+            ("dvc", Some("4:1:1")),
             ("dvcp", Some("4:2:0")),
             ("dv5p", Some("4:2:2")),
             ("dvh1", Some("4:2:2")),

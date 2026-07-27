@@ -412,10 +412,17 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         let (fps, fps_rational) = match (track.default_duration_ns, duration_secs, chunks.len())
         {
             (Some(dd), _, _) if dd > 0 => {
-                let f = super::plausible_fps(1_000_000_000.0 / dd as f64);
-                // The stated per-frame duration is an exact ratio of the
-                // nanosecond clock; the fallback below is a measurement.
-                (f, f.is_some().then_some((1_000_000_000u64, dd)))
+                // A `DefaultDuration` that is bit-exactly the ns encoding of
+                // a standard rate decodes to that rate — 41708333 *is*
+                // 24000/1001 on this clock (`nominal_rate_from_period`).
+                // Anything else keeps the raw nanosecond ratio; the count
+                // fallback below is a measurement and gets no ratio at all.
+                if let Some((n, d)) = super::nominal_rate_from_period(dd, 1_000_000_000) {
+                    (Some(n as f64 / d as f64), Some((n, d)))
+                } else {
+                    let f = super::plausible_fps(1_000_000_000.0 / dd as f64);
+                    (f, f.is_some().then_some((1_000_000_000u64, dd)))
+                }
             }
             // Frame-count / duration fallback is only valid when we indexed every
             // block; a bounded head window would divide a partial count by the full
