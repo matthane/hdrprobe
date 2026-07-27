@@ -461,6 +461,7 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         let mut td = TrackDemux {
             track_number: Some(track.track_number),
             default_flag: Some(track.default_flag),
+            codec_id: Some(track.codec_id),
             width: track.width,
             height: track.height,
             fps,
@@ -955,6 +956,10 @@ struct TrackInfo {
     /// FlagDefault (0x88); the EBML default is true when the element is absent.
     default_flag: bool,
     codec: Codec,
+    /// The CodecID string, sanitized; a `V_MS/VFW/FOURCC` track appends the
+    /// inner `biCompression` FourCC (`"V_MS/VFW/FOURCC / WVC1"`), MediaInfo's
+    /// rendering of the same pair.
+    codec_id: String,
     nal_format: NalFormat,
     bit_depth: Option<u8>,
     chroma: Option<String>,
@@ -1135,6 +1140,7 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
         track_uid,
         default_flag,
         codec: cc.codec,
+        codec_id: codec_id_label(codec_id, codec_private),
         nal_format: cc.nal_format,
         bit_depth: cc.bit_depth,
         chroma: cc.chroma,
@@ -1252,6 +1258,20 @@ fn nal_config(
         }
     }
     cfg
+}
+
+/// The reported `codec_id`: the CodecID string (control characters
+/// sanitized — it reaches the terminal and the JSON verbatim), with the
+/// inner VfW FourCC appended for `V_MS/VFW/FOURCC`, whose CodecID alone is
+/// the same six words on every such track.
+fn codec_id_label(codec_id: &[u8], codec_private: &[u8]) -> String {
+    let base = super::sanitize_label(&String::from_utf8_lossy(codec_id));
+    if codec_id.starts_with(b"V_MS/VFW/FOURCC") {
+        if let Some(b) = super::bmih::parse(codec_private) {
+            return format!("{base} / {}", super::bmih::fourcc_label(&b.compression));
+        }
+    }
+    base
 }
 
 /// Map a Matroska CodecID (+ CodecPrivate) to codec, NAL framing and codec config.
@@ -1803,6 +1823,17 @@ mod tests {
         assert_eq!(read_size(&[0x7F, 0xFF], 0), Some((None, 2)));
     }
 
+    /// `codec_id` is the CodecID itself; a VfW wrapper appends the inner
+    /// FourCC (MediaInfo's rendering), and control characters in a crafted
+    /// CodecID render as U+FFFD like the codec label's own fallback.
+    #[test]
+    fn codec_id_label_appends_the_vfw_fourcc() {
+        assert_eq!(codec_id_label(b"V_MPEGH/ISO/HEVC", &[]), "V_MPEGH/ISO/HEVC");
+        let private = vfw_private(b"WVC1", &[]);
+        assert_eq!(codec_id_label(b"V_MS/VFW/FOURCC", &private), "V_MS/VFW/FOURCC / WVC1");
+        assert_eq!(codec_id_label(b"V_\x1b[31m", &[]), "V_\u{FFFD}[31m");
+    }
+
     #[test]
     fn classify_codec_mpeg_video() {
         // `V_MPEG1`/`V_MPEG2` carry no CodecPrivate: the sequence header rides
@@ -2227,6 +2258,7 @@ mod tests {
             track_uid: None,
             default_flag: true,
             codec: Codec::Hevc,
+            codec_id: "V_MPEGH/ISO/HEVC".to_string(),
             nal_format: NalFormat::LengthPrefixed(4),
             bit_depth: None,
             chroma: None,

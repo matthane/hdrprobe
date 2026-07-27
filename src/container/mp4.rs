@@ -519,6 +519,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
 
         out.push(TrackDemux {
             track_number: Some(t.track_id as u64),
+            codec_id: Some(t.sd.codec_id.clone()),
             width: t.sd.width,
             height: t.sd.height,
             fps: t.fps,
@@ -661,6 +662,9 @@ fn parse_video_track(
 
 struct SampleDesc {
     codec: Codec,
+    /// The sample-entry FourCC, post-`encv`/`frma` recovery, rendered through
+    /// the shared printable-or-hex rule.
+    codec_id: String,
     codec_profile: Option<String>,
     width: u32,
     height: u32,
@@ -1080,6 +1084,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let (sps_aspect, scan_type) = sps_aspect_scan.unwrap_or((None, None));
     Ok(SampleDesc {
         codec,
+        codec_id: super::bmih::fourcc_label(&format),
         codec_profile,
         width,
         height,
@@ -1551,6 +1556,7 @@ mod tests {
         VideoTrack {
             sd: SampleDesc {
                 codec: Codec::Hevc,
+                codec_id: "hvc1".to_string(),
                 codec_profile: None,
                 width: w,
                 height: h,

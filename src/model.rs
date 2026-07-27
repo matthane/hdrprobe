@@ -124,6 +124,17 @@ pub struct VideoTrack {
     /// sidecars, which carry no video.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<String>,
+    /// The container's own codec identifier, verbatim: the MP4/MOV
+    /// sample-entry FourCC (`"hvc1"` vs `"hev1"`, post-encryption recovery),
+    /// the Matroska CodecID (with the inner VfW FourCC appended for
+    /// `V_MS/VFW/FOURCC`), a TS PMT `stream_type` in hex (`"0x24"`), an
+    /// AVI/ASF FourCC (hex form when unprintable), an FLV legacy id
+    /// (`"7"`) or Enhanced FourCC, RealMedia's VIDO FourCC, or an Ogg
+    /// mapping name (`"theora"`). Absent where no container-level identifier
+    /// exists: raw elementary streams, program streams (whose PES id is
+    /// already `track_number`), raw DV, and sidecars.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -794,6 +805,7 @@ mod tests {
             program: Some(28),
             default: Some(true),
             codec: Some("HEVC".to_string()),
+            codec_id: Some("hvc1".to_string()),
             codec_profile: Some("Main 10, High tier @ L5.1".to_string()),
             width: Some(3840),
             height: Some(2160),
@@ -972,6 +984,7 @@ mod tests {
             "video_tracks[].program",
             "video_tracks[].default",
             "video_tracks[].codec",
+            "video_tracks[].codec_id",
             "video_tracks[].codec_profile",
             "video_tracks[].width",
             "video_tracks[].height",

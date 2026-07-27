@@ -287,6 +287,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             };
             TrackDemux {
                 track_number: Some(u64::from(v.stream_number)),
+                codec_id: Some(super::bmih::fourcc_label(&v.fourcc)),
                 width: v.width,
                 height: v.height,
                 fps: v.fps,

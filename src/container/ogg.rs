@@ -750,6 +750,14 @@ fn track_of(serial: u32, v: &Video, bitrate: Option<Bitrate>) -> TrackDemux {
     // small ordinal — a 32-bit value the muxer picks at random, so it reads
     // nothing like an MKV TrackNumber or an MP4 track_ID.
     td.track_number = Some(serial as u64);
+    // The BOS packet's mapping name, Ogg's codec identifier.
+    td.codec_id = Some(
+        match v {
+            Video::Theora(_) => "theora",
+            Video::Vp8(_) => "vp8",
+        }
+        .to_string(),
+    );
     td.bitrate = bitrate;
     td
 }

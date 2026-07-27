@@ -90,6 +90,17 @@ pub(crate) fn parse(data: &[u8]) -> Option<BitmapInfoHeader> {
 /// this with [`is_config_record`]. That rule is settled by real files now
 /// (`dev/sdr-format-reference.md` §5, and `testfiles/sdr/h264.avi` against
 /// `h264_avcc.avi`), which is what unblocked them.
+/// A FourCC as a display string, falling back to little-endian hex for a
+/// non-printable or all-spaces one so a report never emits control characters
+/// (MediaInfo prints the same `0x…` form). Shared by every carriage that
+/// reports a FourCC — AVI/ASF codec fallbacks and each backend's `codec_id`.
+pub(crate) fn fourcc_label(f: &[u8; 4]) -> String {
+    if f.iter().all(|b| (0x20..=0x7E).contains(b)) && f.iter().any(|b| *b != b' ') {
+        return String::from_utf8_lossy(f).trim_end().to_string();
+    }
+    format!("0x{:08X}", u32::from_le_bytes(*f))
+}
+
 pub(crate) fn codec_from_fourcc(fourcc: &[u8; 4]) -> Option<Codec> {
     let mut upper = *fourcc;
     upper.make_ascii_uppercase();

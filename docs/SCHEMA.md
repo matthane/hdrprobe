@@ -307,6 +307,7 @@ error, the AACS rule; decrypted backups clear those bits and probe normally.
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
 | `codec` | string | optional | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, `"DV"` (raw `.dv`/`.dif` input; DV inside AVI/MOV still reports its carriage FourCC), `"RealVideo 1"`/`"2"`/`"3"`/`"4"` (RealMedia `VIDO` FourCCs `RV10`..`RV40`; an unrecognized `VIDO` FourCC reports verbatim), or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. Absent for metadata sidecars, which carry no video; always present for video inputs. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **AVI only**: a Video for Windows code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so the two carriages differ here |
+| `codec_id` | string | optional | The container's own codec identifier, verbatim (sanitized like `codec`'s fallback): the MP4/MOV sample-entry FourCC (`"hvc1"` vs `"hev1"` — for an encrypted `encv` track, the recovered original), the Matroska CodecID (a `V_MS/VFW/FOURCC` track appends the inner FourCC: `"V_MS/VFW/FOURCC / WVC1"`, MediaInfo's rendering), the TS PMT `stream_type` in hex (`"0x24"`), an AVI/ASF `biCompression` FourCC (hex form when unprintable, the `codec` fallback's rule), an FLV legacy CodecID as a decimal string (`"7"`) or Enhanced FourCC (`"hvc1"`), RealMedia's `VIDO` FourCC (`"RV40"`), or an Ogg mapping name (`"theora"`, `"vp8"`). Absent where no container-level identifier exists: raw elementary streams, program streams (whose PES stream id is already `track_number`), raw DV, and metadata sidecars. Unlike `codec`, this reports what the file says rather than what hdrprobe recognized, so the pair separates the two |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
@@ -862,7 +863,10 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   `"declared"`), saying whether hdrprobe computed the rate or read it from a header — the
   distinction the `Bitrate` section's prose previously carried only as documentation. `hdr`
   gains the optional `base` (`"HDR10"` / `"HLG"` / `"SDR"`), the format string's base tag as
-  a structured field.
+  a structured field. And `video_tracks` gains the optional `codec_id` (see its row): the
+  container's own identifier beside the resolved `codec` name, which both separates
+  recognized codecs from verbatim fallbacks and surfaces identity the name cannot
+  (`"hvc1"` vs `"hev1"`, an encrypted track's recovered FourCC).
   Also additive alongside those: the new always-present `video_tracks[].color_source` object gives
   per-field provenance for `color` (`container` / `stream` / `sei` / `spec`); `dolby_vision`
   gains the optional `pq_reshaping` and `deprecated_combination` booleans; and

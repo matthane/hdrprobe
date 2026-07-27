@@ -78,11 +78,18 @@ impl Codec {
             // control character — C0, DEL, C1, all of which can open an
             // escape — renders as U+FFFD, the same mark `from_utf8_lossy`
             // already uses for invalid bytes on this path.
-            Codec::Other(s) => {
-                s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
-            }
+            Codec::Other(s) => sanitize_label(s),
         }
     }
+}
+
+/// Sanitize file-supplied identifier text for display: every control
+/// character — C0, DEL, C1, all of which can open an ANSI escape — renders as
+/// U+FFFD, the same mark `from_utf8_lossy` uses for invalid bytes. Shared by
+/// the `Codec::Other` fallback label and every backend's `codec_id`, both of
+/// which reach the terminal and the JSON verbatim.
+pub(crate) fn sanitize_label(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +208,15 @@ pub struct TrackDemux {
     /// container has no such flag (MP4/TS/raw).
     pub default_flag: Option<bool>,
     pub codec: Codec,
+    /// The container's own codec identifier, verbatim (sanitized for
+    /// display): the MP4/MOV sample-entry FourCC (post-`encv`/`frma`
+    /// recovery), the Matroska CodecID (with the inner VfW FourCC appended
+    /// for `V_MS/VFW/FOURCC`), a TS PMT `stream_type` in hex, an AVI/ASF/FLV
+    /// FourCC or FLV legacy id, RealMedia's VIDO FourCC, an Ogg mapping
+    /// name. `None` where no container-level identifier exists (raw
+    /// elementary streams, program streams — whose PES id is already
+    /// `track_number` — and DIF).
+    pub codec_id: Option<String>,
     pub nal_format: NalFormat,
     pub width: u32,
     pub height: u32,
@@ -302,6 +318,7 @@ impl TrackDemux {
             program: None,
             default_flag: None,
             codec,
+            codec_id: None,
             nal_format,
             width: 0,
             height: 0,

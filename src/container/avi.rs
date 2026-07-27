@@ -229,6 +229,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             .unwrap_or_else(|| Codec::Other(fourcc_label(&bh.compression)));
         let mut td = TrackDemux {
             track_number: Some(index as u64),
+            codec_id: Some(fourcc_label(&bh.compression)),
             width: bh.width,
             height: bh.height,
             chunks,
@@ -896,20 +897,10 @@ fn collect_movi(
 
 // --- codec identity and bitstream fields -------------------------------------
 
-/// Render a `biCompression` value for the report.
-///
-/// Printable ASCII is the FourCC itself, which is the identifier a user
-/// recognises and what MediaInfo shows as CodecID. Anything else becomes the
-/// hex form — `BI_RGB`, uncompressed video, is the integer 0, and printing four
-/// NUL bytes (or four attacker-chosen bytes that spell an ANSI escape) into a
-/// terminal is not an option. MediaInfo prints `0x00000000` for that same file,
-/// so the two agree.
-fn fourcc_label(f: &[u8; 4]) -> String {
-    if f.iter().all(|b| (0x20..=0x7E).contains(b)) && f.iter().any(|b| *b != b' ') {
-        return String::from_utf8_lossy(f).trim_end().to_string();
-    }
-    format!("0x{:08X}", u32::from_le_bytes(*f))
-}
+// `biCompression` rendering (printable FourCC, else hex — `BI_RGB` is the
+// integer 0 and four NUL bytes must never reach a terminal) lives in
+// `bmih::fourcc_label`, shared with ASF and every backend's `codec_id`.
+use super::bmih::fourcc_label;
 
 /// Fill everything the container cannot state — depth, chroma, profile, colour
 /// and (preferentially) the frame rate — from the codec's own headers.

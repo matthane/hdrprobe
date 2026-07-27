@@ -982,6 +982,7 @@ fn assemble_report(
             program: track.program,
             default: track.default_flag,
             codec: Some(track.codec.label()),
+            codec_id: track.codec_id.clone(),
             codec_profile: track.codec_profile.clone(),
             width: if track.width > 0 { Some(track.width) } else { None },
             height: if track.height > 0 { Some(track.height) } else { None },

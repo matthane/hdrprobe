@@ -211,6 +211,9 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         let buf = out.buf;
         let mut td = TrackDemux {
             track_number: Some(g.primary_pid() as u64),
+            // The PMT stream_type in hex, the convention MediaInfo and DVB
+            // documentation use for the field ("0x24" = HEVC).
+            codec_id: Some(format!("0x{:02X}", g.primary_stream_type())),
             program: multi_program.then_some(g.program_number),
             width,
             height,
@@ -353,6 +356,16 @@ impl PidGroup {
             .find(|e| is_video_type(e.stream_type))
             .unwrap_or(&self.streams[0])
             .pid
+    }
+
+    /// The primary stream's PMT `stream_type` — the container's codec
+    /// identifier, same selection rule as `primary_pid`.
+    fn primary_stream_type(&self) -> u8 {
+        self.streams
+            .iter()
+            .find(|e| is_video_type(e.stream_type))
+            .unwrap_or(&self.streams[0])
+            .stream_type
     }
 }
 

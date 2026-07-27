@@ -196,6 +196,7 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
 
         let mut td = TrackDemux {
             track_number: Some(v.number as u64),
+            codec_id: Some(fourcc_label(&bh.compression)),
             width: bh.width,
             height: bh.height,
             // The spec says the outer Encoded Image Width/Height "should be
@@ -495,15 +496,9 @@ fn fill_from_extradata(td: &mut TrackDemux, extradata: &[u8]) {
     }
 }
 
-/// A FourCC as a codec label, falling back to hex for a non-printable one so a
-/// report never emits control characters. Matches the AVI backend's rendering
-/// of the same field.
-fn fourcc_label(f: &[u8; 4]) -> String {
-    if f.iter().all(|b| (0x20..=0x7E).contains(b)) && f.iter().any(|b| *b != b' ') {
-        return String::from_utf8_lossy(f).trim_end().to_string();
-    }
-    format!("0x{:08X}", u32::from_le_bytes(*f))
-}
+// The FourCC-or-hex rendering lives in `bmih::fourcc_label`, shared with the
+// AVI backend and every backend's `codec_id`.
+use bmih::fourcc_label;
 
 #[cfg(test)]
 mod tests {

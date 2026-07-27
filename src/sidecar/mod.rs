@@ -227,6 +227,7 @@ fn build_report(
             program: None,
             default: None,
             codec: None,
+            codec_id: None,
             codec_profile: None,
             width: None,
             height: None,

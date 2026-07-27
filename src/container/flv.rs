@@ -186,10 +186,18 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     // one whose headers could not be read. With neither, the file is refused
     // rather than reporting a placeholder track, which is what the sibling
     // backends do for a file that carries no video.
-    let Some(codec) = walk.codec.clone().or_else(|| meta.and_then(metadata_codec)) else {
-        bail!("no video stream in the FLV tag chain");
+    let (codec, codec_id) = match walk.codec.clone() {
+        Some(c) => (c, walk.codec_id_label.clone()),
+        None => match meta.and_then(metadata_codec) {
+            Some((c, id)) => (c, Some(id)),
+            None => bail!("no video stream in the FLV tag chain"),
+        },
     };
-    let mut td = TrackDemux { chunks: walk.chunks, ..TrackDemux::new(codec, NalFormat::AnnexB) };
+    let mut td = TrackDemux {
+        chunks: walk.chunks,
+        codec_id,
+        ..TrackDemux::new(codec, NalFormat::AnnexB)
+    };
     // The coded stream first, so nothing declared can overwrite what the
     // bitstream states — ffmpeg's `trust_metadata` gate reaches the same
     // ordering from the other side.
@@ -316,6 +324,10 @@ struct HeadWalk {
     chunks: Vec<Chunk>,
     /// The codec named by the first video tag.
     codec: Option<Codec>,
+    /// The identifier that named it, first-wins beside `codec`: a legacy
+    /// CodecID as a decimal string ("7"), an Enhanced FourCC through the
+    /// shared printable-or-hex rule ("hvc1").
+    codec_id_label: Option<String>,
     /// Byte range of the decoder configuration record, when one was seen.
     config: Option<(usize, usize)>,
     /// The Enhanced FLV `colorInfo` metadata packet, decoded.
@@ -446,6 +458,7 @@ fn apply_video_tag(data: &[u8], body: usize, end: usize, w: &mut HeadWalk) {
     let codec = legacy_codec(codec_id);
     if w.codec.is_none() {
         w.codec = Some(codec);
+        w.codec_id_label = Some(codec_id.to_string());
     }
     if codec_id != LEGACY_CODEC_AVC {
         // Every other legacy codec's payload starts right after the one-byte
@@ -544,6 +557,7 @@ fn apply_enhanced_tag(data: &[u8], body: usize, end: usize, w: &mut HeadWalk) {
     pos += 4;
     if w.codec.is_none() {
         w.codec = Some(enhanced_codec(&fourcc));
+        w.codec_id_label = Some(super::bmih::fourcc_label(&fourcc));
     }
     if multitrack {
         return;
@@ -586,7 +600,7 @@ fn has_composition_time(fourcc: &[u8; 4]) -> bool {
 /// The codec `onMetaData.videocodecid` declares: a legacy `CodecID` as a small
 /// integer, or an Enhanced `VideoFourCc` as a big-endian `u32` — the corpus's
 /// Enhanced file writes 1752589105, which is `hvc1`.
-fn metadata_codec(m: &AmfObject) -> Option<Codec> {
+fn metadata_codec(m: &AmfObject) -> Option<(Codec, String)> {
     let v = m.number("videocodecid")?;
     if !v.is_finite() || v < 0.0 || v > f64::from(u32::MAX) || v.fract() != 0.0 {
         return None;
@@ -595,9 +609,10 @@ fn metadata_codec(m: &AmfObject) -> Option<Codec> {
     // The legacy ids are a 4-bit field, so nothing above 15 can be one; a
     // FourCC of printable characters is far above it.
     if n <= 0x0F {
-        return Some(legacy_codec(n as u8));
+        return Some((legacy_codec(n as u8), n.to_string()));
     }
-    Some(enhanced_codec(&n.to_be_bytes()))
+    let fourcc = n.to_be_bytes();
+    Some((enhanced_codec(&fourcc), super::bmih::fourcc_label(&fourcc)))
 }
 
 /// Legacy `CodecID`, named from the spec's own table. Only H.264 has a parser
