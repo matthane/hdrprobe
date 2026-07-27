@@ -41,13 +41,15 @@ pub struct SpsInfo {
 }
 
 impl SpsInfo {
-    pub fn chroma_str(&self) -> &'static str {
+    /// `None` for a reserved `chroma_format_idc`: an undefined code names
+    /// nothing, so the report omits the field rather than print a placeholder.
+    pub fn chroma_str(&self) -> Option<&'static str> {
         match self.chroma_format_idc {
-            0 => "monochrome",
-            1 => "4:2:0",
-            2 => "4:2:2",
-            3 => "4:4:4",
-            _ => "?",
+            0 => Some("monochrome"),
+            1 => Some("4:2:0"),
+            2 => Some("4:2:2"),
+            3 => Some("4:4:4"),
+            _ => None,
         }
     }
 
@@ -327,14 +329,19 @@ mod tests {
             0x01, 0x01, 0x40, 0x00, 0x00, 0x03, 0x00, 0x40, 0x00, 0x00, 0x0c, 0x03, 0xc6, 0x0c,
             0x92,
         ];
-        let info = parse_sps(&sps).expect("valid SPS");
+        let mut info = parse_sps(&sps).expect("valid SPS");
         assert_eq!((info.width, info.height), (1920, 1080));
         assert_eq!(info.bit_depth, 8);
-        assert_eq!(info.chroma_str(), "4:2:0");
+        assert_eq!(info.chroma_str(), Some("4:2:0"));
         assert_eq!(info.profile_idc, 100);
         assert_eq!(info.profile_label(), "High @ L4");
         let c = info.color.expect("VUI colour present");
         assert_eq!((c.primaries, c.transfer, c.matrix), (1, 1, 1)); // BT.709
         assert!(!c.full_range); // limited range
+
+        // A reserved chroma_format_idc names no format, so the field is
+        // omitted rather than a placeholder printed.
+        info.chroma_format_idc = 4;
+        assert_eq!(info.chroma_str(), None);
     }
 }

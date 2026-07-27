@@ -127,7 +127,7 @@ either use `--format ndjson` or normalize after parsing, e.g. in Python:
   when nothing was found.
 - **Default-false booleans may be omitted.** `unconverted_dual_layer_rpu`,
   `pq_reshaping`, and `deprecated_combination` appear only when `true`. All other booleans (`bl_present`,
-  `el_present`, `rpu_present`, `sampled`, `zeroed`, `l11.reference_mode`) are serialized
+  `el_present`, `rpu_present`, `zeroed`, `l11.reference_mode`) are serialized
   whenever their containing object is.
 - **Numbers.** JSON has a single number type; the tables below note the underlying type.
   Integer-typed fields are always whole numbers. Float-typed fields (`fps`, `duration_secs`,
@@ -313,7 +313,7 @@ error, the AACS rule; decrypted backups clear those bits and probe normally.
 | `fps` | float | optional | Frame rate. From container timing (MP4/MKV), the SPS VUI (TS, raw HEVC), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>`. Absent when the input carries no rate signal; never guessed |
 | `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists. The `"overall"` (file-length) fallback rate appears only when this is the file's sole video track (an overall rate attributed to one of several tracks would be a wrong number) |
 | `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
-| `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"`, `"4:1:1"` (DV, MJPEG), `"4:4:0"` (MJPEG) (a reserved signalling value renders `"?"`) |
+| `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"`, `"4:1:1"` (DV, MJPEG), `"4:4:0"` (MJPEG, VP9). A reserved signalling value names no format and omits the field |
 | `pixel_aspect_ratio` | float | optional | Pixel (sample) aspect ratio, width of one pixel over its height (1.0 = square). Signalled by the coded stream (H.264/HEVC VUI `aspect_ratio_idc`/Extended_SAR, MPEG-4 Part 2 and MPEG-1 aspect codes, Theora `PARN`:`PARD`, VC-1 `ASPECT_RATIO`) or the container (MP4 `pasp` — which wins over the stream, like colour), or derived exactly from a signalled display ratio and the coded size (MPEG-2's DAR codes, MKV `DisplayWidth`:`DisplayHeight`, AVI `vprp`). Absent when nothing signals either ratio — never a guessed square |
 | `display_aspect_ratio` | float | optional | Display aspect ratio of the presented picture. Signalled directly or derived exactly from the pixel ratio and the coded size; present exactly when `pixel_aspect_ratio` is. The text report shows it (as `DAR 16:9` etc.) only when the pixels are not square; the JSON always carries both |
 | `scan_type` | string | optional | `"progressive"` or `"interlaced"`, from a sequence-level signal of the coded stream (AVC `frame_mbs_only_flag`, HEVC PTL source flags / `field_seq_flag`, MPEG-2 `progressive_sequence` — affirmative only, since a clear flag merely permits interlaced pictures and film-sourced DVDs are progressive under it, MPEG-4 Part 2 and VC-1 interlace flags, MKV `FlagInterlaced`, AVI `vprp` fields-per-frame; MPEG-1, Theora and MJPEG-free formats that structurally cannot interlace state `"progressive"`). Absent when unsignalled — absence never means progressive. The text report marks only `interlaced` |
@@ -387,16 +387,19 @@ Metadata sidecars (one `video_tracks` entry with no `codec` and no `hdr` section
 |---|---|---|---|
 | `bits_per_sec` | float | always | Average rate in bits per second |
 | `scope` | string | always | `"video_stream"` (exact encoded video byte count or a container-stated per-stream rate) or `"overall"` (file length divided by duration, which also counts audio and container overhead) |
+| `source` | string | always | `"measured"` (hdrprobe computed the rate from per-sample/per-chunk sums or actual payload/file bytes: MP4 sample tables, an AVI index, a `--full` streamed sum, every `"overall"` rate) or `"declared"` (a single rate or byte count stated in a container header, however the muxer obtained it: MKV `BPS`/`NUMBER_OF_BYTES` statistics tags, ASF `Data Bitrate`, FLV `videodatarate`, RealMedia's MDPR average) |
 
 A `"video_stream"` rate is always about the video track alone, but it is not always a
-measurement. On MP4/MOV it is an exact sum of the sample-size table; on Matroska it is
-mkvmerge's own measured `BPS` statistic; on AVI it is the file's index summed. On **ASF and
-FLV** it may instead be a per-stream average the muxer *declared* — ASF's Extended Stream
-Properties `Data Bitrate`, FLV's `onMetaData.videodatarate` — which is what both reference
-tools report for those formats and is the only per-stream figure those containers carry. A
-declared value can differ from the encoded reality by a percent or two. Running `--full` on an
-FLV replaces it with the exact summed video payload; ASF has no such upgrade, because its
-payload is not addressable without a full demux.
+measurement, and `source` says which kind each rate is. On MP4/MOV it is an exact sum of the
+sample-size table (`"measured"`); on AVI it is the file's index summed (`"measured"`); on
+Matroska it is mkvmerge's own `BPS` statistic — measured by the muxer, but read from a header
+tag, so it is `"declared"`. On **ASF, FLV and RealMedia** it is a per-stream average the muxer
+*declared* — ASF's Extended Stream Properties `Data Bitrate`, FLV's
+`onMetaData.videodatarate`, RealMedia's MDPR average — which is what both reference tools
+report for those formats and is the only per-stream figure those containers carry. A declared
+value can differ from the encoded reality by a percent or two. Running `--full` on an FLV
+replaces it with the exact summed video payload (`"measured"`); ASF has no such upgrade,
+because its payload is not addressable without a full demux.
 
 ### `ColorInfo`
 
@@ -450,6 +453,7 @@ Present for every video input; absent for sidecars.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `format` | string | always | Overall classification; see below |
+| `base` | string | optional | The base signal a decoder without the dynamic-metadata layer receives: `"HDR10"`, `"HLG"`, or `"SDR"` — exactly the `format` string's base tag (item 5 below) as a field of its own, built from the same value so the two can never disagree. Absent exactly when the tag is: a Dolby Vision stream with no independently viewable base (compatibility id 0), or an unresolved id over a base layer that is neither PQ nor HLG |
 | `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values. Like `content_light`, the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6, or an unresolved id on Profile 8, which keeps the historical HDR10-base default), where L6 by definition mirrors the base layer's own static metadata. On any other base (IPT-PQ-C2, HLG, SDR) the L6 values merely restate the DV grade's own display, which `dolby_vision.mastering_display` already reports, so the field is omitted. A container or SEI value, when actually signalled, is always reported |
 | `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values. MaxCLL/MaxFALL is HDR10 (CTA-861.3) convention, so the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6, or an unresolved id on Profile 8); no other base consumes it, and on an IPT-PQ-C2 or HLG base L6 is typically a zeroed placeholder, so the field is omitted rather than echo noise. A container or SEI value, when actually signalled, is always reported |
 
@@ -463,7 +467,8 @@ The string is a ` / `-joined list built from, in order:
    the stream's own signalled mode).
 4. `HDR Vivid` when HDR Vivid metadata is present.
 5. A base-signal tag: `HDR10`, `HLG`, or `SDR`, naming the signal a decoder without the
-   dynamic-metadata layer receives. Under Dolby Vision the tag is decided by the
+   dynamic-metadata layer receives (also reported structurally as `hdr.base`, always equal
+   to this component). Under Dolby Vision the tag is decided by the
    compatibility id (1 or 6 -> `HDR10`, 2 -> `SDR`, 4 -> `HLG`) rather than by the base
    layer's raw transfer characteristic, which disagrees for Profile 4 (SDR base, however
    tagged) and Profile 5/20 (a PQ-encoded IPT-PQ-C2 base that no ordinary decoder can
@@ -532,7 +537,7 @@ SL-HDR metadata predates the current MDCV box for the third.
 | `l11` | object | optional | The L11 (Dolby Vision IQ) block, present when L11 was seen; its three fields ride one block so they always appear together. `content`: the content type, named per Dolby's definitions (`"Default"`, `"Movies"`, `"Game"`, `"Sport"`, `"User Generated Content"`, or `"Unknown"` for values outside the published 0-4 range). `white_point`: the intended white point (`"D65"` (0, the default), `"D93"` (8), or `"code N"` for the other codes, which Dolby accepts but does not publicly name). `reference_mode`: the reference-mode flag, boolean |
 | `trim_targets` | array of `TrimTarget` | omitted when empty | Distinct trim target displays, in nits, sorted ascending: the L2/L8 trims read plus any L10-defined target displays (custom L8 targets, folded into the L8 set) |
 | `rpu_count` | integer | always | Number of RPUs successfully parsed (0 under `--no-rpu`) |
-| `sampled` | boolean | always | `true` when the DV facts reflect sampling; `false` under `--full`, for sidecars (exhaustive by construction), and under `--no-rpu` (nothing was sampled) |
+| `coverage` | string | always | What the DV facts rest on: `"sampled"` (a spread of RPUs — the union fields may be incomplete), `"full"` (every RPU was read: `--full`, or a sidecar, exhaustive by construction), or `"none"` (no RPU was read: `--no-rpu`, or a container config whose track yielded no parseable RPU — `rpu_count` is `0` and the section is built from the config alone) |
 | `metadata_cadence` | `MetadataCadence` | optional | Whether the dynamic metadata is authored shot-by-shot or frame-by-frame; see below. Present under `--full` and for DV sidecars; absent for sampled video runs (no adjacent frames to compare) and `--no-rpu` |
 | `census` | `DvCensus` | optional | Exhaustive per-level census. Present under `--full` and for DV sidecars; absent for sampled video runs and `--no-rpu` |
 
@@ -695,7 +700,7 @@ per-frame tone-mapping payload never is.
 | `version` | string | always | The CUVA metadata version, `"1.0"` through `"4.0"`. From the `cuvv` box's version bitmap when the container declares one (its highest declared version — the declaration covers the whole stream, where a sampled SEI shows one frame's), else from the SEI's T.35 provider-oriented code (the field T/UWA 005.2-1 itself defines as the version; note MediaInfo's SEI-path `HDR_Format_Version` renders the data-set type below instead) |
 | `system_start_code` | integer | optional | The dynamic-metadata data-set type byte from the T.35 message. Absent when detection came only from the `cuvv` declaration and no frame's SEI was read (e.g. `--no-rpu`) |
 | `target_max_luminances` | array of integers | when non-empty | Distinct targeted-system-display max luminances of the tone-mapping parameter sets, cd/m², sorted ascending — the display anchors the per-frame curves are computed toward, the HDR Vivid analogue of the DV trim-target set (e.g. `[100, 500]` for a title carrying an SDR curve and a 500-nit HDR curve). A sampled union unless every frame was read |
-| `sampled` | boolean | always | True when `target_max_luminances` is a sampled union rather than a full-scan read, mirroring `dolby_vision.sampled` (`false` under `--full` and under `--no-rpu`, where nothing was sampled) |
+| `coverage` | string | always | What the HDR Vivid facts rest on, mirroring `dolby_vision.coverage`: `"sampled"` (a spread of frames, `target_max_luminances` a possibly incomplete union), `"full"` (every frame read), or `"none"` (no frame's SEI was read — a `cuvv` box-only detection under `--no-rpu`, where `version` alone survives) |
 
 ## How input kind and flags affect presence
 
@@ -709,14 +714,14 @@ XML additionally provides `fps` (from `<EditRate>`) and the report-level `format
 raw RPU bin provides neither. An HDR10+ JSON sidecar has no `dolby_vision` section; DV
 sidecars have no `hdr10plus` section.
 
-**Default (sampled) run.** `dolby_vision.sampled` is `true`; `l5_active_areas` and
+**Default (sampled) run.** `dolby_vision.coverage` is `"sampled"`; `l5_active_areas` and
 `trim_targets` are unions over the sampled RPUs and may be incomplete (though the L10-defined
 custom targets folded into the L8 set are title-global: the definition rides every RPU, so
 those entries are complete from any sample); `census` and `metadata_cadence` are absent.
-`hdr_vivid.sampled` is likewise `true`, its `target_max_luminances` a union over the sampled
-frames.
+`hdr_vivid.coverage` is likewise `"sampled"`, its `target_max_luminances` a union over the
+sampled frames.
 
-**`--full`.** Every RPU is scanned: `sampled` is `false` (on `dolby_vision` and `hdr_vivid`
+**`--full`.** Every RPU is scanned: `coverage` is `"full"` (on `dolby_vision` and `hdr_vivid`
 alike), `census` and `metadata_cadence` appear, and TS inputs gain an exact video-stream
 `bitrate`. DV sidecars behave like `--full` by construction (every RPU in the file is read).
 
@@ -727,10 +732,11 @@ just the RPU-derived ones. The DV section is built from the container configurat
 `color`'s spec-defined fill and `pq_reshaping`, both of which need only the container's
 declared profile and id); everything RPU-derived (`el_type`, `reconstructed_bit_depth`,
 `cm_version`, L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `metadata_cadence`,
-`census`) is absent, and `rpu_count` is `0`. `hdr10plus` and `sl_hdr` are entirely absent
+`census`) is absent, `rpu_count` is `0`, and `coverage` is `"none"`. `hdr10plus` and `sl_hdr` are entirely absent
 (their only carriage is in-frame), SEI-sourced `hdr.mastering_display`/`hdr.content_light` fall away
 (container-box values still report), and `hdr_vivid` survives only via the MP4 `cuvv`
-declaration — `version` alone, no `system_start_code`, no `target_max_luminances`.
+declaration — `version` alone with `coverage` `"none"`, no `system_start_code`, no
+`target_max_luminances`.
 
 **`--samples <N>`.** Changes only how many seek points feed the sampled sets; it never changes
 the schema.
@@ -751,7 +757,7 @@ count is the prefix's length ÷ the frame size) — and every `bitrate` except M
 RealMedia's (a header declaration the buffered head carries whole). Declared header facts (MP4 `mvhd` and
 MKV Segment-Info durations, resolution, color, HDR and Dolby Vision metadata from the sampled
 head) report normally. The sampled union fields (`l5_active_areas`, `trim_targets`) draw only
-on head frames: `dolby_vision.sampled` is `true` exactly as on a default file probe, but a
+on head frames: `dolby_vision.coverage` is `"sampled"` exactly as on a default file probe, but a
 head-only window is likelier to miss mid-title variation (an aspect-ratio change, trims added
 in later scenes) than a file probe's whole-file sample spread. Limits: no tail-dependent facts ever (TS runtime, MKV statistics-tag
 bitrate, an MP4 whose `moov` sits at the end fails honestly), `--full` errors on `-` (a pipe
@@ -840,7 +846,24 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
      `l5_assumed_canvas` becomes a named `{width, height}` **object** instead of a two-element
      array. And a metadata sidecar's `codec` is **absent** instead of the empty string, so
      "is this a sidecar" reads as a missing key rather than a sentinel value.
-  Additive alongside those: the new always-present `video_tracks[].color_source` object gives
+  7. **Scan coverage as one field.** The `sampled` booleans on `dolby_vision` and `hdr_vivid`
+     are **replaced** by `coverage` (`"sampled"` / `"full"` / `"none"`): whether the sampled
+     union fields are complete previously took two fields to read (`sampled: false` meant
+     either a full scan or `--no-rpu`'s nothing-at-all, disambiguated by `rpu_count`), and now
+     states itself directly. `.sampled == true` becomes `.coverage == "sampled"`; a consumer
+     that read `sampled == false` as "complete" should read `"full"`.
+  8. **Reserved signalling codes omit their field.** A reserved `chroma_format_idc` /
+     `chromaSubsamplingIdc` / AV1 subsampling pair rendered `chroma: "?"` through 2.x, and a
+     reserved AV1 `seq_profile` rendered a `"?"` inside `codec_profile`; both now omit the
+     field, the same honest-absence rule `color` already follows. (VP9's fourth subsampling
+     combination is *defined*, and now reports `"4:4:0"` instead of `"?"`.) No real file is
+     affected — reserved codes require a crafted stream.
+  Additive alongside those: `bitrate` gains an always-present `source` (`"measured"` /
+  `"declared"`), saying whether hdrprobe computed the rate or read it from a header — the
+  distinction the `Bitrate` section's prose previously carried only as documentation. `hdr`
+  gains the optional `base` (`"HDR10"` / `"HLG"` / `"SDR"`), the format string's base tag as
+  a structured field.
+  Also additive alongside those: the new always-present `video_tracks[].color_source` object gives
   per-field provenance for `color` (`container` / `stream` / `sei` / `spec`); `dolby_vision`
   gains the optional `pq_reshaping` and `deprecated_combination` booleans; and
   `color.primaries`, `color.transfer` and `color.matrix` now name **every code point ITU-T

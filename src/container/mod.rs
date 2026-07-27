@@ -711,7 +711,10 @@ fn parse_dovi_record(rec: &[u8], ts_descriptor: bool) -> Option<(DvConfig, Optio
 
 pub(crate) struct HvccInfo {
     pub bit_depth: u8,
-    pub chroma: &'static str,
+    /// `None` for a reserved `chroma_format_idc`: a code H.265 does not
+    /// define names nothing, so the field stays honestly absent rather than
+    /// printing a placeholder.
+    pub chroma: Option<&'static str>,
     pub nal_len: u8,
     pub profile_str: String,
 }
@@ -739,11 +742,11 @@ pub(crate) fn parse_hvcc_record(rec: &[u8]) -> Option<HvccInfo> {
         chroma_idc = sps.chroma_format_idc;
     }
     let chroma = match chroma_idc {
-        0 => "monochrome",
-        1 => "4:2:0",
-        2 => "4:2:2",
-        3 => "4:4:4",
-        _ => "?",
+        0 => Some("monochrome"),
+        1 => Some("4:2:0"),
+        2 => Some("4:2:2"),
+        3 => Some("4:4:4"),
+        _ => None,
     };
     Some(HvccInfo {
         bit_depth,
@@ -755,7 +758,8 @@ pub(crate) fn parse_hvcc_record(rec: &[u8]) -> Option<HvccInfo> {
 
 pub(crate) struct AvccInfo {
     pub bit_depth: u8,
-    pub chroma: &'static str,
+    /// `None` for a reserved `chroma_format_idc`, like `HvccInfo::chroma`.
+    pub chroma: Option<&'static str>,
     pub nal_len: u8,
     pub profile_str: String,
 }
@@ -775,8 +779,11 @@ pub(crate) fn parse_avcc_record(rec: &[u8]) -> Option<AvccInfo> {
 }
 
 /// Parse an AV1CodecConfigurationRecord (`av1C` box payload / MKV AV1
-/// CodecPrivate). Returns `(bit_depth, chroma, codec_profile_label)`.
-pub(crate) fn parse_av1c_record(rec: &[u8]) -> Option<(u8, &'static str, String)> {
+/// CodecPrivate). Returns `(bit_depth, chroma, codec_profile_label)`; the
+/// inner options are `None` for reserved subsampling / profile codes.
+pub(crate) fn parse_av1c_record(
+    rec: &[u8],
+) -> Option<(u8, Option<&'static str>, Option<String>)> {
     // byte 0: marker+version; byte 1: seq_profile(3) + seq_level_idx_0(5); byte 2:
     // seq_tier_0(1)+high_bitdepth(1)+twelve_bit(1)+mono(1)+ss_x(1)+ss_y(1)+pos(2).
     if rec.len() < 3 {
@@ -812,7 +819,8 @@ pub(crate) fn parse_av1c_record(rec: &[u8]) -> Option<(u8, &'static str, String)
 /// What a `VPCodecConfigurationRecord` states.
 pub(crate) struct VpccInfo {
     pub bit_depth: u8,
-    pub chroma: &'static str,
+    /// `None` for a reserved `chromaSubsamplingIdc`, like `HvccInfo::chroma`.
+    pub chroma: Option<&'static str>,
     pub profile_str: String,
     pub color: (ColorInfo, ColorSources),
 }
@@ -836,10 +844,10 @@ pub(crate) fn parse_vpcc_record(rec: &[u8]) -> Option<VpccInfo> {
     }
     let packed = r[6];
     let chroma = match (packed >> 1) & 0x07 {
-        0 | 1 => "4:2:0",
-        2 => "4:2:2",
-        3 => "4:4:4",
-        _ => "?",
+        0 | 1 => Some("4:2:0"),
+        2 => Some("4:2:2"),
+        3 => Some("4:4:4"),
+        _ => None,
     };
     Some(VpccInfo {
         bit_depth: packed >> 4,
@@ -1050,7 +1058,7 @@ pub(crate) struct SpsCommon {
     pub width: u32,
     pub height: u32,
     pub bit_depth: u8,
-    pub chroma: String,
+    pub chroma: Option<String>,
     pub profile: String,
     pub color: (ColorInfo, ColorSources),
     pub frame_rate: Option<f64>,
@@ -1097,7 +1105,7 @@ pub(crate) fn sps_fields(best: Option<SpsCommon>) -> SpsFieldsTuple {
             c.width,
             c.height,
             Some(c.bit_depth),
-            Some(c.chroma),
+            c.chroma,
             Some(c.profile),
             c.color,
             c.frame_rate,
@@ -1156,7 +1164,7 @@ fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         width: sps.width,
         height: sps.height,
         bit_depth: sps.bit_depth,
-        chroma: sps.chroma_str().to_string(),
+        chroma: sps.chroma_str().map(str::to_string),
         profile: sps.profile_label(),
         color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
         frame_rate: sps.frame_rate,
@@ -1197,7 +1205,7 @@ fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
         width: sps.width,
         height: sps.height,
         bit_depth: sps.bit_depth,
-        chroma: sps.chroma_str().to_string(),
+        chroma: sps.chroma_str().map(str::to_string),
         profile: sps.profile_label(),
         color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
         frame_rate: sps.frame_rate,
@@ -1340,7 +1348,7 @@ pub(crate) fn fill_nal_config_fields(td: &mut TrackDemux, rec: &[u8]) {
             let Some(info) = parse_hvcc_record(rec) else { return };
             td.nal_format = NalFormat::LengthPrefixed(info.nal_len);
             td.bit_depth = Some(info.bit_depth);
-            td.chroma = Some(info.chroma.to_string());
+            td.chroma = info.chroma.map(str::to_string);
             td.codec_profile = Some(info.profile_str);
             if let Some(c) = color_from_hvcc(rec) {
                 (td.color, td.color_source) = c;
@@ -1364,7 +1372,7 @@ pub(crate) fn fill_nal_config_fields(td: &mut TrackDemux, rec: &[u8]) {
             let Some(info) = parse_avcc_record(rec) else { return };
             td.nal_format = NalFormat::LengthPrefixed(info.nal_len);
             td.bit_depth = Some(info.bit_depth);
-            td.chroma = Some(info.chroma.to_string());
+            td.chroma = info.chroma.map(str::to_string);
             td.codec_profile = Some(info.profile_str);
             if let Some(c) = color_from_avcc(rec) {
                 (td.color, td.color_source) = c;
@@ -2196,13 +2204,26 @@ mod tests {
         ];
         let h = parse_hvcc_record(&hvcc).expect("valid hvcC");
         assert_eq!(h.bit_depth, 10);
-        assert_eq!(h.chroma, "4:2:0");
+        assert_eq!(h.chroma, Some("4:2:0"));
         assert_eq!(h.profile_str, "Main 10, Main tier @ L4");
 
         // With the SPS arrays cut off, the summary bytes are the fallback.
         let head_only = &hvcc[..23];
         let h = parse_hvcc_record(head_only).expect("head-only hvcC");
         assert_eq!(h.bit_depth, 8);
+    }
+
+    /// A reserved `chromaSubsamplingIdc` (the 3-bit field defines 0..=3)
+    /// names no format, so the field stays absent rather than a placeholder.
+    #[test]
+    fn vpcc_reserved_chroma_names_nothing() {
+        // Minimal version-1 record: profile 2, level 51,
+        // bitDepth(4)+chromaSubsamplingIdc(3)+range(1), CICP 9/16/9.
+        let mut rec = [1u8, 0, 0, 0, 2, 51, 0, 9, 16, 9];
+        rec[6] = (10 << 4) | (4 << 1) | 1; // idc 4: reserved
+        assert_eq!(parse_vpcc_record(&rec).expect("valid vpcC").chroma, None);
+        rec[6] = (10 << 4) | (2 << 1) | 1; // idc 2: 4:2:2
+        assert_eq!(parse_vpcc_record(&rec).expect("valid vpcC").chroma, Some("4:2:2"));
     }
 
     #[test]
@@ -2218,7 +2239,7 @@ mod tests {
         ];
         let a = parse_avcc_record(&avcc).expect("valid avcC");
         assert_eq!(a.bit_depth, 8);
-        assert_eq!(a.chroma, "4:2:0");
+        assert_eq!(a.chroma, Some("4:2:0"));
         assert_eq!(a.nal_len, 4);
         assert_eq!(a.profile_str, "High @ L4");
         // Its embedded SPS also yields the Rec.709 base-layer colour.

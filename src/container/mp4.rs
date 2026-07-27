@@ -939,7 +939,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                 hvcc_bytes = Some(&data[c.payload..c.end]);
                 if let Some(h) = super::parse_hvcc_record(&data[c.payload..c.end]) {
                     bit_depth = Some(h.bit_depth);
-                    chroma = Some(h.chroma.to_string());
+                    chroma = h.chroma.map(str::to_string);
                     nal_len = h.nal_len;
                     codec_profile = Some(h.profile_str);
                 }
@@ -948,7 +948,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                 avcc_bytes = Some(&data[c.payload..c.end]);
                 if let Some(a) = super::parse_avcc_record(&data[c.payload..c.end]) {
                     bit_depth = Some(a.bit_depth);
-                    chroma = Some(a.chroma.to_string());
+                    chroma = a.chroma.map(str::to_string);
                     nal_len = a.nal_len;
                     codec_profile = Some(a.profile_str);
                 }
@@ -959,14 +959,14 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                 }
                 if let Some((bd, ch, prof)) = parse_av1c(data, c) {
                     bit_depth = Some(bd);
-                    chroma = Some(ch.to_string());
-                    codec_profile = Some(prof);
+                    chroma = ch.map(str::to_string);
+                    codec_profile = prof;
                 }
             }
             b"vpcC" => {
                 if let Some(v) = super::parse_vpcc_record(&data[c.payload..c.end]) {
                     bit_depth = Some(v.bit_depth);
-                    chroma = Some(v.chroma.to_string());
+                    chroma = v.chroma.map(str::to_string);
                     codec_profile = Some(v.profile_str);
                     vpcc_color = Some(v.color);
                 }
@@ -1173,7 +1173,7 @@ fn color_from_stream(
     None
 }
 
-fn parse_av1c(data: &[u8], b: &BoxHdr) -> Option<(u8, &'static str, String)> {
+fn parse_av1c(data: &[u8], b: &BoxHdr) -> Option<(u8, Option<&'static str>, Option<String>)> {
     if b.end < b.payload {
         return None;
     }

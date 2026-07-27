@@ -72,7 +72,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
             sps.width,
             sps.height,
             Some(sps.bit_depth),
-            Some(sps.chroma_str().to_string()),
+            sps.chroma_str().map(str::to_string),
             Some(sps.profile_label()),
             sps.color
                 .as_ref()

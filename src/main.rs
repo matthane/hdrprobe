@@ -917,6 +917,18 @@ fn assemble_report(
         // declares them all, where a sampled SEI shows one); the SEI supplies
         // the data-set type and target set and is the sole source everywhere
         // else. Either alone is presence. The published versions are all X.0.
+        // Coverage mirrors dolby_vision's: `none` when no frame was read at
+        // all (--no-rpu, where only the cuvv declaration can detect), `full`
+        // for a complete scan, else `sampled` — including a box-only default
+        // run whose sample spread found no SEI (frames *were* read, and a
+        // mid-title-only SEI could sit outside them).
+        let vivid_coverage = if cli.no_rpu {
+            model::Coverage::None
+        } else if complete_scan {
+            model::Coverage::Full
+        } else {
+            model::Coverage::Sampled
+        };
         let hdr_vivid = match (track.cuvv_version_map, scan.sei.hdr_vivid.as_ref()) {
             (Some(map), sei) => Some(model::HdrVivid {
                 version: format!("{}.0", 16 - map.leading_zeros()),
@@ -924,15 +936,13 @@ fn assemble_report(
                 target_max_luminances: sei
                     .map(|s| hdr::pq_targets_to_nits(&s.target_pq))
                     .unwrap_or_default(),
-                // Like dolby_vision.sampled: false under --no-rpu (a box-only
-                // detection sampled nothing) and under --full.
-                sampled: !complete_scan && sei.is_some(),
+                coverage: vivid_coverage,
             }),
             (None, Some(s)) => Some(model::HdrVivid {
                 version: format!("{}.0", s.version),
                 system_start_code: Some(s.system_start_code),
                 target_max_luminances: hdr::pq_targets_to_nits(&s.target_pq),
-                sampled: !complete_scan,
+                coverage: vivid_coverage,
             }),
             (None, None) => None,
         };
@@ -1212,8 +1222,12 @@ mod tests {
 
     #[test]
     fn truncation_suppresses_span_derived_facts_only() {
-        use model::{Bitrate, BitrateScope};
-        let overall = Some(Bitrate { bits_per_sec: 1.0, scope: BitrateScope::Overall });
+        use model::{Bitrate, BitrateScope, BitrateSource};
+        let overall = Some(Bitrate {
+            bits_per_sec: 1.0,
+            scope: BitrateScope::Overall,
+            source: BitrateSource::Measured,
+        });
         let stream = Some(Bitrate::video_stream_bps(1.0));
 
         // TS: the PCR-span duration and the overall rate are prefix-derived.

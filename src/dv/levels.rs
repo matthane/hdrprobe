@@ -16,9 +16,9 @@ use dolby_vision::rpu::vdr_dm_data::VdrDmData;
 use crate::container::DvConfig;
 use crate::dv::ccid;
 use crate::model::{
-    ActiveArea, ColorSource, CompatSource, DolbyVision, DvCensus, FelBrightnessExpansion, L11, L6,
-    LevelPresence, LevelSource, MasteringDisplay, MasteringPrimariesMismatch, MetadataCadence,
-    TrimTarget,
+    ActiveArea, ColorSource, CompatSource, Coverage, DolbyVision, DvCensus,
+    FelBrightnessExpansion, L11, L6, LevelPresence, LevelSource, MasteringDisplay,
+    MasteringPrimariesMismatch, MetadataCadence, TrimTarget,
 };
 
 /// Metadata levels we census, in report order.
@@ -440,7 +440,7 @@ impl DvAggregate {
             },
             trim_targets,
             rpu_count: self.rpu_count,
-            sampled: !full,
+            coverage: if full { Coverage::Full } else { Coverage::Sampled },
             metadata_cadence,
             census,
         })
@@ -551,7 +551,9 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         l11: None,
         trim_targets: Vec::new(),
         rpu_count: 0,
-        sampled: false,
+        // No RPU was read on this path — --no-rpu, or a DV config whose track
+        // yielded no parseable RPU — so the scan coverage is honestly `none`.
+        coverage: Coverage::None,
         metadata_cadence: None,
         census: None,
     }

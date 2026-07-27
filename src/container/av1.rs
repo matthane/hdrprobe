@@ -417,9 +417,9 @@ fn build_demux(
     let (bit_depth, chroma, (color, color_source), codec_profile) = match &seq {
         Some(s) => (
             Some(s.bit_depth),
-            Some(s.chroma.to_string()),
+            s.chroma.map(str::to_string),
             s.color.clone(),
-            Some(crate::av1::seq::av1_profile_label(s.seq_profile, s.seq_tier, s.seq_level_idx)),
+            crate::av1::seq::av1_profile_label(s.seq_profile, s.seq_tier, s.seq_level_idx),
         ),
         None => (None, None, (ColorInfo::default(), ColorSources::default()), None),
     };

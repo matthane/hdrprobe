@@ -130,7 +130,9 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
         dv.and_then(|d| d.l6.as_ref()).map(|l6| crate::model::ContentLight::new(l6.max_cll, l6.max_fall))
     });
 
-    Hdr { format, mastering_display: mastering, content_light }
+    // `base` is the same value the format string's base tag was built from, so
+    // the structured field and the display string can never disagree.
+    Hdr { format, base: base.map(str::to_string), mastering_display: mastering, content_light }
 }
 
 /// HDR Vivid target codes (12-bit PQ) -> distinct nits, sorted ascending.
@@ -198,6 +200,31 @@ pub(crate) fn primaries_label(
 #[cfg(test)]
 mod tests {
     use super::primaries_label;
+
+    /// `hdr.base` is the format string's base tag as a field of its own —
+    /// built from the same value, so the two can never disagree — and absent
+    /// exactly when the tag is (a CCID-0 title has no viewable base).
+    #[test]
+    fn base_field_mirrors_the_format_tag() {
+        use crate::container::{Codec, DvConfig, NalFormat, TrackDemux};
+        use crate::hdr::sei::SeiFindings;
+        let td = TrackDemux::new(Codec::Hevc, NalFormat::AnnexB);
+        let h = super::assemble(&td, None, &SeiFindings::default());
+        assert_eq!((h.format.as_str(), h.base.as_deref()), ("SDR", Some("SDR")));
+
+        let cfg = DvConfig {
+            profile: 5,
+            level: None,
+            bl_present: true,
+            el_present: false,
+            rpu_present: true,
+            bl_compatibility_id: Some(0),
+        };
+        let dv = crate::dv::levels::container_only(&cfg, false);
+        let h = super::assemble(&td, Some(&dv), &SeiFindings::default());
+        assert_eq!(h.format, "Dolby Vision");
+        assert_eq!(h.base, None, "no viewable base, no field");
+    }
 
     #[test]
     fn classifies_the_common_mastering_gamuts() {

@@ -645,8 +645,8 @@ fn fill_from_config(td: &mut TrackDemux, rec: &[u8]) {
         Codec::Av1 => {
             if let Some((depth, chroma, profile)) = super::parse_av1c_record(rec) {
                 td.bit_depth = Some(depth);
-                td.chroma = Some(chroma.to_string());
-                td.codec_profile = Some(profile);
+                td.chroma = chroma.map(str::to_string);
+                td.codec_profile = profile;
             }
             if let Some(c) = super::color_from_av1c(rec) {
                 (td.color, td.color_source) = c;
@@ -675,7 +675,7 @@ fn fill_from_config(td: &mut TrackDemux, rec: &[u8]) {
 fn fill_from_vpcc(td: &mut TrackDemux, rec: &[u8]) {
     let Some(v) = super::parse_vpcc_record(rec) else { return };
     td.bit_depth = Some(v.bit_depth);
-    td.chroma = Some(v.chroma.to_string());
+    td.chroma = v.chroma.map(str::to_string);
     td.codec_profile = Some(v.profile_str);
     (td.color, td.color_source) = v.color;
 }

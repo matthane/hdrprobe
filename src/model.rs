@@ -179,13 +179,15 @@ pub struct VideoTrack {
     pub hdr_vivid: Option<HdrVivid>,
 }
 
-/// Average bitrate. `scope` says whether it's the exact video-stream rate (from a
-/// known encoded byte count) or the container's overall rate (file length ÷
-/// duration, which also counts audio and packet overhead).
+/// Average bitrate. `scope` says whether it's the video-stream rate or the
+/// container's overall rate (file length ÷ duration, which also counts audio
+/// and packet overhead); `source` says whether hdrprobe computed the number or
+/// read it from a header.
 #[derive(Debug, Serialize, Clone, Copy)]
 pub struct Bitrate {
     pub bits_per_sec: f64,
     pub scope: BitrateScope,
+    pub source: BitrateSource,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -195,12 +197,30 @@ pub enum BitrateScope {
     Overall,
 }
 
+/// How a `Bitrate` was obtained. `Measured` = computed from per-sample /
+/// per-chunk sums or actual payload/file bytes (MP4 `stsz`, an AVI index, a
+/// `--full` streamed sum, every `overall` rate). `Declared` = a single rate
+/// or byte count stated in a container header, however the muxer obtained it
+/// (MKV `BPS`/`NUMBER_OF_BYTES` statistics tags, ASF `Data Bitrate`, FLV
+/// `videodatarate`, RealMedia's MDPR average); a declared value can differ
+/// from the encoded reality by a percent or two.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BitrateSource {
+    Measured,
+    Declared,
+}
+
 impl Bitrate {
-    /// Exact per-stream rate the container states directly (e.g. the MKV `BPS`
+    /// Per-stream rate the container states directly (e.g. the MKV `BPS`
     /// statistics tag), used verbatim — it already reflects the video track's own
     /// duration, which a whole-file duration would only approximate.
     pub fn video_stream_bps(bits_per_sec: f64) -> Self {
-        Bitrate { bits_per_sec, scope: BitrateScope::VideoStream }
+        Bitrate {
+            bits_per_sec,
+            scope: BitrateScope::VideoStream,
+            source: BitrateSource::Declared,
+        }
     }
 
     /// Per-stream rate from an exact encoded byte count over the stream duration.
@@ -210,14 +230,31 @@ impl Bitrate {
             return None;
         }
         let d = duration_secs.filter(|d| *d > 0.0)?;
-        Some(Bitrate { bits_per_sec: bytes as f64 * 8.0 / d, scope: BitrateScope::VideoStream })
+        Some(Bitrate {
+            bits_per_sec: bytes as f64 * 8.0 / d,
+            scope: BitrateScope::VideoStream,
+            source: BitrateSource::Measured,
+        })
     }
 
     /// Whole-container rate from the file length; counts audio and packet
     /// overhead, so it is labelled distinctly from a true per-stream rate.
     pub fn overall(file_size: u64, duration_secs: Option<f64>) -> Option<Self> {
         let d = duration_secs.filter(|d| *d > 0.0)?;
-        Some(Bitrate { bits_per_sec: file_size as f64 * 8.0 / d, scope: BitrateScope::Overall })
+        Some(Bitrate {
+            bits_per_sec: file_size as f64 * 8.0 / d,
+            scope: BitrateScope::Overall,
+            source: BitrateSource::Measured,
+        })
+    }
+
+    /// Re-tag a rate as header-declared. For the one shape the constructors
+    /// don't cover: a quotient of a *declared* byte count over a duration
+    /// (MKV `NUMBER_OF_BYTES` without `BPS`), where the numerator's provenance
+    /// is the honest tag.
+    pub fn declared(mut self) -> Self {
+        self.source = BitrateSource::Declared;
+        self
     }
 }
 
@@ -297,6 +334,12 @@ pub struct ColorSources {
 pub struct Hdr {
     /// Classified format string, e.g. "Dolby Vision / HDR10".
     pub format: String,
+    /// The base signal a decoder without the dynamic-metadata layer receives:
+    /// "HDR10", "HLG", or "SDR" — exactly the format string's base tag as a
+    /// field of its own. Absent when the stream has no independently viewable
+    /// base (DV compatibility id 0: Profiles 5, 10.0 and 20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
     /// The base layer's declared mastering display (container MDCV box or
     /// ST.2086 SEI, with the DV L6 fallback on an HDR10 base). One name with
     /// `dolby_vision.mastering_display` and `sl_hdr.source_mastering_display`,
@@ -359,6 +402,20 @@ pub enum CompatSource {
     /// `8.1` because that is what the ecosystem writes, and this field is how
     /// the report discloses that the digit is not backed by data.
     Assumed,
+}
+
+/// How much of the input's frame metadata a report's sampled-union facts rest
+/// on. `Sampled`: a spread of frames (the default probe) — union fields may be
+/// incomplete. `Full`: every frame was read (`--full`, or a sidecar, which is
+/// exhaustive by construction). `None`: no frame metadata was read at all
+/// (`--no-rpu`, or a container declaration with no readable frame), so every
+/// frame-derived field is absent and the counts are zero.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    Sampled,
+    Full,
+    None,
 }
 
 /// Provenance of `DolbyVision::level`, the same shape as `CompatSource`.
@@ -512,8 +569,12 @@ pub struct DolbyVision {
     pub trim_targets: Vec<TrimTarget>,
     /// Number of RPUs successfully parsed.
     pub rpu_count: usize,
-    /// True when the report reflects sampling rather than a full scan.
-    pub sampled: bool,
+    /// What the DV facts rest on: `sampled` (a spread of RPUs — the union
+    /// fields may be incomplete), `full` (every RPU was read: `--full` or a
+    /// sidecar), or `none` (no RPU was read: `--no-rpu`, or a container
+    /// config whose track yielded none — `rpu_count` is 0 and the section is
+    /// built from the config alone).
+    pub coverage: Coverage,
     /// Authoring cadence of the dynamic metadata, decided by comparing
     /// consecutive frames' DM payloads. Present only when every frame's RPU
     /// was read in stream order — a `--full` video scan or a DV sidecar; a
@@ -681,9 +742,11 @@ pub struct HdrVivid {
     /// and like it a sampled union unless the scan read every frame.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub target_max_luminances: Vec<u32>,
-    /// True when `target_max_luminances` came from a sampled spread of frames
-    /// rather than a full scan, mirroring `dolby_vision.sampled`.
-    pub sampled: bool,
+    /// What the HDR Vivid facts rest on, mirroring `dolby_vision.coverage`:
+    /// `sampled` (a spread of frames), `full` (every frame read), or `none`
+    /// (no frame's SEI was read — a `cuvv` box-only detection, e.g. under
+    /// `--no-rpu`, where `version` alone survives).
+    pub coverage: Coverage,
 }
 
 #[derive(Debug, Serialize)]
@@ -756,6 +819,7 @@ mod tests {
             },
             hdr: Some(Hdr {
                 format: "Dolby Vision / HDR10".to_string(),
+                base: Some("HDR10".to_string()),
                 mastering_display: Some(MasteringDisplay {
                     max_luminance: 1000.0,
                     min_luminance: 0.0001,
@@ -819,7 +883,7 @@ mod tests {
                 }),
                 trim_targets: vec![TrimTarget { nits: 100, levels: vec![2, 8] }],
                 rpu_count: 722,
-                sampled: false,
+                coverage: Coverage::Full,
                 metadata_cadence: Some(MetadataCadence {
                     cadence: "per-shot".to_string(),
                     frame_pairs: 721,
@@ -854,7 +918,7 @@ mod tests {
                 version: "1.0".to_string(),
                 system_start_code: Some(1),
                 target_max_luminances: vec![100, 500],
-                sampled: true,
+                coverage: Coverage::Sampled,
             }),
         }
     }
@@ -914,6 +978,7 @@ mod tests {
             "video_tracks[].fps",
             "video_tracks[].bitrate.bits_per_sec",
             "video_tracks[].bitrate.scope",
+            "video_tracks[].bitrate.source",
             "video_tracks[].bit_depth",
             "video_tracks[].chroma",
             "video_tracks[].pixel_aspect_ratio",
@@ -929,6 +994,7 @@ mod tests {
             "video_tracks[].color_source.matrix",
             "video_tracks[].color_source.range",
             "video_tracks[].hdr.format",
+            "video_tracks[].hdr.base",
             "video_tracks[].hdr.mastering_display.max_luminance",
             "video_tracks[].hdr.mastering_display.min_luminance",
             "video_tracks[].hdr.mastering_display.primaries",
@@ -980,7 +1046,7 @@ mod tests {
             "video_tracks[].dolby_vision.trim_targets[].nits",
             "video_tracks[].dolby_vision.trim_targets[].levels[]",
             "video_tracks[].dolby_vision.rpu_count",
-            "video_tracks[].dolby_vision.sampled",
+            "video_tracks[].dolby_vision.coverage",
             "video_tracks[].dolby_vision.metadata_cadence.cadence",
             "video_tracks[].dolby_vision.metadata_cadence.frame_pairs",
             "video_tracks[].dolby_vision.metadata_cadence.changed_pairs",
@@ -1003,7 +1069,7 @@ mod tests {
             "video_tracks[].hdr_vivid.version",
             "video_tracks[].hdr_vivid.system_start_code",
             "video_tracks[].hdr_vivid.target_max_luminances[]",
-            "video_tracks[].hdr_vivid.sampled",
+            "video_tracks[].hdr_vivid.coverage",
         ];
         expected.sort_unstable();
         assert_eq!(paths, expected, "JSON schema surface changed; see docs/SCHEMA.md");
@@ -1028,6 +1094,21 @@ mod tests {
         assert_eq!(obj["primaries"], "container");
         assert_eq!(obj["range"], "stream");
         assert!(!v.to_string().contains("unnamed"), "the marker leaked: {v}");
+    }
+
+    /// The measured/declared split is baked into the constructors: a stated
+    /// per-stream rate is `declared`, computed quotients are `measured`, and
+    /// `declared()` re-tags the one shape outside that mapping (a declared
+    /// byte count over a duration). If a constructor's tag changes, every
+    /// backend's provenance changes with it — this pins the mapping.
+    #[test]
+    fn bitrate_source_is_baked_into_the_constructors() {
+        assert_eq!(Bitrate::video_stream_bps(1.0).source, BitrateSource::Declared);
+        let measured = Bitrate::video_stream(1000, Some(1.0)).expect("rate");
+        assert_eq!(measured.source, BitrateSource::Measured);
+        assert_eq!(Bitrate::overall(1000, Some(1.0)).expect("rate").source, BitrateSource::Measured);
+        assert_eq!(measured.declared().source, BitrateSource::Declared);
+        assert_eq!(measured.declared().scope, BitrateScope::VideoStream, "declared() keeps scope");
     }
 
     #[test]

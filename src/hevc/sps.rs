@@ -62,13 +62,15 @@ struct SpsVui {
 }
 
 impl SpsInfo {
-    pub fn chroma_str(&self) -> &'static str {
+    /// `None` for a reserved `chroma_format_idc`: an undefined code names
+    /// nothing, so the report omits the field rather than print a placeholder.
+    pub fn chroma_str(&self) -> Option<&'static str> {
         match self.chroma_format_idc {
-            0 => "monochrome",
-            1 => "4:2:0",
-            2 => "4:2:2",
-            3 => "4:4:4",
-            _ => "?",
+            0 => Some("monochrome"),
+            1 => Some("4:2:0"),
+            2 => Some("4:2:2"),
+            3 => Some("4:4:4"),
+            _ => None,
         }
     }
 
@@ -508,6 +510,28 @@ pub fn find_sps_in_hvcc(hvcc: &[u8]) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reserved `chroma_format_idc` (H.265 defines 0..=3) names no format,
+    /// so the field is omitted rather than a placeholder printed.
+    #[test]
+    fn reserved_chroma_format_idc_names_nothing() {
+        let mut info = SpsInfo {
+            width: 1920,
+            height: 1080,
+            bit_depth: 10,
+            chroma_format_idc: 1,
+            profile_idc: 2,
+            tier_high: false,
+            level_idc: 120,
+            color: None,
+            frame_rate: None,
+            pixel_aspect: None,
+            scan_type: None,
+        };
+        assert_eq!(info.chroma_str(), Some("4:2:0"));
+        info.chroma_format_idc = 4;
+        assert_eq!(info.chroma_str(), None);
+    }
 
     #[test]
     fn sar_table_matches_h264_table_e1() {

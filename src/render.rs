@@ -357,7 +357,11 @@ fn track_sections(
             // toward — a distinct set like the DV trim targets, with the same
             // sampled caveat (its own footnote text: frames, not RPUs).
             if !hv.target_max_luminances.is_empty() {
-                let mark = if hv.sampled { notes.mark(SAMPLED_FRAMES_NOTE) } else { "" };
+                let mark = if hv.coverage == crate::model::Coverage::Sampled {
+                    notes.mark(SAMPLED_FRAMES_NOTE)
+                } else {
+                    ""
+                };
                 let label =
                     if hv.target_max_luminances.len() == 1 { "Target" } else { "Targets" };
                 let vals = hv
@@ -508,7 +512,11 @@ fn track_sections(
                 // title-global and complete from any sample, but the set can
                 // still be missing preset-target trims, so the mark stays
                 // set-level.)
-                let mark = if dv.sampled { notes.mark(SAMPLED_NOTE) } else { "" };
+                let mark = if dv.coverage == crate::model::Coverage::Sampled {
+                    notes.mark(SAMPLED_NOTE)
+                } else {
+                    ""
+                };
                 let list = dv
                     .trim_targets
                     .iter()
@@ -531,7 +539,9 @@ fn track_sections(
                         "assumes a {}×{} canvas; DV sidecars carry no resolution",
                         canvas.width, canvas.height
                     )),
-                    None if dv.sampled => notes.mark(SAMPLED_NOTE),
+                    None if dv.coverage == crate::model::Coverage::Sampled => {
+                        notes.mark(SAMPLED_NOTE)
+                    }
                     None => "",
                 };
                 let offsets = dv
@@ -1734,6 +1744,7 @@ mod tests {
             color_source: Default::default(),
             hdr: Some(crate::model::Hdr {
                 format: "SDR".to_string(),
+                base: Some("SDR".to_string()),
                 mastering_display: None,
                 content_light: None,
             }),
@@ -1791,7 +1802,7 @@ mod tests {
             l11: None,
             trim_targets: Vec::new(),
             rpu_count: 1,
-            sampled: true,
+            coverage: crate::model::Coverage::Sampled,
             metadata_cadence: None,
             census: None,
         };

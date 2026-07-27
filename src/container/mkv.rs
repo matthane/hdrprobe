@@ -441,7 +441,9 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         let bitrate = if let Some(bps) = vstat.and_then(|s| s.bps) {
             Some(Bitrate::video_stream_bps(bps))
         } else if let Some(bytes) = vstat.and_then(|s| s.number_of_bytes) {
-            Bitrate::video_stream(bytes, duration_secs)
+            // The numerator is a header-declared byte count, not bytes this
+            // walk summed, so the rate is tagged declared like `BPS` above.
+            Bitrate::video_stream(bytes, duration_secs).map(Bitrate::declared)
         } else if full {
             // No statistics tag: the streaming scan sums the exact block bytes
             // (`sample::Scan::es_bytes`, applied in main.rs — the same value the
@@ -1224,15 +1226,15 @@ fn nal_config(
     };
     let parsed = match cfg.codec {
         Codec::Hevc => super::parse_hvcc_record(rec).map(|h| {
-            (h.nal_len, h.bit_depth, h.chroma.to_string(), h.profile_str)
+            (h.nal_len, h.bit_depth, h.chroma.map(str::to_string), h.profile_str)
         }),
         _ => super::parse_avcc_record(rec)
-            .map(|a| (a.nal_len, a.bit_depth, a.chroma.to_string(), a.profile_str)),
+            .map(|a| (a.nal_len, a.bit_depth, a.chroma.map(str::to_string), a.profile_str)),
     };
     if let Some((nal_len, bit_depth, chroma, profile)) = parsed {
         cfg.nal_format = NalFormat::LengthPrefixed(nal_len);
         cfg.bit_depth = Some(bit_depth);
-        cfg.chroma = Some(chroma);
+        cfg.chroma = chroma;
         cfg.codec_profile = Some(profile);
         // The record's embedded SPS also states the sample aspect and the
         // scan signal, exactly as it supplies depth/chroma above.
@@ -1308,7 +1310,7 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
         // CodecPrivate is an AV1CodecConfigurationRecord (same layout as `av1C`),
         // which carries profile/tier/level and bit depth.
         let (bit_depth, chroma, codec_profile) = match super::parse_av1c_record(codec_private) {
-            Some((bd, ch, prof)) => (Some(bd), Some(ch.to_string()), Some(prof)),
+            Some((bd, ch, prof)) => (Some(bd), ch.map(str::to_string), prof),
             None => (None, None, None),
         };
         CodecConfig {
