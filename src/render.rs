@@ -155,7 +155,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     // for a single bold value to read as anything but odd, so its report stays
     // headline-free.
     let multi = r.video_tracks.len() > 1;
-    let sidecar = !multi && r.video_tracks[0].codec.is_empty();
+    let sidecar = !multi && r.video_tracks[0].codec.is_none();
 
     s.push_str(&report_header(&r.file, r.size_bytes, r.input_truncated, o, &c));
     s.push('\n');
@@ -239,8 +239,6 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     // Footnotes collected from marked labels render once at the report's
     // foot, so per-line caveats never clutter the values they qualify (two
     // sampled tracks share one mark — `Footnotes` dedupes identical texts).
-    // The elapsed time is JSON-only (`elapsed_ms`); the text report doesn't
-    // show it.
     for (mark, text) in notes.lines() {
         let _ = writeln!(s, "{}", c.faint(&format!("{mark} {text}")));
     }
@@ -303,7 +301,7 @@ fn track_sections(
         if let Some(hdr) = &t.hdr {
             let _ = writeln!(s, "{}", c.section("HDR"));
             kv_styled(s, c, "Format", &c.bright(&hdr.format));
-            if let Some(m) = &hdr.mastering {
+            if let Some(m) = &hdr.mastering_display {
                 // Gamut first, luminance after: "DCI-P3 D65 · max 1000  min 0.0001 cd/m²".
                 let prim = m.primaries.as_ref().map(|p| format!("{p} · ")).unwrap_or_default();
                 kv(
@@ -529,8 +527,9 @@ fn track_sections(
                 // caveat describes the whole set, so both L5 labels share the
                 // same footnote mark; a full scan carries no mark.
                 let mark = match dv.l5_assumed_canvas {
-                    Some([w, h]) => notes.mark(&format!(
-                        "assumes a {w}×{h} canvas; DV sidecars carry no resolution"
+                    Some(canvas) => notes.mark(&format!(
+                        "assumes a {}×{} canvas; DV sidecars carry no resolution",
+                        canvas.width, canvas.height
                     )),
                     None if dv.sampled => notes.mark(SAMPLED_NOTE),
                     None => "",
@@ -587,16 +586,14 @@ fn track_sections(
                     kv(s, c, "L9 mastering", l9);
                 }
             }
-            if let Some(l11) = &dv.l11_content {
-                let wp = match &dv.l11_white_point {
-                    Some(wp) => format!(" · white point {wp}"),
-                    None => String::new(),
-                };
-                let rm = match dv.l11_reference_mode {
-                    Some(true) => " · reference mode",
-                    _ => "",
-                };
-                kv(s, c, "L11 APO", &format!("{}{}{}", l11, wp, rm));
+            if let Some(l11) = &dv.l11 {
+                let rm = if l11.reference_mode { " · reference mode" } else { "" };
+                kv(
+                    s,
+                    c,
+                    "L11 APO",
+                    &format!("{} · white point {}{}", l11.content, l11.white_point, rm),
+                );
             }
             if let Some(census) = &dv.census {
                 let levels = census
@@ -948,9 +945,10 @@ fn wrap_line(line: &str, width: usize, value_col: usize, words: bool) -> Vec<Str
 
 fn video_line(g: &VideoTrack) -> String {
     let mut parts = Vec::new();
-    let codec = match &g.codec_profile {
-        Some(p) => format!("{} ({})", g.codec, p),
-        None => g.codec.clone(),
+    let codec = match (&g.codec, &g.codec_profile) {
+        (Some(codec), Some(p)) => format!("{codec} ({p})"),
+        (Some(codec), None) => codec.clone(),
+        (None, _) => String::new(),
     };
     if !codec.is_empty() {
         parts.push(codec);
@@ -1681,7 +1679,7 @@ mod tests {
                 track_number: None,
                 program: None,
                 default: None,
-                codec: "HEVC".to_string(),
+                codec: Some("HEVC".to_string()),
                 codec_profile: Some("Multiview Main 10, High tier @ L5".to_string()),
                 width: Some(3840),
                 height: Some(2160),
@@ -1701,7 +1699,6 @@ mod tests {
                 sl_hdr: None,
                 hdr_vivid: None,
             }],
-            elapsed_ms: 0.0,
         };
         let plain = render(&r, &opts(false, 1, 1));
         let video = plain.lines().find(|l| l.trim_start().starts_with("Video")).unwrap();
@@ -1721,7 +1718,7 @@ mod tests {
             track_number: None,
             program: None,
             default,
-            codec: codec.to_string(),
+            codec: Some(codec.to_string()),
             codec_profile: None,
             width: Some(w),
             height: Some(w * 9 / 16),
@@ -1737,7 +1734,7 @@ mod tests {
             color_source: Default::default(),
             hdr: Some(crate::model::Hdr {
                 format: "SDR".to_string(),
-                mastering: None,
+                mastering_display: None,
                 content_light: None,
             }),
             dolby_vision: None,
@@ -1759,7 +1756,6 @@ mod tests {
             format_version: None,
             duration_secs: Some(60.0),
             video_tracks: tracks,
-            elapsed_ms: 0.0,
         }
     }
 
@@ -1775,7 +1771,7 @@ mod tests {
             deprecated_combination: deprecated,
             structure: None,
             level: None,
-            level_derived: false,
+            level_source: None,
             bl_present: true,
             el_present: false,
             rpu_present: true,
@@ -1792,9 +1788,7 @@ mod tests {
             mastering_primaries_mismatch: None,
             l6: None,
             l9_mastering: None,
-            l11_content: None,
-            l11_white_point: None,
-            l11_reference_mode: None,
+            l11: None,
             trim_targets: Vec::new(),
             rpu_count: 1,
             sampled: true,

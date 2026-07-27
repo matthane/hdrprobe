@@ -64,8 +64,6 @@ pub struct Report {
     /// is one *logical* track, never two entries. Metadata sidecars carry one
     /// entry too (empty `codec`), so consumers always iterate the array.
     pub video_tracks: Vec<VideoTrack>,
-    /// Wall-clock parse time in milliseconds.
-    pub elapsed_ms: f64,
 }
 
 /// The VIDEO_TS main feature a DVD-Video ISO probe selected (see
@@ -121,7 +119,11 @@ pub struct VideoTrack {
     /// MKV FlagDefault (absent for containers without such a flag).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<bool>,
-    pub codec: String,
+    /// Resolved codec display name ("HEVC"), or the container's identifier
+    /// verbatim for a codec this build has no parser for. Absent for metadata
+    /// sidecars, which carry no video.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,8 +297,12 @@ pub struct ColorSources {
 pub struct Hdr {
     /// Classified format string, e.g. "Dolby Vision / HDR10".
     pub format: String,
+    /// The base layer's declared mastering display (container MDCV box or
+    /// ST.2086 SEI, with the DV L6 fallback on an HDR10 base). One name with
+    /// `dolby_vision.mastering_display` and `sl_hdr.source_mastering_display`,
+    /// which describe the same kind of fact from other pipeline stages.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mastering: Option<MasteringDisplay>,
+    pub mastering_display: Option<MasteringDisplay>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_light: Option<ContentLight>,
 }
@@ -355,6 +361,17 @@ pub enum CompatSource {
     Assumed,
 }
 
+/// Provenance of `DolbyVision::level`, the same shape as `CompatSource`.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelSource {
+    /// Declared by a container `dvcC`/`dvvC`/TS descriptor.
+    Declared,
+    /// Derived from the coded stream's resolution and frame rate against the
+    /// Dolby P&L level table (a pixel-rate floor; a declared level always wins).
+    Derived,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DolbyVision {
     /// `profile.compatibility`, e.g. "8.1", "7.6 (FEL)", "5.0", "10.4".
@@ -392,15 +409,16 @@ pub struct DolbyVision {
     pub structure: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
-    /// True when `level` was derived from the coded stream's resolution and
-    /// frame rate against the Dolby P&L level table rather than declared by a
-    /// container config. Authentic disc muxes carry no declaration at all (a
+    /// Where `level` came from; present exactly when `level` is. `declared`
+    /// is a container `dvcC`/`dvvC`/TS descriptor. `derived` means computed
+    /// from the coded stream's resolution and frame rate against the Dolby
+    /// P&L level table: authentic disc muxes carry no declaration at all (a
     /// UHD-BD M2TS signals DV via the playlist STN table, not the PMT), so
     /// without the derivation the field would simply be absent there. The
     /// derived value is a pixel-rate floor: the level's bitrate/tier axis is
-    /// not probed, and a declared `dvcC`/`dvvC`/descriptor level always wins.
-    #[serde(skip_serializing_if = "is_false")]
-    pub level_derived: bool,
+    /// not probed, and a declared level always wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level_source: Option<LevelSource>,
     pub bl_present: bool,
     pub el_present: bool,
     pub rpu_present: bool,
@@ -443,11 +461,11 @@ pub struct DolbyVision {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub l5_active_areas: Vec<ActiveArea>,
     /// When L5 offsets were computed against an *assumed* canvas — a DV XML
-    /// carries only aspect ratios, no pixel resolution — this is the `[width,
-    /// height]` we assumed. `None` for real bitstreams, whose L5 offsets are
-    /// baked into the RPU in actual pixels.
+    /// carries only aspect ratios, no pixel resolution — this is the canvas
+    /// we assumed. `None` for real bitstreams, whose L5 offsets are baked
+    /// into the RPU in actual pixels.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub l5_assumed_canvas: Option<[u32; 2]>,
+    pub l5_assumed_canvas: Option<AssumedCanvas>,
     /// The DV grade's own mastering-display luminance: the RPU DM header's
     /// `source_min_pq`/`source_max_pq` (or, for a DV CM XML, the exact global
     /// Level-0 values). Distinct from the HDR section's mastering line, which
@@ -483,14 +501,10 @@ pub struct DolbyVision {
     /// L9 mastering-display color space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l9_mastering: Option<String>,
-    /// L11 content type.
+    /// The L11 (Dolby Vision IQ / content type) block, present when L11 was
+    /// seen. Its three fields ride one block, so they appear together.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub l11_content: Option<String>,
-    /// L11 intended white point.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub l11_white_point: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub l11_reference_mode: Option<bool>,
+    pub l11: Option<L11>,
     /// Distinct trim targets: the L2/L8 union across the read RPUs plus any
     /// L10-defined target displays (custom L8 targets, folded into the L8
     /// set), each tagged with the level(s) that produced it.
@@ -576,6 +590,29 @@ pub struct TrimTarget {
     pub levels: Vec<u8>,
 }
 
+/// The canvas a sidecar's L5 active-area dimensions were computed against
+/// (see `DolbyVision::l5_assumed_canvas`).
+#[derive(Debug, Serialize, Clone, Copy)]
+pub struct AssumedCanvas {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The RPU's L11 content-type block. All three fields ride one block, so a
+/// present `l11` always carries all of them.
+#[derive(Debug, Serialize)]
+pub struct L11 {
+    /// Content type, named per Dolby's L11 definitions: "Default", "Movies",
+    /// "Game", "Sport", "User Generated Content", or "Unknown" for values
+    /// outside the published range.
+    pub content: String,
+    /// Intended white point: "D65" (0, the default), "D93" (8), or "code N"
+    /// for codes Dolby accepts but does not publicly name.
+    pub white_point: String,
+    /// Reference-mode flag.
+    pub reference_mode: bool,
+}
+
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveArea {
     pub width: u32,
@@ -620,7 +657,7 @@ pub struct SlHdr {
     /// (`src_mdcv`), distinct from the base layer's own MDCV signalling.
     /// `primaries_level` is never set here (it is a DV provenance tag).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_mastering: Option<MasteringDisplay>,
+    pub source_mastering_display: Option<MasteringDisplay>,
 }
 
 /// HDR Vivid (CUVA, T/UWA 005) metadata, title-stable header facts only —
@@ -685,7 +722,6 @@ mod tests {
             format_version: Some("4.0.2".to_string()),
             duration_secs: Some(30.0),
             video_tracks: vec![maximal_track()],
-            elapsed_ms: 5.0,
         }
     }
 
@@ -694,7 +730,7 @@ mod tests {
             track_number: Some(1),
             program: Some(28),
             default: Some(true),
-            codec: "HEVC".to_string(),
+            codec: Some("HEVC".to_string()),
             codec_profile: Some("Main 10, High tier @ L5.1".to_string()),
             width: Some(3840),
             height: Some(2160),
@@ -720,7 +756,7 @@ mod tests {
             },
             hdr: Some(Hdr {
                 format: "Dolby Vision / HDR10".to_string(),
-                mastering: Some(MasteringDisplay {
+                mastering_display: Some(MasteringDisplay {
                     max_luminance: 1000.0,
                     min_luminance: 0.0001,
                     primaries: Some("DCI-P3 D65".to_string()),
@@ -735,7 +771,7 @@ mod tests {
                 deprecated_combination: true,
                 structure: Some("Single track, dual layer".to_string()),
                 level: Some(6),
-                level_derived: true,
+                level_source: Some(LevelSource::Derived),
                 bl_present: true,
                 el_present: true,
                 rpu_present: true,
@@ -753,7 +789,7 @@ mod tests {
                     top: 276,
                     bottom: 276,
                 }],
-                l5_assumed_canvas: Some([3840, 2160]),
+                l5_assumed_canvas: Some(AssumedCanvas { width: 3840, height: 2160 }),
                 mastering_display: Some(MasteringDisplay {
                     max_luminance: 4000.0,
                     min_luminance: 0.0001,
@@ -776,9 +812,11 @@ mod tests {
                     zeroed: false,
                 }),
                 l9_mastering: Some("BT.2020".to_string()),
-                l11_content: Some("Movies".to_string()),
-                l11_white_point: Some("D65".to_string()),
-                l11_reference_mode: Some(true),
+                l11: Some(L11 {
+                    content: "Movies".to_string(),
+                    white_point: "D65".to_string(),
+                    reference_mode: true,
+                }),
                 trim_targets: vec![TrimTarget { nits: 100, levels: vec![2, 8] }],
                 rpu_count: 722,
                 sampled: false,
@@ -805,7 +843,7 @@ mod tests {
                 payload_mode: Some("parameter-based".to_string()),
                 target_primaries: Some("BT.2020".to_string()),
                 target_max_luminance: Some(100),
-                source_mastering: Some(MasteringDisplay {
+                source_mastering_display: Some(MasteringDisplay {
                     max_luminance: 1000.0,
                     min_luminance: 0.0001,
                     primaries: Some("BT.2020".to_string()),
@@ -866,7 +904,6 @@ mod tests {
             "dvd_iso.title_duration_secs",
             "format_version",
             "duration_secs",
-            "elapsed_ms",
             "video_tracks[].track_number",
             "video_tracks[].program",
             "video_tracks[].default",
@@ -892,10 +929,10 @@ mod tests {
             "video_tracks[].color_source.matrix",
             "video_tracks[].color_source.range",
             "video_tracks[].hdr.format",
-            "video_tracks[].hdr.mastering.max_luminance",
-            "video_tracks[].hdr.mastering.min_luminance",
-            "video_tracks[].hdr.mastering.primaries",
-            "video_tracks[].hdr.mastering.primaries_level",
+            "video_tracks[].hdr.mastering_display.max_luminance",
+            "video_tracks[].hdr.mastering_display.min_luminance",
+            "video_tracks[].hdr.mastering_display.primaries",
+            "video_tracks[].hdr.mastering_display.primaries_level",
             "video_tracks[].hdr.content_light.max_cll",
             "video_tracks[].hdr.content_light.max_fall",
             "video_tracks[].hdr.content_light.zeroed",
@@ -905,7 +942,7 @@ mod tests {
             "video_tracks[].dolby_vision.deprecated_combination",
             "video_tracks[].dolby_vision.structure",
             "video_tracks[].dolby_vision.level",
-            "video_tracks[].dolby_vision.level_derived",
+            "video_tracks[].dolby_vision.level_source",
             "video_tracks[].dolby_vision.bl_present",
             "video_tracks[].dolby_vision.el_present",
             "video_tracks[].dolby_vision.rpu_present",
@@ -921,7 +958,8 @@ mod tests {
             "video_tracks[].dolby_vision.l5_active_areas[].right",
             "video_tracks[].dolby_vision.l5_active_areas[].top",
             "video_tracks[].dolby_vision.l5_active_areas[].bottom",
-            "video_tracks[].dolby_vision.l5_assumed_canvas[]",
+            "video_tracks[].dolby_vision.l5_assumed_canvas.width",
+            "video_tracks[].dolby_vision.l5_assumed_canvas.height",
             "video_tracks[].dolby_vision.mastering_display.max_luminance",
             "video_tracks[].dolby_vision.mastering_display.min_luminance",
             "video_tracks[].dolby_vision.mastering_display.primaries",
@@ -936,9 +974,9 @@ mod tests {
             "video_tracks[].dolby_vision.l6.min_mastering",
             "video_tracks[].dolby_vision.l6.zeroed",
             "video_tracks[].dolby_vision.l9_mastering",
-            "video_tracks[].dolby_vision.l11_content",
-            "video_tracks[].dolby_vision.l11_white_point",
-            "video_tracks[].dolby_vision.l11_reference_mode",
+            "video_tracks[].dolby_vision.l11.content",
+            "video_tracks[].dolby_vision.l11.white_point",
+            "video_tracks[].dolby_vision.l11.reference_mode",
             "video_tracks[].dolby_vision.trim_targets[].nits",
             "video_tracks[].dolby_vision.trim_targets[].levels[]",
             "video_tracks[].dolby_vision.rpu_count",
@@ -959,9 +997,9 @@ mod tests {
             "video_tracks[].sl_hdr.payload_mode",
             "video_tracks[].sl_hdr.target_primaries",
             "video_tracks[].sl_hdr.target_max_luminance",
-            "video_tracks[].sl_hdr.source_mastering.max_luminance",
-            "video_tracks[].sl_hdr.source_mastering.min_luminance",
-            "video_tracks[].sl_hdr.source_mastering.primaries",
+            "video_tracks[].sl_hdr.source_mastering_display.max_luminance",
+            "video_tracks[].sl_hdr.source_mastering_display.min_luminance",
+            "video_tracks[].sl_hdr.source_mastering_display.primaries",
             "video_tracks[].hdr_vivid.version",
             "video_tracks[].hdr_vivid.system_start_code",
             "video_tracks[].hdr_vivid.target_max_luminances[]",

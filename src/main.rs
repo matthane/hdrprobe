@@ -27,7 +27,6 @@ use std::fs::File;
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
@@ -525,7 +524,6 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         return Ok(report);
     }
 
-    let started = Instant::now();
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     // SAFETY: file is read-only inspected; we accept the usual mmap caveat that
@@ -642,7 +640,6 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         cli,
         progress,
         &frontier,
-        started,
     ))
 }
 
@@ -663,7 +660,6 @@ fn process_stdin(cli: &Cli, progress: &progress::Progress) -> Result<Report> {
         bail!("stdin is a terminal; pipe stream data in or pass a file path");
     }
 
-    let started = Instant::now();
     let (buf, truncated) = read_stdin_head(stdin.lock()).context("reading stdin")?;
     if buf.is_empty() {
         bail!("no data on stdin");
@@ -686,7 +682,6 @@ fn process_stdin(cli: &Cli, progress: &progress::Progress) -> Result<Report> {
         cli,
         progress,
         &frontier,
-        started,
     ))
 }
 
@@ -807,7 +802,6 @@ fn assemble_report(
     cli: &Cli,
     progress: &progress::Progress,
     frontier: &prefetch::Frontier,
-    started: Instant,
 ) -> Report {
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
     let scan = sample::scan(demux, data, &opts, progress, frontier);
@@ -959,7 +953,7 @@ fn assemble_report(
                 .and_then(|c| container::cicp_primaries(c as u16))
                 .map(str::to_string),
             target_max_luminance: sl.target_max_nits.map(u32::from),
-            source_mastering: sl.source_mastering.clone(),
+            source_mastering_display: sl.source_mastering.clone(),
         });
 
         let hdr = Some(hdr::assemble(track, dv.as_ref(), &scan.sei));
@@ -977,7 +971,7 @@ fn assemble_report(
             track_number: track.track_number,
             program: track.program,
             default: track.default_flag,
-            codec: track.codec.label(),
+            codec: Some(track.codec.label()),
             codec_profile: track.codec_profile.clone(),
             width: if track.width > 0 { Some(track.width) } else { None },
             height: if track.height > 0 { Some(track.height) } else { None },
@@ -1054,7 +1048,6 @@ fn assemble_report(
         format_version: None,
         duration_secs,
         video_tracks,
-        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     }
 }
 

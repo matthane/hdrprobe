@@ -16,9 +16,9 @@ use dolby_vision::rpu::vdr_dm_data::VdrDmData;
 use crate::container::DvConfig;
 use crate::dv::ccid;
 use crate::model::{
-    ActiveArea, ColorSource, CompatSource, DolbyVision, DvCensus, FelBrightnessExpansion, L6,
-    LevelPresence,
-    MasteringDisplay, MasteringPrimariesMismatch, MetadataCadence, TrimTarget,
+    ActiveArea, ColorSource, CompatSource, DolbyVision, DvCensus, FelBrightnessExpansion, L11, L6,
+    LevelPresence, LevelSource, MasteringDisplay, MasteringPrimariesMismatch, MetadataCadence,
+    TrimTarget,
 };
 
 /// Metadata levels we census, in report order.
@@ -404,11 +404,11 @@ impl DvAggregate {
                 .is_some_and(|id| ccid::deprecated_combination(profile, id)),
             structure,
             level: cfg.and_then(|c| c.level),
-            // Filled by `fill_derived_level` (main.rs only) when no config
-            // declared a level: the derivation needs the track's real coded
-            // dimensions and frame rate, which a metadata sidecar (assumed
-            // canvas, declared-not-coded rate) doesn't have.
-            level_derived: false,
+            // `derived` is filled by `fill_derived_level` (main.rs only) when
+            // no config declared a level: the derivation needs the track's
+            // real coded dimensions and frame rate, which a metadata sidecar
+            // (assumed canvas, declared-not-coded rate) doesn't have.
+            level_source: cfg.and_then(|c| c.level).map(|_| LevelSource::Declared),
             bl_present: bl,
             el_present: el,
             rpu_present: rpu,
@@ -428,9 +428,16 @@ impl DvAggregate {
             mastering_primaries_mismatch: None,
             l6: self.l6,
             l9_mastering: l9_label,
-            l11_content: self.l11_content.map(content_type_name),
-            l11_white_point: self.l11_white_point.map(white_point_name),
-            l11_reference_mode: self.l11_ref_mode,
+            // The three L11 fields ride one block and fill together
+            // (`fold_dm`), so the triple is total whenever content is Some.
+            l11: match (self.l11_content, self.l11_white_point, self.l11_ref_mode) {
+                (Some(ct), Some(wp), Some(rm)) => Some(L11 {
+                    content: content_type_name(ct),
+                    white_point: white_point_name(wp),
+                    reference_mode: rm,
+                }),
+                _ => None,
+            },
             trim_targets,
             rpu_count: self.rpu_count,
             sampled: !full,
@@ -522,7 +529,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
             .is_some_and(|id| ccid::deprecated_combination(cfg.profile, id)),
         structure: structure_str(el, dual_track),
         level: cfg.level,
-        level_derived: false,
+        level_source: cfg.level.map(|_| LevelSource::Declared),
         bl_present: bl,
         el_present: el,
         rpu_present: rpu,
@@ -541,9 +548,7 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         mastering_primaries_mismatch: None,
         l6: None,
         l9_mastering: None,
-        l11_content: None,
-        l11_white_point: None,
-        l11_reference_mode: None,
+        l11: None,
         trim_targets: Vec::new(),
         rpu_count: 0,
         sampled: false,
@@ -672,7 +677,7 @@ pub fn fill_derived_level(dv: &mut DolbyVision, width: u32, height: u32, fps: Op
         .find(|&&(_, max_rate, max_width)| px_rate <= max_rate as f64 && width <= max_width);
     if let Some(&(level, _, _)) = fit {
         dv.level = Some(level);
-        dv.level_derived = true;
+        dv.level_source = Some(LevelSource::Derived);
     }
 }
 
@@ -1219,44 +1224,45 @@ mod tests {
             };
             let mut dv = container_only(&cfg, false);
             fill_derived_level(&mut dv, w, h, fps);
-            (dv.level, dv.level_derived)
+            (dv.level, dv.level_source)
         };
+        let derived = Some(LevelSource::Derived);
 
         // The motivating case: a genuine UHD-BD clip (no PMT descriptor),
         // 3840x2160 @ 23.976 — just under level 6's anchor rate.
-        assert_eq!(derive(3840, 2160, Some(24000.0 / 1001.0)), (Some(6), true));
+        assert_eq!(derive(3840, 2160, Some(24000.0 / 1001.0)), (Some(6), derived));
         // Each anchor format sits exactly at its own level's bound.
-        assert_eq!(derive(1280, 720, Some(24.0)), (Some(1), true));
-        assert_eq!(derive(1920, 1080, Some(24.0)), (Some(3), true));
-        assert_eq!(derive(1920, 1080, Some(30000.0 / 1001.0)), (Some(4), true));
-        assert_eq!(derive(3840, 2160, Some(60000.0 / 1001.0)), (Some(9), true));
-        assert_eq!(derive(3840, 2160, Some(120.0)), (Some(10), true));
+        assert_eq!(derive(1280, 720, Some(24.0)), (Some(1), derived));
+        assert_eq!(derive(1920, 1080, Some(24.0)), (Some(3), derived));
+        assert_eq!(derive(1920, 1080, Some(30000.0 / 1001.0)), (Some(4), derived));
+        assert_eq!(derive(3840, 2160, Some(60000.0 / 1001.0)), (Some(9), derived));
+        assert_eq!(derive(3840, 2160, Some(120.0)), (Some(10), derived));
         // The equal-rate UHD@120 / 8K@30 pair splits on the width axis.
-        assert_eq!(derive(7680, 4320, Some(30.0)), (Some(11), true));
-        assert_eq!(derive(7680, 4320, Some(120.0)), (Some(13), true));
+        assert_eq!(derive(7680, 4320, Some(30.0)), (Some(11), derived));
+        assert_eq!(derive(7680, 4320, Some(120.0)), (Some(13), derived));
 
         // Levels 4 and 5 admit pictures *wider* than their rate anchor: their
         // spec width caps are 2560 and 3840 against a 1920-wide anchor format.
         // Ultrawide-but-low-rate content is the case that separates the spec's
         // width column from the anchor's width, so pin all three rows.
         // 2560x900x24 = 55,296,000 pps, inside level 4's 62,208,000.
-        assert_eq!(derive(2560, 900, Some(24.0)), (Some(4), true));
+        assert_eq!(derive(2560, 900, Some(24.0)), (Some(4), derived));
         // 2560x1080x24 = 66,355,200 pps, past level 4, inside level 5's rate.
-        assert_eq!(derive(2560, 1080, Some(24.0)), (Some(5), true));
+        assert_eq!(derive(2560, 1080, Some(24.0)), (Some(5), derived));
         // 3840x1600x20 = 122,880,000 pps, just inside level 5's 124,416,000,
         // at exactly its 3840 width cap.
-        assert_eq!(derive(3840, 1600, Some(20.0)), (Some(5), true));
+        assert_eq!(derive(3840, 1600, Some(20.0)), (Some(5), derived));
         // The width cap is still a real bound: one pixel over level 5's 3840
         // falls through to level 11, the next row admitting a wider picture.
-        assert_eq!(derive(3841, 1600, Some(20.0)), (Some(11), true));
+        assert_eq!(derive(3841, 1600, Some(20.0)), (Some(11), derived));
         // Beyond the table: absent, never a guess.
-        assert_eq!(derive(7680, 4320, Some(144.0)), (None, false));
+        assert_eq!(derive(7680, 4320, Some(144.0)), (None, None));
         // No frame rate / degenerate dimensions: absent, never a guess.
-        assert_eq!(derive(3840, 2160, None), (None, false));
-        assert_eq!(derive(3840, 2160, Some(0.0)), (None, false));
-        assert_eq!(derive(0, 0, Some(24.0)), (None, false));
+        assert_eq!(derive(3840, 2160, None), (None, None));
+        assert_eq!(derive(3840, 2160, Some(0.0)), (None, None));
+        assert_eq!(derive(0, 0, Some(24.0)), (None, None));
 
-        // A declared container level always wins, unflagged.
+        // A declared container level always wins, tagged `declared`.
         let cfg = DvConfig {
             profile: 7,
             level: Some(9),
@@ -1267,7 +1273,7 @@ mod tests {
         };
         let mut dv = container_only(&cfg, false);
         fill_derived_level(&mut dv, 3840, 2160, Some(24000.0 / 1001.0));
-        assert_eq!((dv.level, dv.level_derived), (Some(9), false));
+        assert_eq!((dv.level, dv.level_source), (Some(9), Some(LevelSource::Declared)));
     }
 
     #[test]

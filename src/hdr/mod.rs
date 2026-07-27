@@ -130,7 +130,7 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
         dv.and_then(|d| d.l6.as_ref()).map(|l6| crate::model::ContentLight::new(l6.max_cll, l6.max_fall))
     });
 
-    Hdr { format, mastering, content_light }
+    Hdr { format, mastering_display: mastering, content_light }
 }
 
 /// HDR Vivid target codes (12-bit PQ) -> distinct nits, sorted ascending.
