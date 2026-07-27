@@ -11,7 +11,7 @@ Perform the following:
 
 - If currently on main, do not commit there. Switch to the active development
   branch for the upcoming version, creating it if it does not exist yet
-  (convention: `dev/vX.Y.Z`, e.g. `dev/v0.9.0`, named for the version in
+  (convention: `dev/vX.Y.Z`, e.g. `dev/v1.0.0`, named for the version in
   Cargo.toml's next planned bump). If the upcoming version is unclear, ask with
   AskUserQuestion.
 - Group changes into logical commits.
