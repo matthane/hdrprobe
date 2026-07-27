@@ -18,6 +18,22 @@ fn is_false(b: &bool) -> bool {
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
 pub const SCHEMA_VERSION: &str = "3.0";
 
+/// A per-file failure, emitted to the machine output stream only under
+/// `--errors`: one object per failed file, beside the ordinary `Report`s (an
+/// NDJSON line, or a member of the `--json` array). Distinguished from a
+/// `Report` by the presence of the `error` key — a `Report` never carries
+/// one. The stderr diagnostic and the exit-code contract are unchanged by
+/// the flag.
+#[derive(Debug, Serialize)]
+pub struct ErrorReport {
+    /// Same contract version as the reports beside it.
+    pub hdrprobe_schema_version: &'static str,
+    /// The input path, exactly as a successful report's `file` would render it.
+    pub file: String,
+    /// The human-readable failure, the same text the stderr diagnostic carries.
+    pub error: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     /// hdrprobe's own output-schema version (`SCHEMA_VERSION`). The name spells
@@ -1171,6 +1187,23 @@ mod tests {
         assert_eq!(obj["primaries"], "container");
         assert_eq!(obj["range"], "stream");
         assert!(!v.to_string().contains("unnamed"), "the marker leaked: {v}");
+    }
+
+    /// The error object's three keys are its whole shape, and `error` is the
+    /// discriminator consumers are told to test — a `Report` never carries it.
+    #[test]
+    fn error_report_shape_is_pinned() {
+        let e = ErrorReport {
+            hdrprobe_schema_version: SCHEMA_VERSION,
+            file: "bad.mkv".to_string(),
+            error: "demux failed".to_string(),
+        };
+        let v = serde_json::to_value(&e).expect("serializes");
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["hdrprobe_schema_version", "file", "error"]);
+        // And a Report never carries the discriminator.
+        let r = serde_json::to_value(maximal_report()).unwrap();
+        assert!(r.get("error").is_none());
     }
 
     /// Reduction is exact and zero is refused: a zero numerator or

@@ -80,6 +80,13 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = ProgressWhen::Auto)]
     progress: ProgressWhen,
 
+    /// Include per-file error objects in the machine output (--json / --format
+    /// ndjson): a failed file contributes {"file", "error"} beside the reports,
+    /// so a scanner learns which files failed without parsing stderr. Off by
+    /// default; text output and exit codes are unchanged either way.
+    #[arg(long)]
+    errors: bool,
+
     /// One-line summary per file.
     #[arg(short, long)]
     quiet: bool,
@@ -344,6 +351,36 @@ fn main() -> ExitCode {
                 drop(progress);
                 had_error = true;
                 eprintln!("error: {}: {:#}", path.display(), e);
+                // Under --errors the failure also joins the machine stream as
+                // an error object (see SCHEMA.md "Error objects"), so an
+                // NDJSON consumer learns which files failed without parsing
+                // stderr. The stderr line above stays either way, and text
+                // output is untouched.
+                if cli.errors && format != Format::Text {
+                    let err = model::ErrorReport {
+                        hdrprobe_schema_version: model::SCHEMA_VERSION,
+                        file: path.display().to_string(),
+                        error: format!("{e:#}"),
+                    };
+                    match format {
+                        Format::Json => {
+                            json_reports.push(serde_json::to_value(&err).unwrap())
+                        }
+                        Format::Ndjson => {
+                            let mut piece = serde_json::to_string(&err).unwrap();
+                            piece.push('\n');
+                            if stream_reports {
+                                if !write_stdout(&piece) {
+                                    stdout_gone = true;
+                                    break;
+                                }
+                            } else {
+                                out_buf.push_str(&piece);
+                            }
+                        }
+                        Format::Text => unreachable!("gated above"),
+                    }
+                }
             }
         }
     }

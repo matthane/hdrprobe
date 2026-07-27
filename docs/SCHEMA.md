@@ -38,6 +38,7 @@ together with the conditions under which it appears.
   - [`SlHdr`](#slhdr)
   - [`HdrVivid`](#hdrvivid)
 - [How input kind and flags affect presence](#how-input-kind-and-flags-affect-presence)
+- [Error objects (`--errors`)](#error-objects---errors)
 - [Progress events (stderr)](#progress-events-stderr)
 - [Version history](#version-history)
 
@@ -57,7 +58,9 @@ the number of command-line arguments: a directory argument containing one file s
 single object, and a directory containing several yields an array.
 
 A file that cannot be parsed produces no `Report`. The error goes to stderr and the process exit
-code becomes `2`; the remaining files are still reported. Consequences for consumers:
+code becomes `2`; the remaining files are still reported. (Under the opt-in `--errors` flag the
+failure *also* joins the machine stream as an error object — see "Error objects" below — so a
+scanner learns which files failed without parsing stderr.) Consequences for consumers:
 
 - Under `--json`, a run where every input failed prints `[]` (an empty array), including the
   single-input case.
@@ -770,6 +773,26 @@ cannot be fully scanned), metadata sidecars are not detectable via stdin (their 
 extension-based), and `-` may be given at most once per run. A practical integration guide,
 including a Kodi/Python example, is in [INTEGRATION-STDIN.md](INTEGRATION-STDIN.md).
 
+## Error objects (`--errors`)
+
+By default a failed file contributes nothing to stdout, so an NDJSON library scanner that wants
+to know *which* files failed has to parse stderr prose. The opt-in `--errors` flag adds one
+**error object** to the machine output per failed file, beside the ordinary reports: an NDJSON
+line at the point of failure, or a member of the `--json` array (a single-input `--json` run
+whose one file failed prints the error object alone). Text output, the stderr diagnostics, and
+the exit-code contract are unchanged by the flag; without it, output is byte-identical to
+earlier versions.
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `hdrprobe_schema_version` | string | always | Same contract version as the reports beside it |
+| `file` | string | always | The input path, exactly as a successful report's `file` would render it |
+| `error` | string | always | The human-readable failure, the same text the stderr diagnostic carries. Free text: match on its presence, not its wording |
+
+**The discriminator is the `error` key**: a `Report` never carries one, so
+`'error' in obj` (Python) or `has("error")` (jq) separates the two shapes. A consumer that
+ignores unknown objects entirely keeps working without changes, since the flag is opt-in.
+
 ## Progress events (stderr)
 
 A `--full` scan of a large file can run for minutes (it reads every access unit), so hdrprobe
@@ -877,6 +900,9 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   beside their floats — `24000/1001` instead of a repeating decimal, for consumers that need
   the ratio itself. See each field's row for its sources; a measured or averaged rate
   deliberately carries no ratio.
+  Also additive: the opt-in **`--errors` flag** adds one error object per failed file to the
+  machine output (see "Error objects"), so a scanner learns which files failed without parsing
+  stderr; without the flag, output is unchanged.
   Also additive alongside those: the new always-present `video_tracks[].color_source` object gives
   per-field provenance for `color` (`container` / `stream` / `sei` / `spec`); `dolby_vision`
   gains the optional `pq_reshaping` and `deprecated_combination` booleans; and
