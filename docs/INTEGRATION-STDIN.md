@@ -58,8 +58,9 @@ caveat is the sampled union fields, `l5_active_areas` and `trim_targets`: they a
 from the frames a probe actually saw, and a head probe sees only the opening minutes, while a
 file probe spreads its sample points across the whole title. A film that switches aspect ratio
 mid-way, or whose later scenes carry trim targets the opening does not, will show a smaller
-set. The report already marks these fields as sampled (`dolby_vision.sampled: true`, the same
-flag every default probe carries); read them as "at least these", never as a complete list.
+set. The report already marks these fields as sampled (`dolby_vision.coverage: "sampled"`, the
+same value every default probe carries); read them as "at least these", never as a complete
+list.
 
 ## Kodi addon example (Python)
 

@@ -834,8 +834,10 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
 
 ## Version history
 
-- **3.0**: Dolby Vision colour and compatibility provenance (**breaking**). Four changes, each
-  independently breaking, batched into one bump so consumers adapt once.
+- **3.0**: the 1.0.0 contract (**breaking**). Dolby Vision colour and compatibility
+  provenance, the shape and provenance alignments, and the format-coverage growth of the
+  1.0.0 cycle, batched into one bump so consumers adapt once. The eight numbered items are
+  each independently breaking; everything after them is additive.
   1. `dolby_vision.profile_compat_assumed` is **removed** and replaced by
      `dolby_vision.compat_source`, a four-valued string (`declared` / `spec` / `inferred` /
      `assumed`). The boolean could not express the middle two rungs. A consumer reading the old
@@ -1070,7 +1072,7 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
   than the file holds (with slack for ffmpeg's muxer, which systematically declares 10 bytes
   past EOF on complete files); RealAudio-only files error rather than reporting an empty
   track.
-  Ships in hdrprobe 0.9.0. A step-by-step consumer migration guide is in
+  Ships in hdrprobe 1.0.0. A step-by-step consumer migration guide is in
   [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
   `video_tracks[].sl_hdr` object appears when an SL-HDR (ETSI TS 103 433) information SEI was
