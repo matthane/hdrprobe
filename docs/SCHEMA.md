@@ -126,16 +126,19 @@ either use `--format ndjson` or normalize after parsing, e.g. in Python:
 
 - **Absent means omitted, never `null`.** Every optional field is skipped entirely when it has
   no value. No field in the schema is ever serialized as `null`.
-- **Empty arrays are omitted.** `l5_active_areas` and `trim_targets` are absent rather than `[]`
-  when nothing was found.
-- **Default-false booleans may be omitted.** `unconverted_dual_layer_rpu`,
+- **Empty arrays are omitted.** `l5_active_areas`, `trim_targets`, and
+  `hdr_vivid.target_max_luminances` are absent rather than `[]` when nothing was found.
+- **Default-false booleans may be omitted.** `input_truncated`, `unconverted_dual_layer_rpu`,
   `pq_reshaping`, and `deprecated_combination` appear only when `true`. All other booleans (`bl_present`,
   `el_present`, `rpu_present`, `zeroed`, `l11.reference_mode`) are serialized
-  whenever their containing object is.
+  whenever their containing object is — except `video_tracks[].default`, which is present
+  only when the container states a default-track flag (MKV) and carries whichever value it
+  states.
 - **Numbers.** JSON has a single number type; the tables below note the underlying type.
   Integer-typed fields are always whole numbers. Float-typed fields (`fps`, `duration_secs`,
-  `bits_per_sec`, `max_luminance`, `min_luminance`, `bl_max_nits`, `rpu_max_nits`, and the
-  progress events' `elapsed_ms`)
+  `bits_per_sec`, `max_luminance`, `min_luminance`, `bl_max_nits`, `rpu_max_nits`,
+  `pixel_aspect_ratio`, `display_aspect_ratio`, `bd_iso.playlist_duration_secs`,
+  `dvd_iso.title_duration_secs`, and the progress events' `elapsed_ms`)
   may carry fractional digits.
 - **Key order is not significant.** Keys currently serialize in model order, but consumers
   should treat objects as unordered maps.
@@ -193,6 +196,9 @@ Report
 ├─ bd_iso: BdIso                      (Blu-ray ISO probes only)
 ├─ dvd_iso: DvdIso                    (DVD-Video ISO probes only)
 └─ video_tracks[]: VideoTrack         (always at least one entry)
+   ├─ fps_rational: Rational
+   ├─ pixel_aspect_ratio_rational: Rational
+   ├─ display_aspect_ratio_rational: Rational
    ├─ bitrate: Bitrate
    ├─ color: ColorInfo
    ├─ color_source: ColorSources
@@ -205,12 +211,15 @@ Report
    │  ├─ mastering_primaries_mismatch: MasteringPrimariesMismatch
    │  ├─ l6: L6
    │  ├─ l5_active_areas[]: ActiveArea
+   │  ├─ l5_assumed_canvas: AssumedCanvas   (sidecars only)
+   │  ├─ l11: L11
    │  ├─ trim_targets[]: TrimTarget
    │  ├─ metadata_cadence: MetadataCadence
    │  └─ census: DvCensus
    │     └─ level_presence[]: LevelPresence
    ├─ hdr10plus: Hdr10Plus            (when HDR10+ metadata was found)
    ├─ sl_hdr: SlHdr                   (when an SL-HDR information SEI was found)
+   │  └─ source_mastering_display: MasteringDisplay
    └─ hdr_vivid: HdrVivid             (when HDR Vivid metadata was found)
 ```
 
@@ -224,7 +233,7 @@ section.
 | `hdrprobe_schema_version` | string | always | Version of hdrprobe's own output schema, `"<major>.<minor>"`; see Schema versioning above. Not related to the inspected file's metadata (contrast `format_version` and `video_tracks[].dolby_vision.cm_version`) |
 | `file` | string | always | The input path as given on the command line (or as found during a directory scan); `"-"` for a stdin probe |
 | `size_bytes` | integer | always | File size in bytes. For a truncated stdin probe (`input_truncated` present) this is the bytes actually probed, not the source's size |
-| `input_truncated` | boolean | when true | Only part of the input was (or could be) probed. For a **stdin** probe: the piped stream exceeded the head budget, so only a leading window was probed — `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (TS `duration_secs`, non-MP4 `bitrate`) are withheld; see the stdin paragraph under "How input kind and flags affect presence". For a **file** probe: the container itself declares more bytes than the file holds (AVI's RIFF segment sizes, ASF's `File Properties.File Size`, FLV's `onMetaData.filesize`, RealMedia's `DATA` chunk extent) — a partial download or a capture that never closed; the backend has already withheld what a prefix cannot support (any `"overall"` bitrate; ASF also its duration), and the flag names why (RealMedia's declared duration and stream bitrate are header facts and stand). Never set from a merely absent declaration. Absent for whole files and for stdin streams that ended within the budget |
+| `input_truncated` | boolean | when true | Only part of the input was (or could be) probed. For a **stdin** probe: the piped stream exceeded the head budget, so only a leading window was probed — `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (the span-measured `duration_secs` of TS, program streams, Ogg, and raw DV; every `bitrate` except MP4/MOV's and RealMedia's `video_stream` rates) are withheld; see the stdin paragraph under "How input kind and flags affect presence". For a **file** probe: the container itself declares more bytes than the file holds (AVI's RIFF segment sizes, ASF's `File Properties.File Size`, FLV's `onMetaData.filesize`, RealMedia's `DATA` chunk extent) — a partial download or a capture that never closed; the backend has already withheld what a prefix cannot support (any `"overall"` bitrate; ASF also its duration), and the flag names why (RealMedia's declared duration and stream bitrate are header facts and stand). Never set from a merely absent declaration. Absent for whole files and for stdin streams that ended within the budget |
 | `container` | string | always | Container or sidecar kind; see the value table under `VideoTrack` below |
 | `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes and `BdIso`" below |
 | `dvd_iso` | `DvdIso` | DVD-Video ISO probes only | Which VIDEO_TS title set was auto-selected as the main feature; see "DVD-Video ISO probes and `DvdIso`" below |
@@ -253,7 +262,8 @@ TS capture with one video stream per service. A Dolby Vision Profile-7 base+enha
 pair is **one logical track** and never produces two entries, whatever the mux shape (MP4
 dual-`trak`, TS dual-PID, or an atypical dual-track MKV): the pair reports as a single entry
 with `dolby_vision.structure` = `"Dual track, dual layer"`. Track order follows the container:
-MKV by TrackNumber, MP4 by `trak` order, TS by program then PID.
+MKV by TrackNumber, MP4 by `trak` order, TS by program then PID, AVI by header-list order,
+ASF by stream number, Ogg by BOS-page order, MPEG program streams by stream id.
 
 ### Blu-ray ISO probes and `BdIso`
 
@@ -306,7 +316,7 @@ error, the AACS rule; decrypted backups clear those bits and probe normally.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number, MPEG program stream the PES stream id (or, for HD DVD `.evo` video on the extended id 0xFD, the `stream_id_extension` substream id, 0x55..0x5F). Absent where no such id exists (raw elementary streams, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
+| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number, MPEG program stream the PES stream id (or, for HD DVD `.evo` video on the extended id 0xFD, the `stream_id_extension` substream id, 0x55..0x5F), AVI the stream's header-list index, ASF the stream number, RealMedia the MDPR stream number. Absent where no such id exists (raw elementary streams, FLV, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
 | `codec` | string | optional | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, `"DV"` (raw `.dv`/`.dif` input; DV inside AVI/MOV still reports its carriage FourCC), `"RealVideo 1"`/`"2"`/`"3"`/`"4"` (RealMedia `VIDO` FourCCs `RV10`..`RV40`; an unrecognized `VIDO` FourCC reports verbatim), or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. Absent for metadata sidecars, which carry no video; always present for video inputs. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **FourCC fallbacks** (AVI/ASF `biCompression`, the MP4/MOV sample-entry code): space padding is trimmed (QuickTime's `dvc ` reports `"dvc"`, matching `codec_id` and MediaInfo), and a code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed AVI video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so that carriage differs here |
@@ -314,12 +324,12 @@ error, the AACS rule; decrypted backups clear those bits and probe normally.
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
-| `fps` | float | optional | Frame rate. From container timing (MP4/MKV), the SPS VUI (TS, raw HEVC), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>`. A clock-quantized period (MKV `DefaultDuration`, ASF's tick period) that exactly encodes a standard rate reports that rate — see `fps_rational`'s decode rule — so MKV remuxes read `23.976023976…` rather than the quantized `23.976024167…`. Absent when the input carries no rate signal; never guessed |
+| `fps` | float | optional | Frame rate. From container timing (MP4/MKV/AVI/ASF/FLV/RealMedia), the coded stream's own timing signal (the SPS VUI for TS and raw HEVC, the MPEG-1/2 and VC-1 rate tables, MPEG-4 Part 2's `fixed_vop_rate` pair, Theora's identification header, raw DV's system rate), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>` — the same source set as `fps_rational`, plus the measured/averaged cases. A clock-quantized period (MKV `DefaultDuration`, ASF's tick period) that exactly encodes a standard rate reports that rate — see `fps_rational`'s decode rule — so MKV remuxes read `23.976023976…` rather than the quantized `23.976024167…`. Absent when the input carries no rate signal; never guessed |
 | `fps_rational` | object `{num, den}` | optional | The frame rate as the exact reduced ratio it was signalled as (`{"num": 24000, "den": 1001}`), where the source states one: an H.264/HEVC VUI's `time_scale`/`num_units_in_tick`, MP4's uniform `stts` delta, the MPEG-1/2 and VC-1 rate tables, MPEG-4 Part 2's `fixed_vop_rate` pair, Theora `FRN`:`FRD`, an AV1 sequence header's timing info, DV's system rate, RealMedia's 16.16 field, AVI's `dwRate`:`dwScale`. MKV's `DefaultDuration` (nanoseconds per frame) and ASF's average frame period (100 ns ticks) are **clock-quantized encodings** of the authored rate, and are decoded exactly: a stored period that is bit-for-bit the integer encoding of a standard broadcast/cinema rate reports that rate (`41708333` ns *is* 24000/1001 on the nanosecond clock), while a period matching no standard rate's encoding keeps the raw tick ratio — an exact inverse of the quantization, never a tolerance snap, so a genuinely nonstandard rate is preserved. The `fps` float is the same value as a decimal (they may differ in the last binary digit). Absent when the rate was measured or averaged rather than stated as a ratio (IVF timestamps, frame-count over duration), or when `fps` is |
 | `duration_secs` | float | optional | This track's own duration, where the container states one per track: MP4's media duration (or summed fragment runs), the mkvmerge `DURATION` statistics tag, AVI's per-stream declared length, RealMedia's MDPR duration. The report-level `duration_secs` stays the file-level value (the longest stream's); on single-track files the two usually agree to within a frame |
 | `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists. The `"overall"` (file-length) fallback rate appears only when this is the file's sole video track (an overall rate attributed to one of several tracks would be a wrong number) |
-| `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
-| `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"`, `"4:1:1"` (DV, MJPEG), `"4:4:0"` (MJPEG, VP9). A reserved signalling value names no format and omits the field |
+| `bit_depth` | integer | optional | Luma bit depth: 8, 10, or 12 for every recognized codec except MJPEG, which reports the frame's own `SOF` sample precision verbatim (8 for baseline; extended and lossless frames may legally state up to 16) |
+| `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"`, `"4:4:4:4"` (a ProRes 4444 frame with alpha, when the frame header is the source — the Matroska carriage), `"4:1:1"` (DV, MJPEG), `"4:4:0"` (MJPEG, VP9). A reserved signalling value names no format and omits the field |
 | `pixel_aspect_ratio` | float | optional | Pixel (sample) aspect ratio, width of one pixel over its height (1.0 = square). Signalled by the coded stream (H.264/HEVC VUI `aspect_ratio_idc`/Extended_SAR, MPEG-4 Part 2 and MPEG-1 aspect codes, Theora `PARN`:`PARD`, VC-1 `ASPECT_RATIO`) or the container (MP4 `pasp` — which wins over the stream, like colour), or derived exactly from a signalled display ratio and the coded size (MPEG-2's DAR codes, MKV `DisplayWidth`:`DisplayHeight`, AVI `vprp`). Absent when nothing signals either ratio — never a guessed square |
 | `pixel_aspect_ratio_rational` | object `{num, den}` | optional | The pixel aspect ratio as an exact reduced ratio; present exactly when the float is (both derive from the same signalled rational) |
 | `display_aspect_ratio` | float | optional | Display aspect ratio of the presented picture. Signalled directly or derived exactly from the pixel ratio and the coded size; present exactly when `pixel_aspect_ratio` is. The text report shows it (as `DAR 16:9` etc.) only when the pixels are not square; the JSON always carries both |
@@ -375,7 +385,7 @@ Metadata sidecars (one `video_tracks` entry with no `codec` and no `hdr` section
 
 | Codec | Format | Examples |
 |---|---|---|
-| HEVC | `<profile>, <tier> tier @ L<level>` | `"Main 10, High tier @ L5.1"`, `"Main, Main tier @ L4"` |
+| HEVC | `<profile>, <tier> tier @ L<level>` (an unrecognized `profile_idc` renders as `profile <n>`) | `"Main 10, High tier @ L5.1"`, `"Main, Main tier @ L4"` |
 | MV-HEVC | The HEVC label prefixed with `Multiview ` | `"Multiview Main 10, High tier @ L5"` |
 | AVC | `<profile> @ L<level>` | `"High @ L4.2"`, `"Constrained High @ L4"`, `"Constrained Baseline @ L3.1"` |
 | AV1 | `<profile> profile, <tier> tier @ L<level>` (level omitted when unset) | `"Main profile, Main tier @ L5.1"`, `"Main profile, Main tier"` |
@@ -385,7 +395,7 @@ Metadata sidecars (one `video_tracks` entry with no `codec` and no `hdr` section
 | MPEG-2 | `<profile>@<level>` from `profile_and_level_indication`; omitted when the byte is a reserved combination | `"Main@Main"`, `"Main@High"`, `"High@High 1440"`, `"4:2:2@High"` |
 | MPEG-1 | Always omitted: ISO/IEC 11172-2 has no profile or level field | |
 | MPEG-4 Visual | `<profile>@L<level>` from `profile_and_level_indication`; omitted when the byte is reserved, and omitted entirely when the stream carries no VisualObjectSequence header, which many muxes drop | `"Simple@L1"`, `"Simple@L0b"`, `"Advanced Simple@L3b"`, `"Simple Studio@L4"` |
-| VC-1 | `Advanced@L<level>` from the sequence header for Advanced Profile; the bare profile name (`"Simple"`, `"Main"`, `"Complex"`) for the others, whose STRUCT_C carries no level | `"Advanced@L3"`, `"Main"` |
+| VC-1 | `Advanced@L<level>` from the sequence header for Advanced Profile. Simple and Main report `<profile>@<Low|Medium|High>` when an MP4 `dvc1` box states its level field, else the bare profile name (`"Simple"`, `"Main"`) — STRUCT_C itself carries no level, which is what the VfW carriages have | `"Advanced@L3"`, `"Main@High"`, `"Main"` |
 | MS-MPEG-4 | Always omitted: the pre-standard Microsoft variants signal no profile | |
 | MJPEG | Always omitted: T.81 defines processes, not signalled profiles | |
 
@@ -402,8 +412,9 @@ measurement, and `source` says which kind each rate is. On MP4/MOV it is an exac
 sample-size table (`"measured"`); on AVI it is the file's index summed (`"measured"`); on
 Matroska it is mkvmerge's own `BPS` statistic — measured by the muxer, but read from a header
 tag, so it is `"declared"`. On **ASF, FLV and RealMedia** it is a per-stream average the muxer
-*declared* — ASF's Extended Stream Properties `Data Bitrate`, FLV's
-`onMetaData.videodatarate`, RealMedia's MDPR average — which is what both reference tools
+*declared* — ASF's Extended Stream Properties `Data Bitrate` (falling back to the
+`Stream Bitrate Properties` per-stream record, which additionally counts packet overhead),
+FLV's `onMetaData.videodatarate`, RealMedia's MDPR average — which is what both reference tools
 report for those formats and is the only per-stream figure those containers carry. A declared
 value can differ from the encoded reality by a percent or two. Running `--full` on an FLV
 replaces it with the exact summed video payload (`"measured"`); ASF has no such upgrade,
@@ -446,7 +457,7 @@ when `ColorInfo` carries a value for it, so the two objects always have the same
 | Value | Meaning |
 |---|---|
 | `"container"` | A container colour box or element: MP4 `colr` or `vpcC`, MKV `Colour` |
-| `"stream"` | The coded stream's own signalling: an SPS/sequence-header VUI, read in band or from the parameter set embedded in an `hvcC`/`avcC`/`av1C`/`dvc1` record, or a VP9/ProRes/MPEG frame or visual-object header |
+| `"stream"` | The coded stream's own signalling: an SPS/sequence-header VUI, read in band or from the parameter set embedded in an `hvcC`/`avcC`/`av1C`/`dvc1` record, a VP9/ProRes/MPEG frame or visual-object header, or Theora's identification header |
 | `"sei"` | An SEI message overriding the above; today only the HLG/PQ alternative-transfer-characteristics message |
 | `"spec"` | Not signalled anywhere, and supplied by a specification that defines what an absent signal means: the Dolby Vision profile and compatibility id, MPEG-4 Part 2's defaults for an absent `video_signal_type()`, and VC-1's defaults for a clear `COLOR_FORMAT_FLAG` |
 
@@ -705,7 +716,7 @@ per-frame tone-mapping payload never is.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `version` | string | always | The CUVA metadata version, `"1.0"` through `"4.0"`. From the `cuvv` box's version bitmap when the container declares one (its highest declared version — the declaration covers the whole stream, where a sampled SEI shows one frame's), else from the SEI's T.35 provider-oriented code (the field T/UWA 005.2-1 itself defines as the version; note MediaInfo's SEI-path `HDR_Format_Version` renders the data-set type below instead) |
+| `version` | string | always | The CUVA metadata version — `"1.0"` through `"4.0"` are the versions T/UWA 005 defines today (a `cuvv` bitmap declaring a reserved higher bit renders that higher number verbatim rather than clamping). From the `cuvv` box's version bitmap when the container declares one (its highest declared version — the declaration covers the whole stream, where a sampled SEI shows one frame's), else from the SEI's T.35 provider-oriented code (the field T/UWA 005.2-1 itself defines as the version; note MediaInfo's SEI-path `HDR_Format_Version` renders the data-set type below instead) |
 | `system_start_code` | integer | optional | The dynamic-metadata data-set type byte from the T.35 message. Absent when detection came only from the `cuvv` declaration and no frame's SEI was read (e.g. `--no-rpu`) |
 | `target_max_luminances` | array of integers | when non-empty | Distinct targeted-system-display max luminances of the tone-mapping parameter sets, cd/m², sorted ascending — the display anchors the per-frame curves are computed toward, the HDR Vivid analogue of the DV trim-target set (e.g. `[100, 500]` for a title carrying an SDR curve and a 500-nit HDR curve). A sampled union unless every frame was read |
 | `coverage` | string | always | What the HDR Vivid facts rest on, mirroring `dolby_vision.coverage`: `"sampled"` (a spread of frames, `target_max_luminances` a possibly incomplete union), `"full"` (every frame read), or `"none"` (no frame's SEI was read — a `cuvv` box-only detection under `--no-rpu`, where `version` alone survives) |
@@ -730,17 +741,21 @@ those entries are complete from any sample); `census` and `metadata_cadence` are
 sampled frames.
 
 **`--full`.** Every RPU is scanned: `coverage` is `"full"` (on `dolby_vision` and `hdr_vivid`
-alike), `census` and `metadata_cadence` appear, and TS inputs gain an exact video-stream
-`bitrate`. DV sidecars behave like `--full` by construction (every RPU in the file is read).
+alike), `census` and `metadata_cadence` appear, and the formats whose exact video byte count
+needs a whole-file walk gain an exact measured video-stream `bitrate`: TS/M2TS, an MKV with
+no statistics tags, FLV (replacing its declared rate), Ogg, and raw MPEG-1/2 (which also
+gains its frame-arithmetic `duration_secs`). DV sidecars behave like `--full` by construction
+(every RPU in the file is read).
 
 **`--no-rpu`.** No frame bytes are read at all, so every SEI-derived fact disappears, not
 just the RPU-derived ones. The DV section is built from the container configuration alone:
-`profile`, `compat_source`, `structure`, `level`, the presence booleans,
+`profile`, `compat_source`, `structure`, `level` (with `level_source`, present exactly when
+`level` is), the presence booleans,
 `bl_compatibility_id`, `compatibility`, and `deprecated_combination` can appear (as can
 `color`'s spec-defined fill and `pq_reshaping`, both of which need only the container's
 declared profile and id); everything RPU-derived (`el_type`, `reconstructed_bit_depth`,
 `cm_version`, L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `metadata_cadence`,
-`census`) is absent, `rpu_count` is `0`, and `coverage` is `"none"`. `hdr10plus` and `sl_hdr` are entirely absent
+`census`, `unconverted_dual_layer_rpu`) is absent, `rpu_count` is `0`, and `coverage` is `"none"`. `hdr10plus` and `sl_hdr` are entirely absent
 (their only carriage is in-frame), SEI-sourced `hdr.mastering_display`/`hdr.content_light` fall away
 (container-box values still report), and `hdr_vivid` survives only via the MP4 `cuvv`
 declaration — `version` alone with `coverage` `"none"`, no `system_start_code`, no
@@ -818,7 +833,7 @@ Two event shapes, distinguished by `event`:
 | `phase` | string | `progress` only | `"index"` (a demux-time whole-file walk) or `"scan"` (the per-frame scan) |
 | `bytes_done` | integer | `progress` only | Bytes processed within the phase |
 | `bytes_total` | integer | `progress` only | The phase's byte denominator |
-| `percent` | number | `progress` only | `bytes_done / bytes_total`, one decimal |
+| `percent` | number | `progress` only | `bytes_done / bytes_total` as a percentage, `0.0`–`100.0`, one decimal |
 | `elapsed_ms` | number | always | Milliseconds since this file's processing started |
 
 Per file: each phase opens with a `percent: 0` line, updates are throttled (at most a few per

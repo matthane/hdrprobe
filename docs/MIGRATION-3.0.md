@@ -139,10 +139,11 @@ All additive; a consumer that tolerates unknown fields needs no changes for thes
   (`{hdrprobe_schema_version, file, error}`) to the machine output beside the reports, so a
   scanner learns which files failed without parsing stderr. Discriminate on the `error` key,
   which a `Report` never carries.
-- **New formats.** MPEG-1/2, MPEG-4 Part 2, VC-1, MS-MPEG-4, MJPEG, Theora, DV and RealVideo
-  join the `codec` set, and program streams, AVI, ASF, FLV, Ogg, raw DV, RealMedia and
-  DVD-Video ISOs join the `container` set; files that previously produced no report at all
-  now produce full ones. See SCHEMA.md's version history for the per-format details.
+- **New formats.** MPEG-1/2, MPEG-4 Visual, VC-1, MS-MPEG-4, MJPEG, Theora, VP8,
+  Sorenson H.263, On2 VP6, DV and RealVideo join the `codec` set, and program streams, AVI,
+  ASF, FLV, Ogg, raw DV, RealMedia and DVD-Video ISOs join the `container` set; files that
+  previously produced no report at all now produce full ones. See SCHEMA.md's version history
+  for the per-format details.
 
 ## Typical jq migrations
 

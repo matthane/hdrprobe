@@ -209,15 +209,15 @@ hdrprobe reads both video files and standalone metadata sidecar files:
 
 | Input | Type | Codecs | Notes |
 |---|---|---|---|
-| MP4 / MOV | Video | HEVC, AVC, AV1, VP9, ProRes | One or more video tracks; an enhancement layer may ride its own track |
-| MKV / WebM | Video | HEVC, AVC, AV1, VP9, ProRes | One or more video tracks; an enhancement layer is typically interleaved into its base track |
-| MPEG-TS / M2TS | Video | HEVC, AVC | One or more programs, each with its own video stream; an enhancement layer may ride its own PID |
+| MP4 / MOV | Video | HEVC, AVC, AV1, VP9, ProRes, plus the legacy codecs below | One or more video tracks; an enhancement layer may ride its own track |
+| MKV / WebM | Video | HEVC, AVC, AV1, VP9, ProRes, plus the legacy codecs below | One or more video tracks; an enhancement layer is typically interleaved into its base track |
+| MPEG-TS / M2TS | Video | HEVC, AVC, MPEG-1/2, MPEG-4 Visual | One or more programs, each with its own video stream; an enhancement layer may ride its own PID |
 | Blu-ray ISO (`.iso`) | Video | HEVC, AVC | Decrypted disc image: hdrprobe reads the disc's playlists, picks the main feature automatically, and reports on it as if the stream file had been probed directly. Encrypted images are detected and rejected |
 | DVD-Video ISO (`.iso`) | Video | MPEG-2 | Decrypted disc image: hdrprobe finds the main feature's title set, reports on its video, and shows the disc's own declared runtime. CSS-encrypted images are detected and rejected |
 | Raw HEVC (Annex-B) | Video | HEVC | Elementary stream; profile inferred from the RPU |
 | Raw AV1 (IVF or low-overhead OBU) | Video | AV1 | Elementary stream; the RPU rides an in-band metadata OBU |
 | Raw VP9 (IVF) | Video | VP9 | Elementary stream; a bare VP9 stream carries no HDR signalling of its own, so colour beyond matrix and range comes only from a container |
-| Legacy containers | Video | MPEG-1/2, MPEG-4 Visual, VC-1, Theora, VP8, RealVideo, DV, and the above | AVI, ASF/WMV, FLV, MPEG program stream (`.mpg`, `.vob`), Ogg, RealMedia (`.rm`, `.rmvb`), raw DV tape streams (`.dv`), and raw MPEG elementary streams. These formats predate HDR and record little, so hdrprobe reports the general facts they do carry rather than an HDR section; the point is that an older file in a mixed library is described rather than skipped |
+| Legacy containers | Video | MPEG-1/2, MPEG-4 Visual, VC-1, Motion JPEG, MS-MPEG-4, Sorenson H.263, On2 VP6, Theora, VP8, RealVideo, DV, and the above | AVI, ASF/WMV, FLV, MPEG program stream (`.mpg`, `.vob`, HD DVD `.evo`), Ogg, RealMedia (`.rm`, `.rmvb`), raw DV tape streams (`.dv`, `.dif`), and raw MPEG elementary streams. These formats predate HDR and record little, so hdrprobe reports the general facts they do carry rather than an HDR section; the point is that an older file in a mixed library is described rather than skipped |
 | Dolby Vision RPU (`.bin`, `.rpu`) | Sidecar | – | Raw RPU stream (for example from `dovi_tool extract-rpu`), aggregated across every frame |
 | Dolby Vision CM XML (`.xml`) | Sidecar | – | Dolby CM metadata (DolbyLabsMDF), aggregated per shot |
 | HDR10+ JSON (`.json`) | Sidecar | – | hdr10plus_tool metadata; reports the file-level profile and the first scene from a bounded head read |
@@ -228,7 +228,7 @@ correctly, at no cost to correctly-named files. Likewise each sidecar is identif
 rather than extension alone, so an unrelated `.bin`, `.xml`, or `.json` in a scanned directory
 is skipped.
 
-Sidecars carry no picture data, bypass the video pipeline entirely. Because none of these
+Sidecars carry no picture data and bypass the video pipeline entirely. Because none of these
 formats records a resolution, the L5 active-area dimensions for the Dolby Vision sidecars are
 computed against an assumed UHD (3840x2160) master and labelled as assumed in the report.
 
@@ -281,7 +281,10 @@ hdrprobe --format ndjson -r ./library > report.ndjson
 curl -sr 0-25165823 "$URL" | hdrprobe --json -   # probe the head of a piped stream
 ```
 
-A directory argument is scanned for video files. Add `-r` to descend into subdirectories.
+A directory argument is scanned for video files. Add `-r` to descend into subdirectories. A
+few extensions that usually name something other than video (`.ogg`, `.oga`, `.wma`, `.bin`)
+are deliberately left out of directory scans, so pointing hdrprobe at a music library does not
+print an error per audio file; name such a file directly and it is read normally.
 
 Media that has no file path (a network stream, or an app's internal virtual file system) can
 be piped to `hdrprobe -`: it probes the beginning of the stream, takes only what it needs, and
@@ -289,7 +292,8 @@ the report says when it saw a partial stream. Integrators can start with
 [docs/INTEGRATION-STDIN.md](docs/INTEGRATION-STDIN.md).
 
 For scripting against the JSON output, every object and field is documented in
-[docs/SCHEMA.md](docs/SCHEMA.md).
+[docs/SCHEMA.md](docs/SCHEMA.md). Consumers of the 2.x JSON schema can migrate with
+[docs/MIGRATION-3.0.md](docs/MIGRATION-3.0.md).
 
 ### Options
 
@@ -299,9 +303,10 @@ For scripting against the JSON output, every object and field is documented in
 | `--format <fmt>` | `text` (default), `json`, or `ndjson` (one object per line) |
 | `-f, --full` | Exhaustive per-frame scan: all distinct L5, a full trim-target census, scene counts, and the shot-based vs frame-by-frame metadata cadence. Trades speed for completeness. Shows a live progress bar in the terminal. |
 | `--progress <mode>` | Progress reporting for `--full` scans: `auto` (default, bar on an interactive terminal), `bar`, `json` (machine-readable events on stderr, see [docs/SCHEMA.md](docs/SCHEMA.md)), or `off` |
+| `--errors` | With `--json` / `--format ndjson`: a file that fails to parse contributes an error object beside the reports, so a scan's failures are machine-readable instead of stderr-only. Text output and exit codes are unchanged. |
 | `--no-rpu` | Report the container DV configuration only, skipping RPU parsing. Effectively instant. |
 | `-s, --samples <N>` | Number of seek points to sample (default 16). Higher values capture more distinct L5 areas. |
-| `--sections <list>` | Comma-separated list drawn from `general,hdr,dv,hdr10plus,slhdr,hdrvivid` |
+| `--sections <list>` | Comma-separated list drawn from `general,hdr,dv,hdr10plus,slhdr,hdrvivid` (`sl-hdr` and `hdr-vivid` are accepted spellings; unknown names are ignored) |
 | `--color <when>` | `auto` (default, plain when piped), `always`, or `never` |
 | `--theme <name>` | Color theme: `paper` (default), `green`, `amber`, `red`, `ice`, `purple`, or `mono` (adapts to your terminal's own colors). Set `HDRPROBE_THEME` to make it stick. |
 | `-q, --quiet` | One-line summary per file |

@@ -508,9 +508,11 @@ fn sniff_demux(
     match classify_start_code(data) {
         Some(StreamFamily::AnnexB) => Some(annexb::demux(data, full, progress, frontier)),
         // A raw MPEG video elementary stream. `mpegv::demux` errors honestly
-        // when it finds no sequence header, which is what an MPEG-4 Part 2
-        // stream gets today: Part 2 shares this family (`0xB0`/`0xB6` are its
-        // own start codes) and has no backend yet.
+        // when it finds no sequence header, which is what a raw MPEG-4 Part 2
+        // stream gets: Part 2 shares this family (`0xB0`/`0xB6` are its own
+        // start codes), and `mpeg4part2` runs only on bytes a container
+        // already identified — it is deliberately not a sniffer, so raw
+        // Part 2 elementary streams stay undispatched.
         Some(StreamFamily::MpegVideoEs) => Some(mpegv::demux(data, full)),
         Some(StreamFamily::ProgramStream) => Some(ps::demux(data)),
         None => None,

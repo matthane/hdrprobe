@@ -50,8 +50,9 @@ pub struct Report {
     /// declared header (TS duration, non-MP4 bitrates) are withheld. **File
     /// probes** (open-items B6): the container itself declares more bytes
     /// than the file holds (AVI RIFF segment sizes, ASF `File Properties`,
-    /// FLV `onMetaData.filesize`) — a partial download or a capture that
-    /// never closed; the backend has already withheld what a prefix cannot
+    /// FLV `onMetaData.filesize`, RealMedia's `DATA` chunk extent) — a
+    /// partial download or a capture that never closed; the backend has
+    /// already withheld what a prefix cannot
     /// support, and this names why. Absent for whole files and for stdin
     /// streams that ended within the budget.
     #[serde(skip_serializing_if = "is_false")]
