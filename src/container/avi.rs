@@ -105,7 +105,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::model::Bitrate;
+use crate::model::{Bitrate, BitrateScope};
 
 use super::{bmih, Chunk, Codec, Demux, NalFormat, TrackDemux};
 
@@ -286,6 +286,17 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             None => None,
         };
         tracks.push(td);
+    }
+
+    // The whole-container fallback belongs to a sole video track only:
+    // stamped on each of several it would claim every track averages the
+    // file's rate (the schema contract since 2.0; the TS/PS/MKV backends
+    // carry the same gate). The exact index-summed rates above are genuinely
+    // per-stream and stand.
+    if tracks.len() > 1 {
+        for t in &mut tracks {
+            t.bitrate = t.bitrate.filter(|b| b.scope == BitrateScope::VideoStream);
+        }
     }
 
     if tracks.is_empty() {
@@ -1349,6 +1360,29 @@ mod tests {
         chunks_point_at_payload(&built, &t.chunks);
         assert_eq!(t.bitrate.map(|b| b.scope), Some(crate::model::BitrateScope::Overall));
         assert!(d.bounded_index, "a bounded walk keeps the report's sampled marks on");
+    }
+
+    #[test]
+    fn the_overall_fallback_is_withheld_when_several_video_tracks_exist() {
+        // The bound-overrun shape above, so each track's only candidate rate
+        // is the whole-container fallback — which belongs to a sole video
+        // track: stamped on each of several it would claim every track
+        // averages the file's rate (the schema contract since 2.0; the
+        // TS/PS/MKV backends carry the same gate).
+        let span = 3 << 20;
+        let mut strl0 = strh(b"vids", b"XVID", 1, 25, 3);
+        strl0.extend_from_slice(&strf(320, 240, b"XVID", &[]));
+        let mut strl1 = strh(b"vids", b"XVID", 1, 25, 3);
+        strl1.extend_from_slice(&strf(320, 240, b"XVID", &[]));
+        let mut hdrl = chunk(b"avih", &[0u8; 56]);
+        hdrl.extend_from_slice(&list(b"strl", &strl0));
+        hdrl.extend_from_slice(&list(b"strl", &strl1));
+        let mut f = frames(b"00dc", &[span, span, span]);
+        f.extend(frames(b"01dc", &[span, span, span]));
+        let d = demux(&build(&hdrl, &f, Idx1::None)).unwrap();
+        assert_eq!(d.tracks.len(), 2);
+        assert!(d.duration_secs.is_some(), "the fallback was constructible; the gate withheld it");
+        assert!(d.tracks.iter().all(|t| t.bitrate.is_none()));
     }
 
     #[test]

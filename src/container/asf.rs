@@ -71,7 +71,7 @@
 
 use anyhow::{bail, Result};
 
-use crate::model::Bitrate;
+use crate::model::{Bitrate, BitrateScope};
 
 use super::{bmih, Codec, Demux, NalFormat, TrackDemux};
 
@@ -241,6 +241,17 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
         // `WMV1`/`WMV2` track can ever have here.
         super::fill_constant_depth_chroma(&mut td);
         tracks.push(td);
+    }
+
+    // The whole-container fallback belongs to a sole video track only:
+    // stamped on each of several it would claim every track averages the
+    // file's rate (the schema contract since 2.0; the TS/PS/MKV backends
+    // carry the same gate). The ESP/SBP rates above are genuinely
+    // per-stream declarations and stand.
+    if tracks.len() > 1 {
+        for t in &mut tracks {
+            t.bitrate = t.bitrate.filter(|b| b.scope == BitrateScope::VideoStream);
+        }
     }
 
     if tracks.is_empty() {
@@ -971,6 +982,41 @@ mod tests {
         assert_eq!(
             d.tracks.iter().map(|t| t.track_number).collect::<Vec<_>>(),
             vec![Some(2), Some(3)]
+        );
+    }
+
+    #[test]
+    fn a_multi_video_file_keeps_per_stream_rates_but_never_the_overall_fallback() {
+        // With no per-stream rate object, two video streams' only candidate
+        // is the whole-container fallback — which belongs to a sole video
+        // track: stamped on each of several it would claim every track
+        // averages the file's rate (the schema contract since 2.0; the
+        // TS/PS/MKV backends carry the same gate).
+        let strf = bitmapinfoheader(b"WVC1", 512, 288, &WVC1_EXTRADATA);
+        let mut children = Vec::new();
+        children.extend_from_slice(&file_properties(4096, 20_000_000, 0, 0x2));
+        children.extend_from_slice(&stream_properties(VIDEO_MEDIA, 2, &strf));
+        children.extend_from_slice(&stream_properties(VIDEO_MEDIA, 3, &strf));
+        let d = demux(&asf_file(&children, 3, 4096)).expect("demuxes");
+        assert_eq!(d.tracks.len(), 2);
+        assert_eq!(d.duration_secs, Some(2.0), "the fallback was constructible; the gate withheld it");
+        assert!(d.tracks.iter().all(|t| t.bitrate.is_none()));
+
+        // A genuinely per-stream declaration is untouched by the gate.
+        let mut children = Vec::new();
+        children.extend_from_slice(&file_properties(4096, 20_000_000, 0, 0x2));
+        children.extend_from_slice(&stream_properties(VIDEO_MEDIA, 2, &strf));
+        children.extend_from_slice(&stream_properties(VIDEO_MEDIA, 3, &strf));
+        children.extend_from_slice(&stream_bitrate_properties(&[(2, 500_000), (3, 750_000)]));
+        let d = demux(&asf_file(&children, 4, 4096)).expect("demuxes");
+        let rates: Vec<_> =
+            d.tracks.iter().map(|t| t.bitrate.map(|b| (b.bits_per_sec, b.scope))).collect();
+        assert_eq!(
+            rates,
+            vec![
+                Some((500_000.0, BitrateScope::VideoStream)),
+                Some((750_000.0, BitrateScope::VideoStream)),
+            ]
         );
     }
 

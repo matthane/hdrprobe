@@ -654,9 +654,13 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     // The exact per-stream sum exists only after the `--full` walk, so demux
     // leaves the rate unset on that path and `main.rs` applies what the scan
     // measured — the FLV shape. Everything else gets the file-length `overall`
-    // rate, which counts audio and page overhead and is labelled as such.
+    // rate, which counts audio and page overhead and is labelled as such —
+    // but only on a sole video track: stamped on each of several it would
+    // claim every track averages the whole file's rate, against a duration
+    // that is the *first* video stream's (the schema contract since 2.0;
+    // the TS/PS/MKV backends carry the same gate).
     let stream_plan = full.then(|| single_video_plan(&head)).flatten();
-    let overall = (stream_plan.is_none())
+    let overall = (stream_plan.is_none() && head.videos.len() == 1)
         .then(|| Bitrate::overall(data.len() as u64, duration_secs))
         .flatten();
 
@@ -1198,7 +1202,13 @@ mod tests {
         let dm = demux(&two, true).expect("demuxes");
         assert_eq!(dm.tracks.len(), 2);
         assert!(dm.raw_stream.is_none(), "no plan, so neither track is dropped");
-        assert!(dm.tracks[0].bitrate.is_some(), "the overall rate stands instead");
+        // The whole-file fallback is withheld too: it belongs to a sole video
+        // track (the schema contract since 2.0), and its denominator here
+        // would be the *first* stream's duration stamped on both tracks.
+        assert!(dm.duration_secs.is_some(), "the fallback was constructible; the gate withheld it");
+        assert!(dm.tracks.iter().all(|t| t.bitrate.is_none()));
+        let dm = demux(&two, false).expect("demuxes");
+        assert!(dm.tracks.iter().all(|t| t.bitrate.is_none()), "the default path likewise");
     }
 
     #[test]
