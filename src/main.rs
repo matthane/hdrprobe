@@ -146,7 +146,21 @@ enum ProgressWhen {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Not `Cli::parse()`: clap's own exit path uses code 2 for a malformed
+    // command line, which the exit-code contract (SCHEMA.md "Exit codes")
+    // reserves for unreadable *input* — a usage error is 1, like the tool's
+    // own usage checks below. `--help`/`--version` stay clap's success exit.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                e.exit()
+            }
+            let _ = e.print();
+            return ExitCode::from(1);
+        }
+    };
 
     // Shell integration is an action-and-exit path: register/remove the Explorer
     // context-menu verb, then return without touching the file pipeline. Its
