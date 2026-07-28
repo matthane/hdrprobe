@@ -259,7 +259,7 @@ The binary is self-contained with no runtime dependencies, so you can drop it an
 
 ### Build from source
 
-If you would rather build it yourself, you need a Rust toolchain (1.85 or newer):
+If you would rather build it yourself, you need a Rust toolchain (1.88 or newer):
 
 ```sh
 cargo build --release

@@ -14,7 +14,7 @@ To refresh it after a dependency change: `cargo about generate about.hbs -o THIR
 
 | License | Crates |
 |---|---|
-| MIT License | 60 |
+| MIT License | 58 |
 | Apache License 2.0 | 1 |
 | ISC License | 1 |
 | Unicode License v3 | 1 |
@@ -532,7 +532,6 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- **bitstream-io 2.6.0** — <https://github.com/tuffy/bitstream-io>
 - **bitstream-io 4.10.0** — <https://github.com/tuffy/bitstream-io>
 
 ```
@@ -926,38 +925,6 @@ SOFTWARE.
 
 Used by:
 
-- **bitvec_helpers 3.1.6** — <https://github.com/quietvoid/bitvec_helpers>
-
-```
-MIT License
-
-Copyright (c) 2021 quietvoid
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-## MIT License
-
-Used by:
-
-- **dolby_vision 3.3.2** — <https://github.com/quietvoid/dovi_tool/tree/main/dolby_vision>
 - **hdr10plus 2.1.5** — <https://github.com/quietvoid/hdr10plus_tool/tree/master/hdr10plus>
 
 ```
@@ -1020,6 +987,7 @@ SOFTWARE.
 
 Used by:
 
+- **dolby_vision 3.4.0** — <https://github.com/quietvoid/dovi_tool/tree/main/dolby_vision>
 - **bitvec_helpers 4.0.2** — <https://github.com/quietvoid/bitvec_helpers>
 
 ```
@@ -1204,7 +1172,7 @@ SOFTWARE.
 
 Used by:
 
-- **roxmltree 0.20.0** — <https://github.com/RazrFalcon/roxmltree>
+- **roxmltree 0.21.1** — <https://github.com/RazrFalcon/roxmltree>
 
 ```
 The MIT License (MIT)
