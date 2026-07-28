@@ -430,6 +430,14 @@ impl DvAggregate {
             l9_mastering: l9_label,
             // The three L11 fields ride one block and fill together
             // (`fold_dm`), so the triple is total whenever content is Some.
+            // The reference-mode flag is the block's provenance bit (Dolby
+            // patent US 2022/0264190): set = authored by the original content
+            // creator, so a display may honor the APO metadata even in its
+            // reference picture mode; clear = added downstream, non-reference
+            // modes only. It is bitstream-only — the CM XML carries just
+            // ContentType and IntendedWhitePoint, which is why Dolby's
+            // metadata-levels article lists L11 with two args, not three.
+            // libdovi decodes it out of the white-point byte (value 16+wp).
             l11: match (self.l11_content, self.l11_white_point, self.l11_ref_mode) {
                 (Some(ct), Some(wp), Some(rm)) => Some(L11 {
                     content: content_type_name(ct),
