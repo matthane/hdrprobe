@@ -27,14 +27,16 @@ everything it needs" and move on to reading the report.
 the budget (you close stdin after the last block), hdrprobe has seen the entire input and the
 report is identical to probing the same bytes as a file, except that `file` is `"-"`.
 
-**Exit codes are unchanged.** `0` means a report was produced, `2` means the input could not
-be parsed (not a recognized container, or a head too short to carry the format's metadata).
-An empty or unparseable stdin never hangs and never fabricates a report.
+**Exit codes are unchanged.** `0` means a report was produced, `1` a usage error (for example
+naming `-` twice), `2` that the input could not be parsed (not a recognized container, or a
+head too short to carry the format's metadata). An empty or unparseable stdin never hangs and
+never fabricates a report.
 
 **Constraints.** `-` may appear at most once per invocation. `--full` is rejected on stdin (a
-pipe cannot be seeked or fully scanned). Metadata sidecar files (raw RPU `.bin`, DV CM XML,
-HDR10+ JSON) are recognized by file extension and are therefore not detectable on stdin; pass
-those as paths.
+pipe cannot be seeked or fully scanned); the rejection is reported as a per-file error (exit
+`2`), so path arguments in the same invocation still process. Metadata sidecar files (raw RPU
+`.bin`, DV CM XML, HDR10+ JSON) are recognized by file extension and are therefore not
+detectable on stdin; pass those as paths.
 
 ## Reading the report
 
@@ -42,12 +44,17 @@ Everything is standard [SCHEMA.md](SCHEMA.md) output. Three things are specific 
 
 - `file` is the literal string `"-"`.
 - `input_truncated: true` appears when the stream exceeded the head budget, meaning only a
-  leading window was probed. It is absent (never `false`) for complete streams and file probes.
-- When `input_truncated` is present, `size_bytes` is the number of bytes probed, not the size
-  of the source, and hdrprobe withholds the fields a prefix cannot honestly state rather than
-  reporting wrong numbers: a TS input's `duration_secs` (its duration is normally measured
-  across the whole file) and every `bitrate` except MP4/MOV's exact `video_stream` rate. All
-  declared header facts report normally: resolution, frame rate, color, HDR10 static metadata,
+  leading window was probed. It is absent (never `false`) for streams that ended within the
+  budget. Since schema 3.0 the same flag also fires on *file* probes whose container declares
+  more bytes than the file holds (a partial download or an unclosed capture), so it is not by
+  itself a stdin marker; the stdin test is `file == "-"`.
+- When `input_truncated` is present on a stdin probe, `size_bytes` is the number of bytes
+  probed, not the size of the source, and hdrprobe withholds the fields a prefix cannot
+  honestly state rather than reporting wrong numbers: `duration_secs` for the containers that
+  measure it from the payload rather than declare it in a header (TS/M2TS, MPEG program
+  streams, Ogg, raw DV), and every `bitrate` except the video-stream rates a head carries
+  whole (MP4/MOV's exact table-summed rate, RealMedia's declared header rate). All declared
+  header facts report normally: resolution, frame rate, color, HDR10 static metadata,
   HDR10+, the full Dolby Vision section, and MP4/MKV durations (those are stated in the
   header, not measured).
 
@@ -58,8 +65,9 @@ caveat is the sampled union fields, `l5_active_areas` and `trim_targets`: they a
 from the frames a probe actually saw, and a head probe sees only the opening minutes, while a
 file probe spreads its sample points across the whole title. A film that switches aspect ratio
 mid-way, or whose later scenes carry trim targets the opening does not, will show a smaller
-set. The report already marks these fields as sampled (`dolby_vision.sampled: true`, the same
-flag every default probe carries); read them as "at least these", never as a complete list.
+set. The report already marks these fields as sampled (`dolby_vision.coverage: "sampled"`, the
+same value every default probe carries); read them as "at least these", never as a complete
+list.
 
 ## Kodi addon example (Python)
 
@@ -129,7 +137,9 @@ Notes for Kodi specifically:
 
 These require the end of the file and are unavailable from any prefix, no matter the size:
 
-- The runtime of a TS/M2TS stream (measured from timestamps at both ends of the file).
+- The runtime of a TS/M2TS or program stream (measured from timestamps at both ends of the
+  file), of an Ogg stream (the tail page's granule position), or of a raw DV stream (the
+  whole file's frame count).
 - MKV bitrate statistics tags (written after the clusters).
 - An MP4 whose index (`moov`) was written at the end of the file rather than the front; such
   a stream fails honestly with exit code 2.

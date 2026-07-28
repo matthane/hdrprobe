@@ -38,49 +38,41 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
         formats.push("HDR Vivid".to_string());
     }
 
-    // A base signalled in Dolby's IPT-PQ-c2 colour space (matrix 15, Profile 20 /
-    // MV-HEVC) is not a standard, independently viewable HDR10/HLG signal even
-    // though its colr carries PQ/HLG — like Profile 5, its cross-compatibility is
-    // governed solely by the DV compatibility id (0=none, 4=HLG). So don't let the
-    // raw transfer imply a fallback here; fall through to the compat-id branch.
-    let ipt_base = demux.color.matrix.as_deref() == Some("IPT-PQ-c2");
-
-    let base = if is_pq && !ipt_base {
-        // HDR10 fallback is implied when DV rides on a PQ base layer.
-        if dv.is_some() {
-            Some("HDR10 (fallback)")
-        } else {
-            Some("HDR10")
+    // A Dolby Vision title's cross-compatible base is decided by its
+    // compatibility id, not by the base layer's raw transfer: the id *is* the
+    // declaration of what a non-DV decoder gets. It is named exactly as every
+    // other layered format's base is ("HDR10+ / HDR10", "SL-HDR2 / HDR10"), with
+    // no editorial suffix: the reportable fact is whether a cross-compatible
+    // base exists at all, and the tag's *presence* already states it — which is
+    // why a CCID-0 title renders a bare "Dolby Vision". Where the distinction
+    // that suffix gestured at is real (a dual-layer P4/P7 base is not the full
+    // presentation) it is already reported precisely, and separately, by
+    // `dolby_vision.structure` and `el_type`. Reading the transfer instead
+    // mis-classifies the two cases where the two disagree — a Profile 5 or 20
+    // base is PQ-encoded in Dolby's own IPT-PQ-C2 space (id 0: nothing viewable
+    // without a DV decoder), and a Profile 4 base is SDR however its container
+    // is tagged. Ids: 0 none, 1 HDR10, 2 SDR, 4 HLG, 6 HDR10 per UHD Blu-ray.
+    let ccid = dv.and_then(|d| d.bl_compatibility_id);
+    let base = match dv {
+        // A resolved id answers on its own, including id 0's "no viewable base".
+        Some(_) if ccid.is_some_and(|id| id == 0 || crate::dv::ccid::base_signal(id).is_some()) => {
+            ccid.and_then(crate::dv::ccid::base_signal)
         }
-    } else if is_hlg && !ipt_base {
-        if dv.is_some() {
-            Some("HLG (fallback)")
-        } else {
-            Some("HLG")
-        }
-    } else if let Some(dv) = dv {
-        // No independently viewable base — infer it from the DV BL compatibility id
-        // (1=HDR10, 2=SDR, 4=HLG, 6=HDR10 per UHD Blu-ray). Profiles 5 and 20
-        // (compat 0) have no directly viewable base, so we show no base tag.
-        //
-        // Profile 4 is defined with an SDR (BT.709/BT.1886) base layer, so its base
-        // is SDR even when the container omits the compatibility id (older P4 TS
-        // descriptors carry no compat nibble) — infer it from the profile.
-        if dv.profile.starts_with('4') {
-            Some("SDR (fallback)")
-        } else {
-            // Compat 6 is the UHD Blu-ray base signal: the same CTA-861.3 HDR10
-            // base as compat 1 with disc constraints on top — the L6 gating
-            // below already treats the two as one HDR10 family.
-            match dv.bl_compatibility_id {
-                Some(1) | Some(6) => Some("HDR10 (fallback)"),
-                Some(2) => Some("SDR (fallback)"),
-                Some(4) => Some("HLG (fallback)"),
-                _ => None,
+        // Unresolved (a Profile 8 whose carriage declares nothing and whose VUI
+        // separates nothing) or an id outside the defined set: fall back to
+        // whatever the base layer itself signals, which is all there is.
+        Some(_) => {
+            if is_pq {
+                Some("HDR10")
+            } else if is_hlg {
+                Some("HLG")
+            } else {
+                None
             }
         }
-    } else {
-        Some("SDR")
+        None if is_pq => Some("HDR10"),
+        None if is_hlg => Some("HLG"),
+        None => Some("SDR"),
     };
     if let Some(b) = base {
         formats.push(b.to_string());
@@ -89,13 +81,16 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
     let format = formats.join(" / ");
 
     // L6 is the DV carriage of HDR10 static metadata, and Dolby's
-    // profiles/levels spec defines it as meaningful only for the compat-id-1
-    // (HDR10) base signal — so both L6 fallbacks below apply only on an HDR10
-    // base. Every other base has no consumer for it: IPT-PQ-c2 (P5/P20/AV1
-    // 10.0) has no viewable base at all, HLG (8.4/10.4) is scene-referred and
-    // consumes no static metadata (corpus 8.4/10.4 titles carry a zeroed L6
-    // placeholder, exactly like P5), and an SDR base likewise signals none.
-    let hdr10_base = base.is_some_and(|b| b.starts_with("HDR10"));
+    // profiles/levels spec defines it as meaningful only for the HDR10 base
+    // signal — so both L6 fallbacks below apply only there. Every other base has
+    // no consumer for it: CCID 0 (P5/P20/AV1 10.0) has no viewable base at all,
+    // HLG (8.4/10.4) is scene-referred and consumes no static metadata (corpus
+    // 8.4/10.4 titles carry a zeroed L6 placeholder, exactly like P5), and an
+    // SDR base likewise signals none. Same verdict the text report's own L6 line
+    // uses, from the one shared gate.
+    let hdr10_base = dv.is_some_and(|d| {
+        crate::dv::ccid::hdr10_base(ccid, crate::dv::levels::profile_major(&d.profile))
+    });
 
     // Prefer container mastering, then the SEI ST.2086 message, then DV L6.
     // This line means the *base layer's own* declared display, so the L6
@@ -135,7 +130,9 @@ pub fn assemble(demux: &TrackDemux, dv: Option<&DolbyVision>, sei: &SeiFindings)
         dv.and_then(|d| d.l6.as_ref()).map(|l6| crate::model::ContentLight::new(l6.max_cll, l6.max_fall))
     });
 
-    Hdr { format, mastering, content_light }
+    // `base` is the same value the format string's base tag was built from, so
+    // the structured field and the display string can never disagree.
+    Hdr { format, base: base.map(str::to_string), mastering_display: mastering, content_light }
 }
 
 /// HDR Vivid target codes (12-bit PQ) -> distinct nits, sorted ascending.
@@ -203,6 +200,31 @@ pub(crate) fn primaries_label(
 #[cfg(test)]
 mod tests {
     use super::primaries_label;
+
+    /// `hdr.base` is the format string's base tag as a field of its own —
+    /// built from the same value, so the two can never disagree — and absent
+    /// exactly when the tag is (a CCID-0 title has no viewable base).
+    #[test]
+    fn base_field_mirrors_the_format_tag() {
+        use crate::container::{Codec, DvConfig, NalFormat, TrackDemux};
+        use crate::hdr::sei::SeiFindings;
+        let td = TrackDemux::new(Codec::Hevc, NalFormat::AnnexB);
+        let h = super::assemble(&td, None, &SeiFindings::default());
+        assert_eq!((h.format.as_str(), h.base.as_deref()), ("SDR", Some("SDR")));
+
+        let cfg = DvConfig {
+            profile: 5,
+            level: None,
+            bl_present: true,
+            el_present: false,
+            rpu_present: true,
+            bl_compatibility_id: Some(0),
+        };
+        let dv = crate::dv::levels::container_only(&cfg, false);
+        let h = super::assemble(&td, Some(&dv), &SeiFindings::default());
+        assert_eq!(h.format, "Dolby Vision");
+        assert_eq!(h.base, None, "no viewable base, no field");
+    }
 
     #[test]
     fn classifies_the_common_mastering_gamuts() {

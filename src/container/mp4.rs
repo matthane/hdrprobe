@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
-use crate::model::{ColorInfo, ContentLight, MasteringDisplay};
+use crate::model::{ColorInfo, ColorSource, ColorSources, ContentLight, MasteringDisplay};
 
 struct BoxHdr {
     typ: [u8; 4],
@@ -64,7 +64,14 @@ fn iter_boxes(d: &[u8], start: usize, end: usize) -> Vec<BoxHdr> {
         } else {
             (p + 8, p + size32)
         };
-        if box_end > end || box_end <= p {
+        // `box_end < payload` means the declared size does not even cover the
+        // box header it was read from (a 32-bit `size` of 2..=7, or a 64-bit
+        // `largesize` under 16). Every consumer below slices `payload..end`, so
+        // admitting such a box turns a malformed file into a *panic* rather
+        // than an error: an out-of-contract exit 101 that, in a directory scan,
+        // takes every remaining file with it. Two call sites already spot-check
+        // this individually; making it the walk's rule closes the class.
+        if box_end > end || box_end <= p || box_end < payload {
             break;
         }
         out.push(BoxHdr { typ, start: p, payload, end: box_end });
@@ -289,9 +296,11 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
             })
             .unwrap_or(0);
 
-        if let Some(t) =
+        if let Some(mut t) =
             parse_video_track(data, &mdia_boxes, movie_timescale, movie_duration, track_id)?
         {
+            // `tref` is a trak child, not an mdia one, so it is read here.
+            t.vdep_refs = parse_vdep_refs(data, &trak_boxes);
             tracks.push(t);
         }
     }
@@ -330,12 +339,18 @@ pub fn demux(data: &[u8]) -> Result<Demux> {
                 );
             }
             // fps: prefer the summed sample durations (exact, media timescale);
-            // fall back to sample count over the container duration.
+            // fall back to sample count over the container duration. Every term
+            // is a file-supplied integer, so both quotients take the shared
+            // plausibility bound.
             if t.fps.is_none() && !t.chunks.is_empty() {
                 t.fps = if duration_ticks > 0 && t.media_timescale > 0 {
-                    Some(t.chunks.len() as f64 * t.media_timescale as f64 / duration_ticks as f64)
+                    super::plausible_fps(
+                        t.chunks.len() as f64 * t.media_timescale as f64 / duration_ticks as f64,
+                    )
                 } else {
-                    t.duration_secs.filter(|d| *d > 0.0).map(|d| t.chunks.len() as f64 / d)
+                    t.duration_secs
+                        .filter(|d| *d > 0.0)
+                        .and_then(|d| super::plausible_fps(t.chunks.len() as f64 / d))
                 };
             }
         }
@@ -349,6 +364,8 @@ struct VideoTrack {
     sd: SampleDesc,
     chunks: Vec<Chunk>,
     fps: Option<f64>,
+    /// The stts-declared CFR ratio, when one exists (see `stts_uniform_fps`).
+    fps_rational: Option<(u64, u64)>,
     duration_secs: Option<f64>,
     /// The track's *own* playback duration, when it is known exactly — the mdhd
     /// media duration, or for a fragmented mux the summed trun sample durations.
@@ -358,6 +375,35 @@ struct VideoTrack {
     stream_duration_secs: Option<f64>,
     track_id: u32,
     media_timescale: u32,
+    /// Track ids named by this trak's `tref`/`vdep` box — the base layer(s) a
+    /// Dolby Vision enhancement-layer trak depends on. Empty when the file
+    /// carries no `tref`, which is common enough that it can't be required.
+    vdep_refs: Vec<u32>,
+}
+
+/// Cap on `vdep` entries read from one `tref`. The box carries no count field,
+/// so the entry total is implied by its extent; a real one names a single base
+/// layer, and the list is only ever searched for a match among the file's own
+/// traks. Bounding it keeps a corrupt box extent from driving a large alloc,
+/// per the same discipline as `clamp_count`.
+const MAX_TREF_REFS: usize = 16;
+
+/// Track ids from a trak's `tref` box with reference type `vdep`. §8.2.2 of
+/// *Dolby Vision Streams Within the ISO Base Media File Format* requires a
+/// dual-track file to signal the BL/EL dependency exactly here: "The
+/// dependency between the Dolby Vision base and enhancement track shall be
+/// signaled by the `tref` box. The reference_type shall be set to `vdep`."
+fn parse_vdep_refs(data: &[u8], trak_boxes: &[BoxHdr]) -> Vec<u32> {
+    let Some(tref) = find(trak_boxes, b"tref") else { return Vec::new() };
+    let mut refs = Vec::new();
+    for r in iter_boxes(data, tref.payload, tref.end) {
+        if &r.typ != b"vdep" {
+            continue;
+        }
+        let n = clamp_count(MAX_TREF_REFS, r.payload, 4, r.end);
+        refs.extend((0..n).map(|k| read_u32(data, r.payload + k * 4)));
+    }
+    refs
 }
 
 /// Assemble the parsed video `trak`s into reported tracks. A trak whose
@@ -369,6 +415,13 @@ struct VideoTrack {
 /// and the pair reports as one logical track with `dv_dual_track` set. Every
 /// other trak — including a second independent video track with no dvcC, or
 /// with a `bl_present == 1` dvcC — is its own reported track, in trak order.
+///
+/// An EL folds into the base layer its `tref`/`vdep` box names, which §8.2.2 of
+/// the Dolby ISOBMFF spec requires a dual-track file to signal, and which is
+/// the exact analogue of the TS backend's `dependency_pid`. Only when no `vdep`
+/// resolves to one of this file's own base traks does it fall back to the
+/// widest independent trak: plenty of real muxes omit `tref`, so the heuristic
+/// has to stay, but it must not outrank an explicit reference.
 fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str) -> Demux {
     let is_el = |t: &VideoTrack| t.sd.dv_config.as_ref().is_some_and(|c| !c.bl_present);
     let (els, base): (Vec<VideoTrack>, Vec<VideoTrack>) = tracks.into_iter().partition(is_el);
@@ -376,19 +429,34 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
     // than dropping everything (no BL exists to fold into).
     let (els, base) = if base.is_empty() { (Vec::new(), els) } else { (els, base) };
 
-    // The fold target for any ELs: the widest independent trak is the base
-    // layer whose picture the residual enhances.
-    let fold = base
+    // Fallback fold target: the widest independent trak is the base layer whose
+    // picture a residual most plausibly enhances.
+    let widest = base
         .iter()
         .enumerate()
         .max_by_key(|(_, t)| t.sd.width as u64 * t.sd.height as u64)
         .map(|(i, _)| i)
         .unwrap_or(0);
+    // Bucket each EL against its own fold target, so a file with several base
+    // traks routes each residual by what it actually references.
+    let mut buckets: Vec<Vec<VideoTrack>> = (0..base.len().max(1)).map(|_| Vec::new()).collect();
+    for e in els {
+        let target = e
+            .vdep_refs
+            .iter()
+            .find_map(|id| base.iter().position(|b| b.track_id == *id))
+            .unwrap_or(widest);
+        buckets[target].push(e);
+    }
 
     let mut duration_secs: Option<f64> = None;
     let mut out = Vec::with_capacity(base.len());
+    // Kept beside `out` rather than on `TrackDemux`: it is a byte range in the
+    // sample entry, meaningful only to the gap-fill below, and every other
+    // backend resolves its own equivalent the same way.
+    let mut part2_headers: Vec<std::ops::Range<usize>> = Vec::with_capacity(base.len());
     for (i, t) in base.into_iter().enumerate() {
-        let group_els: &[VideoTrack] = if i == fold { &els } else { &[] };
+        let group_els: &[VideoTrack] = &buckets[i];
 
         // DV config / static HDR from the trak itself, gaps filled from its
         // folded EL (a real dual-track pair carries the dvcC on the EL trak).
@@ -401,19 +469,25 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         let stereo = t.sd.stereo.clone().or_else(|| group_els.iter().find_map(|e| e.sd.stereo.clone()));
         // Colour: prefer signalling that actually resolved (a bare BL may omit
         // its colr box / carry only an SPS the base parse can't reach).
-        let color = if t.sd.color.transfer.is_some() {
-            t.sd.color.clone()
+        let (color, mut color_source) = if t.sd.color.transfer.is_some() {
+            (t.sd.color.clone(), t.sd.color_source)
         } else {
             group_els
                 .iter()
                 .find(|e| e.sd.color.transfer.is_some())
-                .map(|e| e.sd.color.clone())
-                .unwrap_or_else(|| t.sd.color.clone())
+                .map(|e| (e.sd.color.clone(), e.sd.color_source))
+                .unwrap_or_else(|| (t.sd.color.clone(), t.sd.color_source))
         };
         // Last resort for colour: recover the VUI colour from an in-band SPS in
         // this track's own samples (the `hev1` case), as TS does.
         let color = if color.transfer.is_none() {
-            color_from_stream(data, &t.chunks, t.sd.nal_len).unwrap_or(color)
+            match color_from_stream(data, &t.chunks, t.sd.nal_len) {
+                Some((c, c_src)) => {
+                    color_source = c_src;
+                    c
+                }
+                None => color,
+            }
         } else {
             color
         };
@@ -447,14 +521,22 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
 
         out.push(TrackDemux {
             track_number: Some(t.track_id as u64),
+            codec_id: Some(t.sd.codec_id.clone()),
+            // The track's own media duration (or summed fragment runs) —
+            // already the bitrate denominator above.
+            duration_secs: t.stream_duration_secs,
             width: t.sd.width,
             height: t.sd.height,
             fps: t.fps,
+            fps_rational: t.fps_rational,
             bit_depth: t.sd.bit_depth,
             chroma: t.sd.chroma.clone(),
+            pixel_aspect: t.sd.pixel_aspect,
+            scan_type: t.sd.scan_type,
             codec_profile: t.sd.codec_profile.clone(),
             stereo,
             color,
+            color_source,
             dv_config,
             dv_dual_track,
             mastering,
@@ -464,6 +546,7 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
             cuvv_version_map: t.sd.cuvv_version_map,
             ..TrackDemux::new(t.sd.codec.clone(), NalFormat::LengthPrefixed(nal_len))
         });
+        part2_headers.push(t.sd.codec_headers.clone());
     }
 
     // A ProRes MOV without a `colr` box (ffmpeg writes none by default) signals
@@ -474,6 +557,30 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         if t.codec == Codec::ProRes {
             super::fill_prores_stream_fields(t, data);
         }
+        // MPEG-1/2 the same way: an `mp4v` entry carries no decoder-config box
+        // describing the picture (ffmpeg writes no DecoderSpecificInfo for
+        // these), so chroma, profile@level, frame rate and colour all come from
+        // the sequence header in the first sample.
+        if matches!(t.codec, Codec::Mpeg1 | Codec::Mpeg2) {
+            super::fill_mpeg2_stream_fields(t, data);
+        }
+        // MJPEG the same way again: depth and chroma exist only in each
+        // frame's own SOF header.
+        if t.codec == Codec::Mjpeg {
+            super::fill_mjpeg_stream_fields(t, data);
+        }
+        // Then the families whose values are format constants (the QuickTime
+        // DV sample entries, H.263) — fills only what is still absent.
+        super::fill_constant_depth_chroma(t);
+    }
+    // MPEG-4 Part 2 the same way, but with the `esds` DecoderSpecificInfo tried
+    // first: a muxer that wrote one has already handed over the visual headers,
+    // and only one that left it out costs a sample read. The range is resolved
+    // before this loop because `t` no longer carries the sample entry.
+    for (t, headers) in out.iter_mut().zip(part2_headers) {
+        if t.codec == Codec::Mpeg4Part2 {
+            super::fill_mpeg4part2_stream_fields(t, data.get(headers).unwrap_or(&[]), data);
+        }
     }
 
     Demux {
@@ -483,6 +590,8 @@ fn assemble_tracks(data: &[u8], tracks: Vec<VideoTrack>, container: &'static str
         ts_stream: None,
         mkv_stream: None,
         raw_stream: None,
+        bounded_index: false,
+        declared_short: false,
     }
 }
 
@@ -539,25 +648,37 @@ fn parse_video_track(
     // report for CFR); fall back to sample count over the media duration for
     // genuinely variable tracks. Gated on a non-empty sample index so an fMP4's
     // empty stbl leaves fps to the fragment path.
-    let fps = if sample_count > 0 { stts_uniform_fps(data, &stbl_boxes, media_timescale) } else { None }
-        .or(match (duration_secs, sample_count) {
-            (Some(d), n) if d > 0.0 && n > 0 => Some(n as f64 / d),
-            _ => None,
-        });
+    let cfr = if sample_count > 0 {
+        stts_uniform_fps(data, &stbl_boxes, media_timescale)
+    } else {
+        None
+    };
+    // The stts-declared ratio is exact; the count-over-duration fallback is a
+    // measurement and carries no rational.
+    let fps_rational = cfr.map(|(_, r)| r);
+    let fps = cfr.map(|(f, _)| f).or(match (duration_secs, sample_count) {
+        (Some(d), n) if d > 0.0 && n > 0 => Some(n as f64 / d),
+        _ => None,
+    });
 
     Ok(Some(VideoTrack {
         sd,
         chunks,
         fps,
+        fps_rational,
         duration_secs,
         stream_duration_secs,
         track_id,
         media_timescale,
+        vdep_refs: Vec::new(),
     }))
 }
 
 struct SampleDesc {
     codec: Codec,
+    /// The sample-entry FourCC, post-`encv`/`frma` recovery, rendered through
+    /// the shared printable-or-hex rule.
+    codec_id: String,
     codec_profile: Option<String>,
     width: u32,
     height: u32,
@@ -565,11 +686,149 @@ struct SampleDesc {
     chroma: Option<String>,
     nal_len: u8,
     color: ColorInfo,
+    color_source: ColorSources,
     dv_config: Option<DvConfig>,
     stereo: Option<String>,
     mastering: Option<MasteringDisplay>,
     content_light: Option<ContentLight>,
     cuvv_version_map: Option<u16>,
+    /// `pasp` (container authority) or, failing that, the config record's
+    /// embedded-SPS sample aspect.
+    pixel_aspect: Option<(u32, u32)>,
+    /// The embedded SPS's sequence-level scan signal.
+    scan_type: Option<&'static str>,
+    /// Byte range of this track's codec headers inside the file: today the
+    /// `esds` `DecoderSpecificInfo` of an MPEG-4 Part 2 track. Empty for every
+    /// codec whose fields come from a config record read above.
+    codec_headers: std::ops::Range<usize>,
+}
+
+/// Read an ISO/IEC 14496-1 §8.3.3 expandable class length at `*p`, advancing
+/// past it. Up to four bytes, each contributing seven bits, with the high bit
+/// set on every byte but the last. `None` on truncation.
+fn read_descriptor_len(data: &[u8], p: &mut usize) -> Option<u32> {
+    let mut len = 0u32;
+    for _ in 0..4 {
+        let b = *data.get(*p)?;
+        *p += 1;
+        len = (len << 7) | (b & 0x7F) as u32;
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    Some(len)
+}
+
+/// The `objectTypeIndication` inside an `esds` box — the byte that says which
+/// codec a generic `mp4v` sample entry actually carries — and the range of the
+/// `DecoderSpecificInfo` that follows it, relative to `payload`.
+///
+/// Walks ES_Descriptor (tag 3) to DecoderConfigDescriptor (tag 4), whose first
+/// byte it is. The three optional ES_Descriptor fields are each gated on a flag
+/// bit and must be skipped in order, or the tag check lands mid-field and the
+/// whole thing reads as malformed rather than as the codec it names.
+///
+/// The `DecoderSpecificInfo` (tag 5) is where an MPEG-4 Part 2 track keeps its
+/// VOS/VisualObject/VOL headers, byte-identical to what Matroska puts in
+/// CodecPrivate. It is optional, so an absent or truncated one yields an empty
+/// range rather than failing the whole read: the object type alone still names
+/// the codec.
+fn esds_decoder_config(payload: &[u8]) -> Option<(u8, std::ops::Range<usize>)> {
+    // FullBox header: version(8) + flags(24).
+    let mut p = 4usize;
+    if *payload.get(p)? != 0x03 {
+        return None;
+    }
+    p += 1;
+    read_descriptor_len(payload, &mut p)?;
+    // ES_ID(16), then streamDependenceFlag(1) URL_Flag(1) OCRstreamFlag(1)
+    // streamPriority(5).
+    let flags = *payload.get(p + 2)?;
+    p += 3;
+    if flags & 0x80 != 0 {
+        p += 2; // dependsOn_ES_ID
+    }
+    if flags & 0x40 != 0 {
+        p += 1 + *payload.get(p)? as usize; // URLlength + URLstring
+    }
+    if flags & 0x20 != 0 {
+        p += 2; // OCR_ES_Id
+    }
+    if *payload.get(p)? != 0x04 {
+        return None;
+    }
+    p += 1;
+    let config_len = read_descriptor_len(payload, &mut p)? as usize;
+    let config_end = p.saturating_add(config_len).min(payload.len());
+    let oti = *payload.get(p)?;
+    // objectTypeIndication(8) streamType(6) upStream(1) reserved(1)
+    // bufferSizeDB(24) maxBitrate(32) avgBitrate(32) = 13 bytes.
+    p += 13;
+    // Everything below is best-effort: the DecoderSpecificInfo is optional, so
+    // a missing, truncated or out-of-bounds one must still yield the object
+    // type, which is what names the codec. An earlier draft used `?` on the
+    // length read and dropped the whole descriptor chain — and with it the
+    // codec — whenever a file was cut inside that one field.
+    //
+    // `p < config_end` is the load-bearing half: a DecoderConfigDescriptor
+    // shorter than its own fixed fields leaves `p` past its declared end, and
+    // without the test the tag would be read from bytes belonging to the
+    // *next* descriptor. It also keeps the range below from inverting, which
+    // `slice::get` tolerates but this file's malformed-input discipline does
+    // not.
+    let dsi = match payload.get(p) {
+        Some(0x05) if p < config_end => {
+            p += 1;
+            match read_descriptor_len(payload, &mut p) {
+                Some(len) => p.min(config_end)..p.saturating_add(len as usize).min(config_end),
+                None => 0..0,
+            }
+        }
+        _ => 0..0,
+    };
+    Some((oti, dsi))
+}
+
+/// Map an `esds` `objectTypeIndication` to a codec, per the MP4 Registration
+/// Authority's object-type list (the registry ISO/IEC 14496-1 Table 5 defers
+/// to). Only the values this backend can then describe are mapped; anything
+/// else leaves the entry on its FourCC fallback rather than claiming a codec
+/// nothing downstream can parse.
+///
+/// `0x60`..=`0x65` are the six 13818-2 rows, one per profile. The profile is
+/// read from the sequence header itself, which is both more reliable and the
+/// only source in every other container, so they collapse to one codec here.
+fn codec_from_oti(oti: u8) -> Option<Codec> {
+    Some(match oti {
+        // ISO/IEC 14496-2 "Visual ISO/IEC 14496-2". One row for every Part 2
+        // profile, unlike the six MPEG-2 rows below.
+        0x20 => Codec::Mpeg4Part2,
+        0x60..=0x65 => Codec::Mpeg2,
+        0x6A => Codec::Mpeg1,
+        // "Visual ISO/IEC 10918-1" — JPEG, i.e. MJPEG when it is a video
+        // track. ffmpeg's MP4 muxer writes exactly this pairing.
+        0x6C => Codec::Mjpeg,
+        _ => return None,
+    })
+}
+
+/// The pre-encryption sample-entry FourCC of a protected entry: `encv` →
+/// `sinf` → `frma` → the original format. `None` for an ordinary unprotected
+/// entry, whose own FourCC already is the format.
+///
+/// Only `encv` is unwrapped. `enca`/`encs`/`enct` are the audio, subtitle and
+/// text forms, and this backend reports video tracks only.
+fn original_format(data: &[u8], entry: &BoxHdr) -> Option<[u8; 4]> {
+    if &entry.typ != b"encv" {
+        return None;
+    }
+    // Children sit after the fixed VisualSampleEntry fields, as below.
+    let sinf = iter_boxes(data, entry.start + 86, entry.end);
+    let sinf = find(&sinf, b"sinf")?;
+    let frma = iter_boxes(data, sinf.payload, sinf.end);
+    let frma = find(&frma, b"frma")?;
+    let f = data.get(frma.payload..frma.payload + 4)?;
+    Some([f[0], f[1], f[2], f[3]])
 }
 
 fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
@@ -578,16 +837,43 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let entries = iter_boxes(data, entries_start, stsd.end);
     let entry = entries.first().context("empty stsd")?;
 
-    let format = entry.typ;
-    let codec = match &format {
+    // Under ISO/IEC 23001-7 common encryption the real sample-entry FourCC is
+    // swapped for `encv` and preserved in a `sinf`/`frma` box — both the Dolby
+    // HLS and MPEG-DASH carriage specs say so outright ("the fourCC string (for
+    // example, dvh1 for profile 5) must be replaced with encv"). Recover it, so
+    // an encrypted track reports its actual codec instead of the literal
+    // "encv". Everything else is unaffected: `sinf` is an *added* child, so the
+    // original `hvcC`/`avcC`/`dvcC` boxes stay where the walk below expects
+    // them. Sampling such a track is sound because both specs also require the
+    // NAL length fields, the nal_unit_type bytes, and the whole Dolby Vision
+    // RPU to be left unencrypted; only slice payload is ciphertext.
+    let format = original_format(data, entry).unwrap_or(entry.typ);
+    let mut codec = match &format {
         b"hvc1" | b"hev1" | b"dvh1" | b"dvhe" => Codec::Hevc,
-        b"avc1" | b"avc3" | b"dva1" | b"dvav" => Codec::Avc,
+        // `avc2`/`avc4` are AVC2SampleEntry, which *Dolby Vision Streams Within
+        // the ISO Base Media File Format* lists alongside `avc1`/`avc3` as a
+        // container for a dvcC/dvvC box (§3.1, §8.1.1). Without them such a
+        // track fell to `Codec::Other`, which reports the raw FourCC as the
+        // codec and — because the sampler has no arm for it — skips RPU
+        // scanning entirely, dropping the whole dynamic half of the report.
+        b"avc1" | b"avc3" | b"avc2" | b"avc4" | b"dva1" | b"dvav" => Codec::Avc,
         b"av01" | b"dav1" => Codec::Av1,
         b"vp09" => Codec::Vp9,
         // The six ProRes video profiles. ProRes RAW (`aprn`/`aprh`) is a
         // different codec family and stays on the generic fallback.
         b"apco" | b"apcs" | b"apcn" | b"apch" | b"ap4h" | b"ap4x" => Codec::ProRes,
-        other => Codec::Other(String::from_utf8_lossy(other).to_string()),
+        // SMPTE RP 2025-2007, "VC-1 Bitstream Storage in the ISO Base Media
+        // File Format": the sample entry is `vc-1` and always contains a `dvc1`
+        // config box, VC-1's analogue of `avcC`.
+        b"vc-1" => Codec::Vc1,
+        // QuickTime MJPEG (what `ffmpeg -c:v mjpeg out.mov` writes). Apple's
+        // `mjpa`/`mjpb` field-split variants alter the frame layout and keep
+        // their FourCC.
+        b"jpeg" => Codec::Mjpeg,
+        // The shared FourCC rendering: space padding trimmed ("dvc " reports
+        // "dvc", matching MediaInfo and the codec_id beside it) and an
+        // unprintable code as the 0x… hex form the other carriages use.
+        other => Codec::Other(super::bmih::fourcc_label(other)),
     };
 
     // VisualSampleEntry: width/height at box offset 32/34; child boxes at 86.
@@ -596,9 +882,35 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let height = read_u16(data, entry_box_start + 34) as u32;
     let children = iter_boxes(data, entry_box_start + 86, entry.end);
 
+    // `mp4v` is the generic MPEG-4 visual sample entry and names no codec by
+    // itself: the `esds` descriptor's `objectTypeIndication` says what is
+    // actually inside. Without this the entry falls to `Codec::Other("mp4v")`,
+    // which reports the FourCC as the codec and skips the sampler entirely.
+    //
+    // The same descriptor's `DecoderSpecificInfo` is where an MPEG-4 Part 2
+    // track keeps its visual headers, so the range is carried through to the
+    // post-index fill rather than re-walked there.
+    let mut codec_headers = 0..0;
+    if &format == b"mp4v" {
+        if let Some((oti, dsi)) = children
+            .iter()
+            .find(|c| &c.typ == b"esds")
+            .and_then(|c| {
+                esds_decoder_config(&data[c.payload..c.end])
+                    .map(|(oti, r)| (oti, c.payload + r.start..c.payload + r.end))
+            })
+        {
+            if let Some(c) = codec_from_oti(oti) {
+                codec = c;
+                codec_headers = dsi;
+            }
+        }
+    }
+
     let mut bit_depth = None;
     let mut chroma = None;
     let mut codec_profile = None;
+    let mut pasp: Option<(u32, u32)> = None;
     // ProRes has no decoder-config child box: the sample-entry FourCC itself
     // is the profile, and the family defines chroma/depth (10-bit 4:2:2, or
     // 12-bit 4:4:4 for the 4444 pair). Colour still comes from the ordinary
@@ -610,6 +922,13 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             bit_depth = Some(bd);
         }
     }
+    // VC-1's depth is a format constant, not a signal, so it does not depend on
+    // the `dvc1` box parsing — a track whose config box is missing or malformed
+    // is still 8-bit, and reporting nothing there would disagree with the same
+    // stream carried in Matroska.
+    if codec == Codec::Vc1 {
+        bit_depth = Some(crate::vc1::BIT_DEPTH);
+    }
     let mut nal_len = 4u8;
     let mut color = ColorInfo::default();
     let mut dv_config = None;
@@ -618,7 +937,13 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     let mut hvcc_bytes: Option<&[u8]> = None;
     let mut avcc_bytes: Option<&[u8]> = None;
     let mut av1c_bytes: Option<&[u8]> = None;
-    let mut vpcc_color: Option<ColorInfo> = None;
+    let mut vpcc_color: Option<(ColorInfo, ColorSources)> = None;
+    // The VC-1 sequence header's own colour description, which for this codec is
+    // never absent: a clear `COLOR_FORMAT_FLAG` means the spec's defaults apply.
+    let mut vc1_color: Option<(ColorInfo, ColorSources)> = None;
+    // The `colr` box's own provenance, kept beside the values it produced so an
+    // unnamed CICP code is not mistaken later for a field nothing signalled.
+    let mut colr_source: Option<ColorSources> = None;
     // A layered-HEVC config box (`lhvC`) beside the base `hvcC` marks MV-HEVC — the
     // multiview form of DV Profile 20 (for 3D / dual-view); its absence is the 2D
     // single-view form. Free to detect: the box is already a sample-entry child.
@@ -635,7 +960,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                 hvcc_bytes = Some(&data[c.payload..c.end]);
                 if let Some(h) = super::parse_hvcc_record(&data[c.payload..c.end]) {
                     bit_depth = Some(h.bit_depth);
-                    chroma = Some(h.chroma.to_string());
+                    chroma = h.chroma.map(str::to_string);
                     nal_len = h.nal_len;
                     codec_profile = Some(h.profile_str);
                 }
@@ -644,7 +969,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                 avcc_bytes = Some(&data[c.payload..c.end]);
                 if let Some(a) = super::parse_avcc_record(&data[c.payload..c.end]) {
                     bit_depth = Some(a.bit_depth);
-                    chroma = Some(a.chroma.to_string());
+                    chroma = a.chroma.map(str::to_string);
                     nal_len = a.nal_len;
                     codec_profile = Some(a.profile_str);
                 }
@@ -655,14 +980,14 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
                 }
                 if let Some((bd, ch, prof)) = parse_av1c(data, c) {
                     bit_depth = Some(bd);
-                    chroma = Some(ch.to_string());
-                    codec_profile = Some(prof);
+                    chroma = ch.map(str::to_string);
+                    codec_profile = prof;
                 }
             }
             b"vpcC" => {
-                if let Some(v) = parse_vpcc(data, c) {
+                if let Some(v) = super::parse_vpcc_record(&data[c.payload..c.end]) {
                     bit_depth = Some(v.bit_depth);
-                    chroma = Some(v.chroma.to_string());
+                    chroma = v.chroma.map(str::to_string);
                     codec_profile = Some(v.profile_str);
                     vpcc_color = Some(v.color);
                 }
@@ -672,10 +997,42 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
             b"dvcC" | b"dvvC" | b"dvwC" => {
                 dv_config = super::parse_dovi_config(&data[c.payload..c.end])
             }
+            // `dvc1` (`VC1DecSpecStruc`) is a config record like `hvcC`: for
+            // Advanced Profile its `seqhdr_ephdr` holds the sequence header
+            // EBDU verbatim, so the colour description costs no sample reads.
+            // Note its `profile` field numbers Simple/Main/Advanced 0/4/12,
+            // *not* the bitstream's 0/1/3 — `vc1::parse_dvc1` owns that
+            // distinction so no call site can conflate the two.
+            b"dvc1" => {
+                if let Some(cfg) = crate::vc1::parse_dvc1(&data[c.payload..c.end]) {
+                    codec_profile = cfg.profile_level;
+                    if let Some(seq) = cfg.seq {
+                        chroma = seq.chroma.map(str::to_string);
+                        vc1_color = Some(seq.color);
+                    }
+                }
+            }
             b"lhvC" => layered = true,
             b"vexu" => stereo = parse_stereo(data, c).or(stereo),
+            // PixelAspectRatioBox: hSpacing/vSpacing, the container's own
+            // pixel-shape declaration — wins over the coded stream's SAR,
+            // like every other container-vs-stream authority here.
+            b"pasp" => {
+                if c.end - c.payload >= 8 {
+                    let h = read_u32(data, c.payload);
+                    let v = read_u32(data, c.payload + 4);
+                    if h > 0 && v > 0 {
+                        pasp = Some((h, v));
+                    }
+                }
+            }
             b"cuvv" => cuvv_version_map = parse_cuvv(&data[c.payload..c.end]),
-            b"colr" => color = parse_colr(data, c).unwrap_or(color),
+            b"colr" => {
+                if let Some((c, src)) = parse_colr(data, c) {
+                    color = c;
+                    colr_source = Some(src);
+                }
+            }
             b"mdcv" | b"SmDm" => mastering = parse_mdcv(data, c).or(mastering),
             b"clli" | b"CoLL" => content_light = parse_clli(data, c).or(content_light),
             _ => {}
@@ -696,29 +1053,55 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
     // field — iPhone HLG/DV MOVs are the common case): the colr keeps authority
     // over primaries/transfer/matrix and just the VUI's video_full_range_flag
     // fills in, the same stream-sourced range MediaInfo reports for these files.
+    let mut color_source = colr_source.unwrap_or_default();
     if color.transfer.is_none() || color.range.is_none() {
+        // The parameter-set forms are the coded stream's own signalling and say
+        // so themselves; `vpcC` is a container record carrying CICP directly,
+        // so it is tagged Container where it is parsed.
         let cfg_color = if let Some(h) = hvcc_bytes {
             super::color_from_hvcc(h)
         } else if let Some(a) = avcc_bytes {
             super::color_from_avcc(a)
         } else if let Some(v) = av1c_bytes {
             super::color_from_av1c(v)
+        } else if vc1_color.is_some() {
+            // The VC-1 sequence header is the coded stream's own signalling in
+            // the same sense as an SPS VUI, and tags itself accordingly.
+            vc1_color
         } else {
             // `vpcC` carries the CICP triplet + range directly (VP9 has no
             // parameter set to embed), same fallback treatment.
             vpcc_color
         };
-        if let Some(c) = cfg_color {
+        if let Some((c, c_src)) = cfg_color {
             if color.transfer.is_none() {
                 color = c;
+                color_source = c_src;
             } else if color.range.is_none() {
                 color.range = c.range;
+                color_source.range = c_src.range;
             }
         }
     }
 
+    // The coded stream's own aspect/scan, from the config record's embedded
+    // SPS — the gap-filler behind a missing `pasp`, exactly as the record
+    // supplies depth and chroma.
+    let sps_aspect_scan = if let Some(h) = hvcc_bytes {
+        crate::hevc::sps::find_sps_in_hvcc(h)
+            .and_then(crate::hevc::sps::parse_sps)
+            .map(|s| (s.pixel_aspect, s.scan_type))
+    } else if let Some(a) = avcc_bytes {
+        crate::avc::nal::find_sps_in_avcc(a)
+            .and_then(crate::avc::sps::parse_sps)
+            .map(|s| (s.pixel_aspect, s.scan_type))
+    } else {
+        None
+    };
+    let (sps_aspect, scan_type) = sps_aspect_scan.unwrap_or((None, None));
     Ok(SampleDesc {
         codec,
+        codec_id: super::bmih::fourcc_label(&format),
         codec_profile,
         width,
         height,
@@ -726,11 +1109,15 @@ fn parse_stsd(data: &[u8], stsd: &BoxHdr) -> Result<SampleDesc> {
         chroma,
         nal_len,
         color,
+        color_source,
         dv_config,
         stereo,
         mastering,
         content_light,
         cuvv_version_map,
+        pixel_aspect: pasp.or(sps_aspect),
+        scan_type,
+        codec_headers,
     })
 }
 
@@ -780,7 +1167,11 @@ fn parse_stereo(data: &[u8], vexu: &BoxHdr) -> Option<String> {
 /// Recover VUI colour from an in-band SPS in the first few samples of a track.
 /// Used when the container carries neither a `colr` box nor an hvcC SPS the base
 /// parser can reach — the base layer of some Profile 7 dual-track MP4s.
-fn color_from_stream(data: &[u8], chunks: &[Chunk], nal_len: u8) -> Option<ColorInfo> {
+fn color_from_stream(
+    data: &[u8],
+    chunks: &[Chunk],
+    nal_len: u8,
+) -> Option<(ColorInfo, ColorSources)> {
     use crate::hevc::nal;
     let mut nals = Vec::new();
     for ch in chunks.iter().take(8) {
@@ -804,7 +1195,7 @@ fn color_from_stream(data: &[u8], chunks: &[Chunk], nal_len: u8) -> Option<Color
     None
 }
 
-fn parse_av1c(data: &[u8], b: &BoxHdr) -> Option<(u8, &'static str, String)> {
+fn parse_av1c(data: &[u8], b: &BoxHdr) -> Option<(u8, Option<&'static str>, Option<String>)> {
     if b.end < b.payload {
         return None;
     }
@@ -814,47 +1205,7 @@ fn parse_av1c(data: &[u8], b: &BoxHdr) -> Option<(u8, &'static str, String)> {
 /// What the `vpcC` (VPCodecConfigurationBox, FullBox version 1) declares: the
 /// stream's profile/level/depth/chroma plus its CICP colour + range — VP9 has
 /// no parameter set to embed, so the record carries the values directly.
-struct VpccInfo {
-    bit_depth: u8,
-    chroma: &'static str,
-    profile_str: String,
-    color: ColorInfo,
-}
-
-/// Parse a `vpcC` box: version(1)+flags(3), then profile u8, level u8,
-/// bitDepth(4)+chromaSubsamplingIdc(3)+videoFullRangeFlag(1), and the CICP
-/// colourPrimaries / transferCharacteristics / matrixCoefficients bytes.
-fn parse_vpcc(data: &[u8], b: &BoxHdr) -> Option<VpccInfo> {
-    let p = b.payload;
-    if b.end < p + 10 || data[p] != 1 {
-        return None; // only version 1 has this layout
-    }
-    let profile = data[p + 4];
-    let level = data[p + 5];
-    let packed = data[p + 6];
-    let bit_depth = packed >> 4;
-    let chroma = match (packed >> 1) & 0x07 {
-        0 | 1 => "4:2:0",
-        2 => "4:2:2",
-        3 => "4:4:4",
-        _ => "?",
-    };
-    let full_range = packed & 1 == 1;
-    let color = ColorInfo {
-        primaries: super::cicp_primaries(data[p + 7] as u16).map(str::to_string),
-        transfer: super::cicp_transfer(data[p + 8] as u16).map(str::to_string),
-        matrix: super::cicp_matrix(data[p + 9] as u16).map(str::to_string),
-        range: Some(if full_range { "full" } else { "limited" }.to_string()),
-    };
-    Some(VpccInfo {
-        bit_depth,
-        chroma,
-        profile_str: crate::vp9::profile_label(profile, (level > 0).then_some(level)),
-        color,
-    })
-}
-
-fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<ColorInfo> {
+fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<(ColorInfo, ColorSources)> {
     let p = b.payload;
     if b.end < p + 4 {
         return None;
@@ -870,18 +1221,18 @@ fn parse_colr(data: &[u8], b: &BoxHdr) -> Option<ColorInfo> {
         // Only the ISO `nclx` form carries a range flag (one byte after the
         // matrix); the QuickTime `nclc` form ends at the matrix, so its range
         // stays None for the caller to recover from the SPS VUI.
-        let range = if kind == b"nclx" && b.end >= p + 11 {
-            let full = (data[p + 10] & 0x80) != 0;
-            Some(if full { "full".to_string() } else { "limited".to_string() })
+        let full_range = if kind == b"nclx" && b.end >= p + 11 {
+            Some((data[p + 10] & 0x80) != 0)
         } else {
             None
         };
-        return Some(ColorInfo {
-            primaries: super::cicp_primaries(primaries).map(str::to_string),
-            transfer: super::cicp_transfer(transfer).map(str::to_string),
-            matrix: super::cicp_matrix(matrix).map(str::to_string),
-            range,
-        });
+        return Some(super::color_from_cicp(
+            primaries,
+            transfer,
+            matrix,
+            full_range,
+            ColorSource::Container,
+        ));
     }
     None
 }
@@ -926,7 +1277,11 @@ fn parse_clli(data: &[u8], b: &BoxHdr) -> Option<ContentLight> {
 /// entry covering a single sample is ignored — the common last-sample padding
 /// delta in otherwise-constant tracks — and any other delta mix (true VFR)
 /// yields `None`, keeping the averaged fallback.
-fn stts_uniform_fps(data: &[u8], stbl: &[BoxHdr], media_timescale: u32) -> Option<f64> {
+fn stts_uniform_fps(
+    data: &[u8],
+    stbl: &[BoxHdr],
+    media_timescale: u32,
+) -> Option<(f64, (u64, u64))> {
     let stts = find(stbl, b"stts")?;
     let p = stts.payload;
     let n = clamp_count(read_u32(data, p + 4) as usize, p + 8, 8, stts.end);
@@ -947,7 +1302,10 @@ fn stts_uniform_fps(data: &[u8], stbl: &[BoxHdr], media_timescale: u32) -> Optio
     if d == 0 || media_timescale == 0 {
         return None;
     }
-    Some(media_timescale as f64 / d as f64)
+    // Two unvalidated 32-bit fields; the shared bound keeps a misread pair
+    // from stating a timescale's worth of frames per second.
+    let f = super::plausible_fps(media_timescale as f64 / d as f64)?;
+    Some((f, (u64::from(media_timescale), u64::from(d))))
 }
 
 fn build_sample_index(data: &[u8], stbl: &[BoxHdr], _codec: Codec) -> Result<Vec<Chunk>> {
@@ -1220,6 +1578,7 @@ mod tests {
         VideoTrack {
             sd: SampleDesc {
                 codec: Codec::Hevc,
+                codec_id: "hvc1".to_string(),
                 codec_profile: None,
                 width: w,
                 height: h,
@@ -1227,18 +1586,24 @@ mod tests {
                 chroma: Some("4:2:0".to_string()),
                 nal_len,
                 color: ColorInfo::default(),
+                color_source: ColorSources::default(),
                 dv_config: dv,
                 stereo: None,
                 mastering: None,
                 content_light: None,
                 cuvv_version_map: None,
+                pixel_aspect: None,
+                scan_type: None,
+                codec_headers: 0..0,
             },
             chunks: (0..chunks).map(|i| Chunk { offset: i as u64, size: 1 }).collect(),
             fps: Some(24.0),
+            fps_rational: None,
             duration_secs: Some(1.0),
             stream_duration_secs: None,
             track_id: 1,
             media_timescale: 0,
+            vdep_refs: Vec::new(),
         }
     }
 
@@ -1294,6 +1659,61 @@ mod tests {
         assert_eq!(d.tracks[0].chunks.len(), 3, "no cross-track concatenation");
         assert_eq!(d.tracks[1].chunks.len(), 2);
         assert!(d.tracks.iter().all(|t| !t.dv_dual_track));
+    }
+
+    #[test]
+    fn tref_vdep_parses_referenced_track_ids() {
+        let refs = |children: &[u8]| {
+            let tref = boxed(*b"tref", children);
+            let boxes = iter_boxes(&tref, 0, tref.len());
+            parse_vdep_refs(&tref, &boxes)
+        };
+        let ids = |v: &[u32]| -> Vec<u8> {
+            v.iter().flat_map(|i| i.to_be_bytes()).collect()
+        };
+        assert_eq!(refs(&boxed(*b"vdep", &ids(&[1]))), vec![1]);
+        assert_eq!(refs(&boxed(*b"vdep", &ids(&[1, 7]))), vec![1, 7]);
+        // Other reference types share the tref and must be ignored.
+        let mut mixed = boxed(*b"cdsc", &ids(&[4]));
+        mixed.extend_from_slice(&boxed(*b"vdep", &ids(&[2])));
+        assert_eq!(refs(&mixed), vec![2]);
+        // A vdep whose extent isn't a whole number of ids reads only the
+        // complete ones, never past the box.
+        assert_eq!(refs(&boxed(*b"vdep", &[0, 0, 0, 3, 0xAA])), vec![3]);
+        assert!(refs(&[]).is_empty());
+        // No tref at all is the common case, not an error.
+        let empty: Vec<BoxHdr> = Vec::new();
+        assert!(parse_vdep_refs(&[], &empty).is_empty());
+    }
+
+    #[test]
+    fn vdep_outranks_the_width_heuristic_for_the_el_fold_target() {
+        // Two independent base traks plus an EL whose tref/vdep names the
+        // *narrower* one. §8.2.2 makes that reference the authoritative
+        // dependency signal, so the EL must fold there rather than into the
+        // widest trak the fallback would otherwise pick.
+        let a = track(3840, 2160, 4, None, 3);
+        let mut b = track(1920, 1080, 4, None, 2);
+        b.track_id = 2;
+        let mut el = track(1920, 1080, 4, Some(dv7_el()), 4);
+        el.track_id = 3;
+        el.vdep_refs = vec![2];
+        let d = assemble_tracks(&[], vec![a, b, el], "MP4 (ISOBMFF)");
+        assert_eq!(d.tracks.len(), 2);
+        assert_eq!(d.tracks[0].chunks.len(), 3, "widest trak left alone");
+        assert!(!d.tracks[0].dv_dual_track);
+        assert_eq!(d.tracks[1].chunks.len(), 6, "EL folded into the referenced trak");
+        assert!(d.tracks[1].dv_dual_track);
+
+        // A vdep naming a track the file doesn't contain is unusable, so the
+        // width fallback still runs — the EL is never dropped.
+        let mut el = track(1920, 1080, 4, Some(dv7_el()), 4);
+        el.track_id = 3;
+        el.vdep_refs = vec![99];
+        let d = assemble_tracks(&[], vec![track(3840, 2160, 4, None, 3), el], "MP4 (ISOBMFF)");
+        assert_eq!(d.tracks.len(), 1);
+        assert_eq!(d.tracks[0].chunks.len(), 7);
+        assert!(d.tracks[0].dv_dual_track);
     }
 
     #[test]
@@ -1404,23 +1824,28 @@ mod tests {
             let boxes = iter_boxes(&buf, 0, buf.len());
             (buf, boxes)
         };
-        // Uniform: 3568 samples at delta 256, timescale 15360 → exactly 60.
+        // Uniform: 3568 samples at delta 256, timescale 15360 → exactly 60,
+        // with the exact declared ratio beside the float.
         let (buf, boxes) = mk(&[(3568, 256)]);
-        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(60.0));
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some((60.0, (15360, 256))));
         // A trailing single-sample padding delta doesn't break uniformity.
         let (buf, boxes) = mk(&[(3567, 256), (1, 512)]);
-        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(60.0));
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some((60.0, (15360, 256))));
         // True VFR (mixed deltas over multiple samples) declares no rate.
         let (buf, boxes) = mk(&[(100, 256), (100, 512)]);
         assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
         // A single-entry table covering one sample is still a declared rate.
         let (buf, boxes) = mk(&[(1, 512)]);
-        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some(30.0));
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), Some((30.0, (15360, 512))));
         // Degenerate values never divide: zero delta, empty table, timescale 0.
         let (buf, boxes) = mk(&[(10, 0)]);
         assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
         let (buf, boxes) = mk(&[]);
         assert_eq!(stts_uniform_fps(&buf, &boxes, 15360), None);
+        // A delta of 1 tick under a 1 MHz timescale states a million fps — a
+        // misread pair, dropped by the shared plausibility bound.
+        let (buf, boxes) = mk(&[(10, 1)]);
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 1_000_000), None);
         let (buf, boxes) = mk(&[(10, 256)]);
         assert_eq!(stts_uniform_fps(&buf, &boxes, 0), None);
         // A lying entry count is clamped to the box payload (one real entry).
@@ -1430,7 +1855,7 @@ mod tests {
         body.extend_from_slice(&1000u32.to_be_bytes());
         let buf = boxed(*b"stts", &body);
         let boxes = iter_boxes(&buf, 0, buf.len());
-        assert_eq!(stts_uniform_fps(&buf, &boxes, 24000), Some(24.0));
+        assert_eq!(stts_uniform_fps(&buf, &boxes, 24000), Some((24.0, (24000, 1000))));
     }
 
     /// One size-prefixed ISOBMFF box.
@@ -1473,16 +1898,266 @@ mod tests {
 
     /// An stsd holding one `hvc1` VisualSampleEntry with the given child boxes.
     fn stsd_with(children: &[Vec<u8>]) -> Vec<u8> {
+        stsd_with_fourcc(*b"hvc1", children)
+    }
+
+    /// As [`stsd_with`], with the sample entry's FourCC chosen by the caller.
+    fn stsd_with_fourcc(fourcc: [u8; 4], children: &[Vec<u8>]) -> Vec<u8> {
         let mut entry_payload = vec![0u8; 78]; // fixed VisualSampleEntry fields
         entry_payload[24..26].copy_from_slice(&3840u16.to_be_bytes()); // width (entry offset 32)
         entry_payload[26..28].copy_from_slice(&2160u16.to_be_bytes()); // height (entry offset 34)
         for c in children {
             entry_payload.extend_from_slice(c);
         }
-        let entry = boxed(*b"hvc1", &entry_payload);
+        let entry = boxed(fourcc, &entry_payload);
         let mut stsd_payload = vec![0, 0, 0, 0, 0, 0, 0, 1]; // ver/flags + entry_count
         stsd_payload.extend_from_slice(&entry);
         boxed(*b"stsd", &stsd_payload)
+    }
+
+    #[test]
+    fn a_box_whose_size_undercuts_its_own_header_is_skipped() {
+        // A 32-bit `size` of 2..=7, or a 64-bit `largesize` under 16, declares
+        // a box shorter than the header it was read from, so `payload > end`.
+        // Every consumer slices `payload..end`, so admitting one turns a
+        // malformed file into a panic: exit 101, outside the tool's contract,
+        // and in a directory scan it takes every remaining file with it.
+        for size in 0u32..8 {
+            let mut d = size.to_be_bytes().to_vec();
+            d.extend_from_slice(b"esds");
+            d.extend_from_slice(&[0xAA; 16]);
+            for b in iter_boxes(&d, 0, d.len()) {
+                assert!(b.payload <= b.end, "size {size} yielded payload > end");
+                let _ = &d[b.payload..b.end]; // must not panic
+            }
+        }
+        // The 64-bit form.
+        let mut d = 1u32.to_be_bytes().to_vec();
+        d.extend_from_slice(b"esds");
+        d.extend_from_slice(&8u64.to_be_bytes());
+        d.extend_from_slice(&[0xAA; 16]);
+        for b in iter_boxes(&d, 0, d.len()) {
+            assert!(b.payload <= b.end);
+            let _ = &d[b.payload..b.end];
+        }
+        // A well-formed box still parses, so the guard costs nothing real.
+        let good = boxed(*b"esds", &[0xAA; 8]);
+        let boxes = iter_boxes(&good, 0, good.len());
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].end - boxes[0].payload, 8);
+    }
+
+    #[test]
+    fn esds_object_type_reads_the_real_descriptor_chain() {
+        // `testfiles/sdr/mpeg2.mp4`'s esds payload verbatim: FullBox header,
+        // ES_Descriptor (tag 3, four-byte expandable length `80 80 80 1b`),
+        // ES_ID 1, flags 0, then DecoderConfigDescriptor (tag 4) whose first
+        // byte is objectTypeIndication 0x61, MPEG-2 Main Profile. It carries no
+        // DecoderSpecificInfo, which is why an MPEG-2 MP4 needs the sample read.
+        let esds = [
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x1B, 0x00, 0x01, 0x00, 0x04, 0x80,
+            0x80, 0x80, 0x0D, 0x61, 0x11, 0x00, 0x00, 0x00, 0x00, 0x05, 0xEB, 0xD0, 0x00, 0x05,
+            0xEB, 0xD0, 0x06, 0x80, 0x80, 0x80, 0x01, 0x02,
+        ];
+        let (oti, dsi) = esds_decoder_config(&esds).unwrap();
+        assert_eq!(oti, 0x61);
+        assert!(dsi.is_empty());
+        assert_eq!(codec_from_oti(0x61), Some(Codec::Mpeg2));
+
+        // The single-byte length form, and the three optional ES_Descriptor
+        // fields that must be skipped in order. Flags 0xE0 sets all three:
+        // dependsOn_ES_ID(16), a URL, and OCR_ES_Id(16).
+        let mut d = vec![0x00, 0x00, 0x00, 0x00, 0x03, 0x0C, 0x00, 0x01, 0xE0];
+        d.extend_from_slice(&[0x00, 0x02]); // dependsOn_ES_ID
+        d.extend_from_slice(&[0x03, b'a', b'b', b'c']); // URLlength + URLstring
+        d.extend_from_slice(&[0x00, 0x04]); // OCR_ES_Id
+        d.extend_from_slice(&[0x04, 0x05, 0x6A]); // DecoderConfig, OTI 0x6A
+        assert_eq!(esds_decoder_config(&d).unwrap().0, 0x6A);
+        assert_eq!(codec_from_oti(0x6A), Some(Codec::Mpeg1));
+
+        // All six 13818-2 profile rows collapse to one codec; the profile comes
+        // from the sequence header instead.
+        for oti in 0x60..=0x65u8 {
+            assert_eq!(codec_from_oti(oti), Some(Codec::Mpeg2), "OTI {oti:#04x}");
+        }
+        assert_eq!(codec_from_oti(0x20), Some(Codec::Mpeg4Part2));
+        // Anything this backend cannot then describe stays unmapped, so the
+        // entry keeps its FourCC fallback rather than claiming a codec.
+        assert_eq!(codec_from_oti(0x40), None);
+        assert_eq!(codec_from_oti(0x00), None);
+
+        // Truncation and a wrong tag both decline rather than reading garbage.
+        assert!(esds_decoder_config(&esds[..16]).is_none());
+        assert!(esds_decoder_config(&[0, 0, 0, 0, 0x05, 0x01, 0x61]).is_none());
+        assert!(esds_decoder_config(&[]).is_none());
+    }
+
+    #[test]
+    fn the_decoder_specific_info_is_the_mpeg4_part2_header_set() {
+        // `testfiles/sdr/mpeg4p2.mp4`'s esds payload verbatim. Its
+        // DecoderSpecificInfo (tag 5, length 0x2F) is byte-identical to the same
+        // encode's Matroska CodecPrivate, so both containers reach the visual
+        // headers with no sample read at all.
+        let esds = [
+            0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x4F, 0x00, 0x01, 0x00, 0x04, 0x80,
+            0x80, 0x80, 0x41, 0x20, 0x11, 0x00, 0x00, 0x00, 0x00, 0x05, 0x54, 0xB8, 0x00, 0x05,
+            0x54, 0xB8, 0x05, 0x80, 0x80, 0x80, 0x2F, 0x00, 0x00, 0x01, 0xB0, 0x01, 0x00, 0x00,
+            0x01, 0xB5, 0x89, 0x13, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00, 0xC4,
+            0x8D, 0x88, 0x00, 0xCD, 0x0A, 0x04, 0x1E, 0x14, 0x43, 0x00, 0x00, 0x01, 0xB2, 0x4C,
+            0x61, 0x76, 0x63, 0x36, 0x32, 0x2E, 0x31, 0x31, 0x2E, 0x31, 0x30, 0x30, 0x06, 0x80,
+            0x80, 0x80, 0x01, 0x02,
+        ];
+        let (oti, dsi) = esds_decoder_config(&esds).unwrap();
+        assert_eq!(oti, 0x20);
+        assert_eq!(codec_from_oti(oti), Some(Codec::Mpeg4Part2));
+        assert_eq!(dsi.len(), 0x2F);
+        assert_eq!(&esds[dsi.clone()][..4], &[0x00, 0x00, 0x01, 0xB0]);
+        // And it really does describe the picture from here.
+        let v = crate::mpeg4part2::parse_visual(&esds[dsi]).expect("VOL parses");
+        assert_eq!((v.width, v.height), (320, 240));
+        assert_eq!(v.profile_level.as_deref(), Some("Simple@L1"));
+    }
+
+    #[test]
+    fn a_truncated_decoder_specific_info_yields_no_headers_not_a_short_read() {
+        // The DecoderConfigDescriptor declares 0x11 bytes, which is long enough
+        // to reach the tag and length, and the DecoderSpecificInfo inside it
+        // then claims 0x2F bytes where only two remain. Both clamps have to
+        // fire: the range must stay inside its parent descriptor *and* inside
+        // the buffer, so the visual parse sees two bytes and declines rather
+        // than reading whatever follows the box.
+        //
+        // The declared length matters. An earlier version of this test used a
+        // DecoderConfigDescriptor length of 6, which put `p` past the
+        // descriptor's end before the tag was ever examined — so it passed on
+        // an empty range and proved nothing about the clamp it was named for.
+        let esds = esds_with(17, &[0x05, 0x2F, 0xAA, 0xBB]);
+        let (oti, dsi) = esds_decoder_config(&esds).unwrap();
+        assert_eq!(oti, 0x20);
+        // The two bytes that are actually there, not the 47 claimed.
+        assert_eq!(dsi, 26..28, "clamped to the buffer, and to the parent descriptor");
+        assert!(crate::mpeg4part2::parse_visual(&esds[dsi]).is_none());
+    }
+
+    /// An `esds` payload: FullBox header, ES_Descriptor with no optional
+    /// fields, then a DecoderConfigDescriptor declaring `config_len` whose
+    /// object type is MPEG-4 Part 2, with `tail` following its 13 fixed bytes.
+    /// The 13 are objectTypeIndication, streamType, bufferSizeDB(3),
+    /// maxBitrate(4) and avgBitrate(4).
+    fn esds_with(config_len: u8, tail: &[u8]) -> Vec<u8> {
+        let mut d = vec![0x00, 0x00, 0x00, 0x00, 0x03];
+        let body_len = 3 + 2 + 13 + tail.len();
+        d.push(body_len as u8);
+        d.extend_from_slice(&[0x00, 0x01, 0x00]); // ES_ID + flags
+        d.extend_from_slice(&[0x04, config_len, 0x20, 0x11]);
+        d.extend_from_slice(&[0u8; 11]); // bufferSizeDB + the two bitrates
+        d.extend_from_slice(tail);
+        d
+    }
+
+    #[test]
+    fn a_descriptor_shorter_than_its_fixed_fields_still_names_the_codec() {
+        // Two ways an `esds` can be cut inside the DecoderSpecificInfo, both of
+        // which used to take the whole descriptor chain down with them — and
+        // with it the codec, since `mp4v` names none by itself. A track that
+        // falls to `Codec::Other("mp4v")` loses its codec label *and* is never
+        // sampled, so this is the "unrecognized FourCC costs the whole report"
+        // failure mode reached through a one-byte truncation.
+        //
+        // 1. The tag is the last byte, so there is no length to read at all.
+        let cut_at_tag = esds_with(14, &[0x05]);
+        assert_eq!(esds_decoder_config(&cut_at_tag).unwrap().0, 0x20);
+        assert!(esds_decoder_config(&cut_at_tag).unwrap().1.is_empty());
+
+        // 2. The length is a multi-byte form that runs off the end.
+        let cut_in_len = esds_with(16, &[0x05, 0x80, 0x80]);
+        let (oti, dsi) = esds_decoder_config(&cut_in_len).unwrap();
+        assert_eq!(oti, 0x20);
+        assert!(dsi.is_empty());
+
+        // And a DecoderConfigDescriptor too short to contain its own fixed
+        // fields must not read the tag from the bytes after it: here it
+        // declares 6 bytes while a `0x05` sits well past its end.
+        let short_config = esds_with(6, &[0x05, 0x02, 0xAA, 0xBB]);
+        let (oti, dsi) = esds_decoder_config(&short_config).unwrap();
+        assert_eq!(oti, 0x20);
+        assert!(dsi.is_empty(), "a descriptor's tail is not its child");
+    }
+
+    /// The `codec` a one-entry stsd with this sample-entry FourCC resolves to.
+    fn codec_of(fourcc: &[u8; 4], children: &[Vec<u8>]) -> Codec {
+        let data = stsd_with_fourcc(*fourcc, children);
+        let top = iter_boxes(&data, 0, data.len());
+        parse_stsd(&data, &top[0]).unwrap().codec
+    }
+
+    /// A common-encryption `sinf` preserving `orig` as the original format.
+    fn sinf_box(orig: &[u8; 4]) -> Vec<u8> {
+        boxed(*b"sinf", &boxed(*b"frma", orig))
+    }
+
+    #[test]
+    fn encv_resolves_to_the_original_codec_via_sinf_frma() {
+        // ISO/IEC 23001-7 swaps the sample-entry FourCC for `encv` and keeps
+        // the real one in sinf/frma. Both Dolby streaming specs require it:
+        // "the fourCC string (for example, dvh1 for profile 5) must be
+        // replaced with encv".
+        assert_eq!(codec_of(b"encv", &[sinf_box(b"dvh1")]), Codec::Hevc);
+        assert_eq!(codec_of(b"encv", &[sinf_box(b"hvc1")]), Codec::Hevc);
+        assert_eq!(codec_of(b"encv", &[sinf_box(b"dvav")]), Codec::Avc);
+        assert_eq!(codec_of(b"encv", &[sinf_box(b"av01")]), Codec::Av1);
+        // The unwrap must not fabricate a codec when the chain is incomplete:
+        // no sinf, no frma, or a truncated frma each stay on the fallback.
+        let enc = Codec::Other("encv".to_string());
+        assert_eq!(codec_of(b"encv", &[]), enc);
+        assert_eq!(codec_of(b"encv", &[boxed(*b"sinf", &[])]), enc);
+        assert_eq!(codec_of(b"encv", &[boxed(*b"sinf", &boxed(*b"frma", b"dv"))]), enc);
+        // An unprotected entry is never unwrapped, even carrying a stray sinf.
+        assert_eq!(codec_of(b"hvc1", &[sinf_box(b"av01")]), Codec::Hevc);
+    }
+
+    #[test]
+    fn avc2_and_avc4_sample_entries_are_avc() {
+        // AVC2SampleEntry is a dvcC/dvvC container per the Dolby ISOBMFF spec
+        // (§3.1 container list, §8.1.1), so it must resolve to AVC like its
+        // avc1/avc3 siblings rather than falling through to the raw-FourCC
+        // fallback, which also costs the track its RPU scan.
+        for f in [b"avc1", b"avc3", b"avc2", b"avc4", b"dva1", b"dvav"] {
+            assert_eq!(codec_of(f, &[]), Codec::Avc, "{}", String::from_utf8_lossy(f));
+        }
+        for f in [b"hvc1", b"hev1", b"dvh1", b"dvhe"] {
+            assert_eq!(codec_of(f, &[]), Codec::Hevc, "{}", String::from_utf8_lossy(f));
+        }
+        // `mp4v` names no codec by itself and falls through verbatim when
+        // nothing resolves it.
+        assert_eq!(codec_of(b"mp4v", &[]), Codec::Other("mp4v".to_string()));
+        // The fallback trims FourCC space padding (QuickTime consumer DV is
+        // 'd','v','c',0x20), agreeing with codec_id and MediaInfo's CodecID.
+        assert_eq!(codec_of(b"dvc ", &[]), Codec::Other("dvc".to_string()));
+
+        // With an `esds`, the objectTypeIndication does resolve it. Same
+        // descriptor chain as the real `testfiles/sdr/mpeg2.mp4`, OTI byte
+        // swapped per case. Without the refinement this whole block reports
+        // `Other("mp4v")`, which skips the sampler and prints the FourCC.
+        let esds_with = |oti: u8| {
+            boxed(
+                *b"esds",
+                &[
+                    0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x80, 0x80, 0x1B, 0x00, 0x01, 0x00, 0x04,
+                    0x80, 0x80, 0x80, 0x0D, oti, 0x11, 0x00, 0x00, 0x00, 0x00, 0x05, 0xEB, 0xD0,
+                    0x00, 0x05, 0xEB, 0xD0,
+                ],
+            )
+        };
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x61)]), Codec::Mpeg2);
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x6A)]), Codec::Mpeg1);
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x20)]), Codec::Mpeg4Part2);
+        // An object type this backend cannot then describe keeps the FourCC
+        // fallback rather than being claimed as something it is not.
+        assert_eq!(codec_of(b"mp4v", &[esds_with(0x40)]), Codec::Other("mp4v".to_string()));
+        // The refinement is gated on `mp4v`: another entry's esds must not
+        // relabel it.
+        assert_eq!(codec_of(b"avc1", &[esds_with(0x61)]), Codec::Avc);
     }
 
     #[test]
@@ -1506,7 +2181,7 @@ mod tests {
         let parse = |payload: &[u8]| {
             let data = boxed(*b"colr", payload);
             let top = iter_boxes(&data, 0, data.len());
-            parse_colr(&data, &top[0])
+            parse_colr(&data, &top[0]).map(|(c, _)| c)
         };
         // ISO nclx: the byte after the matrix carries the full-range flag.
         let c = parse(b"nclx\x00\x09\x00\x12\x00\x09\x80").unwrap();

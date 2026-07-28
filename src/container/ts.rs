@@ -26,17 +26,18 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::avc::nal as avc_nal;
-use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
-use crate::hevc::nal::{self, NalRef};
-use crate::hevc::sps::{parse_sps, SpsInfo};
-use crate::model::{Bitrate, ColorInfo};
+use crate::container::{best_sps, sps_fields, Chunk, Codec, Demux, DvConfig, NalFormat, SpsCommon, TrackDemux};
+use crate::model::Bitrate;
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
 const SYNC: u8 = 0x47;
 const TS_UNIT: usize = 188;
 const PID_PAT: u16 = 0x0000;
+const STREAM_TYPE_MPEG1: u8 = 0x01;
+const STREAM_TYPE_MPEG2: u8 = 0x02;
+/// ISO/IEC 14496-2 video in a PES stream, per ITU-T H.222.0 Table 2-34.
+const STREAM_TYPE_MPEG4_PART2: u8 = 0x10;
 const STREAM_TYPE_AVC: u8 = 0x1B;
 const STREAM_TYPE_HEVC: u8 = 0x24;
 
@@ -93,7 +94,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
     let programs = parse_psi(data, layout).context("no PMT / program map found")?;
     let groups = group_video_pids(&programs);
     if groups.is_empty() {
-        bail!("no HEVC/AVC/Dolby Vision video PID in the program map");
+        bail!("no MPEG, AVC, HEVC or Dolby Vision video PID in the program map");
     }
 
     // Metadata always comes from the bounded head pass — even under `--full`,
@@ -116,7 +117,7 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         outs.iter().zip(&codecs).map(|(o, c)| best_sps(&o.buf, &o.chunks, c)).collect();
     let mut sps_chunks: Vec<Option<usize>> =
         bests.iter().map(|b| b.as_ref().map(|c| c.chunk)).collect();
-    if full && bests.iter().any(|b| b.is_none()) {
+    if full {
         // A group's head window held no SPS at all (first IDR beyond the
         // budget — atypical captures): under `--full` keep looking through the
         // whole stream rather than losing the resolution the old whole-stream
@@ -124,28 +125,48 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         // hit's chunk index is window-relative, meaningless against the head
         // chunks — and unneeded: the `--full` scan covers every AU, so nothing
         // must be pinned.
+        //
+        // MPEG groups are excluded — MPEG-1/2 and MPEG-4 Part 2 alike: they have
+        // no SPS to find, so their `None` is not a miss, and hunting one would
+        // run the walk to EOF for a structure that cannot exist. That would make
+        // `--full` two passes over an MPEG transport stream against the
+        // single-pass invariant, and two wire transfers of a capture on a
+        // network volume.
         let targets: Vec<(usize, Vec<u16>, Codec)> = bests
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.is_none())
+            .filter(|(i, b)| {
+                b.is_none()
+                    && !matches!(
+                        codecs[*i],
+                        Codec::Mpeg1 | Codec::Mpeg2 | Codec::Mpeg4Part2
+                    )
+            })
             .map(|(i, _)| (i, group_pids[i].clone(), codecs[i].clone()))
             .collect();
-        for (i, rescued) in sps_rescue(data, layout, &targets, progress, frontier) {
-            bests[i] = rescued;
-            sps_chunks[i] = None;
+        if !targets.is_empty() {
+            for (i, rescued) in sps_rescue(data, layout, &targets, progress, frontier) {
+                bests[i] = rescued;
+                sps_chunks[i] = None;
+            }
         }
     }
 
-    // Duration from the transport clock (head+tail PCR delta), file-level: a
-    // multi-program capture shares one mux timeline. Prefer the PMTs' declared
-    // PCR PIDs, falling back to the video PID(s) — most streams carry the PCR
-    // on the video PID anyway.
-    let duration_secs = programs
+    // Duration from the clocks (video PTS span, PCR fallback — see
+    // `clock_duration`), file-level: a multi-program capture shares one mux
+    // timeline. Prefer the PMTs' declared PCR PIDs, falling back to the video
+    // PID(s) — most streams carry the PCR on the video PID anyway. The PTS
+    // route is offered only for a single-program, single-video-group file:
+    // sibling programs ride independent STCs, and a span across two clocks is
+    // not a duration.
+    let video_pids: Vec<u16> = group_pids.iter().flatten().copied().collect();
+    let pts_ok = programs.len() <= 1 && group_pids.len() == 1;
+    let clock_est = programs
         .iter()
         .map(|p| p.pcr_pid)
-        .chain(group_pids.iter().flatten().copied())
+        .chain(video_pids.iter().copied())
         .filter(|&pid| pid != PID_NONE)
-        .find_map(|pid| pcr_duration(data, layout, pid));
+        .find_map(|pid| clock_duration(data, layout, pid, pts_ok.then_some(&video_pids[..])));
 
     let container = if layout.stride == 192 {
         "MPEG-2 TS (M2TS/BDAV)"
@@ -162,41 +183,92 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         groups.iter().zip(outs).zip(bests.into_iter().zip(sps_chunks)).zip(codecs)
     {
         let (best, sps_chunk) = best;
-        let (width, height, bit_depth, chroma, codec_profile, color, fps) = sps_fields(best);
+        let (
+            width,
+            height,
+            bit_depth,
+            chroma,
+            codec_profile,
+            (color, color_source),
+            fps,
+            fps_rational,
+            pixel_aspect,
+            scan_type,
+        ) = sps_fields(best);
 
         // `--full`: the exact video-stream byte total is only known after the
         // sampler's streaming walk, so leave the rate unset here — main.rs
         // fills it from `sample::Scan` (the same value the old whole-stream
         // reassembly produced, including `None` when no video bytes complete).
-        // The default bounded path reports the file-length overall rate as
-        // before — but only when this is the file's only video track: an
-        // overall rate (audio + overhead included) attributed to one of
-        // several tracks would be a wrong number, so multi-track reports
-        // `None` instead.
-        let bitrate = if full || !single {
-            None
-        } else {
-            Bitrate::overall(data.len() as u64, duration_secs)
-        };
+        // The default bounded path's overall rate is filled after this loop —
+        // its denominator is the completed duration, which needs the video
+        // track's frame rate resolved first.
+        let bitrate = None;
 
-        tracks.push(TrackDemux {
+        // MPEG-1/2 has no SPS, so `best_sps` left every field unset and the
+        // sequence header supplies them. It rides the reassembled elementary
+        // stream this track's chunks index into, not the mmap, so the buffer is
+        // bound out here rather than reached through the half-built track.
+        let buf = out.buf;
+        let mut td = TrackDemux {
             track_number: Some(g.primary_pid() as u64),
+            // The PMT stream_type in hex, the convention MediaInfo and DVB
+            // documentation use for the field ("0x24" = HEVC).
+            codec_id: Some(format!("0x{:02X}", g.primary_stream_type())),
             program: multi_program.then_some(g.program_number),
             width,
             height,
             fps,
+            fps_rational,
             bit_depth,
             chroma,
+            pixel_aspect,
+            scan_type,
             codec_profile,
+            // TS carries no colour box: every field here is the in-band SPS VUI.
+            color_source,
             color,
             dv_config: g.streams.iter().find_map(|e| e.dv_config.clone()),
             dv_dual_track: g.dv_dual_track,
             bitrate,
             chunks: out.chunks,
             sps_chunk,
-            reassembled: Some(out.buf),
+            reassembled: None,
             ..TrackDemux::new(codec, NalFormat::AnnexB)
-        });
+        };
+        if matches!(td.codec, Codec::Mpeg1 | Codec::Mpeg2) {
+            super::fill_mpeg2_stream_fields(&mut td, &buf);
+        }
+        // MPEG-4 Part 2 has no container-side config in a transport stream — no
+        // descriptor carries the visual headers — so the headers at the head of
+        // the first access unit are the only source. Hence no `headers` slice:
+        // the chunk fallback is the whole path here.
+        if td.codec == Codec::Mpeg4Part2 {
+            super::fill_mpeg4part2_stream_fields(&mut td, &[], &buf);
+        }
+        td.reassembled = Some(buf);
+        tracks.push(td);
+    }
+
+    // Complete the timeline: a PTS span is one frame short of the duration by
+    // arithmetic (the shared `whole_frame_duration`), and the frame rate that
+    // completes it — the SPS VUI's or the MPEG sequence header's — resolved
+    // inside the loop above. A PCR span is an arrival measure and takes no
+    // completion. Then the default bounded path's overall rate, whose
+    // denominator this is — only when this is the file's only video track: an
+    // overall rate (audio + overhead included) attributed to one of several
+    // tracks would be a wrong number, so multi-track reports `None` instead.
+    let duration_secs = match clock_est {
+        Some(TsDuration::PtsSpan(span)) => {
+            super::whole_frame_duration(Some(span), tracks.first().and_then(|t| t.fps))
+        }
+        Some(TsDuration::Pcr(secs)) => Some(secs),
+        None => None,
+    };
+    if !full && single {
+        if let Some(t) = tracks.first_mut() {
+            t.bitrate = Bitrate::overall(data.len() as u64, duration_secs);
+        }
     }
 
     Ok(Demux {
@@ -206,6 +278,8 @@ pub fn demux(data: &[u8], full: bool, progress: &Progress, frontier: &Frontier) 
         ts_stream,
         mkv_stream: None,
         raw_stream: None,
+        bounded_index: false,
+        declared_short: false,
     })
 }
 
@@ -227,7 +301,14 @@ fn group_codec(streams: &[Es]) -> Codec {
         || streams.iter().find_map(|e| e.dv_config.as_ref()).map(|c| c.profile) == Some(9)
     {
         Codec::Avc
+    } else if has(STREAM_TYPE_MPEG4_PART2) {
+        Codec::Mpeg4Part2
+    } else if has(STREAM_TYPE_MPEG2) {
+        Codec::Mpeg2
+    } else if has(STREAM_TYPE_MPEG1) {
+        Codec::Mpeg1
     } else {
+        // No video stream type at all: a bare DV EL/RPU PID, which is HEVC.
         Codec::Hevc
     }
 }
@@ -278,19 +359,48 @@ impl PidGroup {
             .unwrap_or(&self.streams[0])
             .pid
     }
+
+    /// The primary stream's PMT `stream_type` — the container's codec
+    /// identifier, same selection rule as `primary_pid`.
+    fn primary_stream_type(&self) -> u8 {
+        self.streams
+            .iter()
+            .find(|e| is_video_type(e.stream_type))
+            .unwrap_or(&self.streams[0])
+            .stream_type
+    }
 }
 
 fn is_video_type(t: u8) -> bool {
-    t == STREAM_TYPE_HEVC || t == STREAM_TYPE_AVC
+    matches!(
+        t,
+        STREAM_TYPE_MPEG1
+            | STREAM_TYPE_MPEG2
+            | STREAM_TYPE_MPEG4_PART2
+            | STREAM_TYPE_AVC
+            | STREAM_TYPE_HEVC
+    )
 }
 
-/// A Dolby Vision enhancement-layer stream: its 0xB0 descriptor says the PID
-/// carries no base layer, or it is DV-flagged with no video stream type at all
-/// (the bare EL/RPU PID shape, PES-private 0x06 with only a DOVI registration
-/// descriptor).
+/// A Dolby Vision enhancement-layer stream.
+///
+/// A present 0xB0 descriptor **states this outright and is authoritative**:
+/// `bl_present_flag` decides, and the stream type is not consulted. Inferring
+/// it from the stream type instead misreads a legal single-PID Profile 5
+/// stream, which per §7.1.2 of *Dolby Vision Streams Within the MPEG-2
+/// Transport Stream Format* is signalled with PES-private `stream_type` 0x06
+/// (its base layer is not SDR/HDR compliant, so it may not claim 0x1B/0x24), a
+/// DOVI registration descriptor, **and `bl_present_flag == 1`**. That PID is a
+/// base layer wearing a private stream type, not an EL.
+///
+/// Only with no descriptor at all does the shape have to be inferred: a
+/// DV-flagged PID carrying no video stream type is the bare EL/RPU PID, which
+/// is PES-private 0x06 with only a DOVI registration descriptor.
 fn is_el_stream(e: &Es) -> bool {
-    e.dv_config.as_ref().is_some_and(|c| !c.bl_present)
-        || (e.has_dovi && !is_video_type(e.stream_type))
+    match &e.dv_config {
+        Some(c) => !c.bl_present,
+        None => e.has_dovi && !is_video_type(e.stream_type),
+    }
 }
 
 /// Group each program's video PIDs into reported tracks.
@@ -302,8 +412,13 @@ fn is_el_stream(e: &Es) -> bool {
 /// PIDs carry **no DV descriptor at all** keeps the historical rule: more
 /// than one video PID means a descriptor-less BDMV Profile-7 BL+EL pair (an
 /// untouched Blu-ray M2TS signals DV via the playlist, not the PMT), so they
-/// form one dual-track group rather than independent tracks. Groups come back
-/// in program order, then PID order.
+/// form one dual-track group rather than independent tracks. That rule is
+/// **gated on the PIDs being HEVC**: Dolby Vision Profile 7 is an HEVC BL+EL
+/// pair by definition, and MPEG-1/2 has no enhancement-layer concept at all, so
+/// without the gate two ordinary MPEG-2 video PIDs in one program (a mosaic,
+/// a picture-in-picture feed, a multi-feed mux) would merge into a single
+/// bogus "dual track" whose chunk list interleaves two unrelated streams.
+/// Groups come back in program order, then PID order.
 fn group_video_pids(programs: &[Program]) -> Vec<PidGroup> {
     let mut groups: Vec<PidGroup> = Vec::new();
     for prog in programs {
@@ -316,7 +431,9 @@ fn group_video_pids(programs: &[Program]) -> Vec<PidGroup> {
             continue;
         }
         let any_dv_desc = vids.iter().any(|e| e.has_dovi);
-        if !any_dv_desc && vids.len() > 1 {
+        // Only HEVC PIDs can be a descriptor-less DV Profile 7 pair.
+        let all_hevc = vids.iter().all(|e| e.stream_type == STREAM_TYPE_HEVC);
+        if !any_dv_desc && all_hevc && vids.len() > 1 {
             // Descriptor-less multi-PID program: the BDMV P7 shape.
             groups.push(PidGroup {
                 program_number: prog.program_number,
@@ -787,42 +904,199 @@ fn packet_pcr(data: &[u8], off: usize) -> Option<(u16, bool, u64)> {
     Some((pid, discontinuity, base * 300 + ext))
 }
 
-/// Duration in seconds from `last_PCR - first_PCR` on `clock_pid`: the first PCR
-/// is read from the head, the last from a bounded tail window. Returns `None` if
-/// either PCR is missing, a discontinuity is seen in the sampled tail (the clock
-/// reset, so the delta is meaningless), or the span is implausible.
-fn pcr_duration(data: &[u8], layout: Layout, clock_pid: u16) -> Option<f64> {
-    let head_end = (HEAD_SCAN_BYTES as usize).min(data.len());
-    let first = scan_pcr(data, layout, clock_pid, layout.first, head_end, false)?;
-
-    let tail_start = data.len().saturating_sub(TAIL_SCAN_BYTES as usize);
-    let last = scan_pcr(data, layout, clock_pid, tail_start, data.len(), true)?;
-
-    let span = if last >= first { last - first } else { last + PCR_MODULUS - first };
-    let secs = span as f64 / 27_000_000.0;
-    // Reject a zero/absurd span (junk PCRs, an undetected mid-file discontinuity,
-    // or a second wrap we can't disambiguate) rather than print a wrong number.
-    if secs <= 0.0 || secs > 26.0 * 3600.0 {
-        return None;
-    }
-    Some(secs)
+/// What the clocks in one bounded packet window showed: PCRs on the clock PID
+/// plus video PES presentation timestamps — the transport analogue of the
+/// program-stream backend's `Walk`, and the guards mirror its invariants.
+#[derive(Default)]
+struct ClockWindow {
+    pcr_first: Option<u64>,
+    pcr_last: Option<u64>,
+    /// The clock stepped backward inside this window — a reset, since a wrap
+    /// within one bounded window is a 26-hour clock folding inside a few MiB.
+    pcr_backward: bool,
+    /// The *first* PCR seen carried the discontinuity flag: the historical
+    /// abort condition for the head window's PCR read.
+    first_pcr_discontinuity: bool,
+    /// Any sampled PCR carried the discontinuity flag.
+    any_discontinuity: bool,
+    pts_min: Option<u64>,
+    pts_max: Option<u64>,
 }
 
-/// Scan packets in `[start, end)` for PCRs on `clock_pid`. Returns the first such
-/// PCR when `want_last` is false, else the last. Bails to `None` if a
-/// discontinuity flag is seen (only meaningful for the tail scan, where it means
-/// the clock is no longer comparable to the head's).
-fn scan_pcr(
+impl ClockWindow {
+    fn note_pcr(&mut self, pcr: u64, discontinuity: bool) {
+        if self.pcr_first.is_none() {
+            self.first_pcr_discontinuity = discontinuity;
+        }
+        self.any_discontinuity |= discontinuity;
+        if self.pcr_last.is_some_and(|l| pcr < l) {
+            self.pcr_backward = true;
+        }
+        self.pcr_first.get_or_insert(pcr);
+        self.pcr_last = Some(pcr);
+    }
+
+    fn note_pts(&mut self, pts: u64) {
+        self.pts_min = Some(self.pts_min.map_or(pts, |m| m.min(pts)));
+        self.pts_max = Some(self.pts_max.map_or(pts, |m| m.max(pts)));
+    }
+
+    /// Seconds of transport clock this window covers.
+    fn pcr_span(&self) -> Option<f64> {
+        let (a, b) = (self.pcr_first?, self.pcr_last?);
+        Some(b.saturating_sub(a) as f64 / 27_000_000.0)
+    }
+
+    /// Whether this window's presentation span is credible against its own
+    /// transport clock — the program-stream backend's `pts_within`, verbatim:
+    /// over the same bytes the two clocks measure the same interval, so the
+    /// presentation span may exceed the arrival span only by the decoder
+    /// buffer delay. This is what stops a single stray timestamp from setting
+    /// the answer (a min/max over a window has no other defence). It catches
+    /// an *impossible* span, never a plausible-but-wrong one.
+    fn pts_within(&self) -> bool {
+        let (Some(pcr), Some(lo), Some(hi)) = (self.pcr_span(), self.pts_min, self.pts_max)
+        else {
+            return true;
+        };
+        let pts = hi.saturating_sub(lo) as f64 / 90_000.0;
+        pts <= pcr + (0.5 * pcr).max(super::SPAN_SLACK_SECS)
+    }
+}
+
+/// How a candidate clock resolved the timeline: the video PTS span (still a
+/// bare span — the caller completes it with the last frame's own display time
+/// once the frame rate is known), or the PCR arrival span.
+pub(crate) enum TsDuration {
+    /// Video presentation span in seconds, head minimum to tail maximum.
+    PtsSpan(f64),
+    /// Transport-clock span in seconds, first PCR to last.
+    Pcr(f64),
+}
+
+/// Resolve the mux timeline for one candidate clock PID: the **video PTS span
+/// when it is credible, else the PCR span** (open-items B1).
+///
+/// The PCR alone is short on a clipped tail — the muxer flushes trailing
+/// packets without a clock, measured at 11.6% of `testfiles/sdr/mpeg2.ts`
+/// carrying no PCR at all, so the span read 1.92 s against a true 2.000 —
+/// while the video PTS closes when the last picture is *shown*, which is the
+/// quantity the report calls duration. The program-stream backend made the
+/// same move for the same reason; the guards here are its, adapted to the
+/// transport clock:
+///
+/// - both windows must show a forward-only, discontinuity-free PCR (the flag
+///   is TS's own reset signal), and the tail's clock must not start before
+///   the head's ended;
+/// - each window's presentation span must be credible against its own PCR
+///   span (`pts_within` — one stray timestamp was measured turning a real
+///   program stream into "25 h 55 m");
+/// - the two windows must stay disjoint (`tail_start.max(head_end)`), or the
+///   tail's clock starts before the head's by construction and the reset
+///   guard fires on every ordinary file in the 24–28 MiB band;
+/// - when the windows meet, they have read the whole file between them, so a
+///   timestampless tail falls back to the head's own maximum; when they do
+///   not, it must not, or the answer would describe the head window alone;
+/// - one wrap is folded through the shared modulus; a span past
+///   `MAX_SPAN_SECS` or non-positive yields `None` rather than a wrong
+///   number.
+///
+/// `video_pids` is `Some` only when the file has a single program and a
+/// single video group: PTS from a sibling program rides a different STC, and
+/// a span across two independent clocks is not a duration.
+fn clock_duration(
     data: &[u8],
     layout: Layout,
     clock_pid: u16,
+    video_pids: Option<&[u16]>,
+) -> Option<TsDuration> {
+    let head_end = (HEAD_SCAN_BYTES as usize).min(data.len());
+    let natural_tail = data.len().saturating_sub(TAIL_SCAN_BYTES as usize);
+    let contiguous = natural_tail <= head_end;
+    let tail_start = natural_tail.max(head_end);
+
+    let head = scan_clocks(data, layout, clock_pid, video_pids, layout.first, head_end);
+    let tail = scan_clocks(data, layout, clock_pid, video_pids, tail_start, data.len());
+
+    if video_pids.is_some() {
+        if let Some(span) = pts_route(&head, &tail, contiguous) {
+            return Some(TsDuration::PtsSpan(span));
+        }
+    }
+    pcr_route(&head, &tail, contiguous).map(TsDuration::Pcr)
+}
+
+/// The PTS half of [`clock_duration`]; `None` means "not credible", never a
+/// best effort.
+fn pts_route(head: &ClockWindow, tail: &ClockWindow, contiguous: bool) -> Option<f64> {
+    if head.any_discontinuity || tail.any_discontinuity {
+        return None;
+    }
+    if head.pcr_backward || tail.pcr_backward {
+        return None;
+    }
+    if let (Some(hl), Some(tf)) = (head.pcr_last, tail.pcr_first) {
+        if tf < hl {
+            return None; // the tail's clock predates the head's end: a reset
+        }
+    }
+    // The credibility checks need a clock behind them. The head window always
+    // must show one: a TS carries a PCR at least every 100 ms, so a head with
+    // none means the wrong clock PID and the checks would be vacuously true,
+    // not passed. The tail must only when the windows are disjoint — a
+    // contiguous tail is a sliver (possibly empty) whose bytes the head
+    // window already covered.
+    head.pcr_span()?;
+    if !contiguous {
+        tail.pcr_span()?;
+    }
+    if !head.pts_within() || !tail.pts_within() {
+        return None;
+    }
+    let first = head.pts_min?;
+    let last = if contiguous { tail.pts_max.or(head.pts_max) } else { tail.pts_max }?;
+    let span =
+        if last >= first { last - first } else { last + super::PTS_MODULUS - first };
+    let secs = span as f64 / 90_000.0;
+    (secs > 0.0 && secs <= super::MAX_SPAN_SECS).then_some(secs)
+}
+
+/// The PCR half of [`clock_duration`]: `last_PCR - first_PCR`, exactly the
+/// historical rule — the head's first PCR (refused when it carries the
+/// discontinuity flag), the tail's last (refused when any sampled tail PCR
+/// carries it, the clock no longer being comparable), one wrap folded, and a
+/// zero/absurd span refused rather than printed.
+fn pcr_route(head: &ClockWindow, tail: &ClockWindow, contiguous: bool) -> Option<f64> {
+    // Historical semantics per window shape. Disjoint: the head contributes
+    // only its first PCR (refused when flagged), the tail refuses on any
+    // flagged PCR. Contiguous: the head window has seen every packet the old
+    // overlapping tail scan saw, so any flagged PCR anywhere refuses.
+    let head_reset =
+        if contiguous { head.any_discontinuity } else { head.first_pcr_discontinuity };
+    if head_reset || tail.any_discontinuity {
+        return None;
+    }
+    let first = head.pcr_first?;
+    let last = if contiguous { tail.pcr_last.or(head.pcr_last) } else { tail.pcr_last }?;
+    let span = if last >= first { last - first } else { last + PCR_MODULUS - first };
+    let secs = span as f64 / 27_000_000.0;
+    (secs > 0.0 && secs <= super::MAX_SPAN_SECS).then_some(secs)
+}
+
+/// Walk `[start, end)` collecting the clocks: PCRs on `clock_pid`, and — when
+/// `video_pids` is given — the presentation timestamp of every video PES that
+/// starts in the window.
+fn scan_clocks(
+    data: &[u8],
+    layout: Layout,
+    clock_pid: u16,
+    video_pids: Option<&[u16]>,
     start: usize,
     end: usize,
-    want_last: bool,
-) -> Option<u64> {
+) -> ClockWindow {
+    let mut w = ClockWindow::default();
     let end = end.min(data.len());
-    let mut p = align(data, layout, start)?;
-    let mut found: Option<u64> = None;
+    let Some(mut p) = align(data, layout, start) else { return w };
     while p + TS_UNIT <= end {
         if data[p] != SYNC {
             match resync(data, layout, p) {
@@ -835,65 +1109,39 @@ fn scan_pcr(
         }
         if let Some((pid, discontinuity, pcr)) = packet_pcr(data, p) {
             if pid == clock_pid {
-                if discontinuity {
-                    return None;
+                w.note_pcr(pcr, discontinuity);
+            }
+        }
+        if let Some(pids) = video_pids {
+            if let Some((pid, pusi, payload)) = packet_payload(data, p) {
+                if pusi && pids.contains(&pid) {
+                    if let Some(pts) = pes_pts(payload) {
+                        w.note_pts(pts);
+                    }
                 }
-                if !want_last {
-                    return Some(pcr);
-                }
-                found = Some(pcr);
             }
         }
         p += layout.stride;
     }
-    found
+    w
 }
 
-// --- SPS metadata (no container box in TS) ----------------------------------
-
-/// Common SPS-derived metadata, codec-independent, so the HEVC and AVC scans
-/// converge on one shape.
-struct SpsCommon {
-    width: u32,
-    height: u32,
-    bit_depth: u8,
-    chroma: String,
-    profile: String,
-    color: ColorInfo,
-    frame_rate: Option<f64>,
-    /// Index of the chunk the SPS was found in — a RAP access unit, which is
-    /// where the per-GOP prefix SEIs ride (see `Demux::sps_chunk`).
-    chunk: usize,
-}
-
-/// Recover the widest SPS in the reassembled buffer (the base layer outranks a
-/// smaller enhancement layer). TS carries no container box, so both colour and
-/// frame rate come only from the in-band SPS VUI — parsed with the codec's own
-/// SPS reader.
-fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<SpsCommon> {
-    match codec {
-        Codec::Avc => best_avc_sps(buf, chunks),
-        _ => best_hevc_sps(buf, chunks),
+/// The presentation timestamp of a PES packet starting in this payload, when
+/// its header declares one. TS carries only the H.222.0 `'10'`-marker header
+/// form (the 11172-1 layout is a program-stream shape).
+///
+/// `header_data_length >= 5` mirrors the program-stream backend's rule (and
+/// ffmpeg's): a packet claiming a timestamp its own declared header is too
+/// short to hold is reading its payload, not a timestamp.
+fn pes_pts(payload: &[u8]) -> Option<u64> {
+    if payload.len() < 14 || payload[0] != 0x00 || payload[1] != 0x00 || payload[2] != 0x01 {
+        return None;
     }
-}
-
-/// Unpack the winning SPS into the demux metadata fields.
-#[allow(clippy::type_complexity)]
-fn sps_fields(
-    best: Option<SpsCommon>,
-) -> (u32, u32, Option<u8>, Option<String>, Option<String>, ColorInfo, Option<f64>) {
-    match best {
-        Some(c) => (
-            c.width,
-            c.height,
-            Some(c.bit_depth),
-            Some(c.chroma),
-            Some(c.profile),
-            c.color,
-            c.frame_rate,
-        ),
-        None => (0, 0, None, None, None, ColorInfo::default(), None),
-    }
+    let flags = payload[7];
+    let header_len = payload[8] as usize;
+    (payload[6] & 0xC0 == 0x80 && flags & 0x80 != 0 && header_len >= 5)
+        .then(|| super::parse_timestamp(payload, 9))
+        .flatten()
 }
 
 /// `--full` fallback when the head window held no SPS: stream the whole
@@ -942,78 +1190,6 @@ fn sps_rescue(
         }
         progress.update(st.position() as u64);
     }
-}
-
-fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
-    let mut best: Option<(usize, SpsInfo)> = None;
-    let mut nals: Vec<NalRef> = Vec::new();
-    for (ci, c) in chunks.iter().enumerate() {
-        let s = c.offset as usize;
-        let e = (c.offset + c.size) as usize;
-        if e > buf.len() {
-            continue;
-        }
-        nals.clear();
-        nal::split_annexb(&buf[s..e], &mut nals);
-        for n in &nals {
-            if n.nal_type == nal::NAL_SPS {
-                if let Some(sps) = parse_sps(&buf[s + n.start..s + n.end]) {
-                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
-                        best = Some((ci, sps));
-                    }
-                }
-            }
-        }
-        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
-            break;
-        }
-    }
-    best.map(|(chunk, sps)| SpsCommon {
-        width: sps.width,
-        height: sps.height,
-        bit_depth: sps.bit_depth,
-        chroma: sps.chroma_str().to_string(),
-        profile: sps.profile_label(),
-        color: sps.color.as_ref().map(crate::container::color_from_vui).unwrap_or_default(),
-        frame_rate: sps.frame_rate,
-        chunk,
-    })
-}
-
-fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
-    let mut best: Option<(usize, crate::avc::sps::SpsInfo)> = None;
-    let mut nals: Vec<avc_nal::NalRef> = Vec::new();
-    for (ci, c) in chunks.iter().enumerate() {
-        let s = c.offset as usize;
-        let e = (c.offset + c.size) as usize;
-        if e > buf.len() {
-            continue;
-        }
-        nals.clear();
-        avc_nal::split_annexb(&buf[s..e], &mut nals);
-        for n in &nals {
-            if n.nal_type == avc_nal::NAL_SPS {
-                if let Some(sps) = crate::avc::sps::parse_sps(&buf[s + n.start..s + n.end]) {
-                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
-                        best = Some((ci, sps));
-                    }
-                }
-            }
-        }
-        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
-            break;
-        }
-    }
-    best.map(|(chunk, sps)| SpsCommon {
-        width: sps.width,
-        height: sps.height,
-        bit_depth: sps.bit_depth,
-        chroma: sps.chroma_str().to_string(),
-        profile: sps.profile_label(),
-        color: sps.color.as_ref().map(crate::container::color_from_vui).unwrap_or_default(),
-        frame_rate: sps.frame_rate,
-        chunk,
-    })
 }
 
 #[cfg(test)]
@@ -1175,6 +1351,118 @@ mod tests {
         v
     }
 
+    /// A PES start declaring a presentation timestamp of `pts` 90 kHz ticks.
+    fn pes_start_pts(pts: u64) -> Vec<u8> {
+        vec![
+            0x00,
+            0x00,
+            0x01,
+            0xE0,
+            0x00,
+            0x00,
+            0x80,
+            0x80, // PTS_DTS_flags '10'
+            0x05, // PES_header_data_length
+            0x21 | (((pts >> 30) & 0x07) as u8) << 1,
+            ((pts >> 22) & 0xFF) as u8,
+            ((((pts >> 15) & 0x7F) as u8) << 1) | 0x01,
+            ((pts >> 7) & 0xFF) as u8,
+            (((pts & 0x7F) as u8) << 1) | 0x01,
+        ]
+    }
+
+    /// A packet on `pid` whose adaptation field carries a PCR of `base` 90 kHz
+    /// ticks (extension 0), with the discontinuity flag as given.
+    fn pcr_packet(pid: u16, base: u64, discontinuity: bool) -> Vec<u8> {
+        let mut pkt = vec![0xFFu8; TS_UNIT];
+        pkt[0] = SYNC;
+        pkt[1] = (pid >> 8) as u8 & 0x1F;
+        pkt[2] = (pid & 0xFF) as u8;
+        pkt[3] = 0x20; // adaptation field only
+        pkt[4] = (TS_UNIT - 5) as u8;
+        pkt[5] = 0x10 | if discontinuity { 0x80 } else { 0 };
+        pkt[6] = ((base >> 25) & 0xFF) as u8;
+        pkt[7] = ((base >> 17) & 0xFF) as u8;
+        pkt[8] = ((base >> 9) & 0xFF) as u8;
+        pkt[9] = ((base >> 1) & 0xFF) as u8;
+        pkt[10] = (((base & 1) << 7) as u8) | 0x7E;
+        pkt[11] = 0;
+        pkt
+    }
+
+    const CLOCK: u16 = 0x30;
+    const VIDEO: u16 = 0x100;
+    const LAYOUT: Layout = Layout { first: 0, stride: TS_UNIT };
+
+    /// PCRs at 0.70 s and 2.62 s (the corpus `mpeg2.ts` shape: the muxer
+    /// flushed the tail without a clock), video PTS from 0.72 s to 2.68 s.
+    fn clipped_tail_stream(stray_pts: Option<u64>, tail_discontinuity: bool) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend(pcr_packet(CLOCK, 63_000, false)); // 0.70 s
+        d.extend(ts_packet(VIDEO, true, &pes_start_pts(64_800))); // 0.72 s
+        if let Some(p) = stray_pts {
+            d.extend(ts_packet(VIDEO, true, &pes_start_pts(p)));
+        }
+        d.extend(ts_packet(VIDEO, true, &pes_start_pts(120_000)));
+        d.extend(pcr_packet(CLOCK, 235_800, tail_discontinuity)); // 2.62 s
+        d.extend(ts_packet(VIDEO, true, &pes_start_pts(241_200))); // 2.68 s
+        d
+    }
+
+    #[test]
+    fn duration_takes_the_video_pts_span_past_the_clipped_pcr_tail() {
+        // The PCR span is 1.92 s while the video presents through 2.68 s: the
+        // PTS route answers with the 1.96 s span (whole-frame completion is
+        // the demux's job, where the frame rate is known).
+        let d = clipped_tail_stream(None, false);
+        let est = clock_duration(&d, LAYOUT, CLOCK, Some(&[VIDEO]));
+        match est {
+            Some(TsDuration::PtsSpan(s)) => assert!((s - 1.96).abs() < 1e-9, "{s}"),
+            _ => panic!("expected the PTS route"),
+        }
+        // Without the video PIDs (multi-program gate) the PCR span stands.
+        match clock_duration(&d, LAYOUT, CLOCK, None) {
+            Some(TsDuration::Pcr(s)) => assert!((s - 1.92).abs() < 1e-9, "{s}"),
+            _ => panic!("expected the PCR route"),
+        }
+    }
+
+    #[test]
+    fn a_stray_pts_is_refused_by_the_arrival_clock() {
+        // One non-conforming timestamp 100 s out would otherwise set the span
+        // (a min/max has no other defence); the window's own PCR span refutes
+        // it and the route falls back to the PCR answer.
+        let d = clipped_tail_stream(Some(9_000_000), false);
+        match clock_duration(&d, LAYOUT, CLOCK, Some(&[VIDEO])) {
+            Some(TsDuration::Pcr(s)) => assert!((s - 1.92).abs() < 1e-9, "{s}"),
+            _ => panic!("a stray PTS must downgrade to the PCR span"),
+        }
+    }
+
+    #[test]
+    fn a_discontinuity_refuses_both_routes() {
+        // The tail clock reset: neither span is comparable across it.
+        let d = clipped_tail_stream(None, true);
+        assert!(clock_duration(&d, LAYOUT, CLOCK, Some(&[VIDEO])).is_none());
+    }
+
+    #[test]
+    fn pes_pts_reads_only_a_declared_credible_timestamp() {
+        let p = pes_start_pts(241_200);
+        assert_eq!(pes_pts(&p), Some(241_200));
+        // Flags clear: no timestamp claimed.
+        assert_eq!(pes_pts(&pes_start(&[1, 2, 3, 4, 5, 6])), None);
+        // A header too short to hold the timestamp it claims is reading its
+        // payload, not a timestamp.
+        let mut short = p.clone();
+        short[8] = 4;
+        assert_eq!(pes_pts(&short), None);
+        // A marker bit cleared means these are not timestamp bytes.
+        let mut bad = p;
+        bad[9] &= !0x01;
+        assert_eq!(pes_pts(&bad), None);
+    }
+
     /// Two interleaved PIDs; AUs span packets; both PIDs end mid-AU, so the
     /// trailing accumulators must never be flushed. Completed AUs in emission
     /// order: pid 0x100 `[1,2,3,4,5]`, pid 0x200 `[9,9,8]`, pid 0x100 `[6]`.
@@ -1320,6 +1608,41 @@ mod tests {
     }
 
     #[test]
+    fn mpeg_video_stream_types_are_recognized_and_never_merged() {
+        // 0x01 and 0x02 are MPEG-1 and MPEG-2 video. Before they were video
+        // types at all, a transport stream carrying only these produced no
+        // report; HEVC and AVC still win when both are present, because a mux
+        // carrying both describes the same programme twice.
+        assert!(is_video_type(STREAM_TYPE_MPEG1) && is_video_type(STREAM_TYPE_MPEG2));
+        assert_eq!(group_codec(&[es(0x100, STREAM_TYPE_MPEG2, None)]), Codec::Mpeg2);
+        assert_eq!(group_codec(&[es(0x100, STREAM_TYPE_MPEG1, None)]), Codec::Mpeg1);
+        assert_eq!(
+            group_codec(&[es(0x100, STREAM_TYPE_MPEG2, None), es(0x101, STREAM_TYPE_HEVC, None)]),
+            Codec::Hevc
+        );
+
+        // The descriptor-less multi-PID rule is the BDMV Dolby Vision Profile 7
+        // shape and must stay HEVC-only. MPEG-1/2 has no enhancement layer, so
+        // two MPEG-2 video PIDs in one program are two independent tracks;
+        // merging them would report one "dual track" whose chunks interleave
+        // two unrelated streams.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![es(0x100, STREAM_TYPE_MPEG2, None), es(0x200, STREAM_TYPE_MPEG2, None)],
+        )]);
+        assert_eq!(g.len(), 2, "two MPEG-2 video PIDs are two tracks");
+        assert!(!g[0].dv_dual_track && !g[1].dv_dual_track);
+
+        // The HEVC pair still merges, which is the behaviour the gate protects.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![es(0x100, STREAM_TYPE_HEVC, None), es(0x200, STREAM_TYPE_HEVC, None)],
+        )]);
+        assert_eq!(g.len(), 1);
+        assert!(g[0].dv_dual_track);
+    }
+
+    #[test]
     fn grouping_folds_el_by_dependency_pid() {
         // Two independent BLs + an EL whose dependency_pid names the *second*
         // BL: the EL folds there, not into the first.
@@ -1352,6 +1675,54 @@ mod tests {
             ],
         )]);
         assert_eq!(g.len(), 2);
+        assert!(g.iter().all(|g| !g.dv_dual_track));
+    }
+
+    #[test]
+    fn private_stream_type_with_bl_present_is_a_base_layer() {
+        // TS spec §7.1.2: a single-PID Profile 5 stream (non-SDR/non-HDR
+        // compliant BL, so it may not claim 0x1B/0x24) rides PES-private
+        // stream_type 0x06 with bl_present_flag == 1. The descriptor is
+        // authoritative — inferring from the stream type calls it an EL.
+        let p5_bl = es(0x200, 0x06, Some((true, None)));
+        assert!(!is_el_stream(&p5_bl));
+        // The bare EL/RPU PID shape still reads as an EL by both routes. With
+        // a descriptor, its explicit bl_present == 0 says so:
+        assert!(is_el_stream(&es(0x300, 0x06, Some((false, None)))));
+        // With none — DV-flagged by the registration descriptor alone, which
+        // the `es` helper cannot express since its `None` clears has_dovi too —
+        // the stream type is the only evidence left, so the shape is inferred.
+        let bare = |stream_type| Es {
+            pid: 0x300,
+            stream_type,
+            has_dovi: true,
+            dv_config: None,
+            dependency_pid: None,
+        };
+        assert!(is_el_stream(&bare(0x06)));
+        // ...but a DV-flagged PID that *does* carry a video stream type is a
+        // base layer, so the inference stays confined to the private type.
+        assert!(!is_el_stream(&bare(STREAM_TYPE_HEVC)));
+
+        // Alone in its program it is one ordinary single-layer track. This
+        // case was already right by accident, via the "only EL-shaped PIDs"
+        // fallback, so it pins the outcome rather than the reasoning.
+        let g = group_video_pids(&[prog(1, vec![es(0x200, 0x06, Some((true, None)))])]);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].pids(), [0x200]);
+        assert!(!g[0].dv_dual_track);
+        assert_eq!(g[0].primary_pid(), 0x200);
+
+        // Sharing a program with an ordinary video PID is where it mattered:
+        // two independent tracks. Folding the P5 BL in as an enhancement layer
+        // merged both PIDs into one stream and claimed a dual-layer structure.
+        let g = group_video_pids(&[prog(
+            1,
+            vec![es(0x100, STREAM_TYPE_HEVC, None), es(0x200, 0x06, Some((true, None)))],
+        )]);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].pids(), [0x100]);
+        assert_eq!(g[1].pids(), [0x200]);
         assert!(g.iter().all(|g| !g.dv_dual_track));
     }
 

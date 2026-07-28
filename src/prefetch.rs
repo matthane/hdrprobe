@@ -36,11 +36,11 @@ use crate::container::Demux;
 /// extent-resolved MKV with smaller ones (`MP4_HEAD_WARM` / `MKV_HEAD_WARM`)
 /// since their real regions are warmed by exact extent.
 ///
-/// The raw bounded head walks (`av1::HEAD_SCAN_BYTES`, `annexb::HEAD_SCAN_BYTES`)
-/// are deliberately kept `<=` this so the warm covers them whole; shrink this
-/// below them and those windows' tails fault in one page at a time on the NAS
-/// again. The MKV fallback relies on this covering the first block offset +
-/// `mkv::HEAD_SPAN_BYTES`.
+/// The raw bounded head walks (`av1::HEAD_SCAN_BYTES`, `annexb::HEAD_SCAN_BYTES`,
+/// `mpegv::HEAD_SCAN_BYTES`) are deliberately kept `<=` this so the warm covers
+/// them whole; shrink this below them and those windows' tails fault in one page
+/// at a time on the NAS again. The MKV fallback relies on this covering the
+/// first block offset + `mkv::HEAD_SPAN_BYTES`.
 const HEAD_WARM: usize = 8 << 20; // 8 MiB
 
 /// Head window for ISOBMFF (a `moov` was found): everything the MP4 path reads
@@ -283,6 +283,7 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
 
     let is_iso = looks_like_iso(path);
     let is_ts = !is_iso && looks_like_ts(path, data);
+    let is_ps = !is_iso && !is_ts && looks_like_ps(path, data);
     let is_mp4 = !is_iso && looks_like_mp4(path, data);
     let is_mkv = !is_iso && looks_like_mkv(path, data);
     let moov = if is_mp4 { crate::container::mp4::moov_extent(data) } else { None };
@@ -297,6 +298,7 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
     // extent below, and a generic head would stream bytes nothing parses. Raw
     // HEVC/AV1 head walks are covered by the generic head (the `<=` couplings
     // on `HEAD_WARM`).
+    let is_ogg = !is_iso && looks_like_ogg(path, data);
     let head = if is_iso {
         ISO_HEAD_WARM
     } else if is_ts {
@@ -305,6 +307,15 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
         MP4_HEAD_WARM
     } else if mkv_blocks.is_some() {
         MKV_HEAD_WARM
+    } else if is_ogg {
+        // The whole Ogg front parse is the beginning-of-stream run, which RFC
+        // 3533 §3 puts at the head as one small identification packet per
+        // logical stream — 70 bytes on a single-stream file, a few hundred on
+        // any real mux. Warming the generic 8 MiB would stream megabytes
+        // nothing parses, the same reasoning `MP4_HEAD_WARM` and
+        // `MKV_HEAD_WARM` carry. Taking the backend's own walk bound makes the
+        // coupling structural instead of two numbers that must be kept equal.
+        crate::container::ogg::HEAD_SCAN_BYTES
     } else {
         HEAD_WARM
     }
@@ -318,6 +329,54 @@ pub fn warm_metadata(remote: bool, file: &File, path: &Path, data: &[u8]) -> usi
         let tail = crate::container::ts::TAIL_SCAN_BYTES as usize;
         let start = size.saturating_sub(tail);
         ranges.push((start as u64, size - start));
+    }
+
+    // A program stream has no duration field either, so it reads a bounded tail
+    // for the last presentation timestamp (see `ps::pts_span`) — the exact
+    // analogue of the TS tail-PCR warm above, and warmed alongside the head for
+    // the same reason. Its head walk needs no branch here: `ps::HEAD_SCAN_BYTES`
+    // is `<=` `HEAD_WARM`, the same coupling the raw HEVC/AV1 walks rely on.
+    if is_ps {
+        let tail = crate::container::ps::TAIL_SCAN_BYTES;
+        let start = size.saturating_sub(tail);
+        ranges.push((start as u64, size - start));
+    }
+
+    // FLV's duration fallback follows the file's final `PreviousTagSize` back
+    // to the last tag's header, which is the only length signal a capture with
+    // no `onMetaData` duration has — the same shape as the TS tail-PCR and
+    // program-stream tail-PTS warms above, and the same exact-size coupling
+    // (`flv::TAIL_SCAN_BYTES`). Its head walk needs no branch: FLV's
+    // `HEAD_SCAN_BYTES` is `<=` `HEAD_WARM`. An ASF needs nothing here at all —
+    // its Header Object is at byte 0 and a few tens of KiB at most, so the
+    // generic head covers the whole parse.
+    if !is_iso && looks_like_flv(path, data) {
+        let tail = crate::container::flv::TAIL_SCAN_BYTES;
+        let start = size.saturating_sub(tail);
+        ranges.push((start as u64, size - start));
+    }
+
+    // Ogg records no duration either: it comes from the last granule position
+    // in a bounded tail window, the fourth instance of the TS tail-PCR shape.
+    // Warmed at exactly `ogg::TAIL_SCAN_BYTES` — keep the two in step. The head
+    // above takes `ogg::HEAD_SCAN_BYTES` directly rather than a constant of its
+    // own, because the BOS run is the entire front parse and a second number
+    // would only be something to keep equal.
+    if is_ogg {
+        let tail = crate::container::ogg::TAIL_SCAN_BYTES;
+        let start = size.saturating_sub(tail);
+        ranges.push((start as u64, size - start));
+    }
+
+    // AVI resolves every chunk position from an index rather than by walking, so
+    // what it needs warmed past the head is the index itself: `idx1` sits after
+    // all the data, and an OpenDML file's `ix##` sub-indexes sit one per RIFF
+    // segment. Both are located by arithmetic on the head's declared sizes, so
+    // the exact extents are known before a byte of them is faulted — the same
+    // shape as the MKV `Tags` warm below. The `hdrl` the arithmetic reads is
+    // inside the generic head window, so no head branch is needed.
+    if !is_iso && looks_like_avi(path, data) {
+        ranges.extend(crate::container::avi::index_extents(data));
     }
 
     // The `moov` is warmed by its exact extent, wherever it sits (front-placed
@@ -389,6 +448,22 @@ pub fn warm_ts_windows(remote: bool, file: &File, base: u64, len: u64) {
     }
     let head = crate::container::ts::HEAD_SCAN_BYTES.min(len);
     let tail_start = len.saturating_sub(crate::container::ts::TAIL_SCAN_BYTES);
+    warm_ranges(
+        file,
+        vec![(base, head as usize), (base + tail_start, (len - tail_start) as usize)],
+    );
+}
+
+/// The PS analogue for a DVD ISO's main-feature title set: `ps::demux` reads
+/// a head window and a tail window from the subslice, so warm exactly those
+/// at their positions in the image. Keep in sync with `ps::HEAD_SCAN_BYTES` /
+/// `ps::TAIL_SCAN_BYTES` like the TS pair above.
+pub fn warm_ps_windows(remote: bool, file: &File, base: u64, len: u64) {
+    if !remote {
+        return;
+    }
+    let head = (crate::container::ps::HEAD_SCAN_BYTES as u64).min(len);
+    let tail_start = len.saturating_sub(crate::container::ps::TAIL_SCAN_BYTES as u64);
     warm_ranges(
         file,
         vec![(base, head as usize), (base + tail_start, (len - tail_start) as usize)],
@@ -593,10 +668,48 @@ fn looks_like_mp4(path: &Path, data: &[u8]) -> bool {
         || (data.len() >= 8 && &data[4..8] == b"ftyp")
 }
 
+/// Unlike the TS and program-stream probes, the content half here costs
+/// nothing: `RIFF....AVI ` is twelve bytes at offset 0, inside the head warm
+/// the caller is about to request anyway.
+fn looks_like_avi(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    ext == "avi" || crate::container::avi::is_avi(data)
+}
+
+/// Nine bytes at offset 0, like the AVI probe, so the content half is free.
+fn looks_like_flv(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    ext == "flv" || crate::container::flv::is_flv(data)
+}
+
+/// Twenty-seven bytes at offset 0, so the content half is free like AVI's and
+/// FLV's.
+fn looks_like_ogg(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "ogv" | "ogg" | "oga" | "ogm" | "ogx")
+        || crate::container::ogg::is_ogg(data)
+}
+
 fn looks_like_ts(path: &Path, data: &[u8]) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     matches!(ext.as_str(), "ts" | "m2ts" | "mts")
         || crate::container::ts::detect_layout(data).is_some()
+}
+
+/// The content half is byte 0 only — a `pack_start_code` and a valid pack
+/// discriminator — not the head census `ps::demux` runs. The census reads up to
+/// a megabyte, and faulting that in *before* the warm is the round-trip storm
+/// warming exists to prevent; the cost of guessing wrong here is one extra
+/// 4 MiB tail read, never a wrong report.
+fn looks_like_ps(path: &Path, data: &[u8]) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "mpg" | "mpeg" | "vob" | "m2p" | "evo")
+        || (data.len() >= 5
+            && data[0] == 0
+            && data[1] == 0
+            && data[2] == 1
+            && data[3] == 0xBA
+            && (data[4] & 0xC0 == 0x40 || data[4] & 0xF0 == 0x20))
 }
 
 // Extension-only on purpose, unlike the other sniffs: the ISO pipeline itself

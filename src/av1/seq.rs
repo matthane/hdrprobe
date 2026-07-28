@@ -6,8 +6,7 @@
 //! and stop. Never decodes.
 
 use crate::bits::BitReader;
-use crate::container::{cicp_matrix, cicp_primaries, cicp_transfer};
-use crate::model::ColorInfo;
+use crate::model::{ColorInfo, ColorSource, ColorSources};
 
 pub struct SeqInfo {
     pub seq_profile: u8,
@@ -18,8 +17,9 @@ pub struct SeqInfo {
     pub width: u32,
     pub height: u32,
     pub bit_depth: u8,
-    pub chroma: &'static str,
-    pub color: ColorInfo,
+    /// `None` for the undefined subsampling flag pair (see `av1_chroma_str`).
+    pub chroma: Option<&'static str>,
+    pub color: (ColorInfo, ColorSources),
     /// Whether `color_config()` carried an explicit `color_description` (CICP
     /// triplet). When false, `color`'s CICP fields are the spec's "unspecified"
     /// defaults — the stream declares nothing, which callers recovering colour
@@ -31,6 +31,8 @@ pub struct SeqInfo {
     /// omit `timing_info` entirely, so this is `None` far more often than for
     /// HEVC — correct-or-`None`, never a guess.
     pub fps: Option<f64>,
+    /// The same rate as the exact signalled ratio; present exactly when `fps` is.
+    pub fps_rational: Option<(u64, u64)>,
 }
 
 /// Human label for an AV1 operating point, e.g. `"Main profile, Main tier @ L5.1"`.
@@ -40,20 +42,22 @@ pub struct SeqInfo {
 /// via `seq_tier` (only signalled when `seq_level_idx > 7`; Main below that), so
 /// the word "profile" is spelled out to keep the two Mains distinct. Levels keep
 /// the `X.Y` form AV1 conventionally uses; idx 31 signals no fixed level.
-pub fn av1_profile_label(seq_profile: u8, seq_tier: u8, seq_level_idx: u8) -> String {
+pub fn av1_profile_label(seq_profile: u8, seq_tier: u8, seq_level_idx: u8) -> Option<String> {
+    // `seq_profile` 3 is the one reserved value the 3-bit field admits: it
+    // names no profile, so the label is omitted rather than a placeholder.
     let profile = match seq_profile {
         0 => "Main",
         1 => "High",
         2 => "Professional",
-        _ => "?",
+        _ => return None,
     };
     let tier = if seq_tier == 1 { "High tier" } else { "Main tier" };
-    if seq_level_idx == 31 {
+    Some(if seq_level_idx == 31 {
         format!("{profile} profile, {tier}")
     } else {
         let (major, minor) = (2 + (seq_level_idx >> 2), seq_level_idx & 3);
         format!("{profile} profile, {tier} @ L{major}.{minor}")
-    }
+    })
 }
 
 /// Parse a sequence-header OBU payload. Returns `None` on any short read.
@@ -71,6 +75,7 @@ pub fn parse_sequence_header(p: &[u8]) -> Option<SeqInfo> {
     let mut seq_tier = 0u8;
     let mut seq_level_idx = 0u8;
     let mut fps: Option<f64> = None;
+    let mut fps_rational: Option<(u64, u64)> = None;
 
     if reduced_still_picture_header {
         seq_level_idx = r.read_bits(5)? as u8;
@@ -88,6 +93,7 @@ pub fn parse_sequence_header(p: &[u8]) -> Option<SeqInfo> {
                 let denom = num_units_in_display_tick as u64 * num_ticks_per_picture;
                 if denom > 0 && time_scale > 0 {
                     fps = Some(time_scale as f64 / denom as f64).filter(|&f| f > 0.0 && f <= 480.0);
+                    fps_rational = fps.is_some().then_some((u64::from(time_scale), denom));
                 }
             }
             decoder_model_info_present = r.read_bit()? == 1;
@@ -191,29 +197,33 @@ pub fn parse_sequence_header(p: &[u8]) -> Option<SeqInfo> {
         color,
         color_description_present,
         fps,
+        fps_rational,
     })
 }
 
 /// Map AV1 `mono_chrome` + subsampling flags to a chroma-format label.
-pub fn av1_chroma_str(mono_chrome: bool, ss_x: u8, ss_y: u8) -> &'static str {
+/// `None` for the one flag pair AV1 defines no format for (`ss_x` 0, `ss_y`
+/// 1): an undefined combination names nothing, so the field stays absent.
+pub fn av1_chroma_str(mono_chrome: bool, ss_x: u8, ss_y: u8) -> Option<&'static str> {
     if mono_chrome {
-        "monochrome"
+        Some("monochrome")
     } else {
         match (ss_x, ss_y) {
-            (1, 1) => "4:2:0",
-            (1, 0) => "4:2:2",
-            (0, 0) => "4:4:4",
-            _ => "?",
+            (1, 1) => Some("4:2:0"),
+            (1, 0) => Some("4:2:2"),
+            (0, 0) => Some("4:4:4"),
+            _ => None,
         }
     }
 }
 
-/// color_config() (AV1 spec §5.5.2). Returns (bit_depth, chroma, ColorInfo,
-/// color_description_present).
-fn parse_color_config(
-    r: &mut BitReader,
-    seq_profile: u8,
-) -> Option<(u8, &'static str, ColorInfo, bool)> {
+/// What `color_config()` yields: bit depth, chroma label (`None` for the
+/// undefined subsampling pair), colour + provenance, and whether an explicit
+/// `color_description` was present.
+type ColorConfig = (u8, Option<&'static str>, (ColorInfo, ColorSources), bool);
+
+/// color_config() (AV1 spec §5.5.2).
+fn parse_color_config(r: &mut BitReader, seq_profile: u8) -> Option<ColorConfig> {
     let high_bitdepth = r.read_bit()? == 1;
     let bit_depth = if seq_profile == 2 && high_bitdepth {
         let twelve_bit = r.read_bit()? == 1;
@@ -264,14 +274,16 @@ fn parse_color_config(
 
     let chroma = av1_chroma_str(mono_chrome, ss_x, ss_y);
 
-    let color = ColorInfo {
-        primaries: cicp_primaries(cp).map(str::to_string),
-        transfer: cicp_transfer(tc).map(str::to_string),
-        matrix: cicp_matrix(mc).map(str::to_string),
-        range: Some(if range_full { "full" } else { "limited" }.to_string()),
-    };
+    // An AV1 sequence header is the coded stream's own signalling.
+    let (color, color_source) = crate::container::color_from_cicp(
+        cp,
+        tc,
+        mc,
+        Some(range_full),
+        ColorSource::Stream,
+    );
 
-    Some((bit_depth, chroma, color, color_description_present))
+    Some((bit_depth, chroma, (color, color_source), color_description_present))
 }
 
 /// AV1 uvlc() — unsigned variable-length code.
@@ -289,4 +301,19 @@ fn read_uvlc(r: &mut BitReader) -> Option<u32> {
     }
     let value = r.read_bits(leading_zeros)?;
     Some(value + (1u32 << leading_zeros) - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The reserved codes name nothing and leave their fields absent: 3 is
+    /// the 3-bit `seq_profile` space's one undefined value, and `ss_x` 0 with
+    /// `ss_y` 1 is the one flag pair AV1 defines no chroma format for.
+    #[test]
+    fn reserved_profile_and_subsampling_codes_name_nothing() {
+        assert_eq!(super::av1_profile_label(0, 0, 13), Some("Main profile, Main tier @ L5.1".into()));
+        assert_eq!(super::av1_profile_label(3, 0, 13), None);
+        assert_eq!(super::av1_chroma_str(false, 0, 1), None);
+        assert_eq!(super::av1_chroma_str(false, 1, 1), Some("4:2:0"));
+        assert_eq!(super::av1_chroma_str(true, 0, 1), Some("monochrome"));
+    }
 }

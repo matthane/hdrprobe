@@ -30,7 +30,8 @@ Nothing changed type, unit, or meaning: fields just live at a new path.
 4. **`video_tracks` always exists and always has at least one entry**: one for ordinary
    files, one (with `codec: ""`) for metadata sidecars. You can iterate it unconditionally;
    if you only care about the common single-track case, `.video_tracks[0]` is the drop-in
-   equivalent of the old top-level objects.
+   equivalent of the old top-level objects. (Schema 3.0 later removed the `""` sidecar
+   sentinel: `codec` is simply absent there. See [MIGRATION-3.0.md](MIGRATION-3.0.md).)
 
 5. **New optional per-track fields** you can ignore or use: `track_number` (MKV TrackNumber /
    MP4 track_ID / TS PID), `program` (multi-program TS only), and `default` (MKV only).

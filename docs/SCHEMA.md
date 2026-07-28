@@ -1,6 +1,6 @@
 # hdrprobe JSON output schema
 
-**Schema version: 2.4**
+**Schema version: 3.0**
 
 This document is the field-by-field reference for hdrprobe's machine-readable output, the
 contract external scripts can rely on. It is maintained against the report model in
@@ -17,9 +17,11 @@ together with the conditions under which it appears.
   - [`Report` (top level)](#report-top-level)
   - [Multiple video tracks](#multiple-video-tracks)
   - [Blu-ray ISO probes and `BdIso`](#blu-ray-iso-probes-and-bdiso)
+  - [DVD-Video ISO probes and `DvdIso`](#dvd-video-iso-probes-and-dvdiso)
   - [`VideoTrack`](#videotrack)
   - [`Bitrate`](#bitrate)
   - [`ColorInfo`](#colorinfo)
+  - [`ColorSources`](#colorsources)
   - [`Hdr`](#hdr)
   - [`MasteringDisplay`](#masteringdisplay)
   - [`ContentLight`](#contentlight)
@@ -36,6 +38,7 @@ together with the conditions under which it appears.
   - [`SlHdr`](#slhdr)
   - [`HdrVivid`](#hdrvivid)
 - [How input kind and flags affect presence](#how-input-kind-and-flags-affect-presence)
+- [Error objects (`--errors`)](#error-objects---errors)
 - [Progress events (stderr)](#progress-events-stderr)
 - [Version history](#version-history)
 
@@ -55,7 +58,9 @@ the number of command-line arguments: a directory argument containing one file s
 single object, and a directory containing several yields an array.
 
 A file that cannot be parsed produces no `Report`. The error goes to stderr and the process exit
-code becomes `2`; the remaining files are still reported. Consequences for consumers:
+code becomes `2`; the remaining files are still reported. (Under the opt-in `--errors` flag the
+failure *also* joins the machine stream as an error object — see "Error objects" below — so a
+scanner learns which files failed without parsing stderr.) Consequences for consumers:
 
 - Under `--json`, a run where every input failed prints `[]` (an empty array), including the
   single-input case.
@@ -121,15 +126,19 @@ either use `--format ndjson` or normalize after parsing, e.g. in Python:
 
 - **Absent means omitted, never `null`.** Every optional field is skipped entirely when it has
   no value. No field in the schema is ever serialized as `null`.
-- **Empty arrays are omitted.** `l5_active_areas` and `trim_targets` are absent rather than `[]`
-  when nothing was found.
-- **Default-false booleans may be omitted.** `profile_compat_assumed`, `level_derived`, and
-  `unconverted_dual_layer_rpu` appear only when `true`. All other booleans (`bl_present`,
-  `el_present`, `rpu_present`, `sampled`, `zeroed`, `l11_reference_mode`) are serialized
-  whenever their containing object is.
+- **Empty arrays are omitted.** `l5_active_areas`, `trim_targets`, and
+  `hdr_vivid.target_max_luminances` are absent rather than `[]` when nothing was found.
+- **Default-false booleans may be omitted.** `input_truncated`, `unconverted_dual_layer_rpu`,
+  `pq_reshaping`, and `deprecated_combination` appear only when `true`. All other booleans (`bl_present`,
+  `el_present`, `rpu_present`, `zeroed`, `l11.reference_mode`) are serialized
+  whenever their containing object is — except `video_tracks[].default`, which is present
+  only when the container states a default-track flag (MKV) and carries whichever value it
+  states.
 - **Numbers.** JSON has a single number type; the tables below note the underlying type.
   Integer-typed fields are always whole numbers. Float-typed fields (`fps`, `duration_secs`,
-  `bits_per_sec`, `max_luminance`, `min_luminance`, `bl_max_nits`, `rpu_max_nits`, `elapsed_ms`)
+  `bits_per_sec`, `max_luminance`, `min_luminance`, `bl_max_nits`, `rpu_max_nits`,
+  `pixel_aspect_ratio`, `display_aspect_ratio`, `bd_iso.playlist_duration_secs`,
+  `dvd_iso.title_duration_secs`, and the progress events' `elapsed_ms`)
   may carry fractional digits.
 - **Key order is not significant.** Keys currently serialize in model order, but consumers
   should treat objects as unordered maps.
@@ -185,11 +194,16 @@ object below is a single optional or always-present sub-object of its parent):
 ```
 Report
 ├─ bd_iso: BdIso                      (Blu-ray ISO probes only)
+├─ dvd_iso: DvdIso                    (DVD-Video ISO probes only)
 └─ video_tracks[]: VideoTrack         (always at least one entry)
+   ├─ fps_rational: Rational
+   ├─ pixel_aspect_ratio_rational: Rational
+   ├─ display_aspect_ratio_rational: Rational
    ├─ bitrate: Bitrate
    ├─ color: ColorInfo
+   ├─ color_source: ColorSources
    ├─ hdr: Hdr                        (video inputs only)
-   │  ├─ mastering: MasteringDisplay
+   │  ├─ mastering_display: MasteringDisplay
    │  └─ content_light: ContentLight
    ├─ dolby_vision: DolbyVision      (when DV metadata was found)
    │  ├─ mastering_display: MasteringDisplay
@@ -197,12 +211,15 @@ Report
    │  ├─ mastering_primaries_mismatch: MasteringPrimariesMismatch
    │  ├─ l6: L6
    │  ├─ l5_active_areas[]: ActiveArea
+   │  ├─ l5_assumed_canvas: AssumedCanvas   (sidecars only)
+   │  ├─ l11: L11
    │  ├─ trim_targets[]: TrimTarget
    │  ├─ metadata_cadence: MetadataCadence
    │  └─ census: DvCensus
    │     └─ level_presence[]: LevelPresence
    ├─ hdr10plus: Hdr10Plus            (when HDR10+ metadata was found)
    ├─ sl_hdr: SlHdr                   (when an SL-HDR information SEI was found)
+   │  └─ source_mastering_display: MasteringDisplay
    └─ hdr_vivid: HdrVivid             (when HDR Vivid metadata was found)
 ```
 
@@ -216,26 +233,37 @@ section.
 | `hdrprobe_schema_version` | string | always | Version of hdrprobe's own output schema, `"<major>.<minor>"`; see Schema versioning above. Not related to the inspected file's metadata (contrast `format_version` and `video_tracks[].dolby_vision.cm_version`) |
 | `file` | string | always | The input path as given on the command line (or as found during a directory scan); `"-"` for a stdin probe |
 | `size_bytes` | integer | always | File size in bytes. For a truncated stdin probe (`input_truncated` present) this is the bytes actually probed, not the source's size |
-| `input_truncated` | boolean | stdin probes only, when true | The piped stream exceeded the head budget, so only a leading window was probed: `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (TS `duration_secs`, non-MP4 `bitrate`) are withheld. Absent for file probes and for stdin streams that ended within the budget; see the stdin paragraph under "How input kind and flags affect presence" |
+| `input_truncated` | boolean | when true | Only part of the input was (or could be) probed. For a **stdin** probe: the piped stream exceeded the head budget, so only a leading window was probed — `size_bytes` is the bytes probed, and facts derived from the payload span rather than a declared header (the span-measured `duration_secs` of TS, program streams, Ogg, and raw DV; every `bitrate` except MP4/MOV's and RealMedia's `video_stream` rates) are withheld; see the stdin paragraph under "How input kind and flags affect presence". For a **file** probe: the container itself declares more bytes than the file holds (AVI's RIFF segment sizes, ASF's `File Properties.File Size`, FLV's `onMetaData.filesize`, RealMedia's `DATA` chunk extent) — a partial download or a capture that never closed; the backend has already withheld what a prefix cannot support (any `"overall"` bitrate; ASF also its duration), and the flag names why (RealMedia's declared duration and stream bitrate are header facts and stand). Never set from a merely absent declaration. Absent for whole files and for stdin streams that ended within the budget |
 | `container` | string | always | Container or sidecar kind; see the value table under `VideoTrack` below |
-| `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes" below |
+| `bd_iso` | `BdIso` | Blu-ray ISO probes only | Which BDMV playlist/clip was auto-selected as the main feature; see "Blu-ray ISO probes and `BdIso`" below |
+| `dvd_iso` | `DvdIso` | DVD-Video ISO probes only | Which VIDEO_TS title set was auto-selected as the main feature; see "DVD-Video ISO probes and `DvdIso`" below |
 | `format_version` | string | optional | Sidecar schema version, e.g. `"4.0.2"` from a DV CM XML's root version. Only DV XML sidecars declare one today |
-| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest track's presentation length; a multi-program TS shares one mux timeline). Absent when the input has no duration source (raw HEVC; raw AV1 OBU without a full scan; all sidecars; a truncated stdin TS probe, whose PCR span would describe the prefix, not the stream) |
+| `duration_secs` | float | optional | Duration in seconds, file-level (a multi-track file reports its longest stream's runtime; a multi-program TS shares one mux timeline). The source is per container: a declared header duration (MP4/MKV/AVI/ASF/FLV/RealMedia, and a DVD ISO's IFO-declared runtime, which wins over the measured span), a measured video presentation span plus one frame interval (TS/M2TS and program streams), the video stream's last granule position (Ogg; absent for a chained file), or exact frame arithmetic (raw DV; raw MPEG-1/2 under `--full`). Absent when the input has no duration source (raw HEVC, raw AV1 OBU without a full scan, all sidecars) and for truncated stdin probes of the span-derived formats (see `input_truncated`) |
 | `video_tracks` | array of `VideoTrack` | always, at least one entry | One entry per video track; see "Multiple video tracks" below |
-| `elapsed_ms` | float | always | Wall-clock parse time in milliseconds |
+
+The report carries no wall-clock timing: two runs over one file serialize identically, so
+snapshot diffs of NDJSON scans are stable. (Progress events on stderr carry their own
+`elapsed_ms`; that is a separate contract.)
+
+**`input_truncated` on file probes ships in 3.0** (it was stdin-only through 2.x, and the
+file-side detections existed without surfacing): a truncated AVI/ASF/FLV/RealMedia now names
+why its report withholds what it withholds. The four declarations above are the only ones consulted;
+a format with no self-declared length (TS, raw streams, Ogg) cannot set the flag from a file
+probe, and a short file of such a format still reports without it.
 
 ### Multiple video tracks
 
 `video_tracks` always exists and always holds at least one entry, so consumers iterate it
 unconditionally: a single-track file (the overwhelming majority) simply has one entry, and a
-metadata sidecar has one entry too (with `codec: ""`). More than one entry means the container
+metadata sidecar has one entry too (with no `codec`). More than one entry means the container
 carries genuinely **independent** video tracks: an MKV or MP4 with several video tracks (e.g. a
 remux carrying a color and a black-and-white cut of the same title), or a multi-program
 TS capture with one video stream per service. A Dolby Vision Profile-7 base+enhancement-layer
 pair is **one logical track** and never produces two entries, whatever the mux shape (MP4
 dual-`trak`, TS dual-PID, or an atypical dual-track MKV): the pair reports as a single entry
 with `dolby_vision.structure` = `"Dual track, dual layer"`. Track order follows the container:
-MKV by TrackNumber, MP4 by `trak` order, TS by program then PID.
+MKV by TrackNumber, MP4 by `trak` order, TS by program then PID, AVI by header-list order,
+ASF by stream number, Ogg by BOS-page order, MPEG program streams by stream id.
 
 ### Blu-ray ISO probes and `BdIso`
 
@@ -257,27 +285,59 @@ HDR and Dolby Vision facts) describes **that clip**, exactly as if the mounted
 | `clip_count` | integer | always | Number of distinct clips in the selected playlist. `1` for the common single-clip feature; more for seamless-branching titles, where only the largest clip is probed |
 
 AACS-encrypted images are detected (the clip fails TS sync-lock and an `AACS` directory is
-present) and rejected with an error; hdrprobe never decrypts. DVD-Video ISOs and non-BDMV
-UDF images error distinctly. A fragmented (non-contiguous) main clip is not supported and
-errors rather than guessing.
+present) and rejected with an error; hdrprobe never decrypts. Non-disc UDF images (neither
+`BDMV` nor `VIDEO_TS`) error distinctly. A fragmented (non-contiguous) main clip is not
+supported and errors rather than guessing.
+
+### DVD-Video ISO probes and `DvdIso`
+
+A decrypted DVD-Video ISO (`.iso`, UDF image with a `VIDEO_TS` tree) is probed the same way:
+hdrprobe groups the title VOBs (`VTS_nn_1.VOB` onward — menu VOBs are excluded) by title set,
+selects the byte-largest set as the main feature, and runs the MPEG program-stream pipeline
+over the set's contiguous byte range. Track facts (codec, resolution, frame rate, aspect,
+colour) describe that title set's stream; `size_bytes` stays the whole image's size.
+`container` is `"DVD-Video ISO (VIDEO_TS)"` and `dvd_iso` records the selection:
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `vts` | integer | always | Selected title set number: the probed VOBs are `VTS_<vts>_1.VOB` onward |
+| `vob_count` | integer | always | Title VOBs in the probed set (the ≤1 GiB slices of one program stream) |
+| `title_duration_secs` | float | optional | The longest program chain's declared playback time from the set's IFO (`VTS_nn_0.IFO`) — the feature's authored runtime, shown on the text report's `Main feature` line. Absent when the IFO is missing or unparseable |
+
+**`duration_secs` for a DVD ISO is the IFO's declared runtime** when one parsed (and the
+per-track `"overall"` bitrate divides by it) — the MKV/MP4 declared-duration convention. The
+program-stream backend's measured PTS span is only the fallback, because a cell or layer-break
+timestamp reset between its head and tail windows is invisible to both: a real dual-layer
+pressing measured 33 minutes of a declared 109-minute feature exactly that way. CSS-scrambled
+images are detected per-packet (`PES_scrambling_control` on a video PES) and rejected with an
+error, the AACS rule; decrypted backups clear those bits and probe normally.
 
 ### `VideoTrack`
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID. Absent where no such id exists (raw elementary streams, sidecars) |
+| `track_number` | integer | optional | Container-native track identity: MKV TrackNumber, MP4 `tkhd` track_ID, TS the base layer's PID, Ogg the logical bitstream's serial number, MPEG program stream the PES stream id (or, for HD DVD `.evo` video on the extended id 0xFD, the `stream_id_extension` substream id, 0x55..0x5F), AVI the stream's header-list index, ASF the stream number, RealMedia the MDPR stream number. Absent where no such id exists (raw elementary streams, FLV, sidecars). It is the container's own identifier, not an index: Ogg serials in particular are randomly chosen 32-bit values, so do not expect a small ordinal or a stable ordering relationship with the array position |
 | `program` | integer | optional | TS `program_number`; present only for a multi-program mux |
 | `default` | boolean | optional | MKV FlagDefault; absent for containers without such a flag |
-| `codec` | string | always | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, or `"ProRes"`. The empty string `""` for metadata sidecars, which carry no video |
+| `codec` | string | optional | `"HEVC"`, `"AVC"`, `"AV1"`, `"VP9"`, `"ProRes"`, `"MPEG-1 Video"`, `"MPEG-2 Video"`, `"MPEG-4 Visual"`, `"VC-1"`, `"Theora"`, `"MJPEG"`, `"DV"` (raw `.dv`/`.dif` input; DV inside AVI/MOV still reports its carriage FourCC), `"RealVideo 1"`/`"2"`/`"3"`/`"4"` (RealMedia `VIDO` FourCCs `RV10`..`RV40`; an unrecognized `VIDO` FourCC reports verbatim), or `"MS-MPEG-4 v1"`/`"v2"`/`"v3"`. Absent for metadata sidecars, which carry no video; always present for video inputs. A track whose codec hdrprobe does not recognize reports its container identifier verbatim instead (an MP4/MOV sample-entry FourCC such as `"mp4v"` carrying an object type outside the recognized set, a Matroska CodecID such as `"V_MPEG4/ISO/SQ"`, or — for an AVI or `V_MS/VFW/FOURCC` track — the four-character code inside its `BITMAPINFOHEADER`, such as `"dvsd"`), so treat the list as the recognized set rather than a closed one. **FourCC fallbacks** (AVI/ASF `biCompression`, the MP4/MOV sample-entry code): space padding is trimmed (QuickTime's `dvc ` reports `"dvc"`, matching `codec_id` and MediaInfo), and a code that is not printable ASCII, or is entirely spaces, is rendered as `"0x"` plus its eight hex digits, little-endian, matching what MediaInfo shows as CodecID — uncompressed AVI video declares the integer 0 and reports `"0x00000000"`. A Matroska `V_MS/VFW/FOURCC` track with such a code keeps its CodecID string instead, so that carriage differs here |
+| `codec_id` | string | optional | The container's own codec identifier (control characters sanitized, FourCC space-padding trimmed): the MP4/MOV sample-entry FourCC (`"hvc1"` vs `"hev1"` — for an encrypted `encv` track, the recovered original), the Matroska CodecID (a `V_MS/VFW/FOURCC` track appends the inner FourCC: `"V_MS/VFW/FOURCC / WVC1"`, MediaInfo's rendering), the TS PMT `stream_type` in hex (`"0x24"`), an AVI/ASF `biCompression` FourCC (hex form when unprintable, the `codec` fallback's rule), an FLV legacy CodecID as a decimal string (`"7"`) or Enhanced FourCC (`"hvc1"`), RealMedia's `VIDO` FourCC (`"RV40"`), or an Ogg mapping name (`"theora"`, `"vp8"`). Absent where no container-level identifier exists: raw elementary streams, program streams (whose PES stream id is already `track_number`), raw DV, and metadata sidecars. Unlike `codec`, this reports what the file says rather than what hdrprobe recognized, so the pair separates the two |
 | `codec_profile` | string | optional | Codec profile label; see the format table below |
 | `width` | integer | optional | Coded width in pixels; absent for sidecars and when the demux could not recover it |
 | `height` | integer | optional | Coded height in pixels; same conditions as `width` |
-| `fps` | float | optional | Frame rate. From container timing (MP4/MKV), the SPS VUI (TS, raw HEVC), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>`. Absent when the input carries no rate signal; never guessed |
+| `fps` | float | optional | Frame rate. From container timing (MP4/MKV/AVI/ASF/FLV/RealMedia), the coded stream's own timing signal (the SPS VUI for TS and raw HEVC, the MPEG-1/2 and VC-1 rate tables, MPEG-4 Part 2's `fixed_vop_rate` pair, Theora's identification header, raw DV's system rate), the AV1 sequence header's timing info, averaged IVF timestamps, or a DV XML's `<EditRate>` — the same source set as `fps_rational`, plus the measured/averaged cases. A clock-quantized period (MKV `DefaultDuration`, ASF's tick period) that exactly encodes a standard rate reports that rate — see `fps_rational`'s decode rule — so MKV remuxes read `23.976023976…` rather than the quantized `23.976024167…`. Absent when the input carries no rate signal; never guessed |
+| `fps_rational` | object `{num, den}` | optional | The frame rate as the exact reduced ratio it was signalled as (`{"num": 24000, "den": 1001}`), where the source states one: an H.264/HEVC VUI's `time_scale`/`num_units_in_tick`, MP4's uniform `stts` delta, the MPEG-1/2 and VC-1 rate tables, MPEG-4 Part 2's `fixed_vop_rate` pair, Theora `FRN`:`FRD`, an AV1 sequence header's timing info, DV's system rate, RealMedia's 16.16 field, AVI's `dwRate`:`dwScale`. MKV's `DefaultDuration` (nanoseconds per frame) and ASF's average frame period (100 ns ticks) are **clock-quantized encodings** of the authored rate, and are decoded exactly: a stored period that is bit-for-bit the integer encoding of a standard broadcast/cinema rate reports that rate (`41708333` ns *is* 24000/1001 on the nanosecond clock), while a period matching no standard rate's encoding keeps the raw tick ratio — an exact inverse of the quantization, never a tolerance snap, so a genuinely nonstandard rate is preserved. The `fps` float is the same value as a decimal (they may differ in the last binary digit). Absent when the rate was measured or averaged rather than stated as a ratio (IVF timestamps, frame-count over duration), or when `fps` is |
+| `duration_secs` | float | optional | This track's own duration, where the container states one per track: MP4's media duration (or summed fragment runs), the mkvmerge `DURATION` statistics tag, AVI's per-stream declared length, RealMedia's MDPR duration. The report-level `duration_secs` stays the file-level value (the longest stream's); on single-track files the two usually agree to within a frame |
 | `bitrate` | `Bitrate` | optional | Average bitrate; absent when no exact source and no duration exists. The `"overall"` (file-length) fallback rate appears only when this is the file's sole video track (an overall rate attributed to one of several tracks would be a wrong number) |
-| `bit_depth` | integer | optional | Luma bit depth (8, 10, or 12) |
-| `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"` (a reserved signalling value renders `"?"`) |
+| `bit_depth` | integer | optional | Luma bit depth: 8, 10, or 12 for every recognized codec except MJPEG, which reports the frame's own `SOF` sample precision verbatim (8 for baseline; extended and lossless frames may legally state up to 16) |
+| `chroma` | string | optional | Chroma subsampling: `"monochrome"`, `"4:2:0"`, `"4:2:2"`, `"4:4:4"`, `"4:4:4:4"` (a ProRes 4444 frame with alpha, when the frame header is the source — the Matroska carriage), `"4:1:1"` (DV, MJPEG), `"4:4:0"` (MJPEG, VP9). A reserved signalling value names no format and omits the field |
+| `pixel_aspect_ratio` | float | optional | Pixel (sample) aspect ratio, width of one pixel over its height (1.0 = square). Signalled by the coded stream (H.264/HEVC VUI `aspect_ratio_idc`/Extended_SAR, MPEG-4 Part 2 and MPEG-1 aspect codes, Theora `PARN`:`PARD`, VC-1 `ASPECT_RATIO`) or the container (MP4 `pasp` — which wins over the stream, like colour), or derived exactly from a signalled display ratio and the coded size (MPEG-2's DAR codes, MKV `DisplayWidth`:`DisplayHeight`, AVI `vprp`). Absent when nothing signals either ratio — never a guessed square |
+| `pixel_aspect_ratio_rational` | object `{num, den}` | optional | The pixel aspect ratio as an exact reduced ratio; present exactly when the float is (both derive from the same signalled rational) |
+| `display_aspect_ratio` | float | optional | Display aspect ratio of the presented picture. Signalled directly or derived exactly from the pixel ratio and the coded size; present exactly when `pixel_aspect_ratio` is. The text report shows it (as `DAR 16:9` etc.) only when the pixels are not square; the JSON always carries both |
+| `display_aspect_ratio_rational` | object `{num, den}` | optional | The display aspect ratio as an exact reduced ratio (`{"num": 16, "den": 9}`); present exactly when the float is |
+| `scan_type` | string | optional | `"progressive"` or `"interlaced"`, from a sequence-level signal of the coded stream (AVC `frame_mbs_only_flag`, HEVC PTL source flags / `field_seq_flag`, MPEG-2 `progressive_sequence` — affirmative only, since a clear flag merely permits interlaced pictures and film-sourced DVDs are progressive under it, MPEG-4 Part 2 and VC-1 interlace flags, MKV `FlagInterlaced`, AVI `vprp` fields-per-frame; MPEG-1, Theora and MJPEG-free formats that structurally cannot interlace state `"progressive"`). Absent when unsignalled — absence never means progressive. The text report marks only `interlaced` |
 | `stereo` | string | optional | Stereoscopic view structure from MP4 `vexu`/`stri` (MV-HEVC, DV Profile 20): `"Stereoscopic 3D (2 views)"`, `"Monoscopic (1 view)"`, or `"Multiview 3D (2+ views)"`. Absent for ordinary monoscopic video |
-| `color` | `ColorInfo` | always | Colour signalling; may be `{}` when nothing was signalled |
+| `color` | `ColorInfo` | always | The track's colour description; may be `{}` when nothing signalled it and nothing defines it |
+| `color_source` | `ColorSources` | always | Where each `color` field came from, field for field; `{}` when `color` is |
 | `hdr` | `Hdr` | video inputs only | Static HDR classification and mastering info; absent for metadata sidecars, which have no base layer |
 | `dolby_vision` | `DolbyVision` | when DV metadata was found | Present when at least one RPU parsed, when the container carries a DV configuration (including under `--no-rpu`), or for a DV sidecar |
 | `hdr10plus` | `Hdr10Plus` | when HDR10+ metadata was found | Present when ST.2094-40 metadata was parsed from the input (an HEVC SEI, an AV1 metadata OBU, or the Matroska BlockAdditions carriage used by VP9 in WebM), or for an HDR10+ JSON sidecar. Like `dolby_vision`, the object's existence is the presence signal |
@@ -299,9 +359,21 @@ Video inputs:
 | `"raw AV1 (IVF)"` | AV1 in an IVF wrapper |
 | `"raw AV1 (OBU)"` | AV1 low-overhead OBU stream |
 | `"raw VP9 (IVF)"` | VP9 in an IVF wrapper (`VP90` FourCC) |
+| `"raw MPEG-1 Video (ES)"` | MPEG-1 video elementary stream (`.m1v`, `.mpv`) |
+| `"raw MPEG-2 Video (ES)"` | MPEG-2 video elementary stream (`.m2v`, `.mpv`) |
+| `"raw DV (DIF)"` | Raw DV tape stream (`.dv`, `.dif`): IEC 61834 / SMPTE 314M/370M DIF frames with no container |
+| `"MPEG-2 Program Stream"` | Program stream with ITU-T H.222.0 pack headers (`.vob`, `.mpg`, `.mpeg`, `.m2p`, `.evo`) |
+| `"MPEG-1 System Stream"` | Program stream with ISO/IEC 11172-1 pack headers. The system layer and the video codec version independently, so these routinely carry MPEG-2 video |
+| `"MPEG PES stream"` | Program-stream PES packets with no pack layer: a mid-file cut, or a bare PES stream |
+| `"AVI (RIFF)"` | AVI (`.avi`), including OpenDML multi-segment files — the label does not distinguish them, since OpenDML changes how the file is indexed and no fact the report carries |
+| `"ASF (Windows Media)"` | Advanced Systems Format (`.wmv`, `.asf`, and a `.wma` carrying video) |
+| `"FLV (Flash Video)"` | Flash Video (`.flv`), legacy and Enhanced/E-RTMP alike — the label does not distinguish them, since the header form changes what the report reads and not what it reports |
+| `"Ogg"` | Ogg (`.ogv`, `.ogg`, `.oga`, `.ogm`, `.ogx`) carrying a Theora or VP8 video logical bitstream |
+| `"RealMedia"` | RealNetworks RealMedia (`.rm`, `.rmvb`) with at least one video stream; RealAudio-only files error honestly |
 | `"Blu-ray ISO (BDMV)"` | Decrypted Blu-ray UDF image; the report describes the auto-selected main-feature clip (see "Blu-ray ISO probes" above) |
+| `"DVD-Video ISO (VIDEO_TS)"` | Decrypted DVD-Video UDF image; the report describes the auto-selected main-feature title set (see "DVD-Video ISO probes" above) |
 
-Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` section):
+Metadata sidecars (one `video_tracks` entry with no `codec` and no `hdr` section):
 
 | Value | Source |
 |---|---|
@@ -313,12 +385,19 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 
 | Codec | Format | Examples |
 |---|---|---|
-| HEVC | `<profile>, <tier> tier @ L<level>` | `"Main 10, High tier @ L5.1"`, `"Main, Main tier @ L4"` |
+| HEVC | `<profile>, <tier> tier @ L<level>` (an unrecognized `profile_idc` renders as `profile <n>`) | `"Main 10, High tier @ L5.1"`, `"Main, Main tier @ L4"` |
 | MV-HEVC | The HEVC label prefixed with `Multiview ` | `"Multiview Main 10, High tier @ L5"` |
-| AVC | `<profile> @ L<level>` | `"High @ L4.2"`, `"Constrained High @ L4"`, `"Baseline @ L3.1"` |
+| AVC | `<profile> @ L<level>` | `"High @ L4.2"`, `"Constrained High @ L4"`, `"Constrained Baseline @ L3.1"` |
 | AV1 | `<profile> profile, <tier> tier @ L<level>` (level omitted when unset) | `"Main profile, Main tier @ L5.1"`, `"Main profile, Main tier"` |
 | VP9 | `Profile <n> @ L<level>` (level omitted when the mux states none; only WebM CodecPrivate and MP4 `vpcC` carry one) | `"Profile 2 @ L4.0"`, `"Profile 2"` |
+| DV | The SMPTE variant name, raw `.dv`/`.dif` input only; absent for consumer DV25, which has none | `"DVCPRO"`, `"DVCPRO50"`, `"DVCPRO HD"` |
 | ProRes | The profile name from the MOV/MP4 sample-entry FourCC; omitted entirely for Matroska, which carries no profile signal | `"422 HQ"`, `"4444 XQ"` |
+| MPEG-2 | `<profile>@<level>` from `profile_and_level_indication`; omitted when the byte is a reserved combination | `"Main@Main"`, `"Main@High"`, `"High@High 1440"`, `"4:2:2@High"` |
+| MPEG-1 | Always omitted: ISO/IEC 11172-2 has no profile or level field | |
+| MPEG-4 Visual | `<profile>@L<level>` from `profile_and_level_indication`; omitted when the byte is reserved, and omitted entirely when the stream carries no VisualObjectSequence header, which many muxes drop | `"Simple@L1"`, `"Simple@L0b"`, `"Advanced Simple@L3b"`, `"Simple Studio@L4"` |
+| VC-1 | `Advanced@L<level>` from the sequence header for Advanced Profile. Simple and Main report `<profile>@<Low|Medium|High>` when an MP4 `dvc1` box states its level field, else the bare profile name (`"Simple"`, `"Main"`) — STRUCT_C itself carries no level, which is what the VfW carriages have | `"Advanced@L3"`, `"Main@High"`, `"Main"` |
+| MS-MPEG-4 | Always omitted: the pre-standard Microsoft variants signal no profile | |
+| MJPEG | Always omitted: T.81 defines processes, not signalled profiles | |
 
 ### `Bitrate`
 
@@ -326,21 +405,65 @@ Metadata sidecars (one `video_tracks` entry with empty `codec` and no `hdr` sect
 |---|---|---|---|
 | `bits_per_sec` | float | always | Average rate in bits per second |
 | `scope` | string | always | `"video_stream"` (exact encoded video byte count or a container-stated per-stream rate) or `"overall"` (file length divided by duration, which also counts audio and container overhead) |
+| `source` | string | always | `"measured"` (hdrprobe computed the rate from per-sample/per-chunk sums or actual payload/file bytes: MP4 sample tables, an AVI index, a `--full` streamed sum, every `"overall"` rate) or `"declared"` (a single rate or byte count stated in a container header, however the muxer obtained it: MKV `BPS`/`NUMBER_OF_BYTES` statistics tags, ASF `Data Bitrate`, FLV `videodatarate`, RealMedia's MDPR average) |
+
+A `"video_stream"` rate is always about the video track alone, but it is not always a
+measurement, and `source` says which kind each rate is. On MP4/MOV it is an exact sum of the
+sample-size table (`"measured"`); on AVI it is the file's index summed (`"measured"`); on
+Matroska it is mkvmerge's own `BPS` statistic — measured by the muxer, but read from a header
+tag, so it is `"declared"`. On **ASF, FLV and RealMedia** it is a per-stream average the muxer
+*declared* — ASF's Extended Stream Properties `Data Bitrate` (falling back to the
+`Stream Bitrate Properties` per-stream record, which additionally counts packet overhead),
+FLV's `onMetaData.videodatarate`, RealMedia's MDPR average — which is what both reference tools
+report for those formats and is the only per-stream figure those containers carry. A declared
+value can differ from the encoded reality by a percent or two. Running `--full` on an FLV
+replaces it with the exact summed video payload (`"measured"`); ASF has no such upgrade,
+because its payload is not addressable without a full demux.
 
 ### `ColorInfo`
 
-All four fields are optional; each is omitted when the input does not signal it or signals a
-code hdrprobe does not name.
+All four fields are optional; each is omitted when nothing signals it, nothing defines it, and
+no fallback names it.
 
 | Field | Type | Values |
 |---|---|---|
-| `primaries` | string | `"BT.709"`, `"BT.601 (PAL)"`, `"BT.601 (NTSC)"`, `"BT.2020"`, `"DCI-P3"`, `"Display P3"` |
-| `transfer` | string | `"BT.709"`, `"BT.601"`, `"BT.2020 (10-bit)"`, `"BT.2020 (12-bit)"`, `"PQ (SMPTE ST 2084)"`, `"HLG (ARIB STD-B67)"` |
-| `matrix` | string | `"RGB"`, `"BT.709"`, `"BT.2020 NCL"`, `"BT.2020 CL"`, `"IPT-PQ-c2"` |
+| `primaries` | string | `"BT.709"`, `"BT.470M"`, `"BT.601 (PAL)"`, `"BT.601 (NTSC)"`, `"SMPTE 240M"`, `"Film"`, `"BT.2020"`, `"XYZ (SMPTE ST 428-1)"`, `"DCI-P3"`, `"Display P3"`, `"EBU 3213-E"` |
+| `transfer` | string | `"BT.709"`, `"Gamma 2.2"`, `"Gamma 2.8"`, `"BT.601"`, `"SMPTE 240M"`, `"Linear"`, `"Log (100:1)"`, `"Log (316:1)"`, `"xvYCC (IEC 61966-2-4)"`, `"BT.1361"`, `"sRGB (IEC 61966-2-1)"`, `"BT.2020 (10-bit)"`, `"BT.2020 (12-bit)"`, `"PQ (SMPTE ST 2084)"`, `"SMPTE ST 428-1"`, `"HLG (ARIB STD-B67)"` |
+| `matrix` | string | `"RGB"`, `"BT.709"`, `"FCC"`, `"BT.601 (PAL)"`, `"BT.601 (NTSC)"`, `"SMPTE 240M"`, `"YCgCo"`, `"BT.2020 NCL"`, `"BT.2020 CL"`, `"SMPTE ST 2085"`, `"Chroma-derived NCL"`, `"Chroma-derived CL"`, `"ICtCp"`, `"IPT-PQ-C2"`, `"YCgCo-Re"`, `"YCgCo-Ro"` |
 | `range` | string | `"limited"`, `"full"` |
 
-When an HLG/PQ preferred-transfer SEI (alternative transfer characteristics) is present, it
-overrides the VUI value in `transfer`.
+The three CICP fields cover every code point ITU-T H.273 defines, so one of them is absent only
+when the input signalled nothing, signalled the explicit "unspecified" code (2), or signalled a
+value H.273 reserves.
+
+A value can reach this object three ways, and `color_source` says which per field:
+
+- **Signalled** by a container colour box/element or by the coded stream's own VUI.
+- **Overridden** by an SEI: an HLG/PQ preferred-transfer message (alternative transfer
+  characteristics) replaces the VUI value in `transfer`.
+- **Defined** by a Dolby Vision profile and compatibility id, for fields nothing signalled.
+  Dolby's specification pairs each cross-compatibility id with an exact base-layer VUI, so a
+  Profile 5 stream (whose colour space has no CICP encoding, leaving the SPS at "unspecified")
+  and a legacy Profile 4 mux (which often omits the colour description entirely) both report
+  the colour their profile defines rather than a gap. A signalled value always wins; the fill
+  only ever touches an absent field, and never runs when the compatibility id was itself
+  inferred from this colour description.
+
+### `ColorSources`
+
+Per-field provenance for `ColorInfo`, same four field names. A field is present here exactly
+when `ColorInfo` carries a value for it, so the two objects always have the same key set.
+
+| Value | Meaning |
+|---|---|
+| `"container"` | A container colour box or element: MP4 `colr` or `vpcC`, MKV `Colour` |
+| `"stream"` | The coded stream's own signalling: an SPS/sequence-header VUI, read in band or from the parameter set embedded in an `hvcC`/`avcC`/`av1C`/`dvc1` record, a VP9/ProRes/MPEG frame or visual-object header, or Theora's identification header |
+| `"sei"` | An SEI message overriding the above; today only the HLG/PQ alternative-transfer-characteristics message |
+| `"spec"` | Not signalled anywhere, and supplied by a specification that defines what an absent signal means: the Dolby Vision profile and compatibility id, MPEG-4 Part 2's defaults for an absent `video_signal_type()`, and VC-1's defaults for a clear `COLOR_FORMAT_FLAG` |
+
+The sources genuinely differ within one track, which is why this is per field and not a single
+flag: a Dolby Vision Profile 5 stream signals its range and nothing else, so `range` reads
+`"stream"` while `primaries`, `transfer` and `matrix` read `"spec"`.
 
 ### `Hdr`
 
@@ -349,8 +472,9 @@ Present for every video input; absent for sidecars.
 | Field | Type | Presence | Description |
 |---|---|---|---|
 | `format` | string | always | Overall classification; see below |
-| `mastering` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values. Like `content_light`, the L6 fallback applies only on an HDR10 base (an `HDR10` tag in `format`), where L6 by definition mirrors the base layer's own static metadata. On any other base (IPT-PQ-c2, HLG, SDR) the L6 values merely restate the DV grade's own display, which `dolby_vision.mastering_display` already reports, so the field is omitted. A container or SEI value, when actually signalled, is always reported |
-| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values. MaxCLL/MaxFALL is HDR10 (CTA-861.3) convention, so the L6 fallback applies only on an HDR10 base (an `HDR10` tag in `format`); no other base consumes it, and on an IPT-PQ-c2 or HLG base L6 is typically a zeroed placeholder, so the field is omitted rather than echo noise. A container or SEI value, when actually signalled, is always reported |
+| `base` | string | optional | The base signal a decoder without the dynamic-metadata layer receives: `"HDR10"`, `"HLG"`, or `"SDR"` — exactly the `format` string's base tag (item 5 below) as a field of its own, built from the same value so the two can never disagree. Absent exactly when the tag is: a Dolby Vision stream with no independently viewable base (compatibility id 0), or an unresolved id over a base layer that is neither PQ nor HLG |
+| `mastering_display` | `MasteringDisplay` | optional | Base-layer mastering display, preferring the container box, then the ST.2086 SEI, then the DV L6 values. Like `content_light`, the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6, or an unresolved id on Profile 8, which keeps the historical HDR10-base default), where L6 by definition mirrors the base layer's own static metadata. On any other base (IPT-PQ-C2, HLG, SDR) the L6 values merely restate the DV grade's own display, which `dolby_vision.mastering_display` already reports, so the field is omitted. A container or SEI value, when actually signalled, is always reported |
+| `content_light` | `ContentLight` | optional | MaxCLL/MaxFALL, preferring the container, then the SEI, then the DV L6 values. MaxCLL/MaxFALL is HDR10 (CTA-861.3) convention, so the L6 fallback applies only on an HDR10 base (compatibility id 1 or 6, or an unresolved id on Profile 8); no other base consumes it, and on an IPT-PQ-C2 or HLG base L6 is typically a zeroed placeholder, so the field is omitted rather than echo noise. A container or SEI value, when actually signalled, is always reported |
 
 #### `format` values
 
@@ -361,22 +485,28 @@ The string is a ` / `-joined list built from, in order:
 3. `SL-HDR1`, `SL-HDR2`, or `SL-HDR3` when an SL-HDR information SEI is present (the digit is
    the stream's own signalled mode).
 4. `HDR Vivid` when HDR Vivid metadata is present.
-5. A base-signal tag: `HDR10`, `HLG`, or `SDR` for non-DV content; `HDR10 (fallback)`,
-   `HLG (fallback)`, or `SDR (fallback)` for the base layer under DV. Omitted entirely when the
-   DV stream has no independently viewable base (Profile 5 and Profile 20, whose base is
-   IPT-PQ-c2).
+5. A base-signal tag: `HDR10`, `HLG`, or `SDR`, naming the signal a decoder without the
+   dynamic-metadata layer receives (also reported structurally as `hdr.base`, always equal
+   to this component). Under Dolby Vision the tag is decided by the
+   compatibility id (1 or 6 -> `HDR10`, 2 -> `SDR`, 4 -> `HLG`) rather than by the base
+   layer's raw transfer characteristic, which disagrees for Profile 4 (SDR base, however
+   tagged) and Profile 5/20 (a PQ-encoded IPT-PQ-C2 base that no ordinary decoder can
+   present). When nothing resolves the id (a Profile 8 whose carriage declares none and
+   whose base layer does not separate the ids it admits), the tag falls back to the base
+   layer's own transfer: PQ reads `HDR10`, HLG reads `HLG`, anything else omits the tag.
+   Omitted entirely when the DV stream has no independently viewable base (compatibility
+   id 0: Profiles 5, 10 and 20).
 
 Examples: `"SDR"`, `"HDR10"`, `"HLG"`, `"HDR10+ / HDR10"`, `"SL-HDR2 / HDR10"`,
-`"HDR Vivid / HLG"`, `"Dolby Vision"`, `"Dolby Vision / HDR10 (fallback)"`,
-`"Dolby Vision / HDR10+ / HDR10 (fallback)"`, `"Dolby Vision / SDR (fallback)"`,
-`"Dolby Vision / HLG (fallback)"`.
+`"HDR Vivid / HLG"`, `"HDR Vivid / HDR10"`, `"Dolby Vision"`, `"Dolby Vision / HDR10"`,
+`"Dolby Vision / HDR10+ / HDR10"`, `"Dolby Vision / SDR"`, `"Dolby Vision / HLG"`.
 
 ### `MasteringDisplay`
 
-Used in three places with different meanings: `hdr.mastering` describes the **base layer's**
-declared display (container MDCV box or ST.2086 SEI), `dolby_vision.mastering_display`
+Used in three places with different meanings: `hdr.mastering_display` describes the **base
+layer's** declared display (container MDCV box or ST.2086 SEI), `dolby_vision.mastering_display`
 describes the **DV grade's own** display (the RPU DM header's `source_min_pq`/`source_max_pq`,
-or a DV XML's exact Level-0 values), and `sl_hdr.source_mastering` describes the source
+or a DV XML's exact Level-0 values), and `sl_hdr.source_mastering_display` describes the source
 display **the SL-HDR metadata itself carries** (`src_mdcv`). The values can legitimately
 differ between places — on dual-layer titles for the first two, and on re-encodes whose
 SL-HDR metadata predates the current MDCV box for the third.
@@ -400,33 +530,33 @@ SL-HDR metadata predates the current MDCV box for the third.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `profile` | string | always | `<major>.<minor>` from the container config, e.g. `"8.1"`, `"5.0"`, `"10.4"`, `"20.0"`. Dual-layer profiles (4, 7) append the enhancement-layer kind: `"7.6 (FEL)"`, `"4.2 (MEL)"`. When no compatibility id is available the minor is a convention default for profiles 8 (`8.1`), 7 (`7.6`, the only combination Dolby defines; an untouched BDMV M2TS carries no DV descriptor, so this is the common Blu-ray-original case) and 4 (`4.2`); any other profile then prints its bare major, e.g. `"5"` |
-| `profile_compat_assumed` | boolean | only when `true` | The minor digit above was supplied by convention rather than read from data. Set only for metadata-only sidecars (a raw RPU bin); a video input's base-layer signalling backs the inference, so it is never flagged there |
+| `profile` | string | always | `<major>.<minor>`, e.g. `"8.1"`, `"5.0"`, `"10.4"`, `"20.0"`. Dual-layer profiles (4, 7) append the enhancement-layer kind: `"7.6 (FEL)"`, `"4.2 (MEL)"`. The minor is the resolved compatibility id; `compat_source` says how it was resolved. Only a Profile 8 that resolves nothing prints a convention minor (`8.1`), and only Profiles 10 and 20 can print a bare major (`"10"`, `"20"`) when their base layer does not separate the ids they admit |
+| `compat_source` | string | optional | Provenance of `bl_compatibility_id`, in descending order of evidence: `"declared"` (a container `dvcC`/`dvvC`/TS descriptor, or a DV CM XML's `GenerateProfile`), `"spec"` (fixed by the profile's own definition -- Dolby pairs profiles 4, 5, 7 and 9, and the legacy 0-3 and 6, with exactly one id, so no stream evidence is needed), `"inferred"` (deduced from the base layer's signalled VUI for a profile admitting several ids, and only when exactly one candidate survives), or `"assumed"` (Profile 8's convention default, no evidence). **The `assumed` rung resolves the label only**: `bl_compatibility_id` and `compatibility` stay absent, because a display convention is not a value the stream carries. Absent when nothing resolved the id and the profile has no convention either |
 | `structure` | string | optional | Layer/track layout, present only for dual-layer content: `"Single track, dual layer"` or `"Dual track, dual layer"` |
-| `level` | integer | optional | DV level, from the container `dvcC`/`dvvC`/TS descriptor when one declares it. When no config carries a level (an authentic disc M2TS, where UHD-BD signals DV via the playlist rather than the PMT, or a raw elementary stream) it is derived from the coded stream's resolution and frame rate against the Dolby level table (smallest level admitting `width x height x fps` and the width) and flagged via `level_derived`. The derivation is a pixel-rate floor: the level's bitrate/tier axis is not probed. Absent for metadata sidecars (no coded stream) and when the frame rate is unknown |
-| `level_derived` | boolean | only when `true` | The `level` above was derived from stream properties rather than declared by a container config |
+| `level` | integer | optional | DV level, from the container `dvcC`/`dvvC`/TS descriptor when one declares it. When no config carries a level (an authentic disc M2TS, where UHD-BD signals DV via the playlist rather than the PMT, or a raw elementary stream) it is derived from the coded stream's resolution and frame rate against the Dolby level table (smallest level admitting `width x height x fps` and the width) and tagged `"derived"` in `level_source`. The derivation is a pixel-rate floor: the level's bitrate/tier axis is not probed. Absent for metadata sidecars (no coded stream) and when the frame rate is unknown |
+| `level_source` | string | present exactly when `level` is | Where `level` came from, the `compat_source` shape: `"declared"` (a container `dvcC`/`dvvC`/TS descriptor) or `"derived"` (computed from the coded stream's resolution and frame rate, per the `level` row) |
 | `bl_present` | boolean | always | Base layer present **in the reported logical track** (container flag, else derived from the profile). A dual-track mux declares `bl_present` 0 on the enhancement-layer sub-stream's own config ("no BL in *this* stream"); once that EL is folded into its base layer's track group the merged report says `true`, since the group holds both layers by construction. A genuinely BL-less input (an EL-only cut with no base layer in the mux) still reports `false` |
 | `el_present` | boolean | always | Enhancement layer present in the reported logical track (same dual-track fold rule as `bl_present`) |
 | `rpu_present` | boolean | always | RPU substream present |
 | `el_type` | string | optional | `"FEL"` or `"MEL"`; absent for single-layer profiles and under `--no-rpu` (the kind is read from the RPU) |
 | `unconverted_dual_layer_rpu` | boolean | only when `true` | The RPU carries the dual-layer composer payload (the NLQ block whose fingerprint is `el_type`) but the carriage has no enhancement layer: an explicit container config with `el_present` 0 (and no folded dual-track EL stream, which is an enhancement layer regardless of the declaration), or AV1 (whose DV carriage is single-layer by construction). The signature of a custom transcode that injected a UHD-BD Profile 7 RPU without converting it; the stray payload is inert for playback but misleads tools that guess a profile from the RPU (mkvmerge derives an AV1 `dvvC` compat id that way, producing out-of-spec profile strings like `"10.6"`). A provenance observation, not an error claim. Never set for metadata sidecars (no carriage to compare) or config-less raw HEVC (its EL may legitimately ride in-band). Renders as the `Unconverted RPU` chip on the Profile line |
 | `reconstructed_bit_depth` | integer | optional | The composer's reconstructed signal bit depth, read verbatim from the RPU header's `vdr_bit_depth` field: `12` for Profile 7 FEL, `14` for Profile 4 FEL (never assumed from the profile). Present only when `el_type` is `"FEL"`, the one case where a real residual reconstructs beyond the 10-bit base layer; MEL and single-layer RPUs signal a value too, but it describes composer arithmetic precision rather than content depth, so it is withheld. Absent under `--no-rpu` |
-| `bl_compatibility_id` | integer | optional | Raw `dv_bl_signal_compatibility_id` (0, 1, 2, 4, ...) from the container or a DV XML's declared profile; absent when neither carries it |
-| `compatibility` | string | optional | Human name for the id above: `"no cross-compatibility"`, `"HDR10-compatible"`, `"SDR-compatible"`, `"HLG-compatible"`. Absent for ids outside that set |
+| `bl_compatibility_id` | integer | optional | `dv_bl_signal_compatibility_id` (0, 1, 2, 4, 6), resolved via `compat_source`'s declared, spec or inferred rung. Absent when nothing resolved it -- including on the `assumed` rung, which never fills this field |
+| `compatibility` | string | optional | Human name for the id above: `"no cross-compatibility"`, `"HDR10-compatible"`, `"SDR-compatible"`, `"HLG-compatible"`, `"Ultra HD Blu-ray-compatible"`. Absent for ids outside that set, and whenever `bl_compatibility_id` is |
+| `pq_reshaping` | boolean | only when `true` | The base layer's actual transfer characteristic is Dolby's proprietary "PQ with reshaping" rather than the plain PQ its VUI names. Dolby states this for compatibility id 0 outright: a transfer characteristic of 16 there generally indicates PQ, but the actual proprietary characteristic, even when signalled as 16, is PQ with reshaping. It has no CICP code point, so it cannot live in `color.transfer`, which stays a strict CICP projection. Set for any resolved id of 0 on a video input; never for a metadata sidecar, which has no base layer whose transfer it could describe |
+| `deprecated_combination` | boolean | only when `true` | The profile and compatibility id pair into a combination Dolby has withdrawn: `8.3` or `8.5`, the two rows of the specification's Annex I that name a pairing rather than a whole profile. Profile 8 itself is current, and the legacy *profiles* Annex I also lists (0, 1, 2, 3, 4, 6) are not flagged -- plenty of real content uses them. A provenance observation about how the stream was authored, not a playability claim. Renders as the `Deprecated combination` chip on the Profile line |
 | `cm_version` | string | optional | Content-mapping version from L254: `"CM v4.0"` or `"CM v2.9"`. Absent under `--no-rpu` |
 | `l5_active_areas` | array of `ActiveArea` | omitted when empty | Distinct L5 active areas seen. A sampled set unless `--full` or a sidecar (both exhaustive) |
-| `l5_assumed_canvas` | array `[width, height]` | optional | Present only for DV sidecars, which record no resolution: the canvas (3840x2160) the active-area dimensions were computed against |
+| `l5_assumed_canvas` | object `{width, height}` | optional | Present only for DV sidecars, which record no resolution: the canvas (3840x2160) the active-area dimensions were computed against |
 | `mastering_display` | `MasteringDisplay` | optional | The DV grade's own mastering display (see the `MasteringDisplay` section). Its `primaries` is filled only from a recognized L9 (`primaries_level` 9) or a DV XML Level-0 (`primaries_level` 0); a CM v2.9 RPU carries no display gamut, so the field is luminance-only there |
 | `fel_brightness_expansion` | `FelBrightnessExpansion` | optional | Metadata indication that the FEL likely carries brightness beyond the base layer; see below |
 | `mastering_primaries_mismatch` | `MasteringPrimariesMismatch` | optional | The DV grade's L9 mastering gamut disagrees with the base layer's own signalled mastering primaries; see below |
 | `l6` | `L6` | optional | The RPU's L6 block: MaxCLL/MaxFALL and the mastering luminances (the DV carriage of HDR10-style static metadata) |
 | `l9_mastering` | string | optional | L9 mastering-display gamut name. The `MasteringDisplay.primaries` names plus `"custom"` (an L9 with unrecognized explicit chromaticities) and `"unknown"` (an unrecognized predefined index) |
-| `l11_content` | string | optional | L11 content type, named per Dolby's L11 (Dolby Vision IQ) definitions: `"Default"`, `"Movies"`, `"Game"`, `"Sport"`, `"User Generated Content"`, or `"Unknown"` for values outside the published 0-4 range |
-| `l11_white_point` | string | optional | L11 intended white point: `"D65"` (0, the default), `"D93"` (8), or `"code N"` for the other codes, which Dolby accepts but does not publicly name. Present only when L11 was seen |
-| `l11_reference_mode` | boolean | optional | L11 reference-mode flag; present only when L11 was seen |
+| `l11` | object | optional | The L11 (Dolby Vision IQ) block, present when L11 was seen; its three fields ride one block so they always appear together. `content`: the content type, named per Dolby's definitions (`"Default"`, `"Movies"`, `"Game"`, `"Sport"`, `"User Generated Content"`, or `"Unknown"` for values outside the published 0-4 range). `white_point`: the intended white point (`"D65"` (0, the default), `"D93"` (8), or `"code N"` for the other codes, which Dolby accepts but does not publicly name). `reference_mode`: boolean — whether the L11 block was authored by the original content creator, which tells a display it may apply this APO metadata even in its reference (creative-intent) picture mode; clear means the metadata was added downstream and applies only in non-reference modes (Dolby patent US 2022/0264190; the flag is bitstream-only, which is why Dolby's authoring-side documentation lists L11 with two fields). Set on ordinary studio masters |
 | `trim_targets` | array of `TrimTarget` | omitted when empty | Distinct trim target displays, in nits, sorted ascending: the L2/L8 trims read plus any L10-defined target displays (custom L8 targets, folded into the L8 set) |
 | `rpu_count` | integer | always | Number of RPUs successfully parsed (0 under `--no-rpu`) |
-| `sampled` | boolean | always | `true` when the DV facts reflect sampling; `false` under `--full`, for sidecars (exhaustive by construction), and under `--no-rpu` (nothing was sampled) |
+| `coverage` | string | always | What the DV facts rest on: `"sampled"` (a spread of RPUs — the union fields may be incomplete), `"full"` (every RPU was read: `--full`, or a sidecar, exhaustive by construction), or `"none"` (no RPU was read: `--no-rpu`, or a container config whose track yielded no parseable RPU — `rpu_count` is `0` and the section is built from the config alone) |
 | `metadata_cadence` | `MetadataCadence` | optional | Whether the dynamic metadata is authored shot-by-shot or frame-by-frame; see below. Present under `--full` and for DV sidecars; absent for sampled video runs (no adjacent frames to compare) and `--no-rpu` |
 | `census` | `DvCensus` | optional | Exhaustive per-level census. Present under `--full` and for DV sidecars; absent for sampled video runs and `--no-rpu` |
 
@@ -449,9 +579,25 @@ both sides resolved to a recognized gamut name and the names differ: the DV grad
 recognized L9 block (`dolby_vision.mastering_display.primaries` with `primaries_level` 9), and
 the base layer's own declared mastering primaries from a *signalled* container MDCV box or
 ST.2086 SEI (never a fallback value). Both names come from the same gamut matcher, so the
-comparison is exact. The classic trigger is re-encode drift, such as a BT.2020-claiming MDCV
-written by an encoder over a DCI-P3 D65 grade. Unrecognized coordinates on either side suppress
-the comparison entirely, and a metadata sidecar (no base layer) never carries the object.
+comparison is exact.
+
+A difference here does **not** mean the stream is out of spec, and does not imply either value is
+wrong. The two sides describe the mastering display at **different stages of the pipeline**. The
+base layer's ST.2086 records the display its own grade was mastered on. L9 records, in Dolby's
+words, the display "selection made by the colorist *during the Dolby Vision content creation
+process*" — a later, separate step, frequently performed in a different suite and sometimes by a
+different colorist working from a delivered base-layer master. Two accurate values can therefore
+disagree.
+
+Consistent with that, the values are produced by different tools under different specifications (L9
+by the Dolby authoring tool, ST.2086 by the encoder or muxer), and no specification requires the
+pair to match: Dolby's studio spec attaches a matching requirement to colour *encoding* primaries
+and deliberately attaches none to the mastering display primaries. Both directions occur in the
+wild, including a P3-D65 base layer against a BT.2020 L9 in Dolby's own reference streams, so the
+flag reports the disagreement and asserts no cause for it.
+
+Unrecognized coordinates on either side suppress the comparison entirely, and a metadata sidecar
+(no base layer) never carries the object.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
@@ -558,7 +704,7 @@ analogue of DV L1) never are.
 | `payload_mode` | string | optional | `"parameter-based"` or `"table-based"`. Omitted when the SEI carried the cancel flag or a reserved payload-mode value |
 | `target_primaries` | string | optional | Named CICP primaries of the target picture the adaptation metadata is tuned toward (e.g. `"BT.2020"`, from the same value set as `color.primaries`). Omitted when the SEI carries no target block or the code is unrecognized |
 | `target_max_luminance` | integer | optional | The target picture's max luminance, cd/m² (e.g. `100` for an SDR rendition target). Omitted when the SEI carries no target block |
-| `source_mastering` | `MasteringDisplay` | optional | The source mastering display the SL-HDR metadata itself carries (`src_mdcv`), distinct from the base layer's own MDCV/ST.2086 signalling (the `hdr.mastering` source). `primaries_level` is never set here. Omitted when the SEI carries no such block or it is zero-filled |
+| `source_mastering_display` | `MasteringDisplay` | optional | The source mastering display the SL-HDR metadata itself carries (`src_mdcv`), distinct from the base layer's own MDCV/ST.2086 signalling (the `hdr.mastering_display` source). `primaries_level` is never set here. Omitted when the SEI carries no such block or it is zero-filled |
 
 ### `HdrVivid`
 
@@ -570,10 +716,10 @@ per-frame tone-mapping payload never is.
 
 | Field | Type | Presence | Description |
 |---|---|---|---|
-| `version` | string | always | The CUVA metadata version, `"1.0"` through `"4.0"`. From the `cuvv` box's version bitmap when the container declares one (its highest declared version — the declaration covers the whole stream, where a sampled SEI shows one frame's), else from the SEI's T.35 provider-oriented code (the field T/UWA 005.2-1 itself defines as the version; note MediaInfo's SEI-path `HDR_Format_Version` renders the data-set type below instead) |
+| `version` | string | always | The CUVA metadata version — `"1.0"` through `"4.0"` are the versions T/UWA 005 defines today (a `cuvv` bitmap declaring a reserved higher bit renders that higher number verbatim rather than clamping). From the `cuvv` box's version bitmap when the container declares one (its highest declared version — the declaration covers the whole stream, where a sampled SEI shows one frame's), else from the SEI's T.35 provider-oriented code (the field T/UWA 005.2-1 itself defines as the version; note MediaInfo's SEI-path `HDR_Format_Version` renders the data-set type below instead) |
 | `system_start_code` | integer | optional | The dynamic-metadata data-set type byte from the T.35 message. Absent when detection came only from the `cuvv` declaration and no frame's SEI was read (e.g. `--no-rpu`) |
 | `target_max_luminances` | array of integers | when non-empty | Distinct targeted-system-display max luminances of the tone-mapping parameter sets, cd/m², sorted ascending — the display anchors the per-frame curves are computed toward, the HDR Vivid analogue of the DV trim-target set (e.g. `[100, 500]` for a title carrying an SDR curve and a 500-nit HDR curve). A sampled union unless every frame was read |
-| `sampled` | boolean | always | True when `target_max_luminances` is a sampled union rather than a full-scan read, mirroring `dolby_vision.sampled` (`false` under `--full` and under `--no-rpu`, where nothing was sampled) |
+| `coverage` | string | always | What the HDR Vivid facts rest on, mirroring `dolby_vision.coverage`: `"sampled"` (a spread of frames, `target_max_luminances` a possibly incomplete union), `"full"` (every frame read), or `"none"` (no frame's SEI was read — a `cuvv` box-only detection under `--no-rpu`, where `version` alone survives) |
 
 ## How input kind and flags affect presence
 
@@ -581,32 +727,39 @@ The per-track presence notes below all describe fields of a `video_tracks` entry
 
 **Video vs sidecar.** A video input's track entries carry picture fields as available, an
 `hdr` section, and codec identification. A metadata sidecar (raw RPU, DV XML, HDR10+ JSON) has
-no picture data: its single track entry has `codec` `""`, no `hdr`, and no `width`/`height`/
+no picture data: its single track entry has no `codec`, no `hdr`, and no `width`/`height`/
 `bitrate`/`bit_depth`/`chroma`/`stereo` (and the report-level `duration_secs` is absent). A DV
 XML additionally provides `fps` (from `<EditRate>`) and the report-level `format_version`; a
 raw RPU bin provides neither. An HDR10+ JSON sidecar has no `dolby_vision` section; DV
 sidecars have no `hdr10plus` section.
 
-**Default (sampled) run.** `dolby_vision.sampled` is `true`; `l5_active_areas` and
+**Default (sampled) run.** `dolby_vision.coverage` is `"sampled"`; `l5_active_areas` and
 `trim_targets` are unions over the sampled RPUs and may be incomplete (though the L10-defined
 custom targets folded into the L8 set are title-global: the definition rides every RPU, so
 those entries are complete from any sample); `census` and `metadata_cadence` are absent.
-`hdr_vivid.sampled` is likewise `true`, its `target_max_luminances` a union over the sampled
-frames.
+`hdr_vivid.coverage` is likewise `"sampled"`, its `target_max_luminances` a union over the
+sampled frames.
 
-**`--full`.** Every RPU is scanned: `sampled` is `false` (on `dolby_vision` and `hdr_vivid`
-alike), `census` and `metadata_cadence` appear, and TS inputs gain an exact video-stream
-`bitrate`. DV sidecars behave like `--full` by construction (every RPU in the file is read).
+**`--full`.** Every RPU is scanned: `coverage` is `"full"` (on `dolby_vision` and `hdr_vivid`
+alike), `census` and `metadata_cadence` appear, and the formats whose exact video byte count
+needs a whole-file walk gain an exact measured video-stream `bitrate`: TS/M2TS, an MKV with
+no statistics tags, FLV (replacing its declared rate), Ogg, and raw MPEG-1/2 (which also
+gains its frame-arithmetic `duration_secs`). DV sidecars behave like `--full` by construction
+(every RPU in the file is read).
 
 **`--no-rpu`.** No frame bytes are read at all, so every SEI-derived fact disappears, not
 just the RPU-derived ones. The DV section is built from the container configuration alone:
-`profile`, `structure`, `level`, the presence booleans, `bl_compatibility_id`, and
-`compatibility` can appear; everything RPU-derived (`el_type`, `reconstructed_bit_depth`,
+`profile`, `compat_source`, `structure`, `level` (with `level_source`, present exactly when
+`level` is), the presence booleans,
+`bl_compatibility_id`, `compatibility`, and `deprecated_combination` can appear (as can
+`color`'s spec-defined fill and `pq_reshaping`, both of which need only the container's
+declared profile and id); everything RPU-derived (`el_type`, `reconstructed_bit_depth`,
 `cm_version`, L5/L6/L9/L11 fields, `mastering_display`, `trim_targets`, `metadata_cadence`,
-`census`) is absent, and `rpu_count` is `0`. `hdr10plus` and `sl_hdr` are entirely absent
-(their only carriage is in-frame), SEI-sourced `hdr.mastering`/`hdr.content_light` fall away
+`census`, `unconverted_dual_layer_rpu`) is absent, `rpu_count` is `0`, and `coverage` is `"none"`. `hdr10plus` and `sl_hdr` are entirely absent
+(their only carriage is in-frame), SEI-sourced `hdr.mastering_display`/`hdr.content_light` fall away
 (container-box values still report), and `hdr_vivid` survives only via the MP4 `cuvv`
-declaration — `version` alone, no `system_start_code`, no `target_max_luminances`.
+declaration — `version` alone with `coverage` `"none"`, no `system_start_code`, no
+`target_max_luminances`.
 
 **`--samples <N>`.** Changes only how many seek points feed the sampled sets; it never changes
 the schema.
@@ -619,18 +772,41 @@ about a GOP in), 16 MiB otherwise. When it stops reading, a pipe writer sees a b
 that is the normal success signal, not an error. A stream that ends within the budget is
 complete and reports exactly like a file probe. A stream that exceeds it reports
 `input_truncated: true`, `size_bytes` as the bytes probed, and `file` as `"-"`, and withholds
-what a prefix cannot honestly state: a TS input's `duration_secs` (the PCR span would describe
-the cut, not the stream) and every `bitrate` except MP4/MOV's `video_stream` rate (whose
-sample-table sums are exact regardless of truncation). Declared header facts (MP4 `mvhd` and
+what a prefix cannot honestly state: `duration_secs` for the formats that derive it from the
+payload rather than a declared header — TS and program streams (either clock's span would
+describe the cut, not the stream), Ogg (the tail granule is the cut point), raw DV (frame
+count is the prefix's length ÷ the frame size) — and every `bitrate` except MP4/MOV's
+`video_stream` rate (whose sample-table sums are exact regardless of truncation) and
+RealMedia's (a header declaration the buffered head carries whole). Declared header facts (MP4 `mvhd` and
 MKV Segment-Info durations, resolution, color, HDR and Dolby Vision metadata from the sampled
 head) report normally. The sampled union fields (`l5_active_areas`, `trim_targets`) draw only
-on head frames: `dolby_vision.sampled` is `true` exactly as on a default file probe, but a
+on head frames: `dolby_vision.coverage` is `"sampled"` exactly as on a default file probe, but a
 head-only window is likelier to miss mid-title variation (an aspect-ratio change, trims added
 in later scenes) than a file probe's whole-file sample spread. Limits: no tail-dependent facts ever (TS runtime, MKV statistics-tag
 bitrate, an MP4 whose `moov` sits at the end fails honestly), `--full` errors on `-` (a pipe
 cannot be fully scanned), metadata sidecars are not detectable via stdin (their dispatch is
 extension-based), and `-` may be given at most once per run. A practical integration guide,
 including a Kodi/Python example, is in [INTEGRATION-STDIN.md](INTEGRATION-STDIN.md).
+
+## Error objects (`--errors`)
+
+By default a failed file contributes nothing to stdout, so an NDJSON library scanner that wants
+to know *which* files failed has to parse stderr prose. The opt-in `--errors` flag adds one
+**error object** to the machine output per failed file, beside the ordinary reports: an NDJSON
+line at the point of failure, or a member of the `--json` array (a single-input `--json` run
+whose one file failed prints the error object alone). Text output, the stderr diagnostics, and
+the exit-code contract are unchanged by the flag; without it, output is byte-identical to
+earlier versions.
+
+| Field | Type | Presence | Description |
+|---|---|---|---|
+| `hdrprobe_schema_version` | string | always | Same contract version as the reports beside it |
+| `file` | string | always | The input path, exactly as a successful report's `file` would render it |
+| `error` | string | always | The human-readable failure, the same text the stderr diagnostic carries. Free text: match on its presence, not its wording |
+
+**The discriminator is the `error` key**: a `Report` never carries one, so
+`'error' in obj` (Python) or `has("error")` (jq) separates the two shapes. A consumer that
+ignores unknown objects entirely keeps working without changes, since the flag is opt-in.
 
 ## Progress events (stderr)
 
@@ -657,7 +833,7 @@ Two event shapes, distinguished by `event`:
 | `phase` | string | `progress` only | `"index"` (a demux-time whole-file walk) or `"scan"` (the per-frame scan) |
 | `bytes_done` | integer | `progress` only | Bytes processed within the phase |
 | `bytes_total` | integer | `progress` only | The phase's byte denominator |
-| `percent` | number | `progress` only | `bytes_done / bytes_total`, one decimal |
+| `percent` | number | `progress` only | `bytes_done / bytes_total` as a percentage, `0.0`–`100.0`, one decimal |
 | `elapsed_ms` | number | always | Milliseconds since this file's processing started |
 
 Per file: each phase opens with a `percent: 0` line, updates are throttled (at most a few per
@@ -673,6 +849,253 @@ pacing, not content: nothing in them appears in, or changes, the `Report`.
 
 ## Version history
 
+- **3.0**: the 1.0.0 contract (**breaking**). Dolby Vision colour and compatibility
+  provenance, the shape and provenance alignments, and the format-coverage growth of the
+  1.0.0 cycle, batched into one bump so consumers adapt once. The eight numbered items are
+  each independently breaking; everything after them is additive.
+  1. `dolby_vision.profile_compat_assumed` is **removed** and replaced by
+     `dolby_vision.compat_source`, a four-valued string (`declared` / `spec` / `inferred` /
+     `assumed`). The boolean could not express the middle two rungs. A consumer reading the old
+     field should read `compat_source == "assumed"` instead; the field's meaning is otherwise
+     preserved, including that the `assumed` rung still leaves `bl_compatibility_id` absent.
+  2. `bl_compatibility_id`, `compatibility` and the `profile` minor digit now **resolve for
+     inputs that previously left them absent**: a profile whose definition fixes the id (4, 5,
+     7, 9 and the legacy 0-3, 6) resolves it with no stream evidence, and a profile admitting
+     several resolves it from the base layer's signalled VUI when that is unambiguous. A raw
+     Profile 5 elementary stream reports `"5.0"` with id 0 where it reported `"5"` and nothing;
+     a raw Profile 10 reports `"10.1"`. `compatibility` also gains
+     `"Ultra HD Blu-ray-compatible"` for id 6, which previously reported no name at all.
+  3. `hdr.format`'s Dolby Vision base-signal tags **lose the `(fallback)` suffix**:
+     `"Dolby Vision / HDR10 (fallback)"` becomes `"Dolby Vision / HDR10"`, and likewise for
+     `HLG` and `SDR`. The word was not Dolby's terminology and no other layered format's base
+     carried it. A consumer matching the old strings should match the unsuffixed forms, which
+     is one comparison instead of two.
+  4. `color.matrix`'s IPT value is respelled `"IPT-PQ-C2"` (was `"IPT-PQ-c2"`), per SMPTE
+     ST 2128:2023 and both revisions of Dolby's Profiles and Levels specification.
+  5. `color.primaries`, `color.transfer` and `color.matrix` now **appear on Dolby Vision inputs
+     that signalled nothing**, filled from the colour the profile and compatibility id define
+     and tagged `spec` in `color_source`. A Profile 5 track that reported `{"range": "full"}`
+     now reports all four fields; a Profile 4 track that reported `{}` now reports Rec.709.
+     This is a presence change, so a 2.4 script that read an absent field as "the stream did
+     not signal this" must read `color_source` instead: `spec` is the derived case, and
+     `container` / `stream` / `sei` are the signalled ones.
+  6. **Shape alignment for 1.0.0**, bundled into the same bump. `elapsed_ms` is **removed**
+     from the `Report` (two runs over one file now serialize identically; progress events
+     keep theirs). `hdr.mastering` is **renamed** `hdr.mastering_display`, and
+     `sl_hdr.source_mastering` is renamed `sl_hdr.source_mastering_display`, so the three
+     slots of the shared `MasteringDisplay` shape carry one name.
+     `dolby_vision.level_derived` (a true-only boolean) is **replaced** by
+     `dolby_vision.level_source` (`"declared"` / `"derived"`, present exactly when `level`
+     is) — declared levels, previously unmarked, are now tagged too. The three `l11_*`
+     fields **fold into one `l11` object** (`{content, white_point, reference_mode}`).
+     `l5_assumed_canvas` becomes a named `{width, height}` **object** instead of a two-element
+     array. And a metadata sidecar's `codec` is **absent** instead of the empty string, so
+     "is this a sidecar" reads as a missing key rather than a sentinel value.
+  7. **Scan coverage as one field.** The `sampled` booleans on `dolby_vision` and `hdr_vivid`
+     are **replaced** by `coverage` (`"sampled"` / `"full"` / `"none"`): whether the sampled
+     union fields are complete previously took two fields to read (`sampled: false` meant
+     either a full scan or `--no-rpu`'s nothing-at-all, disambiguated by `rpu_count`), and now
+     states itself directly. `.sampled == true` becomes `.coverage == "sampled"`; a consumer
+     that read `sampled == false` as "complete" should read `"full"`.
+  8. **Reserved signalling codes omit their field.** A reserved `chroma_format_idc` /
+     `chromaSubsamplingIdc` / AV1 subsampling pair rendered `chroma: "?"` through 2.x, and a
+     reserved AV1 `seq_profile` rendered a `"?"` inside `codec_profile`; both now omit the
+     field, the same honest-absence rule `color` already follows. (VP9's fourth subsampling
+     combination is *defined*, and now reports `"4:4:0"` instead of `"?"`.) No real file is
+     affected — reserved codes require a crafted stream.
+  Additive alongside those: `bitrate` gains an always-present `source` (`"measured"` /
+  `"declared"`), saying whether hdrprobe computed the rate or read it from a header — the
+  distinction the `Bitrate` section's prose previously carried only as documentation. `hdr`
+  gains the optional `base` (`"HDR10"` / `"HLG"` / `"SDR"`), the format string's base tag as
+  a structured field. And `video_tracks` gains the optional `codec_id` (see its row): the
+  container's own identifier beside the resolved `codec` name, which both separates
+  recognized codecs from verbatim fallbacks and surfaces identity the name cannot
+  (`"hvc1"` vs `"hev1"`, an encrypted track's recovered FourCC).
+  Further additive fields, all optional: per-track `duration_secs` (the track's own stated
+  length, beside the file-level value), and the exact-ratio companions `fps_rational`,
+  `pixel_aspect_ratio_rational` and `display_aspect_ratio_rational` (`{num, den}`, reduced)
+  beside their floats — `24000/1001` instead of a repeating decimal, for consumers that need
+  the ratio itself. See each field's row for its sources; a measured or averaged rate
+  deliberately carries no ratio.
+  Also additive: the opt-in **`--errors` flag** adds one error object per failed file to the
+  machine output (see "Error objects"), so a scanner learns which files failed without parsing
+  stderr; without the flag, output is unchanged.
+  Two value changes with no shape change: **clock-quantized frame periods decode to the
+  standard rate they encode** (the `fps_rational` row's rule), so an MKV remux's `fps` reads
+  `23.976023976…` where 2.x reported the quantized `23.976024167…` and `fps_rational` reads
+  `24000/1001` — cross-container comparable, and still exact (the decode fires only on
+  bit-exact encodings; nonstandard rates keep the raw ratio). And **FourCC codec fallbacks
+  trim their space padding** (QuickTime `"dvc "` becomes `"dvc"`), aligning `codec` with
+  `codec_id` and MediaInfo.
+  Also additive alongside those: the new always-present `video_tracks[].color_source` object gives
+  per-field provenance for `color` (`container` / `stream` / `sei` / `spec`); `dolby_vision`
+  gains the optional `pq_reshaping` and `deprecated_combination` booleans; and
+  `color.primaries`, `color.transfer` and `color.matrix` now name **every code point ITU-T
+  H.273 defines** rather than a common subset, so values such as `"BT.601 (NTSC)"` (matrix 6,
+  ordinary standard-definition video), `"Linear"` and `"sRGB (IEC 61966-2-1)"` are reported
+  where they were previously omitted as unrecognized. A consumer matching on the old, shorter
+  value sets should widen its match or fall through on unknown names. Note the same widening
+  applies to `sl_hdr.target_primaries`, which shares `color.primaries`' value space.
+  Inputs with no Dolby Vision metadata see only the new `color_source` object, with one
+  unreachable-in-practice exception: a non-DV stream signalling CICP matrix 15 previously
+  classified as `SDR` and now classifies on its transfer like any other stream.
+  Also additive, and unrelated to Dolby Vision: **MPEG-1 and MPEG-2 video are now recognized**,
+  so `"MPEG-1 Video"` and `"MPEG-2 Video"` join the `codec` set and `"raw MPEG-1 Video (ES)"`
+  and `"raw MPEG-2 Video (ES)"` join the `container` set. `codec_profile` for these is
+  `Profile@Level` (`"Main@Main"`, `"4:2:2@High"`), absent for MPEG-1, which has no such field.
+  Tracks that previously reported a container identifier verbatim as their codec now report a
+  real one: an MP4 `mp4v` sample entry whose `esds` names an MPEG-2 object type, and a Matroska
+  `V_MPEG1`/`V_MPEG2` CodecID. A transport stream whose only video PID is `stream_type` `0x01`
+  or `0x02` produced no report at all before and now produces a full one.
+  Also additive: **MPEG-4 Part 2 and VC-1 are now recognized**, so `"MPEG-4 Visual"`, `"VC-1"`
+  and `"MS-MPEG-4 v1"`/`"v2"`/`"v3"` join the `codec` set, each with its own `codec_profile`
+  format (`"Simple@L1"`, `"Advanced@L3"`, `"Main@High"`). The tracks that reach them previously
+  reported a container identifier verbatim as their codec: an MP4 `mp4v` sample entry whose
+  `esds` names object type `0x20`, an MP4 `vc-1` sample entry, and the Matroska CodecIDs
+  `V_MPEG4/ISO/SP`, `/ASP`, `/AP` and `V_MPEG4/MS/V3`. A transport stream whose only video PID
+  is `stream_type` `0x10` produced no report at all before and now produces a full one.
+  Also additive: **MPEG program streams are now recognized**, so `"MPEG-2 Program Stream"`,
+  `"MPEG-1 System Stream"` and `"MPEG PES stream"` join the `container` set. `.mpg`, `.mpeg`,
+  `.vob`, `.m2p` and `.evo` produced no report at all before and now produce a full one, as does
+  any file whose bytes open on a pack or PES start code. `track_number` on these tracks is the
+  PES `stream_id` (`224`..`239`, i.e. `0xE0`..`0xEF`), one reported track per distinct video
+  stream id. `duration_secs` is the video presentation-timestamp span and is absent rather than
+  approximated when the stream's clock is discontinuous or carries no timestamps; `bitrate` is
+  `"overall"` scope, because a program stream's byte count includes audio and packet overhead,
+  and is absent when more than one video stream shares the file.
+  Also additive: **AVI is now recognized**, so `"AVI (RIFF)"` joins the `container` set. `.avi`
+  produced no report at all before and now produces a full one, as does any file whose bytes
+  open `RIFF....AVI `. One reported track per `strh` of type `vids`, with `track_number` the
+  stream's position in the header list (`0` for the usual single-video file). `bitrate` is
+  `"video_stream"` scope and exact, summed from the file's own index — `idx1` on a single-segment
+  file, the OpenDML `ix##` chunks otherwise — over that stream's own declared duration; it falls
+  back to `"overall"` when neither index is usable, and is **absent entirely on a file that
+  declares more bytes than it holds**, where every byte count describes data that is not there.
+  `duration_secs` is the longest stream's declared runtime, audio included. A Video for Windows
+  FourCC naming AVC or HEVC now resolves to that codec rather than being reported verbatim,
+  which also affects Matroska `V_MS/VFW/FOURCC` tracks carrying those codes.
+  Also additive: **ASF and FLV are now recognized**, so `"ASF (Windows Media)"` and
+  `"FLV (Flash Video)"` join the `container` set. `.wmv`, `.asf`, `.wma` and `.flv` produced no
+  report at all before and now produce a full one, as does any file whose bytes open with the
+  ASF Header Object GUID or the `FLV` signature. On ASF, one reported track per video
+  `Stream Properties Object`, ordered by the stream number the file itself assigns, which is
+  also `track_number`; `duration_secs` is `Play Duration` with `Preroll` subtracted, and is
+  absent for a broadcast header or a file holding materially fewer bytes than it declares;
+  `bitrate` is `"video_stream"` scope from the Extended Stream Properties `Data Bitrate` (or
+  `Stream Bitrate Properties`, which includes packet overhead), falling back to `"overall"`.
+  FLV is single-video by format definition, so `track_number` is absent; `duration_secs` comes
+  from `onMetaData` and falls back to the tag timestamps; `bitrate` is `"video_stream"` scope
+  from `onMetaData.videodatarate` (see the note under `bitrate`) or, under `--full`, the exact
+  summed video payload, falling back to `"overall"` and absent entirely over a file shorter
+  than it declares. Both may report `codec` values not seen before — the Windows Media and
+  Flash codec identifiers this build has no parser for keep their names verbatim (`"WMV2"`,
+  `"On2 VP6"`, `"Sorenson H.263"`, `"VP8"`, `"VVC"`, and the rest), which is the existing
+  unrecognized-codec convention rather than a new value space. One shape inside that convention
+  is new and worth stating: an Enhanced FLV four-character code whose bytes are not printable
+  renders as `"0x…"` hex, the same rendering AVI already applies to an unprintable
+  `biCompression`.
+  **One presence condition changes**: `color` and `color_source` now appear on MPEG-4 Part 2 and
+  VC-1 tracks that signal no colour at all, because both formats *define* what an absent signal
+  means — Part 2 fills BT.709 primaries, transfer and matrix plus limited range, and VC-1 fills
+  BT.709 primaries and transfer over a **BT.601** matrix. Every such field is tagged `"spec"`,
+  so a consumer that needs "actually signalled" should read `color_source` rather than testing
+  `color` for presence. A Matroska `V_MS/VFW/FOURCC` track also reports the four-character code
+  from inside its `BITMAPINFOHEADER` (`"WVC1"`, `"MJPG"`) where it previously reported the
+  literal string `"V_MS/VFW/FOURCC"`.
+  Also additive: **Ogg and Theora are now recognized**, so `"Ogg"` joins the `container` set and
+  `"Theora"` joins the `codec` set. `.ogv` produced no report at all before and now produces a
+  full one, as does `.ogg`, `.oga`, `.ogm` or `.ogx` naming a file with video in it, or any file
+  whose bytes open with an `OggS` beginning-of-stream page. VP8 carried in Ogg reports under the
+  existing unrecognized-codec convention, as `"VP8"`. One track per video logical bitstream, in
+  the order the file declares them; **`track_number` is the bitstream's serial number**, which is
+  a randomly chosen 32-bit value rather than the small ordinal the other containers supply.
+  `duration_secs` comes from the last granule position of the *video* stream — not the file's last
+  page, which in a mux with audio is routinely not the video's — and is **absent for a chained
+  file** (two or more concatenated links, which Ogg permits and which makes any tail-derived
+  duration describe the final link only). `bitrate` is `"overall"` scope by default and, under
+  `--full`, the exactly summed video payload at `"video_stream"` scope, with the header packets
+  excluded. `codec_profile` is always absent for Theora, which defines no profiles. Colour comes
+  from Theora's `CS` field, which is not CICP: it fills primaries, transfer and matrix plus
+  limited range, all tagged `"stream"`. The transfer is `"BT.709"` for both defined `CS` values,
+  because Theora specifies Rec.709's opto-electronic function for encoding and that function is
+  exactly what a CICP transfer code states (ffprobe reads the field to the same value; the
+  Rec.470 *display* gammas Theora also states are outside what the code point carries).
+  VP8 reports no colour at all — its only colour signal is one bit inside each frame's
+  payload, which no container-level parse reaches.
+  Also additive: AVC `codec_profile` gains `"Constrained Baseline"`, reported for
+  `profile_idc` 66 with `constraint_set1_flag` set (H.264 §A.2.1.1) on every AVC carriage —
+  streams that previously reported the less specific `"Baseline"`, which both reference tools
+  already refine.
+  Also additive: **`"MJPEG"` joins the `codec` set** — the `MJPG` VfW tag (AVI, ASF, Matroska
+  `V_MS/VFW/FOURCC`), the Matroska `V_MJPEG` CodecID, the QuickTime `jpeg` sample entry and the
+  MP4 `esds` object type 0x6C all resolve to it, where such tracks previously reported their
+  container identifier verbatim (`"MJPG"`, `"V_MJPEG"`, `"jpeg"`). An MJPEG track reports
+  `bit_depth` and `chroma` read from the frame's own JPEG `SOF` header wherever the carriage
+  indexes payload. And `bit_depth`/`chroma` now appear for three families whose values are
+  format constants: VC-1 Simple/Main (`WMV3` — ST 421 defines 8-bit 4:2:0 for every profile,
+  completing what the Advanced-profile sequence-header parse already reported), WMV1/WMV2, and
+  MS-MPEG-4 v1/v2/v3 (H.263-lineage designs with no other pixel format).
+  Also additive: a raw MPEG-1/2 elementary stream under `--full` now reports `duration_secs`
+  (picture count ÷ the sequence header's rate) and a `video_stream`-scope `bitrate`, matching
+  MediaInfo's derivation byte-exactly; the default bounded probe still reports neither.
+  One presence widening: **`input_truncated` now also appears on file probes** whose container
+  declares more bytes than the file holds (AVI RIFF segment sizes, ASF `File Properties`, FLV
+  `onMetaData.filesize`, RealMedia's `DATA` chunk extent). The detections shipped in the backends already — withholding overall
+  rates and, for ASF, the duration — and the flag now names why. A 2.x consumer treating the
+  field as stdin-only should treat it as "partial input" generally.
+  One hardening with a value-space edge: **control characters in fallback `codec` labels
+  render as U+FFFD**. The Matroska CodecID and MP4 sample-entry fallbacks print the file's own
+  text, so a crafted file could put an ANSI escape sequence on the terminal; every control
+  character (C0, DEL, C1) now renders as the replacement character instead — the same mark
+  invalid UTF-8 already produced on that path. No real file is affected.
+  Also additive: **aspect ratio and scan type are reported** (`pixel_aspect_ratio`,
+  `display_aspect_ratio`, `scan_type` — see the field rows). The text report's Video line gains
+  `DAR <ratio>` only for non-square-pixel content (a DVD's 720×480 presenting 16:9) and an
+  `interlaced` marker only when a stream declares it, so square-pixel progressive reports are
+  unchanged.
+  Also additive: **HD DVD `.evo` video is reported.** VC-1 rides the extended PES stream id
+  0xFD with a `stream_id_extension` in 0x55..0x5F (the HD DVD assignment, as ffmpeg maps it);
+  such files previously errored with "extended stream ids are not decoded" and now report the
+  full VC-1 track, with `track_number` the substream id.
+  One value change with no shape change: **TS/M2TS `duration_secs` is now the video
+  presentation span** (head-minimum to tail-maximum video PTS plus one frame interval, the
+  program-stream backend's rule) **with the PCR span as the fallback**, because the PCR times
+  byte arrival and real muxers flush the tail without one — the corpus clip read 1.92 s against
+  a true 2.000, and its `overall` bitrate divided by the short denominator ran 4.2% high. On
+  ordinary content the change is within a frame or two; a consumer that specifically wants the
+  arrival span should read the PCRs itself.
+  Also additive: **raw DV (DIF) tape streams are reported** — `"raw DV (DIF)"` joins the
+  `container` set (`.dv`, `.dif`, also recognized by magic), `"DV"` the `codec` set, and
+  `codec_profile` carries the SMPTE variant (`"DVCPRO"`, `"DVCPRO50"`, `"DVCPRO HD"`) where one
+  is signalled. Everything is system constants keyed by the header DIF block's discriminators:
+  dimensions, frame rate, 8-bit depth, chroma (4:1:1 / 4:2:0 / 4:2:2 by system), an exact
+  whole-frame `duration_secs` and an exact `"overall"` `bitrate` (audio rides inside the DIF
+  frame, so there is no separate video-stream rate), and `display_aspect_ratio` from the
+  VAUX video-control pack's 16:9 flag when the pack is present. `scan_type` is deliberately
+  absent (the reference tools disagree and the candidate bits have no primary spec on hand).
+  `"4:1:1"` also joins the documented `chroma` value set (it was already emitted for
+  QuickTime DV FourCCs and MJPEG), with `"4:4:0"` (MJPEG).
+  Also additive: **DVD-Video ISOs are probed** the way Blu-ray ISOs are —
+  `"DVD-Video ISO (VIDEO_TS)"` joins the `container` set and the new optional `dvd_iso`
+  object on `Report` records the auto-selected main feature (the byte-largest title set),
+  with the set's IFO-declared runtime as `duration_secs`' authority (see "DVD-Video ISO
+  probes and `DvdIso`"). CSS-scrambled program-stream content — inside an ISO or as a bare
+  `.vob`/`.mpg` — now errors honestly (`PES_scrambling_control` set on a video PES in the
+  head window) instead of running the codec census over ciphertext; decrypted backups are
+  unaffected, since decrypters clear those bits.
+  Also additive: **RealMedia is reported** — `"RealMedia"` joins the `container` set (`.rm`,
+  `.rmvb`, also recognized by the `.RMF` magic) and `"RealVideo 1"` through `"RealVideo 4"`
+  join the `codec` set (the `MDPR` `VIDO` FourCCs `RV10`..`RV40`; anything else reports its
+  FourCC verbatim). Dimensions, the 16.16 fixed-point frame rate, the stream's declared
+  duration (`PROP`'s as fallback) and its declared average `bitrate` (`"video_stream"` scope)
+  come from the header chunks; depth/chroma are the family constants 8-bit 4:2:0 (normative
+  for the H.263-design RV10/RV20, witnessed for RV30/RV40); colour is honestly absent — the
+  container records none. `input_truncated` fires when the `DATA` chunk declares more bytes
+  than the file holds (with slack for ffmpeg's muxer, which systematically declares 10 bytes
+  past EOF on complete files); RealAudio-only files error rather than reporting an empty
+  track.
+  Ships in hdrprobe 1.0.0. A step-by-step consumer migration guide is in
+  [MIGRATION-3.0.md](MIGRATION-3.0.md).
 - **2.4**: SL-HDR and HDR Vivid detection (additive). The new optional
   `video_tracks[].sl_hdr` object appears when an SL-HDR (ETSI TS 103 433) information SEI was
   found in an HEVC or AVC stream, carrying `mode`, `spec_version`, `payload_mode`, the

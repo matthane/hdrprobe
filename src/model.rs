@@ -16,7 +16,23 @@ fn is_false(b: &bool) -> bool {
 /// correct consumer (renaming/removing a field, changing a type, unit, presence
 /// condition, or the meaning of an existing value). Any bump must update
 /// `docs/SCHEMA.md` and the golden shape test below in the same change.
-pub const SCHEMA_VERSION: &str = "2.4";
+pub const SCHEMA_VERSION: &str = "3.0";
+
+/// A per-file failure, emitted to the machine output stream only under
+/// `--errors`: one object per failed file, beside the ordinary `Report`s (an
+/// NDJSON line, or a member of the `--json` array). Distinguished from a
+/// `Report` by the presence of the `error` key — a `Report` never carries
+/// one. The stderr diagnostic and the exit-code contract are unchanged by
+/// the flag.
+#[derive(Debug, Serialize)]
+pub struct ErrorReport {
+    /// Same contract version as the reports beside it.
+    pub hdrprobe_schema_version: &'static str,
+    /// The input path, exactly as a successful report's `file` would render it.
+    pub file: String,
+    /// The human-readable failure, the same text the stderr diagnostic carries.
+    pub error: String,
+}
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -27,12 +43,18 @@ pub struct Report {
     pub hdrprobe_schema_version: &'static str,
     pub file: String,
     pub size_bytes: u64,
-    /// Stdin input (`hdrprobe -`) only: true when the stream exceeded the
-    /// head budget and only a leading window was probed. When present,
-    /// `size_bytes` is the bytes actually probed (not the source's size) and
-    /// facts derived from the payload span rather than a declared header
-    /// (TS duration, non-MP4 bitrates) are withheld. File probes, and stdin
-    /// streams that ended within the budget, omit it.
+    /// True when only part of the input was (or could be) probed. Two cases
+    /// share the flag. **Stdin** (`hdrprobe -`): the stream exceeded the head
+    /// budget, only a leading window was probed, `size_bytes` is the bytes
+    /// actually probed, and facts derived from the payload span rather than a
+    /// declared header (TS duration, non-MP4 bitrates) are withheld. **File
+    /// probes** (open-items B6): the container itself declares more bytes
+    /// than the file holds (AVI RIFF segment sizes, ASF `File Properties`,
+    /// FLV `onMetaData.filesize`, RealMedia's `DATA` chunk extent) — a
+    /// partial download or a capture that never closed; the backend has
+    /// already withheld what a prefix cannot
+    /// support, and this names why. Absent for whole files and for stdin
+    /// streams that ended within the budget.
     #[serde(skip_serializing_if = "is_false")]
     pub input_truncated: bool,
     pub container: String,
@@ -41,6 +63,10 @@ pub struct Report {
     /// that clip; `size_bytes` stays the whole image's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bd_iso: Option<BdIso>,
+    /// DVD-Video ISO probes only: which title set was auto-selected as the
+    /// main feature.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dvd_iso: Option<DvdIso>,
     /// Sidecar schema version, e.g. "4.0.2" from a DV CM XML's root
     /// `<DolbyLabsMDF version=…>` attribute. `None` for video inputs and
     /// sidecars that don't declare one.
@@ -55,8 +81,28 @@ pub struct Report {
     /// is one *logical* track, never two entries. Metadata sidecars carry one
     /// entry too (empty `codec`), so consumers always iterate the array.
     pub video_tracks: Vec<VideoTrack>,
-    /// Wall-clock parse time in milliseconds.
-    pub elapsed_ms: f64,
+}
+
+/// The VIDEO_TS main feature a DVD-Video ISO probe selected (see
+/// `Report::dvd_iso`): the byte-largest title set. The report's duration,
+/// bitrate, and tracks describe that set's VOB program stream; `size_bytes`
+/// stays the whole image's.
+#[derive(Debug, Serialize)]
+pub struct DvdIso {
+    /// Title set number: the probed VOBs are `VTS_<vts>_1.VOB` onward.
+    pub vts: u16,
+    /// Title VOBs in the probed set (the ≤1 GiB slices of one program
+    /// stream; menu VOBs are excluded).
+    pub vob_count: usize,
+    /// The longest program chain's declared playback time from the set's
+    /// IFO — the feature's authored runtime, the analogue of a Blu-ray
+    /// playlist's edit duration. When present it is also the report's
+    /// `duration_secs` (the declared runtime is the DVD duration authority;
+    /// the program-stream PTS span is only the fallback, being blind to
+    /// cell/layer-break resets between its windows). Absent when the IFO is
+    /// missing or unparseable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_duration_secs: Option<f64>,
 }
 
 /// The BDMV main feature a Blu-ray ISO probe selected (see `Report::bd_iso`).
@@ -90,7 +136,22 @@ pub struct VideoTrack {
     /// MKV FlagDefault (absent for containers without such a flag).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<bool>,
-    pub codec: String,
+    /// Resolved codec display name ("HEVC"), or the container's identifier
+    /// verbatim for a codec this build has no parser for. Absent for metadata
+    /// sidecars, which carry no video.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// The container's own codec identifier, verbatim: the MP4/MOV
+    /// sample-entry FourCC (`"hvc1"` vs `"hev1"`, post-encryption recovery),
+    /// the Matroska CodecID (with the inner VfW FourCC appended for
+    /// `V_MS/VFW/FOURCC`), a TS PMT `stream_type` in hex (`"0x24"`), an
+    /// AVI/ASF FourCC (hex form when unprintable), an FLV legacy id
+    /// (`"7"`) or Enhanced FourCC, RealMedia's VIDO FourCC, or an Ogg
+    /// mapping name (`"theora"`). Absent where no container-level identifier
+    /// exists: raw elementary streams, program streams (whose PES id is
+    /// already `track_number`), raw DV, and sidecars.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec_profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,18 +160,61 @@ pub struct VideoTrack {
     pub height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fps: Option<f64>,
+    /// The frame rate as the exact ratio it was signalled as, where the
+    /// source states one (`{num: 24000, den: 1001}`); the `fps` float is the
+    /// same value as a decimal. Absent when the rate was measured or averaged
+    /// rather than stated as a ratio (IVF's averaged timestamps), or when
+    /// `fps` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fps_rational: Option<Rational>,
+    /// This track's own duration in seconds, where the container states one
+    /// per track: MP4's media duration (or summed fragment runs), the
+    /// mkvmerge `DURATION` statistics tag, AVI's per-stream declared length,
+    /// RealMedia's MDPR duration. The report-level `duration_secs` stays the
+    /// file-level value (the longest stream's); on single-track files the two
+    /// usually agree to within a frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate: Option<Bitrate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bit_depth: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chroma: Option<String>,
+    /// Pixel (sample) aspect ratio: the width of one pixel over its height,
+    /// 1.0 being square. Signalled by the coded stream or the container, or
+    /// derived exactly from a signalled display ratio and the coded size.
+    /// Absent when nothing signals either ratio; never a guessed square.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pixel_aspect_ratio: Option<f64>,
+    /// The pixel aspect ratio as an exact reduced ratio; present exactly when
+    /// the float is (both derive from the same signalled rational, so the
+    /// float may differ from `num/den` only in the last binary digit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pixel_aspect_ratio_rational: Option<Rational>,
+    /// Display aspect ratio, width over height of the presented picture.
+    /// Signalled directly (MPEG-2's DAR codes, MKV display size, AVI `vprp`)
+    /// or derived exactly from the pixel aspect ratio and the coded size.
+    /// Present exactly when `pixel_aspect_ratio` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_aspect_ratio: Option<f64>,
+    /// The display aspect ratio as an exact reduced ratio (`{num: 16, den: 9}`);
+    /// present exactly when the float is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_aspect_ratio_rational: Option<Rational>,
+    /// `"progressive"` or `"interlaced"`, from a sequence-level signal of the
+    /// coded stream. Absent when the format has no such signal or the stream
+    /// states none — absence is "unsignalled", never "progressive".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_type: Option<String>,
     /// Stereoscopic/multiview view structure, e.g. "Stereoscopic 3D (2 views)",
     /// from the MP4 `vexu`/`stri` boxes of MV-HEVC (DV Profile 20). `None` for
     /// ordinary monoscopic video.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stereo: Option<String>,
     pub color: ColorInfo,
+    /// Where each `color` field came from, same field order.
+    pub color_source: ColorSources,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hdr: Option<Hdr>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,13 +231,44 @@ pub struct VideoTrack {
     pub hdr_vivid: Option<HdrVivid>,
 }
 
-/// Average bitrate. `scope` says whether it's the exact video-stream rate (from a
-/// known encoded byte count) or the container's overall rate (file length ÷
-/// duration, which also counts audio and packet overhead).
+/// An exact ratio, reduced to lowest terms. Reported beside a float that
+/// carries the same value as a decimal, for consumers that need the ratio
+/// itself (`24000/1001` rather than `23.976023976023978`, `16:9` rather than
+/// `1.7777777777777777`).
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct Rational {
+    pub num: u64,
+    pub den: u64,
+}
+
+impl Rational {
+    /// Reduced by gcd; `None` for a zero numerator or denominator, which is
+    /// signalling noise rather than a ratio.
+    pub fn reduced(num: u64, den: u64) -> Option<Self> {
+        if num == 0 || den == 0 {
+            return None;
+        }
+        let g = gcd(num, den);
+        Some(Rational { num: num / g, den: den / g })
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+/// Average bitrate. `scope` says whether it's the video-stream rate or the
+/// container's overall rate (file length ÷ duration, which also counts audio
+/// and packet overhead); `source` says whether hdrprobe computed the number or
+/// read it from a header.
 #[derive(Debug, Serialize, Clone, Copy)]
 pub struct Bitrate {
     pub bits_per_sec: f64,
     pub scope: BitrateScope,
+    pub source: BitrateSource,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -143,12 +278,30 @@ pub enum BitrateScope {
     Overall,
 }
 
+/// How a `Bitrate` was obtained. `Measured` = computed from per-sample /
+/// per-chunk sums or actual payload/file bytes (MP4 `stsz`, an AVI index, a
+/// `--full` streamed sum, every `overall` rate). `Declared` = a single rate
+/// or byte count stated in a container header, however the muxer obtained it
+/// (MKV `BPS`/`NUMBER_OF_BYTES` statistics tags, ASF `Data Bitrate`, FLV
+/// `videodatarate`, RealMedia's MDPR average); a declared value can differ
+/// from the encoded reality by a percent or two.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BitrateSource {
+    Measured,
+    Declared,
+}
+
 impl Bitrate {
-    /// Exact per-stream rate the container states directly (e.g. the MKV `BPS`
+    /// Per-stream rate the container states directly (e.g. the MKV `BPS`
     /// statistics tag), used verbatim — it already reflects the video track's own
     /// duration, which a whole-file duration would only approximate.
     pub fn video_stream_bps(bits_per_sec: f64) -> Self {
-        Bitrate { bits_per_sec, scope: BitrateScope::VideoStream }
+        Bitrate {
+            bits_per_sec,
+            scope: BitrateScope::VideoStream,
+            source: BitrateSource::Declared,
+        }
     }
 
     /// Per-stream rate from an exact encoded byte count over the stream duration.
@@ -158,14 +311,31 @@ impl Bitrate {
             return None;
         }
         let d = duration_secs.filter(|d| *d > 0.0)?;
-        Some(Bitrate { bits_per_sec: bytes as f64 * 8.0 / d, scope: BitrateScope::VideoStream })
+        Some(Bitrate {
+            bits_per_sec: bytes as f64 * 8.0 / d,
+            scope: BitrateScope::VideoStream,
+            source: BitrateSource::Measured,
+        })
     }
 
     /// Whole-container rate from the file length; counts audio and packet
     /// overhead, so it is labelled distinctly from a true per-stream rate.
     pub fn overall(file_size: u64, duration_secs: Option<f64>) -> Option<Self> {
         let d = duration_secs.filter(|d| *d > 0.0)?;
-        Some(Bitrate { bits_per_sec: file_size as f64 * 8.0 / d, scope: BitrateScope::Overall })
+        Some(Bitrate {
+            bits_per_sec: file_size as f64 * 8.0 / d,
+            scope: BitrateScope::Overall,
+            source: BitrateSource::Measured,
+        })
+    }
+
+    /// Re-tag a rate as header-declared. For the one shape the constructors
+    /// don't cover: a quotient of a *declared* byte count over a duration
+    /// (MKV `NUMBER_OF_BYTES` without `BPS`), where the numerator's provenance
+    /// is the honest tag.
+    pub fn declared(mut self) -> Self {
+        self.source = BitrateSource::Declared;
+        self
     }
 }
 
@@ -181,12 +351,82 @@ pub struct ColorInfo {
     pub range: Option<String>,
 }
 
+/// Where one field of `ColorInfo` came from. Per field rather than per object
+/// because the two genuinely differ: a Dolby Vision Profile 5 stream signals its
+/// range and nothing else, so its range is `Stream` while its primaries,
+/// transfer and matrix are `Spec`.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorSource {
+    /// A container colour box or element: MP4 `colr`/`vpcC`, MKV `Colour`.
+    Container,
+    /// The coded stream's own signalling: an SPS/sequence-header VUI, whether
+    /// read in band or from the parameter set embedded in a codec config record
+    /// (`hvcC`/`avcC`/`av1C`), or a VP9/ProRes frame header.
+    Stream,
+    /// An SEI message overriding the above — today only the HLG/PQ
+    /// `alternative_transfer_characteristic` message (SEI 147).
+    Sei,
+    /// Not signalled anywhere: supplied by the Dolby Vision profile and
+    /// compatibility id, which define the base layer's colour outright. Only
+    /// ever fills a field nothing signalled, and only when the compatibility id
+    /// was itself declared or spec-fixed — never when it was inferred from the
+    /// very colour this would be filling.
+    Spec,
+    /// **Internal, never serialized.** The source carried a CICP code for this
+    /// field that this build has no name for, so `ColorInfo` leaves it empty —
+    /// there is no label to put there — and it is otherwise indistinguishable
+    /// from a field nothing signalled at all. Recording it keeps the Dolby
+    /// Vision spec fill from overwriting a real signal and then claiming, via
+    /// `Spec`, that nothing was signalled. `hidden` below keeps it out of the
+    /// report, so `ColorSources` still carries a tag exactly when `ColorInfo`
+    /// carries a value.
+    UnnamedCode,
+}
+
+/// `skip_serializing_if` for every `ColorSources` field: a field with no value
+/// has no provenance to report, and `UnnamedCode` marks precisely that case.
+fn hidden(v: &Option<ColorSource>) -> bool {
+    matches!(v, None | Some(ColorSource::UnnamedCode))
+}
+
+/// Per-field provenance for `ColorInfo`, in the same field order. A field is
+/// tagged exactly when `ColorInfo` carries a value for it.
+#[derive(Debug, Serialize, Default, Clone, Copy)]
+pub struct ColorSources {
+    #[serde(skip_serializing_if = "hidden")]
+    pub primaries: Option<ColorSource>,
+    #[serde(skip_serializing_if = "hidden")]
+    pub transfer: Option<ColorSource>,
+    #[serde(skip_serializing_if = "hidden")]
+    pub matrix: Option<ColorSource>,
+    #[serde(skip_serializing_if = "hidden")]
+    pub range: Option<ColorSource>,
+}
+
+/// Every colour producer builds `ColorInfo` and `ColorSources` together through
+/// `container::color_from_cicp`, which is the only place that sees the raw CICP
+/// codes and so the only place that can tell an unnamed code from an absent one.
+/// There is deliberately no constructor here that derives provenance from a
+/// finished `ColorInfo`: it could not make that distinction, and a caller using
+/// one would silently relabel fields it never wrote.
+
 #[derive(Debug, Serialize)]
 pub struct Hdr {
-    /// Classified format string, e.g. "Dolby Vision / HDR10 (fallback)".
+    /// Classified format string, e.g. "Dolby Vision / HDR10".
     pub format: String,
+    /// The base signal a decoder without the dynamic-metadata layer receives:
+    /// "HDR10", "HLG", or "SDR" — exactly the format string's base tag as a
+    /// field of its own. Absent when the stream has no independently viewable
+    /// base (DV compatibility id 0: Profiles 5, 10.0 and 20).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mastering: Option<MasteringDisplay>,
+    pub base: Option<String>,
+    /// The base layer's declared mastering display (container MDCV box or
+    /// ST.2086 SEI, with the DV L6 fallback on an HDR10 base). One name with
+    /// `dolby_vision.mastering_display` and `sl_hdr.source_mastering_display`,
+    /// which describe the same kind of fact from other pipeline stages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mastering_display: Option<MasteringDisplay>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_light: Option<ContentLight>,
 }
@@ -220,17 +460,86 @@ impl ContentLight {
     }
 }
 
+/// Provenance of `DolbyVision::bl_compatibility_id`, in descending order of
+/// evidence. Every rung but `Assumed` fills `bl_compatibility_id` and
+/// `compatibility`; `Assumed` resolves the *label* only and leaves both fields
+/// absent, because a display convention is not a value the stream carries.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatSource {
+    /// Read from a container dvcC/dvvC/TS descriptor, or a DV CM XML's declared
+    /// `GenerateProfile`.
+    Declared,
+    /// Fixed by the profile's own definition — Dolby's profile table pairs
+    /// profiles 4, 5, 7 and 9 (and the legacy 0-3, 6) with exactly one id, so no
+    /// stream evidence is needed.
+    Spec,
+    /// Deduced from the base layer's signalled VUI, for a profile whose
+    /// definition admits several ids. Returned only when exactly one candidate
+    /// survives; an ambiguous signal resolves nothing.
+    Inferred,
+    /// Convention default with no evidence behind it: a Profile 8 that declares
+    /// no id and whose base layer does not separate CCID 1, 2 and 4 is labelled
+    /// `8.1` because that is what the ecosystem writes, and this field is how
+    /// the report discloses that the digit is not backed by data.
+    Assumed,
+}
+
+/// How much of the input's frame metadata a report's sampled-union facts rest
+/// on. `Sampled`: a spread of frames (the default probe) — union fields may be
+/// incomplete. `Full`: every frame was read (`--full`, or a sidecar, which is
+/// exhaustive by construction). `None`: no frame metadata was read at all
+/// (`--no-rpu`, or a container declaration with no readable frame), so every
+/// frame-derived field is absent and the counts are zero.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    Sampled,
+    Full,
+    None,
+}
+
+/// Provenance of `DolbyVision::level`, the same shape as `CompatSource`.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelSource {
+    /// Declared by a container `dvcC`/`dvvC`/TS descriptor.
+    Declared,
+    /// Derived from the coded stream's resolution and frame rate against the
+    /// Dolby P&L level table (a pixel-rate floor; a declared level always wins).
+    Derived,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DolbyVision {
     /// `profile.compatibility`, e.g. "8.1", "7.6 (FEL)", "5.0", "10.4".
     pub profile: String,
-    /// True when the compatibility minor digit was supplied by convention rather
-    /// than read from data — i.e. no container dvcC/dvvC and no XML-declared
-    /// profile carried the `dv_bl_signal_compatibility_id` (a raw RPU bin, or a
-    /// legacy Profile-4 mux whose compact descriptor omits the nibble). The
-    /// major number is still RPU-derived; only the `.1`/`.2` is a default.
+    /// Where the base-layer cross-compatibility id behind the profile's minor
+    /// digit came from. Absent only when nothing resolved it and the profile has
+    /// no convention default either (a bare Profile 10 or 20 whose base layer
+    /// signals too little to separate its candidates).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compat_source: Option<CompatSource>,
+    /// True when the base layer's actual transfer characteristic is Dolby's
+    /// proprietary "PQ with reshaping" rather than the plain PQ its VUI names.
+    /// Dolby states this for cross-compatibility id 0 outright: a transfer
+    /// characteristic of 16 there "generally indicates perceptual quantization
+    /// (PQ)", but "the actual proprietary transfer characteristic, even when
+    /// signaled with 16, is 'PQ with reshaping'". It has no CICP code point, so
+    /// it cannot live in `color.transfer` — that object stays a strict CICP
+    /// projection. Video inputs only: a metadata sidecar has no base layer whose
+    /// transfer this would describe.
     #[serde(skip_serializing_if = "is_false")]
-    pub profile_compat_assumed: bool,
+    pub pq_reshaping: bool,
+    /// True when the profile and compatibility id pair into a combination Dolby
+    /// has withdrawn: `8.3` or `8.5`, the two rows of Annex I ("Profiles not
+    /// supported for new applications") that name a pairing rather than a whole
+    /// profile. Profile 8 itself is current, and the legacy *profiles* Annex I
+    /// also lists (0, 1, 2, 3, 4, 6) are not flagged — plenty of real content
+    /// uses them and "legacy" is not a defect. A provenance observation about
+    /// how the stream was authored, not a playability claim.
+    #[serde(skip_serializing_if = "is_false")]
+    pub deprecated_combination: bool,
     /// Layer/track layout, present only for dual-layer (Profile 7) content:
     /// "Single track, dual layer" (BL+EL interleaved in one track/stream) or
     /// "Dual track, dual layer" (BL and EL on separate tracks/PIDs).
@@ -238,15 +547,16 @@ pub struct DolbyVision {
     pub structure: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
-    /// True when `level` was derived from the coded stream's resolution and
-    /// frame rate against the Dolby P&L level table rather than declared by a
-    /// container config. Authentic disc muxes carry no declaration at all (a
+    /// Where `level` came from; present exactly when `level` is. `declared`
+    /// is a container `dvcC`/`dvvC`/TS descriptor. `derived` means computed
+    /// from the coded stream's resolution and frame rate against the Dolby
+    /// P&L level table: authentic disc muxes carry no declaration at all (a
     /// UHD-BD M2TS signals DV via the playlist STN table, not the PMT), so
     /// without the derivation the field would simply be absent there. The
     /// derived value is a pixel-rate floor: the level's bitrate/tier axis is
-    /// not probed, and a declared `dvcC`/`dvvC`/descriptor level always wins.
-    #[serde(skip_serializing_if = "is_false")]
-    pub level_derived: bool,
+    /// not probed, and a declared level always wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level_source: Option<LevelSource>,
     pub bl_present: bool,
     pub el_present: bool,
     pub rpu_present: bool,
@@ -289,11 +599,11 @@ pub struct DolbyVision {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub l5_active_areas: Vec<ActiveArea>,
     /// When L5 offsets were computed against an *assumed* canvas — a DV XML
-    /// carries only aspect ratios, no pixel resolution — this is the `[width,
-    /// height]` we assumed. `None` for real bitstreams, whose L5 offsets are
-    /// baked into the RPU in actual pixels.
+    /// carries only aspect ratios, no pixel resolution — this is the canvas
+    /// we assumed. `None` for real bitstreams, whose L5 offsets are baked
+    /// into the RPU in actual pixels.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub l5_assumed_canvas: Option<[u32; 2]>,
+    pub l5_assumed_canvas: Option<AssumedCanvas>,
     /// The DV grade's own mastering-display luminance: the RPU DM header's
     /// `source_min_pq`/`source_max_pq` (or, for a DV CM XML, the exact global
     /// Level-0 values). Distinct from the HDR section's mastering line, which
@@ -329,14 +639,10 @@ pub struct DolbyVision {
     /// L9 mastering-display color space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub l9_mastering: Option<String>,
-    /// L11 content type.
+    /// The L11 (Dolby Vision IQ / content type) block, present when L11 was
+    /// seen. Its three fields ride one block, so they appear together.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub l11_content: Option<String>,
-    /// L11 intended white point.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub l11_white_point: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub l11_reference_mode: Option<bool>,
+    pub l11: Option<L11>,
     /// Distinct trim targets: the L2/L8 union across the read RPUs plus any
     /// L10-defined target displays (custom L8 targets, folded into the L8
     /// set), each tagged with the level(s) that produced it.
@@ -344,8 +650,12 @@ pub struct DolbyVision {
     pub trim_targets: Vec<TrimTarget>,
     /// Number of RPUs successfully parsed.
     pub rpu_count: usize,
-    /// True when the report reflects sampling rather than a full scan.
-    pub sampled: bool,
+    /// What the DV facts rest on: `sampled` (a spread of RPUs — the union
+    /// fields may be incomplete), `full` (every RPU was read: `--full` or a
+    /// sidecar), or `none` (no RPU was read: `--no-rpu`, or a container
+    /// config whose track yielded none — `rpu_count` is 0 and the section is
+    /// built from the config alone).
+    pub coverage: Coverage,
     /// Authoring cadence of the dynamic metadata, decided by comparing
     /// consecutive frames' DM payloads. Present only when every frame's RPU
     /// was read in stream order — a `--full` video scan or a DV sidecar; a
@@ -422,11 +732,34 @@ pub struct TrimTarget {
     pub levels: Vec<u8>,
 }
 
+/// The canvas a sidecar's L5 active-area dimensions were computed against
+/// (see `DolbyVision::l5_assumed_canvas`).
+#[derive(Debug, Serialize, Clone, Copy)]
+pub struct AssumedCanvas {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The RPU's L11 content-type block. All three fields ride one block, so a
+/// present `l11` always carries all of them.
+#[derive(Debug, Serialize)]
+pub struct L11 {
+    /// Content type, named per Dolby's L11 definitions: "Default", "Movies",
+    /// "Game", "Sport", "User Generated Content", or "Unknown" for values
+    /// outside the published range.
+    pub content: String,
+    /// Intended white point: "D65" (0, the default), "D93" (8), or "code N"
+    /// for codes Dolby accepts but does not publicly name.
+    pub white_point: String,
+    /// Reference-mode flag.
+    pub reference_mode: bool,
+}
+
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveArea {
     pub width: u32,
     pub height: u32,
-    /// Aspect ratio numerator:denominator presentation string, e.g. "2.39:1".
+    /// L5 crop offsets, in pixels from each canvas edge.
     pub left: u16,
     pub right: u16,
     pub top: u16,
@@ -466,7 +799,7 @@ pub struct SlHdr {
     /// (`src_mdcv`), distinct from the base layer's own MDCV signalling.
     /// `primaries_level` is never set here (it is a DV provenance tag).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_mastering: Option<MasteringDisplay>,
+    pub source_mastering_display: Option<MasteringDisplay>,
 }
 
 /// HDR Vivid (CUVA, T/UWA 005) metadata, title-stable header facts only —
@@ -490,9 +823,11 @@ pub struct HdrVivid {
     /// and like it a sampled union unless the scan read every frame.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub target_max_luminances: Vec<u32>,
-    /// True when `target_max_luminances` came from a sampled spread of frames
-    /// rather than a full scan, mirroring `dolby_vision.sampled`.
-    pub sampled: bool,
+    /// What the HDR Vivid facts rest on, mirroring `dolby_vision.coverage`:
+    /// `sampled` (a spread of frames), `full` (every frame read), or `none`
+    /// (no frame's SEI was read — a `cuvv` box-only detection, e.g. under
+    /// `--no-rpu`, where `version` alone survives).
+    pub coverage: Coverage,
 }
 
 #[derive(Debug, Serialize)]
@@ -527,10 +862,10 @@ mod tests {
                 clip_index: 1,
                 clip_count: 1,
             }),
+            dvd_iso: Some(DvdIso { vts: 4, vob_count: 6, title_duration_secs: Some(6547.5) }),
             format_version: Some("4.0.2".to_string()),
             duration_secs: Some(30.0),
             video_tracks: vec![maximal_track()],
-            elapsed_ms: 5.0,
         }
     }
 
@@ -539,14 +874,22 @@ mod tests {
             track_number: Some(1),
             program: Some(28),
             default: Some(true),
-            codec: "HEVC".to_string(),
+            codec: Some("HEVC".to_string()),
+            codec_id: Some("hvc1".to_string()),
             codec_profile: Some("Main 10, High tier @ L5.1".to_string()),
             width: Some(3840),
             height: Some(2160),
             fps: Some(23.976),
+            fps_rational: Some(Rational { num: 24000, den: 1001 }),
+            duration_secs: Some(30.0),
             bitrate: Some(Bitrate::video_stream_bps(1.0)),
             bit_depth: Some(10),
             chroma: Some("4:2:0".to_string()),
+            pixel_aspect_ratio: Some(1.0),
+            pixel_aspect_ratio_rational: Some(Rational { num: 1, den: 1 }),
+            display_aspect_ratio: Some(16.0 / 9.0),
+            display_aspect_ratio_rational: Some(Rational { num: 16, den: 9 }),
+            scan_type: Some("progressive".to_string()),
             stereo: Some("Stereoscopic 3D (2 views)".to_string()),
             color: ColorInfo {
                 primaries: Some("BT.2020".to_string()),
@@ -554,9 +897,16 @@ mod tests {
                 matrix: Some("BT.2020 NCL".to_string()),
                 range: Some("limited".to_string()),
             },
+            color_source: ColorSources {
+                primaries: Some(ColorSource::Container),
+                transfer: Some(ColorSource::Sei),
+                matrix: Some(ColorSource::Stream),
+                range: Some(ColorSource::Spec),
+            },
             hdr: Some(Hdr {
-                format: "Dolby Vision / HDR10 (fallback)".to_string(),
-                mastering: Some(MasteringDisplay {
+                format: "Dolby Vision / HDR10".to_string(),
+                base: Some("HDR10".to_string()),
+                mastering_display: Some(MasteringDisplay {
                     max_luminance: 1000.0,
                     min_luminance: 0.0001,
                     primaries: Some("DCI-P3 D65".to_string()),
@@ -566,10 +916,12 @@ mod tests {
             }),
             dolby_vision: Some(DolbyVision {
                 profile: "7.6 (FEL)".to_string(),
-                profile_compat_assumed: true,
+                compat_source: Some(CompatSource::Declared),
+                pq_reshaping: true,
+                deprecated_combination: true,
                 structure: Some("Single track, dual layer".to_string()),
                 level: Some(6),
-                level_derived: true,
+                level_source: Some(LevelSource::Derived),
                 bl_present: true,
                 el_present: true,
                 rpu_present: true,
@@ -587,7 +939,7 @@ mod tests {
                     top: 276,
                     bottom: 276,
                 }],
-                l5_assumed_canvas: Some([3840, 2160]),
+                l5_assumed_canvas: Some(AssumedCanvas { width: 3840, height: 2160 }),
                 mastering_display: Some(MasteringDisplay {
                     max_luminance: 4000.0,
                     min_luminance: 0.0001,
@@ -610,12 +962,14 @@ mod tests {
                     zeroed: false,
                 }),
                 l9_mastering: Some("BT.2020".to_string()),
-                l11_content: Some("Movies".to_string()),
-                l11_white_point: Some("D65".to_string()),
-                l11_reference_mode: Some(true),
+                l11: Some(L11 {
+                    content: "Movies".to_string(),
+                    white_point: "D65".to_string(),
+                    reference_mode: true,
+                }),
                 trim_targets: vec![TrimTarget { nits: 100, levels: vec![2, 8] }],
                 rpu_count: 722,
-                sampled: false,
+                coverage: Coverage::Full,
                 metadata_cadence: Some(MetadataCadence {
                     cadence: "per-shot".to_string(),
                     frame_pairs: 721,
@@ -639,7 +993,7 @@ mod tests {
                 payload_mode: Some("parameter-based".to_string()),
                 target_primaries: Some("BT.2020".to_string()),
                 target_max_luminance: Some(100),
-                source_mastering: Some(MasteringDisplay {
+                source_mastering_display: Some(MasteringDisplay {
                     max_luminance: 1000.0,
                     min_luminance: 0.0001,
                     primaries: Some("BT.2020".to_string()),
@@ -650,7 +1004,7 @@ mod tests {
                 version: "1.0".to_string(),
                 system_start_code: Some(1),
                 target_max_luminances: vec![100, 500],
-                sampled: true,
+                coverage: Coverage::Sampled,
             }),
         }
     }
@@ -695,39 +1049,60 @@ mod tests {
             "bd_iso.clip",
             "bd_iso.clip_index",
             "bd_iso.clip_count",
+            "dvd_iso.vts",
+            "dvd_iso.vob_count",
+            "dvd_iso.title_duration_secs",
             "format_version",
             "duration_secs",
-            "elapsed_ms",
             "video_tracks[].track_number",
             "video_tracks[].program",
             "video_tracks[].default",
             "video_tracks[].codec",
+            "video_tracks[].codec_id",
             "video_tracks[].codec_profile",
             "video_tracks[].width",
             "video_tracks[].height",
             "video_tracks[].fps",
+            "video_tracks[].fps_rational.num",
+            "video_tracks[].fps_rational.den",
+            "video_tracks[].duration_secs",
             "video_tracks[].bitrate.bits_per_sec",
             "video_tracks[].bitrate.scope",
+            "video_tracks[].bitrate.source",
             "video_tracks[].bit_depth",
             "video_tracks[].chroma",
+            "video_tracks[].pixel_aspect_ratio",
+            "video_tracks[].pixel_aspect_ratio_rational.num",
+            "video_tracks[].pixel_aspect_ratio_rational.den",
+            "video_tracks[].display_aspect_ratio",
+            "video_tracks[].display_aspect_ratio_rational.num",
+            "video_tracks[].display_aspect_ratio_rational.den",
+            "video_tracks[].scan_type",
             "video_tracks[].stereo",
             "video_tracks[].color.primaries",
             "video_tracks[].color.transfer",
             "video_tracks[].color.matrix",
             "video_tracks[].color.range",
+            "video_tracks[].color_source.primaries",
+            "video_tracks[].color_source.transfer",
+            "video_tracks[].color_source.matrix",
+            "video_tracks[].color_source.range",
             "video_tracks[].hdr.format",
-            "video_tracks[].hdr.mastering.max_luminance",
-            "video_tracks[].hdr.mastering.min_luminance",
-            "video_tracks[].hdr.mastering.primaries",
-            "video_tracks[].hdr.mastering.primaries_level",
+            "video_tracks[].hdr.base",
+            "video_tracks[].hdr.mastering_display.max_luminance",
+            "video_tracks[].hdr.mastering_display.min_luminance",
+            "video_tracks[].hdr.mastering_display.primaries",
+            "video_tracks[].hdr.mastering_display.primaries_level",
             "video_tracks[].hdr.content_light.max_cll",
             "video_tracks[].hdr.content_light.max_fall",
             "video_tracks[].hdr.content_light.zeroed",
             "video_tracks[].dolby_vision.profile",
-            "video_tracks[].dolby_vision.profile_compat_assumed",
+            "video_tracks[].dolby_vision.compat_source",
+            "video_tracks[].dolby_vision.pq_reshaping",
+            "video_tracks[].dolby_vision.deprecated_combination",
             "video_tracks[].dolby_vision.structure",
             "video_tracks[].dolby_vision.level",
-            "video_tracks[].dolby_vision.level_derived",
+            "video_tracks[].dolby_vision.level_source",
             "video_tracks[].dolby_vision.bl_present",
             "video_tracks[].dolby_vision.el_present",
             "video_tracks[].dolby_vision.rpu_present",
@@ -743,7 +1118,8 @@ mod tests {
             "video_tracks[].dolby_vision.l5_active_areas[].right",
             "video_tracks[].dolby_vision.l5_active_areas[].top",
             "video_tracks[].dolby_vision.l5_active_areas[].bottom",
-            "video_tracks[].dolby_vision.l5_assumed_canvas[]",
+            "video_tracks[].dolby_vision.l5_assumed_canvas.width",
+            "video_tracks[].dolby_vision.l5_assumed_canvas.height",
             "video_tracks[].dolby_vision.mastering_display.max_luminance",
             "video_tracks[].dolby_vision.mastering_display.min_luminance",
             "video_tracks[].dolby_vision.mastering_display.primaries",
@@ -758,13 +1134,13 @@ mod tests {
             "video_tracks[].dolby_vision.l6.min_mastering",
             "video_tracks[].dolby_vision.l6.zeroed",
             "video_tracks[].dolby_vision.l9_mastering",
-            "video_tracks[].dolby_vision.l11_content",
-            "video_tracks[].dolby_vision.l11_white_point",
-            "video_tracks[].dolby_vision.l11_reference_mode",
+            "video_tracks[].dolby_vision.l11.content",
+            "video_tracks[].dolby_vision.l11.white_point",
+            "video_tracks[].dolby_vision.l11.reference_mode",
             "video_tracks[].dolby_vision.trim_targets[].nits",
             "video_tracks[].dolby_vision.trim_targets[].levels[]",
             "video_tracks[].dolby_vision.rpu_count",
-            "video_tracks[].dolby_vision.sampled",
+            "video_tracks[].dolby_vision.coverage",
             "video_tracks[].dolby_vision.metadata_cadence.cadence",
             "video_tracks[].dolby_vision.metadata_cadence.frame_pairs",
             "video_tracks[].dolby_vision.metadata_cadence.changed_pairs",
@@ -781,23 +1157,87 @@ mod tests {
             "video_tracks[].sl_hdr.payload_mode",
             "video_tracks[].sl_hdr.target_primaries",
             "video_tracks[].sl_hdr.target_max_luminance",
-            "video_tracks[].sl_hdr.source_mastering.max_luminance",
-            "video_tracks[].sl_hdr.source_mastering.min_luminance",
-            "video_tracks[].sl_hdr.source_mastering.primaries",
+            "video_tracks[].sl_hdr.source_mastering_display.max_luminance",
+            "video_tracks[].sl_hdr.source_mastering_display.min_luminance",
+            "video_tracks[].sl_hdr.source_mastering_display.primaries",
             "video_tracks[].hdr_vivid.version",
             "video_tracks[].hdr_vivid.system_start_code",
             "video_tracks[].hdr_vivid.target_max_luminances[]",
-            "video_tracks[].hdr_vivid.sampled",
+            "video_tracks[].hdr_vivid.coverage",
         ];
         expected.sort_unstable();
         assert_eq!(paths, expected, "JSON schema surface changed; see docs/SCHEMA.md");
     }
 
+    /// `UnnamedCode` is internal bookkeeping, not a reported provenance: it
+    /// marks a field `ColorInfo` has no value for, and a field with no value has
+    /// nothing to attribute. It must never reach the output, or it would break
+    /// the documented guarantee that `color` and `color_source` carry the same
+    /// key set.
+    #[test]
+    fn the_unnamed_code_marker_never_serializes() {
+        let sources = ColorSources {
+            primaries: Some(ColorSource::Container),
+            transfer: Some(ColorSource::UnnamedCode),
+            matrix: Some(ColorSource::UnnamedCode),
+            range: Some(ColorSource::Stream),
+        };
+        let v = serde_json::to_value(sources).expect("serializes");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 2, "only the two reportable fields survive: {v}");
+        assert_eq!(obj["primaries"], "container");
+        assert_eq!(obj["range"], "stream");
+        assert!(!v.to_string().contains("unnamed"), "the marker leaked: {v}");
+    }
+
+    /// The error object's three keys are its whole shape, and `error` is the
+    /// discriminator consumers are told to test — a `Report` never carries it.
+    #[test]
+    fn error_report_shape_is_pinned() {
+        let e = ErrorReport {
+            hdrprobe_schema_version: SCHEMA_VERSION,
+            file: "bad.mkv".to_string(),
+            error: "demux failed".to_string(),
+        };
+        let v = serde_json::to_value(&e).expect("serializes");
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["hdrprobe_schema_version", "file", "error"]);
+        // And a Report never carries the discriminator.
+        let r = serde_json::to_value(maximal_report()).unwrap();
+        assert!(r.get("error").is_none());
+    }
+
+    /// Reduction is exact and zero is refused: a zero numerator or
+    /// denominator is signalling noise, not a ratio.
+    #[test]
+    fn rational_reduces_and_refuses_zero() {
+        assert_eq!(Rational::reduced(24000, 1001), Some(Rational { num: 24000, den: 1001 }));
+        assert_eq!(Rational::reduced(3840, 2160), Some(Rational { num: 16, den: 9 }));
+        assert_eq!(Rational::reduced(10, 10), Some(Rational { num: 1, den: 1 }));
+        assert_eq!(Rational::reduced(0, 9), None);
+        assert_eq!(Rational::reduced(16, 0), None);
+    }
+
+    /// The measured/declared split is baked into the constructors: a stated
+    /// per-stream rate is `declared`, computed quotients are `measured`, and
+    /// `declared()` re-tags the one shape outside that mapping (a declared
+    /// byte count over a duration). If a constructor's tag changes, every
+    /// backend's provenance changes with it — this pins the mapping.
+    #[test]
+    fn bitrate_source_is_baked_into_the_constructors() {
+        assert_eq!(Bitrate::video_stream_bps(1.0).source, BitrateSource::Declared);
+        let measured = Bitrate::video_stream(1000, Some(1.0)).expect("rate");
+        assert_eq!(measured.source, BitrateSource::Measured);
+        assert_eq!(Bitrate::overall(1000, Some(1.0)).expect("rate").source, BitrateSource::Measured);
+        assert_eq!(measured.declared().source, BitrateSource::Declared);
+        assert_eq!(measured.declared().scope, BitrateScope::VideoStream, "declared() keeps scope");
+    }
+
     #[test]
     fn schema_version_matches_the_documented_one() {
-        assert_eq!(SCHEMA_VERSION, "2.4");
+        assert_eq!(SCHEMA_VERSION, "3.0");
         let v = serde_json::to_value(maximal_report()).unwrap();
-        assert_eq!(v["hdrprobe_schema_version"], "2.4");
+        assert_eq!(v["hdrprobe_schema_version"], "3.0");
         // The HDR10+ profile char must serialize as a one-character string, as
         // documented, not as a number.
         assert_eq!(v["video_tracks"][0]["hdr10plus"]["profile"], "B");

@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::model::{BitrateScope, ColorInfo, DolbyVision, Report, VideoTrack};
+use crate::model::{BitrateScope, ColorInfo, Report, VideoTrack};
 
 pub struct RenderOpts {
     pub color: bool,
@@ -155,7 +155,7 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     // for a single bold value to read as anything but odd, so its report stays
     // headline-free.
     let multi = r.video_tracks.len() > 1;
-    let sidecar = !multi && r.video_tracks[0].codec.is_empty();
+    let sidecar = !multi && r.video_tracks[0].codec.is_none();
 
     s.push_str(&report_header(&r.file, r.size_bytes, r.input_truncated, o, &c));
     s.push('\n');
@@ -168,11 +168,16 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
         if o.show_general {
             let _ = writeln!(s, "{}", c.section("General"));
             kv(&mut s, &c, "Container", &r.container);
-            // Blu-ray ISO probes: which playlist/clip the report describes,
-            // with the playlist's own edit duration (the Duration line below
-            // stays the probed clip's transport-clock duration).
+            // Disc ISO probes: what the report describes, with its own
+            // declared duration — a Blu-ray playlist's edit duration (the
+            // Duration line below stays the probed clip's clock-derived
+            // value) or a DVD title set's IFO runtime (which, when parsed,
+            // is also the Duration line: the DVD duration authority).
             if let Some(iso) = &r.bd_iso {
                 kv(&mut s, &c, "Main feature", &bd_iso_line(iso));
+            }
+            if let Some(iso) = &r.dvd_iso {
+                kv(&mut s, &c, "Main feature", &dvd_iso_line(iso));
             }
             // Sidecar schema version (a DV XML's root `version` attribute); video
             // inputs never carry one, so the line only appears for sidecars.
@@ -203,6 +208,9 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
             if let Some(iso) = &r.bd_iso {
                 kv(&mut s, &c, "Main feature", &bd_iso_line(iso));
             }
+            if let Some(iso) = &r.dvd_iso {
+                kv(&mut s, &c, "Main feature", &dvd_iso_line(iso));
+            }
             if let Some(v) = &r.format_version {
                 kv(&mut s, &c, "Schema version", v);
             }
@@ -231,8 +239,6 @@ pub fn render(r: &Report, o: &RenderOpts) -> String {
     // Footnotes collected from marked labels render once at the report's
     // foot, so per-line caveats never clutter the values they qualify (two
     // sampled tracks share one mark — `Footnotes` dedupes identical texts).
-    // The elapsed time is JSON-only (`elapsed_ms`); the text report doesn't
-    // show it.
     for (mark, text) in notes.lines() {
         let _ = writeln!(s, "{}", c.faint(&format!("{mark} {text}")));
     }
@@ -295,7 +301,7 @@ fn track_sections(
         if let Some(hdr) = &t.hdr {
             let _ = writeln!(s, "{}", c.section("HDR"));
             kv_styled(s, c, "Format", &c.bright(&hdr.format));
-            if let Some(m) = &hdr.mastering {
+            if let Some(m) = &hdr.mastering_display {
                 // Gamut first, luminance after: "DCI-P3 D65 · max 1000  min 0.0001 cd/m²".
                 let prim = m.primaries.as_ref().map(|p| format!("{p} · ")).unwrap_or_default();
                 kv(
@@ -351,7 +357,11 @@ fn track_sections(
             // toward — a distinct set like the DV trim targets, with the same
             // sampled caveat (its own footnote text: frames, not RPUs).
             if !hv.target_max_luminances.is_empty() {
-                let mark = if hv.sampled { notes.mark(SAMPLED_FRAMES_NOTE) } else { "" };
+                let mark = if hv.coverage == crate::model::Coverage::Sampled {
+                    notes.mark(SAMPLED_FRAMES_NOTE)
+                } else {
+                    ""
+                };
                 let label =
                     if hv.target_max_luminances.len() == 1 { "Target" } else { "Targets" };
                 let vals = hv
@@ -399,9 +409,9 @@ fn track_sections(
             // bare metadata: an RPU is profile-agnostic (dovi_tool's blanket
             // "8" for extracted RPUs is remux convention, not a definition)
             // and a DV XML's GenerateProfile is an authoring target. So the
-            // line is skipped for sidecars; the JSON keeps `profile` and
-            // `profile_compat_assumed` (that flag fires only on these inputs,
-            // so its old "[compat assumed]" tag no longer renders anywhere).
+            // line is skipped for sidecars; the JSON keeps `profile` and its
+            // `compat_source`, so a consumer can still see both the label and
+            // the evidence (or lack of it) behind the minor digit.
             if !sidecar {
                 // A dual-layer-authored RPU riding an EL-less carriage: the
                 // usual product of a custom transcode that injected a UHD-BD
@@ -415,8 +425,16 @@ fn track_sections(
                 } else {
                     String::new()
                 };
-                let profile = c.bright(&dv_profile_display(dv, t));
-                kv_styled(s, c, "Profile", &format!("{profile}{unconverted}"));
+                // Likewise a profile/compatibility pairing Dolby has withdrawn
+                // (8.3, 8.5): an authoring observation about the digits on this
+                // very line, so it rides them too.
+                let deprecated = if dv.deprecated_combination {
+                    format!("  {}", c.warn("Deprecated combination"))
+                } else {
+                    String::new()
+                };
+                let profile = c.bright(&dv.profile.clone());
+                kv_styled(s, c, "Profile", &format!("{profile}{unconverted}{deprecated}"));
             }
 
             // The DV level only defines the codec bit-rate envelope; it says
@@ -494,7 +512,11 @@ fn track_sections(
                 // title-global and complete from any sample, but the set can
                 // still be missing preset-target trims, so the mark stays
                 // set-level.)
-                let mark = if dv.sampled { notes.mark(SAMPLED_NOTE) } else { "" };
+                let mark = if dv.coverage == crate::model::Coverage::Sampled {
+                    notes.mark(SAMPLED_NOTE)
+                } else {
+                    ""
+                };
                 let list = dv
                     .trim_targets
                     .iter()
@@ -513,10 +535,13 @@ fn track_sections(
                 // caveat describes the whole set, so both L5 labels share the
                 // same footnote mark; a full scan carries no mark.
                 let mark = match dv.l5_assumed_canvas {
-                    Some([w, h]) => notes.mark(&format!(
-                        "assumes a {w}×{h} canvas; DV sidecars carry no resolution"
+                    Some(canvas) => notes.mark(&format!(
+                        "assumes a {}×{} canvas; DV sidecars carry no resolution",
+                        canvas.width, canvas.height
                     )),
-                    None if dv.sampled => notes.mark(SAMPLED_NOTE),
+                    None if dv.coverage == crate::model::Coverage::Sampled => {
+                        notes.mark(SAMPLED_NOTE)
+                    }
                     None => "",
                 };
                 let offsets = dv
@@ -545,19 +570,17 @@ fn track_sections(
                 }
             }
             // L6's CLL fields exist to feed HDR10 signaling (CTA-861.3), which
-            // only an HDR10-compatible base consumes — compat id 1, or 6 (the
-            // UHD Blu-ray HDR10 base). On every other base (IPT-PQ-c2 compat 0,
-            // HLG compat 4, SDR compat 2) they're a zeroed placeholder or, if
-            // filled, inert for playback — corpus 8.4/10.4 titles carry the same
-            // zeroed L6 as P5. Keep the line out of the text report; the JSON
-            // still carries `l6` verbatim (the mastering half is real either
-            // way). Without a compat id the profile label's minor digit is the
-            // convention default, so gate on the major: P7/P8 default to an
-            // HDR10 base (7.6/8.1), while P4 (SDR) and a bare P5 (IPT) don't.
-            let hdr10_base = match dv.bl_compatibility_id {
-                Some(id) => id == 1 || id == 6,
-                None => dv.profile.starts_with('7') || dv.profile.starts_with('8'),
-            };
+            // only an HDR10-compatible base consumes. On every other base
+            // they're a zeroed placeholder or, if filled, inert for playback —
+            // corpus 8.4/10.4 titles carry the same zeroed L6 as P5. Keep the
+            // line out of the text report; the JSON still carries `l6` verbatim
+            // (the mastering half is real either way). One shared gate with the
+            // HDR section's mastering/CLL fallbacks, which suppress on exactly
+            // the same verdict.
+            let hdr10_base = crate::dv::ccid::hdr10_base(
+                dv.bl_compatibility_id,
+                crate::dv::levels::profile_major(&dv.profile),
+            );
             if let Some(l6) = dv.l6.as_ref().filter(|_| hdr10_base) {
                 let flag = if l6.zeroed { format!("  {}", c.warn("zeroed")) } else { String::new() };
                 let light = c.value(&format!("MaxCLL {} · MaxFALL {}", l6.max_cll, l6.max_fall));
@@ -573,16 +596,14 @@ fn track_sections(
                     kv(s, c, "L9 mastering", l9);
                 }
             }
-            if let Some(l11) = &dv.l11_content {
-                let wp = match &dv.l11_white_point {
-                    Some(wp) => format!(" · white point {wp}"),
-                    None => String::new(),
-                };
-                let rm = match dv.l11_reference_mode {
-                    Some(true) => " · reference mode",
-                    _ => "",
-                };
-                kv(s, c, "L11 APO", &format!("{}{}{}", l11, wp, rm));
+            if let Some(l11) = &dv.l11 {
+                let rm = if l11.reference_mode { " · reference mode" } else { "" };
+                kv(
+                    s,
+                    c,
+                    "L11 APO",
+                    &format!("{} · white point {}{}", l11.content, l11.white_point, rm),
+                );
             }
             if let Some(census) = &dv.census {
                 let levels = census
@@ -729,7 +750,7 @@ pub fn render_quiet(r: &Report) -> String {
         .map(|(i, t)| {
             let mut parts = Vec::new();
             if let Some(dv) = &t.dolby_vision {
-                parts.push(format!("DV {}", dv_profile_display(dv, t)));
+                parts.push(format!("DV {}", dv.profile.clone()));
             }
             if let Some(hdr) = &t.hdr {
                 parts.push(hdr.format.clone());
@@ -934,15 +955,26 @@ fn wrap_line(line: &str, width: usize, value_col: usize, words: bool) -> Vec<Str
 
 fn video_line(g: &VideoTrack) -> String {
     let mut parts = Vec::new();
-    let codec = match &g.codec_profile {
-        Some(p) => format!("{} ({})", g.codec, p),
-        None => g.codec.clone(),
+    let codec = match (&g.codec, &g.codec_profile) {
+        (Some(codec), Some(p)) => format!("{codec} ({p})"),
+        (Some(codec), None) => codec.clone(),
+        (None, _) => String::new(),
     };
     if !codec.is_empty() {
         parts.push(codec);
     }
     if let (Some(w), Some(h)) = (g.width, g.height) {
         parts.push(format!("{}×{}", w, h));
+    }
+    // Presentation policy like the Color line's matrix rule: the display
+    // ratio is stated only when the pixels are not square, i.e. when the
+    // coded size alone would mislead (a DVD's 720×480 presenting as 16:9).
+    // Square-pixel content keeps its historical line byte for byte; the JSON
+    // always carries both ratios when signalled.
+    if let (Some(par), Some(dar)) = (g.pixel_aspect_ratio, g.display_aspect_ratio) {
+        if (par - 1.0).abs() > 0.01 {
+            parts.push(format!("DAR {}", dar_label(dar)));
+        }
     }
     if let Some(f) = g.fps {
         parts.push(format!("{:.3} fps", f));
@@ -961,149 +993,119 @@ fn video_line(g: &VideoTrack) -> String {
     if !depth.is_empty() {
         parts.push(depth);
     }
+    // The notable state only: progressive is the norm and stays silent, the
+    // same absence-reads-as-ordinary convention the sampled footnote uses.
+    if g.scan_type.as_deref() == Some("interlaced") {
+        parts.push("interlaced".to_string());
+    }
     if let Some(s) = &g.stereo {
         parts.push(s.clone());
     }
     parts.join(" · ")
 }
 
-fn color_line(t: &VideoTrack) -> String {
-    // The profile-defined colour inferences inside apply only to video inputs: a
-    // metadata-only sidecar (no codec — the same signal that suppresses the Video
-    // line) has no base layer whose colour they could describe.
-    build_color_line(
-        &t.color,
-        t.dolby_vision.as_ref().map(|dv| dv.profile.as_str()),
-        !t.codec.is_empty(),
-    )
+/// Render a display aspect ratio with its conventional name when it has one
+/// (`16:9`, `4:3`, …), else as `x.xx:1`. The tolerance absorbs the rounding
+/// of code-point and rational signalling; it is presentation only — the JSON
+/// carries the exact float.
+fn dar_label(dar: f64) -> String {
+    const NAMED: [(f64, &str); 7] = [
+        (4.0 / 3.0, "4:3"),
+        (16.0 / 9.0, "16:9"),
+        (3.0 / 2.0, "3:2"),
+        (5.0 / 4.0, "5:4"),
+        (1.0, "1:1"),
+        (2.21, "2.21:1"),
+        (2.35, "2.35:1"),
+    ];
+    for (v, name) in NAMED {
+        if (dar - v).abs() < 0.01 {
+            return name.to_string();
+        }
+    }
+    format!("{dar:.2}:1")
 }
 
-fn build_color_line(cc: &ColorInfo, dv_profile: Option<&str>, has_video: bool) -> String {
+fn color_line(t: &VideoTrack) -> String {
+    build_color_line(&t.color)
+}
+
+/// The Color line: the model's colour description, rendered. Every value here
+/// is one the model resolved — signalled by the container or the coded stream,
+/// overridden by an SEI, or defined by the Dolby Vision profile and
+/// compatibility id (`dv::levels::fill_derived_color`). The renderer states no
+/// opinion of its own about what the colour *is*; the only judgments left are
+/// presentational.
+fn build_color_line(cc: &ColorInfo) -> String {
     let mut parts = Vec::new();
 
-    // Dolby Vision Profile 5 is spec-locked to Dolby's IPT-PQ-c2 colour space over
-    // BT.2020 primaries / PQ / full range — that's definitional, not signalled. The
-    // colour space can't be expressed in CICP, so the SPS carries "unspecified"
-    // (2/2/2) and only the range survives, leaving a bare "full". Any CICP a P5
-    // stream did happen to carry would be noise, so state the fixed profile colour.
-    // Match by prefix: the label carries the compat minor when a dvcC supplied one
-    // ("5.0"), but a raw elementary stream has no dvcC and labels bare ("5").
-    let is_p5 = has_video && dv_profile.is_some_and(|p| p.starts_with('5'));
-    // Profile 4's base layer is defined as Rec.709 SDR (VUI 0,1,1,1,0). Older P4
-    // muxes omit the colour description entirely (colour_description_present_flag=0),
-    // so the SPS yields no primaries/transfer at all — like the P5 case, state the
-    // profile-defined base colour rather than leave it blank. A P4 stream that *does*
-    // signal a colour description keeps its own values (this only fills the gap).
-    let is_p4 = has_video && dv_profile.is_some_and(|p| p.starts_with('4'));
-    let p4_colour_absent = is_p4 && cc.primaries.is_none() && cc.transfer.is_none();
-    if is_p5 {
-        // P5 is the case that must *not* collapse: its encoding (PQ) genuinely
-        // differs from its colour space (IPT-PQ-c2 over BT.2020), so all three show.
-        parts.push("IPT-PQ-c2".to_string());
-        parts.push("BT.2020".to_string());
-        parts.push("PQ (SMPTE ST 2084)".to_string());
-    } else {
-        // Dolby's IPT-PQ-c2 (CICP matrix 15) is the one matrix coefficient worth
-        // naming: it identifies the colour space of Profile 20 (MV-HEVC) DV, which —
-        // unlike P5 — signals valid primaries/transfer/range in its colr box.
-        if cc.matrix.as_deref() == Some("IPT-PQ-c2") {
-            parts.push("IPT-PQ-c2".to_string());
+    // Presentation policy, not inference: of the matrix coefficients, only
+    // Dolby's IPT-PQ-C2 (CICP 15) is worth naming on this line. It is the one
+    // that identifies a colour space the primaries and transfer alone do not
+    // describe — Profile 5 and Profile 20 both ride it — where every other
+    // matrix restates what the primaries already said.
+    //
+    // Two other cases are worth naming, and both are places where that
+    // rationale simply does not hold.
+    //
+    // **A matrix with nothing beside it.** The rationale assumes primaries to
+    // restate; when they and the transfer are both absent, suppressing the
+    // matrix empties the line entirely and the report reads as "nothing was
+    // signalled" over a stream that signalled something. MPEG-2 makes this
+    // ordinary rather than exotic: ffmpeg's encoder writes a
+    // `sequence_display_extension` whose primaries and transfer are the
+    // explicit "unspecified" code 2 and whose matrix is real.
+    //
+    // **A matrix that names a different system than the primaries.** VC-1's
+    // spec defaults are BT.709 primaries and transfer over a **BT.601** matrix,
+    // and a stream that clears `COLOR_FORMAT_FLAG` — every VC-1 file in the
+    // corpus — is defined to be exactly that. Collapsing it to "BT.709" states
+    // the opposite of the matrix half. The comparison is by name because the
+    // labels *are* the value space here, and a matrix whose name extends the
+    // primaries' (BT.2020 against BT.2020 NCL and CL) is the restatement the
+    // rule is about, not a difference.
+    let matrix_alone = cc.primaries.is_none() && cc.transfer.is_none();
+    let matrix_differs = match (cc.primaries.as_deref(), cc.matrix.as_deref()) {
+        (Some(p), Some(m)) => !m.starts_with(p),
+        _ => false,
+    };
+    let ipt = cc.matrix.as_deref() == Some(crate::container::IPT_PQ_C2);
+    if ipt {
+        if let Some(m) = &cc.matrix {
+            parts.push(m.clone());
         }
-        // Colour space (primaries) and encoding (transfer). For Profile 4 with no
-        // signalled colour description, both are the profile-defined Rec.709.
-        let primaries = if p4_colour_absent { Some("BT.709") } else { cc.primaries.as_deref() };
-        let transfer = if p4_colour_absent { Some("BT.709") } else { cc.transfer.as_deref() };
-        // When the colour space and encoding carry the same name (Rec.709 SDR: a
-        // BT.709 gamut with a BT.709 transfer), collapse the pair to one label
-        // instead of printing "BT.709 · BT.709". Distinct pairs (e.g. BT.2020 + PQ)
-        // both show.
-        match (primaries, transfer) {
-            (Some(p), Some(t)) if p == t => parts.push(p.to_string()),
-            _ => {
-                if let Some(p) = primaries {
-                    parts.push(p.to_string());
-                }
-                if let Some(t) = transfer {
-                    parts.push(t.to_string());
-                }
+    }
+    // Colour space (primaries) and encoding (transfer). When the two carry the
+    // same name (Rec.709 SDR: a BT.709 gamut with a BT.709 transfer), collapse
+    // the pair to one label instead of printing "BT.709 · BT.709". Distinct
+    // pairs (BT.2020 + PQ, and P5's IPT-PQ-C2 + BT.2020 + PQ) all show.
+    match (cc.primaries.as_deref(), cc.transfer.as_deref()) {
+        (Some(p), Some(t)) if p == t => parts.push(p.to_string()),
+        (p, t) => {
+            if let Some(p) = p {
+                parts.push(p.to_string());
             }
+            if let Some(t) = t {
+                parts.push(t.to_string());
+            }
+        }
+    }
+    // A shown matrix that is not IPT-PQ-C2 goes *after* the pair and says what
+    // it is. Both halves of that matter. Leading with it puts it in the slot a
+    // reader parses as primaries, and "BT.601 (NTSC)" is a real primaries label
+    // in the same table — so `BT.601 (NTSC) · BT.709` for a VC-1 stream reads as
+    // the exact inverse of its BT.709 primaries over a BT.601 matrix. IPT-PQ-C2
+    // is exempt because it names a colour space no primaries label spells, so it
+    // cannot be misread and it leads by long-standing convention.
+    if !ipt && (matrix_alone || matrix_differs) {
+        if let Some(m) = &cc.matrix {
+            parts.push(format!("{m} matrix"));
         }
     }
     if let Some(m) = &cc.range {
         parts.push(m.clone());
-    } else if p4_colour_absent {
-        parts.push("limited".to_string());
     }
     parts.join(" · ")
-}
-
-/// The Dolby Vision Profile value as displayed (the text report's Profile line
-/// and the `--quiet` summary): the model's label, except that a bare number —
-/// a raw elementary stream, where no dvcC/dvvC *exists* to declare the
-/// compatibility minor — is completed when the digit is certain: "5" from the
-/// profile's definition (compat 0 is the only value P5 admits), "10" from the
-/// base layer's signalled CICP when that signal picks the digit airtight
-/// (`infer_p10_compat`). Video inputs only: a metadata sidecar has no base
-/// layer to read. Display-only opinion by design: the JSON `profile` /
-/// `bl_compatibility_id` / `compatibility` keep exactly what the mux declares
-/// (the bare number / null), so machine consumers get the raw facts and draw
-/// their own inferences.
-fn dv_profile_display(dv: &DolbyVision, track: &VideoTrack) -> String {
-    // A bare label implies no compat id was declared anywhere — a declared or
-    // XML-supplied id would already have rendered the minor digit.
-    if !track.codec.is_empty() {
-        // Profile 5 admits *only* compat 0 (IPT-PQ-c2, no cross-compatible
-        // base — Dolby's P&L spec), so a bare "5" (a raw ES with no dvcC)
-        // completes definitionally, no base-layer signal needed — the same
-        // definition `build_color_line` already states for its Color line.
-        if dv.profile == "5" {
-            return "5.0".to_string();
-        }
-        if dv.profile == "10" {
-            if let Some(id) = infer_p10_compat(&track.color) {
-                return format!("10.{id}");
-            }
-        }
-    }
-    dv.profile.clone()
-}
-
-/// The compatibility minor for a bare Profile 10, deduced by elimination from
-/// the base layer's signalled CICP. Profile 10 admits compat ids {0, 1, 2, 4}
-/// (IPT / HDR10 / SDR / HLG bases), so an explicit base-layer colour signal
-/// leaves exactly one candidate — but only an *explicit* one:
-///
-/// - The IPT-PQ-c2 matrix (CICP 15) is Dolby's own colour system → 0.
-/// - An explicit SDR gamma transfer → 2. No matrix tag needed to exclude IPT:
-///   IPT-PQ-c2 is PQ-encoded by definition.
-/// - PQ → 1 and HLG → 4 additionally require BT.2020 primaries *and* an
-///   explicit non-IPT matrix: an IPT base is itself PQ-encoded and its
-///   signalling convention (inherited from Profile 5) leaves CICP
-///   unspecified, so PQ over an absent matrix is not airtight evidence of an
-///   HDR10 base — it could be a 10.0 stream tagging only its EOTF.
-///
-/// Anything less explicit returns `None` and the label stays bare. Matching
-/// on the closed label strings from `container::cicp_*` keeps this in one
-/// value space with the rest of the renderer.
-fn infer_p10_compat(cc: &ColorInfo) -> Option<u8> {
-    let matrix = cc.matrix.as_deref();
-    if matrix == Some("IPT-PQ-c2") {
-        return Some(0);
-    }
-    let transfer = cc.transfer.as_deref()?;
-    // The SDR gamma transfers `container::cicp_transfer` can name (BT.2020
-    // 10/12-bit are the wide-gamut SDR curves, same OETF family as BT.709).
-    if matches!(transfer, "BT.709" | "BT.601" | "BT.2020 (10-bit)" | "BT.2020 (12-bit)") {
-        return Some(2);
-    }
-    if cc.primaries.as_deref() != Some("BT.2020") || matrix.is_none() {
-        return None;
-    }
-    match transfer {
-        "PQ (SMPTE ST 2084)" => Some(1),
-        "HLG (ARIB STD-B67)" => Some(4),
-        _ => None,
-    }
 }
 
 fn fmt_num(v: f64) -> String {
@@ -1157,6 +1159,17 @@ fn bd_iso_line(iso: &crate::model::BdIso) -> String {
         iso.clip_count,
         iso.clip
     )
+}
+
+/// The Main feature line of a DVD-Video ISO report:
+/// `VTS 04 (1:49:08) · 6 VOBs` — the parenthesized runtime is the IFO's
+/// declared longest program chain and is omitted when no IFO parsed.
+fn dvd_iso_line(iso: &crate::model::DvdIso) -> String {
+    let vobs = format!("{} VOB{}", iso.vob_count, if iso.vob_count == 1 { "" } else { "s" });
+    match iso.title_duration_secs {
+        Some(d) => format!("VTS {:02} ({}) · {}", iso.vts, human_duration(d), vobs),
+        None => format!("VTS {:02} · {}", iso.vts, vobs),
+    }
 }
 
 fn human_duration(secs: f64) -> String {
@@ -1429,90 +1442,121 @@ mod tests {
         assert_eq!(parts.join(" "), cmd);
     }
 
-    /// P5's colour is definitional (never signalled), so the line must state it
-    /// whether the profile labels with a compat minor ("5.0", from a container
-    /// dvcC) or bare ("5", a raw elementary stream with no dvcC).
+    /// The Profile 5 shape, now assembled entirely from the model: the fill
+    /// supplies primaries/transfer/matrix, the stream supplies the range, and
+    /// the line must show all four because P5's encoding (PQ) genuinely differs
+    /// from its colour space (IPT-PQ-C2 over BT.2020).
     #[test]
-    fn p5_states_definitional_colour_for_both_label_shapes() {
-        for label in ["5.0", "5"] {
-            assert_eq!(
-                build_color_line(&range_only(), Some(label), true),
-                "IPT-PQ-c2 · BT.2020 · PQ (SMPTE ST 2084) · full",
-                "profile label {label}"
-            );
-        }
-    }
-
-    /// A metadata-only sidecar has no base layer, so the profile-defined colour
-    /// inferences (P5 IPT-PQ-c2, P4 Rec.709 SDR) must never fire for one.
-    #[test]
-    fn sidecar_gets_no_profile_defined_colour() {
-        assert_eq!(build_color_line(&ColorInfo::default(), Some("5"), false), "");
-        assert_eq!(build_color_line(&ColorInfo::default(), Some("4.2"), false), "");
-    }
-
-    /// Profile 20 signals real CICP in its colr box; the matrix name is prepended
-    /// to the signalled values rather than substituted for them.
-    #[test]
-    fn p20_keeps_signalled_cicp() {
+    fn the_ipt_matrix_prints_alongside_primaries_and_transfer() {
         let cc = ColorInfo {
             primaries: Some("BT.2020".to_string()),
             transfer: Some("PQ (SMPTE ST 2084)".to_string()),
-            matrix: Some("IPT-PQ-c2".to_string()),
+            matrix: Some("IPT-PQ-C2".to_string()),
             range: Some("full".to_string()),
         };
-        assert_eq!(
-            build_color_line(&cc, Some("20.0"), true),
-            "IPT-PQ-c2 · BT.2020 · PQ (SMPTE ST 2084) · full"
-        );
+        assert_eq!(build_color_line(&cc), "IPT-PQ-C2 · BT.2020 · PQ (SMPTE ST 2084) · full");
     }
 
-    /// A P4 mux with no signalled colour description states the profile-defined
-    /// Rec.709 SDR base, collapsed to one label plus the default limited range.
+    /// Every other matrix restates what the primaries already said, so only the
+    /// IPT one is named.
     #[test]
-    fn p4_fills_absent_colour_description() {
-        assert_eq!(
-            build_color_line(&ColorInfo::default(), Some("4.2 (FEL)"), true),
-            "BT.709 · limited"
-        );
+    fn an_ordinary_matrix_is_not_named() {
+        let cc = ColorInfo {
+            primaries: Some("BT.2020".to_string()),
+            transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+            matrix: Some("BT.2020 NCL".to_string()),
+            range: Some("limited".to_string()),
+        };
+        assert_eq!(build_color_line(&cc), "BT.2020 · PQ (SMPTE ST 2084) · limited");
     }
 
-    fn cc(primaries: Option<&str>, transfer: Option<&str>, matrix: Option<&str>) -> ColorInfo {
-        ColorInfo {
-            primaries: primaries.map(str::to_string),
-            transfer: transfer.map(str::to_string),
-            matrix: matrix.map(str::to_string),
+    /// Rec.709 SDR: a BT.709 gamut with a BT.709 transfer collapses to one
+    /// label rather than printing the same name twice. This is the shape a
+    /// Profile 4 or 9 base layer takes once the model has filled it.
+    #[test]
+    fn a_matching_gamut_and_transfer_collapse_to_one_label() {
+        let cc = ColorInfo {
+            primaries: Some("BT.709".to_string()),
+            transfer: Some("BT.709".to_string()),
+            matrix: Some("BT.709".to_string()),
             range: Some("limited".to_string()),
+        };
+        assert_eq!(build_color_line(&cc), "BT.709 · limited");
+    }
+
+    /// VC-1's spec defaults are BT.709 primaries and transfer over a BT.601
+    /// matrix, and every VC-1 file in the corpus clears `COLOR_FORMAT_FLAG`, so
+    /// that mixed combination is the codec's ordinary case. Collapsing it to
+    /// "BT.709" would state the opposite of the matrix half.
+    #[test]
+    fn a_matrix_naming_a_different_system_than_the_primaries_shows() {
+        let cc = ColorInfo {
+            primaries: Some("BT.709".to_string()),
+            transfer: Some("BT.709".to_string()),
+            matrix: Some("BT.601 (NTSC)".to_string()),
+            range: None,
+        };
+        assert_eq!(build_color_line(&cc), "BT.709 · BT.601 (NTSC) matrix");
+        // A matrix whose name *extends* the primaries' is the restatement the
+        // suppression rule is about, and stays suppressed: BT.2020's two matrix
+        // rows (NCL and CL) are the only such pair in the CICP tables.
+        for m in ["BT.2020 NCL", "BT.2020 CL"] {
+            let cc = ColorInfo {
+                primaries: Some("BT.2020".to_string()),
+                transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+                matrix: Some(m.to_string()),
+                range: Some("limited".to_string()),
+            };
+            assert_eq!(build_color_line(&cc), "BT.2020 · PQ (SMPTE ST 2084) · limited");
         }
     }
 
-    /// A fully explicit CICP picks the Profile 10 compat digit by elimination:
-    /// PQ over a real BT.2020 matrix can only be an HDR10 base (1), HLG an HLG
-    /// base (4), an SDR gamma transfer an SDR base (2), and the IPT-PQ-c2
-    /// matrix Dolby's own colour system (0).
+    /// A track the model resolved nothing for — a metadata-only sidecar — has
+    /// an empty line, not an invented one.
     #[test]
-    fn p10_compat_from_explicit_cicp() {
-        let pq = cc(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("BT.2020 NCL"));
-        assert_eq!(infer_p10_compat(&pq), Some(1));
-        let hlg = cc(Some("BT.2020"), Some("HLG (ARIB STD-B67)"), Some("BT.2020 NCL"));
-        assert_eq!(infer_p10_compat(&hlg), Some(4));
-        let sdr = cc(Some("BT.709"), Some("BT.709"), None);
-        assert_eq!(infer_p10_compat(&sdr), Some(2));
-        let ipt = cc(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), Some("IPT-PQ-c2"));
-        assert_eq!(infer_p10_compat(&ipt), Some(0));
+    fn an_empty_colour_description_renders_nothing() {
+        assert_eq!(build_color_line(&ColorInfo::default()), "");
+        assert_eq!(build_color_line(&range_only()), "full");
     }
 
-    /// PQ without an explicit matrix is *not* airtight — an IPT (10.0) base is
-    /// itself PQ-encoded and conventionally leaves CICP unspecified — and an
-    /// empty colour block (a mux signalling nothing, or a sidecar) infers
-    /// nothing at all.
+    /// A matrix is normally suppressed because it restates what the primaries
+    /// already said. With no primaries and no transfer beside it there is
+    /// nothing to restate, and suppressing it empties the line entirely, so the
+    /// report would read as "nothing was signalled" over a stream that
+    /// signalled something. MPEG-2 makes this ordinary: ffmpeg's encoder writes
+    /// a display extension whose primaries and transfer are the explicit
+    /// "unspecified" code 2 and whose matrix is real.
     #[test]
-    fn p10_compat_declines_ambiguous_cicp() {
-        let pq_no_matrix = cc(Some("BT.2020"), Some("PQ (SMPTE ST 2084)"), None);
-        assert_eq!(infer_p10_compat(&pq_no_matrix), None);
-        let pq_no_primaries = cc(None, Some("PQ (SMPTE ST 2084)"), Some("BT.2020 NCL"));
-        assert_eq!(infer_p10_compat(&pq_no_primaries), None);
-        assert_eq!(infer_p10_compat(&ColorInfo::default()), None);
+    fn a_matrix_with_nothing_beside_it_is_the_whole_line() {
+        let matrix_only = |m: &str| ColorInfo {
+            matrix: Some(m.to_string()),
+            ..ColorInfo::default()
+        };
+        // Labelled, because a bare "BT.709" in the line's first slot is what a
+        // reader parses as primaries.
+        assert_eq!(build_color_line(&matrix_only("BT.709")), "BT.709 matrix");
+        assert_eq!(build_color_line(&matrix_only("BT.601 (PAL)")), "BT.601 (PAL) matrix");
+        // With a range beside it, both show.
+        let cc = ColorInfo {
+            matrix: Some("BT.709".to_string()),
+            range: Some("limited".to_string()),
+            ..ColorInfo::default()
+        };
+        assert_eq!(build_color_line(&cc), "BT.709 matrix · limited");
+        // But as soon as either primaries or transfer is present, the matrix
+        // goes back to being suppressed as a restatement.
+        let cc = ColorInfo {
+            primaries: Some("BT.2020".to_string()),
+            matrix: Some("BT.2020 NCL".to_string()),
+            ..ColorInfo::default()
+        };
+        assert_eq!(build_color_line(&cc), "BT.2020");
+        let cc = ColorInfo {
+            transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+            matrix: Some("BT.2020 NCL".to_string()),
+            ..ColorInfo::default()
+        };
+        assert_eq!(build_color_line(&cc), "PQ (SMPTE ST 2084)");
     }
 
     fn opts(color: bool, file_index: usize, file_count: usize) -> RenderOpts {
@@ -1638,29 +1682,38 @@ mod tests {
             input_truncated: false,
             container: "MP4 (ISOBMFF)".to_string(),
             bd_iso: None,
+            dvd_iso: None,
             format_version: None,
             duration_secs: None,
             video_tracks: vec![VideoTrack {
                 track_number: None,
                 program: None,
                 default: None,
-                codec: "HEVC".to_string(),
+                codec: Some("HEVC".to_string()),
+                codec_id: None,
                 codec_profile: Some("Multiview Main 10, High tier @ L5".to_string()),
                 width: Some(3840),
                 height: Some(2160),
                 fps: Some(24.0),
+                fps_rational: None,
+                duration_secs: None,
                 bitrate: None,
                 bit_depth: Some(10),
                 chroma: Some("4:2:0".to_string()),
+                pixel_aspect_ratio: None,
+                pixel_aspect_ratio_rational: None,
+                display_aspect_ratio: None,
+                display_aspect_ratio_rational: None,
+                scan_type: None,
                 stereo: Some("Stereoscopic 3D (2 views)".to_string()),
                 color: ColorInfo::default(),
+                color_source: Default::default(),
                 hdr: None,
                 dolby_vision: None,
                 hdr10plus: None,
                 sl_hdr: None,
                 hdr_vivid: None,
             }],
-            elapsed_ms: 0.0,
         };
         let plain = render(&r, &opts(false, 1, 1));
         let video = plain.lines().find(|l| l.trim_start().starts_with("Video")).unwrap();
@@ -1680,19 +1733,29 @@ mod tests {
             track_number: None,
             program: None,
             default,
-            codec: codec.to_string(),
+            codec: Some(codec.to_string()),
+            codec_id: None,
             codec_profile: None,
             width: Some(w),
             height: Some(w * 9 / 16),
             fps: None,
+            fps_rational: None,
+            duration_secs: None,
             bitrate: None,
             bit_depth: None,
             chroma: None,
+            pixel_aspect_ratio: None,
+            pixel_aspect_ratio_rational: None,
+            display_aspect_ratio: None,
+            display_aspect_ratio_rational: None,
+            scan_type: None,
             stereo: None,
             color: ColorInfo::default(),
+            color_source: Default::default(),
             hdr: Some(crate::model::Hdr {
                 format: "SDR".to_string(),
-                mastering: None,
+                base: Some("SDR".to_string()),
+                mastering_display: None,
                 content_light: None,
             }),
             dolby_vision: None,
@@ -1710,11 +1773,60 @@ mod tests {
             input_truncated: false,
             container: "Matroska".to_string(),
             bd_iso: None,
+            dvd_iso: None,
             format_version: None,
             duration_secs: Some(60.0),
             video_tracks: tracks,
-            elapsed_ms: 0.0,
         }
+    }
+
+    /// A withdrawn profile/compatibility pairing chips the Profile line it
+    /// describes. No corpus file is 8.3 or 8.5, so this is the only place the
+    /// chip is exercised.
+    #[test]
+    fn a_deprecated_combination_chips_the_profile_line() {
+        let dv = |deprecated| crate::model::DolbyVision {
+            profile: "8.5".to_string(),
+            compat_source: Some(crate::model::CompatSource::Declared),
+            pq_reshaping: false,
+            deprecated_combination: deprecated,
+            structure: None,
+            level: None,
+            level_source: None,
+            bl_present: true,
+            el_present: false,
+            rpu_present: true,
+            el_type: None,
+            unconverted_dual_layer_rpu: false,
+            reconstructed_bit_depth: None,
+            bl_compatibility_id: Some(5),
+            compatibility: None,
+            cm_version: None,
+            l5_active_areas: Vec::new(),
+            l5_assumed_canvas: None,
+            mastering_display: None,
+            fel_brightness_expansion: None,
+            mastering_primaries_mismatch: None,
+            l6: None,
+            l9_mastering: None,
+            l11: None,
+            trim_targets: Vec::new(),
+            rpu_count: 1,
+            coverage: crate::model::Coverage::Sampled,
+            metadata_cadence: None,
+            census: None,
+        };
+        let mut track = test_track("HEVC", 3840, None);
+        track.dolby_vision = Some(dv(true));
+        let out = render(&test_report(vec![track]), &opts(false, 1, 1));
+        assert!(out.contains("Profile"), "profile line present");
+        assert!(out.contains("8.5  (Deprecated combination)"), "chip missing:
+{out}");
+
+        let mut track = test_track("HEVC", 3840, None);
+        track.dolby_vision = Some(dv(false));
+        let out = render(&test_report(vec![track]), &opts(false, 1, 1));
+        assert!(!out.contains("Deprecated combination"), "chip fired without the flag");
     }
 
     /// Multi-track reports render one rule-titled group per track with the

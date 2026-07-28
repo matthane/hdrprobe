@@ -1,12 +1,20 @@
-//! Blu-ray ISO (BDMV) main-feature location: walk the UDF filesystem to
-//! `BDMV/PLAYLIST` and `BDMV/STREAM`, rank the playlists by deduped duration,
-//! and resolve the selected feature's largest clip to one contiguous byte
-//! range of the image. `main.rs` then hands that subslice to the ordinary
-//! TS/M2TS pipeline; every slice-relative mechanism (head/tail windows,
-//! streaming positions, bitrate denominators, progress) is correct by
-//! construction, and no HDR/DV fact is read here. Decrypted images only: an
-//! AACS-encrypted clip fails the TS sync-lock gate and errors honestly.
+//! Video disc image (ISO) main-feature location, for both disc formats that
+//! use one: Blu-ray (BDMV) and DVD-Video (VIDEO_TS). One UDF walk reads the
+//! root and dispatches on which directory is present — a Blu-ray ranks its
+//! playlists by deduped duration and resolves the winner's largest clip
+//! ([`locate_bd`]); a DVD picks the byte-largest title set and reads its
+//! IFO's declared runtime ([`dvd`]). Either way the feature resolves to one
+//! contiguous byte range of the image, and `main.rs` hands that *subslice*
+//! to the ordinary pipeline (TS/M2TS for Blu-ray, MPEG program stream for
+//! DVD); every slice-relative mechanism (head/tail windows, streaming
+//! positions, bitrate denominators, progress) is correct by construction,
+//! and no HDR/DV fact is read here. Decrypted images only: an
+//! AACS-encrypted clip fails the TS sync-lock gate here, and a
+//! CSS-scrambled VOB set fails the program-stream backend's own
+//! scrambling gate — each errors honestly. (The module keeps its `bdiso`
+//! name from when it was Blu-ray-only; the disc-image machinery is shared.)
 
+mod dvd;
 mod mpls;
 mod udf;
 
@@ -15,10 +23,55 @@ use std::fs::File;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+pub use dvd::DvdFeature;
 pub use udf::is_udf_iso;
 
 use crate::container::ts;
 use crate::prefetch;
+
+/// The located main feature of a video disc image.
+#[derive(Debug)]
+pub enum DiscFeature {
+    Bd(MainFeature),
+    Dvd(DvdFeature),
+}
+
+impl DiscFeature {
+    /// The feature's absolute byte range inside the image.
+    pub fn clip_range(&self) -> (u64, u64) {
+        match self {
+            DiscFeature::Bd(f) => (f.clip_start, f.clip_len),
+            DiscFeature::Dvd(f) => (f.clip_start, f.clip_len),
+        }
+    }
+}
+
+/// Open the UDF volume, read the root once, and dispatch on the directory
+/// that names the disc format.
+pub fn locate_feature(data: &[u8], warm: Option<&File>) -> Result<DiscFeature> {
+    let vol = udf::UdfVolume::open(data).context("reading UDF volume structure")?;
+    // Every file entry and directory the walk faults lives in the metadata
+    // partition (UDF 2.50); stream it in one pipelined read on remote
+    // volumes. DVDs are UDF 1.02 (no metadata partition) and warm nothing
+    // here — their file entries ride the head sectors the ISO head warm
+    // already covered.
+    if let Some(file) = warm {
+        prefetch::warm_ranges(file, vol.metadata_extents());
+    }
+    let root = vol.root()?;
+    let entries = vol.read_dir(&root)?;
+    let find = |list: &[udf::Entry], name: &str| -> Option<udf::Entry> {
+        list.iter().find(|e| e.name.eq_ignore_ascii_case(name)).cloned()
+    };
+    if let Some(bdmv) = find(&entries, "BDMV").filter(|e| e.is_dir) {
+        let has_aacs = find(&entries, "AACS").is_some();
+        return locate_bd(&vol, &bdmv, has_aacs, data, warm).map(DiscFeature::Bd);
+    }
+    if let Some(video_ts) = find(&entries, "VIDEO_TS").filter(|e| e.is_dir) {
+        return dvd::locate(&vol, &video_ts, data).map(DiscFeature::Dvd);
+    }
+    bail!("no BDMV or VIDEO_TS directory; not a video disc image");
+}
 
 /// Playlists are KiB-scale; cap the read so a corrupt File Entry can't gather
 /// megabytes per playlist.
@@ -46,27 +99,18 @@ pub struct MainFeature {
     pub clip_count: usize,
 }
 
-pub fn locate_main_feature(data: &[u8], warm: Option<&File>) -> Result<MainFeature> {
-    let vol = udf::UdfVolume::open(data).context("reading UDF volume structure")?;
-    // Every file entry and directory the walk faults lives in the metadata
-    // partition (UDF 2.50); stream it in one pipelined read on remote volumes.
-    if let Some(file) = warm {
-        prefetch::warm_ranges(file, vol.metadata_extents());
-    }
-
-    let root = vol.root()?;
-    let entries = vol.read_dir(&root)?;
+/// The BDMV half: rank playlists, resolve the winner's largest clip.
+fn locate_bd(
+    vol: &udf::UdfVolume,
+    bdmv: &udf::Entry,
+    has_aacs: bool,
+    data: &[u8],
+    warm: Option<&File>,
+) -> Result<MainFeature> {
     let find = |list: &[udf::Entry], name: &str| -> Option<udf::Entry> {
         list.iter().find(|e| e.name.eq_ignore_ascii_case(name)).cloned()
     };
-    let has_aacs = find(&entries, "AACS").is_some();
-    let Some(bdmv) = find(&entries, "BDMV").filter(|e| e.is_dir) else {
-        if find(&entries, "VIDEO_TS").is_some() {
-            bail!("DVD-Video ISO; only Blu-ray (BDMV) ISOs are supported");
-        }
-        bail!("no BDMV directory; not a Blu-ray ISO");
-    };
-    let bdmv_entries = vol.read_dir(&bdmv)?;
+    let bdmv_entries = vol.read_dir(bdmv)?;
     let playlist_dir = find(&bdmv_entries, "PLAYLIST")
         .filter(|e| e.is_dir)
         .ok_or_else(|| anyhow!("no BDMV/PLAYLIST directory"))?;
@@ -287,7 +331,10 @@ mod tests {
 
     fn locate(tree: &DirSpec, metadata: bool) -> Result<MainFeature> {
         let img = super::udf::testimg::build(tree, &Opts { metadata_partition: metadata });
-        locate_main_feature(&img, None)
+        match locate_feature(&img, None)? {
+            DiscFeature::Bd(f) => Ok(f),
+            DiscFeature::Dvd(_) => panic!("BD tree located as DVD"),
+        }
     }
 
     #[test]
@@ -295,7 +342,9 @@ mod tests {
         for metadata in [false, true] {
             let tree = feature_tree();
             let img = super::udf::testimg::build(&tree, &Opts { metadata_partition: metadata });
-            let f = locate_main_feature(&img, None).unwrap();
+            let DiscFeature::Bd(f) = locate_feature(&img, None).unwrap() else {
+                panic!("BD tree located as DVD")
+            };
             assert_eq!(f.playlist, "00800.mpls");
             assert_eq!(f.clip, "00010.m2ts");
             assert_eq!((f.clip_index, f.clip_count), (1, 2));
@@ -375,14 +424,15 @@ mod tests {
     }
 
     #[test]
-    fn dvd_and_non_bd_isos_error_honestly() {
+    fn empty_dvd_and_non_disc_isos_error_honestly() {
+        // An empty VIDEO_TS routes to the DVD arm and errors from there.
         let dvd = DirSpec::named("").dir(DirSpec::named("VIDEO_TS"));
         let err = locate(&dvd, false).unwrap_err().to_string();
-        assert!(err.contains("DVD-Video"), "{err}");
+        assert!(err.contains("no title VOBs"), "{err}");
 
         let other = DirSpec::named("").dir(DirSpec::named("DATA"));
         let err = locate(&other, false).unwrap_err().to_string();
-        assert!(err.contains("no BDMV"), "{err}");
+        assert!(err.contains("no BDMV or VIDEO_TS"), "{err}");
     }
 
     #[test]

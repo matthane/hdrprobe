@@ -5,6 +5,12 @@
 
 use crate::bits::{ebsp_to_rbsp, BitReader};
 
+/// The CICP code point meaning "unspecified", shared by primaries, transfer and
+/// matrix. Also what H.264/H.265 Annex E *infers* for all three when the VUI
+/// carries no `colour_description`, which is why a range-only VUI decodes to
+/// this triplet rather than to nothing.
+pub const UNSPECIFIED_CICP: u8 = 2;
+
 /// CICP colour signalling from the SPS VUI (`colour_description` + range).
 #[derive(Debug, Clone, Copy)]
 pub struct VuiColor {
@@ -32,6 +38,19 @@ pub struct SpsInfo {
     /// when present. The only in-band frame-rate source for containers without a
     /// timing box (raw Annex-B, TS/M2TS).
     pub frame_rate: Option<f64>,
+    /// The same rate as the exact signalled ratio (denominator doubled under
+    /// `field_seq_flag`); present exactly when `frame_rate` is.
+    pub frame_rate_rational: Option<(u64, u64)>,
+    /// Sample aspect ratio from the VUI `aspect_ratio_idc` (Table E.1, shared
+    /// with AVC via [`sar_from_idc`]) or its Extended_SAR pair. `None` when
+    /// absent, code 0, or a reserved code.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// From the profile_tier_level source flags — `"progressive"` only when
+    /// `general_progressive_source_flag` is set alone, `"interlaced"` when its
+    /// twin is set alone or the VUI's `field_seq_flag` says fields — else
+    /// `None` (both-set/both-clear mean "unknown/externally signalled" per
+    /// H.265 §7.4.4).
+    pub scan_type: Option<&'static str>,
 }
 
 /// What the VUI carries that we surface: colour signalling and frame rate. Both
@@ -40,16 +59,22 @@ pub struct SpsInfo {
 struct SpsVui {
     color: Option<VuiColor>,
     frame_rate: Option<f64>,
+    frame_rate_rational: Option<(u64, u64)>,
+    pixel_aspect: Option<(u32, u32)>,
+    /// Set only by `field_seq_flag`, which outranks the PTL source flags.
+    scan_type: Option<&'static str>,
 }
 
 impl SpsInfo {
-    pub fn chroma_str(&self) -> &'static str {
+    /// `None` for a reserved `chroma_format_idc`: an undefined code names
+    /// nothing, so the report omits the field rather than print a placeholder.
+    pub fn chroma_str(&self) -> Option<&'static str> {
         match self.chroma_format_idc {
-            0 => "monochrome",
-            1 => "4:2:0",
-            2 => "4:2:2",
-            3 => "4:4:4",
-            _ => "?",
+            0 => Some("monochrome"),
+            1 => Some("4:2:0"),
+            2 => Some("4:2:2"),
+            3 => Some("4:4:4"),
+            _ => None,
         }
     }
 
@@ -57,6 +82,33 @@ impl SpsInfo {
     pub fn profile_label(&self) -> String {
         hevc_profile_label(self.profile_idc, self.tier_high, self.level_idc)
     }
+}
+
+/// Table E.1 of H.265 — identical to H.264's Table E-1, both read verbatim
+/// from the specs in `dev/` — mapping `aspect_ratio_idc` to the sample aspect
+/// ratio. 0 is unspecified, 17..254 reserved (fill nothing), 255 Extended_SAR
+/// (the caller reads the explicit pair itself). Shared with the AVC parser
+/// the same way [`VuiColor`] is.
+pub fn sar_from_idc(idc: u32) -> Option<(u32, u32)> {
+    Some(match idc {
+        1 => (1, 1),
+        2 => (12, 11),
+        3 => (10, 11),
+        4 => (16, 11),
+        5 => (40, 33),
+        6 => (24, 11),
+        7 => (20, 11),
+        8 => (32, 11),
+        9 => (80, 33),
+        10 => (18, 11),
+        11 => (15, 11),
+        12 => (64, 33),
+        13 => (160, 99),
+        14 => (4, 3),
+        15 => (3, 2),
+        16 => (2, 1),
+        _ => return None,
+    })
 }
 
 /// Human label for an HEVC profile_tier_level, shared by the SPS and `hvcC`
@@ -89,7 +141,8 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
     let max_sub_layers_minus1 = r.read_bits(3)?;
     r.skip_bits(1)?; // sps_temporal_id_nesting_flag
 
-    let (profile_idc, tier_high, level_idc) = parse_profile_tier_level(&mut r, max_sub_layers_minus1)?;
+    let (profile_idc, tier_high, level_idc, scan_type) =
+        parse_profile_tier_level(&mut r, max_sub_layers_minus1)?;
 
     r.read_ue()?; // sps_seq_parameter_set_id
     let chroma_format_idc = r.read_ue()?;
@@ -128,9 +181,12 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
         chroma_format_idc: chroma_format_idc as u8,
         profile_idc,
         tier_high,
+        frame_rate_rational: None,
         level_idc,
         color: None,
         frame_rate: None,
+        pixel_aspect: None,
+        scan_type,
     };
 
     // The remainder is best-effort: any failure leaves `color`/`frame_rate` as
@@ -138,6 +194,12 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
     let vui = parse_vui(&mut r, max_sub_layers_minus1, chroma_format_idc);
     info.color = vui.color;
     info.frame_rate = vui.frame_rate;
+    info.frame_rate_rational = vui.frame_rate_rational;
+    info.pixel_aspect = vui.pixel_aspect;
+    if vui.scan_type.is_some() {
+        // `field_seq_flag` is definitive where the PTL flags are declarative.
+        info.scan_type = vui.scan_type;
+    }
     Some(info)
 }
 
@@ -226,8 +288,14 @@ fn parse_vui_inner(
         // aspect_ratio_info_present_flag
         let idc = r.read_bits(8)?;
         if idc == 255 {
-            r.skip_bits(16)?; // sar_width
-            r.skip_bits(16)?; // sar_height
+            // Extended_SAR: the pair rides the bitstream directly.
+            let w = r.read_bits(16)?;
+            let h = r.read_bits(16)?;
+            if w > 0 && h > 0 {
+                out.pixel_aspect = Some((w, h));
+            }
+        } else {
+            out.pixel_aspect = sar_from_idc(idc);
         }
     }
     if r.read_bits(1)? == 1 {
@@ -238,13 +306,16 @@ fn parse_vui_inner(
         // video_signal_type_present_flag
         r.skip_bits(3)?; // video_format
         let full_range = r.read_bits(1)? == 1;
-        if r.read_bits(1)? == 1 {
-            // colour_description_present_flag
-            let primaries = r.read_bits(8)? as u8;
-            let transfer = r.read_bits(8)? as u8;
-            let matrix = r.read_bits(8)? as u8;
-            out.color = Some(VuiColor { primaries, transfer, matrix, full_range });
-        }
+        // `colour_description_present_flag`. When it is 0 the three CICP values
+        // are *inferred* as 2 (unspecified) per H.265 Annex E, but
+        // `video_full_range_flag` was signalled either way and must not be lost
+        // with them: a stream can legally declare full range and nothing else.
+        let (primaries, transfer, matrix) = if r.read_bits(1)? == 1 {
+            (r.read_bits(8)? as u8, r.read_bits(8)? as u8, r.read_bits(8)? as u8)
+        } else {
+            (UNSPECIFIED_CICP, UNSPECIFIED_CICP, UNSPECIFIED_CICP)
+        };
+        out.color = Some(VuiColor { primaries, transfer, matrix, full_range });
     }
     if r.read_bits(1)? == 1 {
         // chroma_loc_info_present_flag
@@ -253,6 +324,11 @@ fn parse_vui_inner(
     }
     r.skip_bits(1)?; // neutral_chroma_indication_flag
     let field_seq = r.read_bits(1)? == 1; // field_seq_flag (fields, not frames)
+    if field_seq {
+        // Fields are coded as pictures: definitively interlaced, whatever the
+        // PTL source flags said.
+        out.scan_type = Some("interlaced");
+    }
     r.skip_bits(1)?; // frame_field_info_present_flag
     if r.read_bits(1)? == 1 {
         // default_display_window_flag
@@ -268,11 +344,17 @@ fn parse_vui_inner(
         if num_units_in_tick > 0 && time_scale > 0 {
             let mut fps = time_scale as f64 / num_units_in_tick as f64;
             // When each coded picture is a field, the tick is a field period, so
-            // the frame rate is half the tick rate.
+            // the frame rate is half the tick rate (the exact ratio doubles its
+            // denominator). Both terms are unvalidated 32-bit fields; the
+            // shared bound keeps a misread pair from stating millions of fps.
+            let mut den = u64::from(num_units_in_tick);
             if field_seq {
                 fps /= 2.0;
+                den *= 2;
             }
-            out.frame_rate = Some(fps);
+            out.frame_rate = crate::container::plausible_fps(fps);
+            out.frame_rate_rational =
+                out.frame_rate.is_some().then_some((u64::from(time_scale), den));
         }
     }
     Some(())
@@ -350,18 +432,33 @@ fn parse_st_ref_pic_set(
 
 /// Parse profile_tier_level, returning the general layer's
 /// `(profile_idc, tier_high, level_idc)`; sub-layer entries are skipped.
-fn parse_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> Option<(u8, bool, u8)> {
+fn parse_profile_tier_level(
+    r: &mut BitReader,
+    max_sub_layers_minus1: u32,
+) -> Option<(u8, bool, u8, Option<&'static str>)> {
     // general layer: profile_space(2) + tier_flag(1) + profile_idc(5), then 32
     // compat flags + 48 constraint bits, then 8-bit general_level_idc = 96 bits.
     r.skip_bits(2)?; // general_profile_space
     let tier_high = r.read_bits(1)? == 1;
     let profile_idc = r.read_bits(5)? as u8;
     r.skip_bits(32)?; // general_profile_compatibility_flags
-    r.skip_bits(48)?; // general_constraint_indicator_flags
+    // The first two constraint bits are the source-format pair (H.265 §7.3.3,
+    // order verified against the spec's syntax table: progressive then
+    // interlaced, directly after the compatibility flags).
+    let progressive_source = r.read_bits(1)? == 1;
+    let interlaced_source = r.read_bits(1)? == 1;
+    r.skip_bits(46)?; // remaining general_constraint_indicator_flags
     let level_idc = r.read_bits(8)? as u8;
+    let scan = match (progressive_source, interlaced_source) {
+        (true, false) => Some("progressive"),
+        (false, true) => Some("interlaced"),
+        // Both clear: unknown. Both set: "indicated at picture level" — also
+        // not a sequence-level answer.
+        _ => None,
+    };
 
     if max_sub_layers_minus1 == 0 {
-        return Some((profile_idc, tier_high, level_idc));
+        return Some((profile_idc, tier_high, level_idc, scan));
     }
 
     let mut profile_present = [false; 8];
@@ -382,7 +479,7 @@ fn parse_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> Op
             r.skip_bits(8)?; // sub_layer_level_idc
         }
     }
-    Some((profile_idc, tier_high, level_idc))
+    Some((profile_idc, tier_high, level_idc, scan))
 }
 
 /// Locate the first SPS NAL (type 33) inside an `hvcC` configuration record
@@ -418,4 +515,46 @@ pub fn find_sps_in_hvcc(hvcc: &[u8]) -> Option<&[u8]> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reserved `chroma_format_idc` (H.265 defines 0..=3) names no format,
+    /// so the field is omitted rather than a placeholder printed.
+    #[test]
+    fn reserved_chroma_format_idc_names_nothing() {
+        let mut info = SpsInfo {
+            width: 1920,
+            height: 1080,
+            bit_depth: 10,
+            chroma_format_idc: 1,
+            profile_idc: 2,
+            tier_high: false,
+            level_idc: 120,
+            color: None,
+            frame_rate: None,
+            frame_rate_rational: None,
+            pixel_aspect: None,
+            scan_type: None,
+        };
+        assert_eq!(info.chroma_str(), Some("4:2:0"));
+        info.chroma_format_idc = 4;
+        assert_eq!(info.chroma_str(), None);
+    }
+
+    #[test]
+    fn sar_table_matches_h264_table_e1() {
+        // Spot rows read verbatim from the spec PDF (Table E-1), plus the
+        // boundaries: 0 unspecified and 17..254 reserved fill nothing, 255 is
+        // the caller's explicit pair.
+        assert_eq!(sar_from_idc(1), Some((1, 1)));
+        assert_eq!(sar_from_idc(5), Some((40, 33)));
+        assert_eq!(sar_from_idc(13), Some((160, 99)));
+        assert_eq!(sar_from_idc(16), Some((2, 1)));
+        for idc in [0, 17, 254, 255] {
+            assert_eq!(sar_from_idc(idc), None, "{idc}");
+        }
+    }
 }

@@ -16,7 +16,6 @@ mod hdr10plus_json;
 mod rpu_bin;
 
 use std::path::Path;
-use std::time::Instant;
 
 use anyhow::{bail, Result};
 
@@ -58,8 +57,6 @@ pub fn try_process(path: &Path) -> Result<Option<Report>> {
         return Ok(None);
     }
 
-    let started = Instant::now();
-
     // HDR10+ JSON is the one sidecar we surface without aggregating across frames
     // — only the file-level profile and the first scene, both at the head of the
     // file — and it's also by far the largest (one metadata object per frame,
@@ -74,7 +71,7 @@ pub fn try_process(path: &Path) -> Result<Option<Report>> {
         }
         let size = std::fs::metadata(path)?.len();
         let payload = hdr10plus_json::parse(&head)?;
-        return Ok(Some(build_report(path, size, "HDR10+ JSON", payload, None, None, started)));
+        return Ok(Some(build_report(path, size, "HDR10+ JSON", payload, None, None)));
     }
 
     let data = std::fs::read(path)?;
@@ -97,7 +94,7 @@ pub fn try_process(path: &Path) -> Result<Option<Report>> {
         Kind::Hdr10PlusJson => unreachable!("json is dispatched before the full read"),
     };
 
-    Ok(Some(build_report(path, size, container, payload, fps, version, started)))
+    Ok(Some(build_report(path, size, container, payload, fps, version)))
 }
 
 #[derive(Clone, Copy)]
@@ -183,18 +180,16 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// assumed UHD master (`ASSUMED_CANVAS`) for both DV sidecars, since neither
 /// records a resolution. Passing `None` (used only by tests / callers with no
 /// canvas) shows bare offsets with dimensions omitted.
-fn finalize_dv(mut agg: DvAggregate, canvas: Option<(u32, u32)>) -> Result<Payload> {
+fn finalize_dv(agg: DvAggregate, canvas: Option<(u32, u32)>) -> Result<Payload> {
     let (cw, ch) = canvas.unwrap_or((0, 0));
-    // Metadata-only input: no base layer, so a convention-default compat minor
-    // (P8 -> .1) can't be backed by a base-layer VUI and is flagged as assumed.
-    agg.mark_metadata_only();
     // Every RPU in the sidecar was accounted for, so this is an exhaustive census,
     // not a sample: pass full=true for the per-level presence / scene-cut counts.
     // There is no container dvcC, it isn't AV1, and it isn't dual-track.
     match agg.finalize(cw, ch, None, true, false, false) {
         Some(mut dv) => {
             if let Some((w, h)) = canvas {
-                dv.l5_assumed_canvas = Some([w, h]);
+                dv.l5_assumed_canvas =
+                    Some(crate::model::AssumedCanvas { width: w, height: h });
             }
             Ok(Payload::DolbyVision(Box::new(dv)))
         }
@@ -209,7 +204,6 @@ fn build_report(
     payload: Payload,
     fps: Option<f64>,
     format_version: Option<String>,
-    started: Instant,
 ) -> Report {
     let (dolby_vision, hdr10plus) = match payload {
         Payload::DolbyVision(dv) => (Some(*dv), None),
@@ -222,32 +216,41 @@ fn build_report(
         input_truncated: false,
         container: container.to_string(),
         bd_iso: None,
+        dvd_iso: None,
         format_version,
         duration_secs: None,
         // One `video_tracks` entry for uniformity — consumers always iterate
         // the array (`.video_tracks[0].dolby_vision` works for every input
-        // kind); the empty `codec` marks the metadata-only shape as before.
+        // kind); the absent `codec` marks the metadata-only shape.
         video_tracks: vec![crate::model::VideoTrack {
             track_number: None,
             program: None,
             default: None,
-            codec: String::new(),
+            codec: None,
+            codec_id: None,
             codec_profile: None,
             width: None,
             height: None,
             fps,
+            fps_rational: None,
+            duration_secs: None,
             bitrate: None,
             bit_depth: None,
             chroma: None,
+            pixel_aspect_ratio: None,
+            pixel_aspect_ratio_rational: None,
+            display_aspect_ratio: None,
+            display_aspect_ratio_rational: None,
+            scan_type: None,
             stereo: None,
             color: ColorInfo::default(),
+            color_source: crate::model::ColorSources::default(),
             hdr: None,
             dolby_vision,
             hdr10plus,
             sl_hdr: None,
             hdr_vivid: None,
         }],
-        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     }
 }
 

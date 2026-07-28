@@ -13,7 +13,7 @@ use anyhow::{bail, Result};
 use crate::av1::obu::{obus, OBU_SEQUENCE_HEADER, OBU_TEMPORAL_DELIMITER};
 use crate::av1::seq::{parse_sequence_header, SeqInfo};
 use crate::container::{Chunk, Codec, Demux, NalFormat, RawFullStream, TrackDemux};
-use crate::model::ColorInfo;
+use crate::model::{ColorInfo, ColorSources};
 use crate::prefetch::Frontier;
 use crate::progress::{Phase, Progress};
 
@@ -128,7 +128,9 @@ fn demux_ivf(data: &[u8], full: bool, _progress: &Progress, frontier: &Frontier)
     let frame_count = ivf_frame_count(&hdr, &chunks, full, walked_all);
     let raw_stream = full
         .then_some(RawFullStream::Ivf { data_start: hdr.data_start, ticks_per_sec: hdr.ticks_per_sec });
-    Ok(build_demux("raw AV1 (IVF)", hdr.width, hdr.height, fps, frame_count, seq, chunks, raw_stream))
+    // IVF's rate is averaged from per-frame timestamps — a measurement, so it
+    // carries no exact ratio.
+    Ok(build_demux("raw AV1 (IVF)", hdr.width, hdr.height, fps, None, frame_count, seq, chunks, raw_stream))
 }
 
 /// Exact frame count: the whole-file chunk count when we walked it all, else
@@ -295,7 +297,8 @@ fn demux_obu(
     // The low-overhead OBU stream carries no timestamps, so a frame rate exists
     // only when the sequence header signals constant `timing_info()`.
     let fps = seq.as_ref().and_then(|s| s.fps);
-    Ok(build_demux(label, w, h, fps, frame_count, seq, chunks, raw_stream))
+    let fps_rational = seq.as_ref().and_then(|s| s.fps_rational);
+    Ok(build_demux(label, w, h, fps, fps_rational, frame_count, seq, chunks, raw_stream))
 }
 
 /// Split a raw low-overhead OBU stream into temporal units (each starting at an
@@ -403,6 +406,7 @@ fn build_demux(
     width: u32,
     height: u32,
     fps: Option<f64>,
+    fps_rational: Option<(u64, u64)>,
     frame_count: Option<u64>,
     seq: Option<SeqInfo>,
     chunks: Vec<Chunk>,
@@ -414,23 +418,25 @@ fn build_demux(
         (Some(n), Some(f)) if f > 0.0 => Some(n as f64 / f),
         _ => None,
     };
-    let (bit_depth, chroma, color, codec_profile) = match &seq {
+    let (bit_depth, chroma, (color, color_source), codec_profile) = match &seq {
         Some(s) => (
             Some(s.bit_depth),
-            Some(s.chroma.to_string()),
+            s.chroma.map(str::to_string),
             s.color.clone(),
-            Some(crate::av1::seq::av1_profile_label(s.seq_profile, s.seq_tier, s.seq_level_idx)),
+            crate::av1::seq::av1_profile_label(s.seq_profile, s.seq_tier, s.seq_level_idx),
         ),
-        None => (None, None, ColorInfo::default(), None),
+        None => (None, None, (ColorInfo::default(), ColorSources::default()), None),
     };
     // AV1 Dolby Vision (Profile 10) is single-layer, single-track.
     let track = TrackDemux {
         width,
         height,
         fps,
+        fps_rational,
         bit_depth,
         chroma,
         codec_profile,
+        color_source,
         color,
         chunks,
         // NalFormat::LengthPrefixed(0) is unused for AV1 (OBU-walked).

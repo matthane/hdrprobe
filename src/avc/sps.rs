@@ -9,7 +9,7 @@
 //! (`time_scale / (2 * num_units_in_tick)`).
 
 use crate::bits::{ebsp_to_rbsp, BitReader};
-use crate::hevc::sps::VuiColor;
+use crate::hevc::sps::{VuiColor, UNSPECIFIED_CICP};
 
 #[derive(Debug, Clone, Copy)]
 pub struct SpsInfo {
@@ -21,6 +21,8 @@ pub struct SpsInfo {
     pub profile_idc: u8,
     /// `level_idc` (level × 10, e.g. 42 = 4.2).
     pub level_idc: u8,
+    /// `constraint_set1_flag` — Constrained Baseline when set on Baseline (66).
+    pub constraint_set1: bool,
     /// `constraint_set4_flag` — frame-only (Progressive High when set on High).
     pub constraint_set4: bool,
     /// `constraint_set5_flag` — Constrained High when set on High.
@@ -29,32 +31,59 @@ pub struct SpsInfo {
     pub color: Option<VuiColor>,
     /// Frame rate from the VUI timing info, when present.
     pub frame_rate: Option<f64>,
+    /// The same rate as the exact signalled ratio (`time_scale` over twice
+    /// `num_units_in_tick`, the AVC frame convention); present exactly when
+    /// `frame_rate` is.
+    pub frame_rate_rational: Option<(u64, u64)>,
+    /// Sample aspect ratio from the VUI `aspect_ratio_idc` (Table E-1, shared
+    /// with HEVC via `hevc::sps::sar_from_idc`) or its Extended_SAR pair.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// `frame_mbs_only_flag`: set means the sequence codes frames only —
+    /// `"progressive"`; clear means field/MBAFF coding — `"interlaced"`,
+    /// which is also how MediaInfo reads the flag.
+    pub scan_type: Option<&'static str>,
 }
 
 impl SpsInfo {
-    pub fn chroma_str(&self) -> &'static str {
+    /// `None` for a reserved `chroma_format_idc`: an undefined code names
+    /// nothing, so the report omits the field rather than print a placeholder.
+    pub fn chroma_str(&self) -> Option<&'static str> {
         match self.chroma_format_idc {
-            0 => "monochrome",
-            1 => "4:2:0",
-            2 => "4:2:2",
-            3 => "4:4:4",
-            _ => "?",
+            0 => Some("monochrome"),
+            1 => Some("4:2:0"),
+            2 => Some("4:2:2"),
+            3 => Some("4:4:4"),
+            _ => None,
         }
     }
 
     /// Codec-profile label, e.g. `"High @ L4.2"`.
     pub fn profile_label(&self) -> String {
-        avc_profile_label(self.profile_idc, self.level_idc, self.constraint_set4, self.constraint_set5)
+        avc_profile_label(
+            self.profile_idc,
+            self.level_idc,
+            self.constraint_set1,
+            self.constraint_set4,
+            self.constraint_set5,
+        )
     }
 }
 
 /// Human label for an AVC profile_idc + level_idc. AVC has no Main/High *tier*
 /// (that is a Dolby-level concept), so unlike HEVC the label carries only the
-/// coding profile and the level. High profile refines to Progressive High
-/// (frame-only, `constraint_set4`) or Constrained High (also `constraint_set5`),
-/// the three High variants Dolby Vision profile 9 allows.
-pub fn avc_profile_label(profile_idc: u8, level_idc: u8, cs4: bool, cs5: bool) -> String {
+/// coding profile and the level. Baseline refines to Constrained Baseline
+/// (`constraint_set1`); High refines to Progressive High (frame-only,
+/// `constraint_set4`) or Constrained High (also `constraint_set5`), the three
+/// High variants Dolby Vision profile 9 allows.
+pub fn avc_profile_label(profile_idc: u8, level_idc: u8, cs1: bool, cs4: bool, cs5: bool) -> String {
     let profile = match profile_idc {
+        // "Conformance of a bitstream to the Constrained Baseline profile is
+        // indicated by profile_idc being equal to 66 with constraint_set1_flag
+        // being equal to 1" — H.264 (06/2019) §A.2.1.1. The gate is 66's
+        // alone: Main encodes routinely set cs1 too (x264 writes it, measured
+        // constraints 0x40 on a Main mux), where it states Main-constraint
+        // conformance, and ffprobe and MediaInfo both keep "Main" for it.
+        66 if cs1 => "Constrained Baseline".to_string(),
         66 => "Baseline".to_string(),
         77 => "Main".to_string(),
         88 => "Extended".to_string(),
@@ -84,6 +113,7 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
     let profile_idc = r.read_bits(8)? as u8;
     // constraint_set0..5_flags (6) + reserved_zero_2bits (2).
     let constraints = r.read_bits(8)?;
+    let constraint_set1 = (constraints >> 6) & 1 == 1;
     let constraint_set4 = (constraints >> 3) & 1 == 1;
     let constraint_set5 = (constraints >> 2) & 1 == 1;
     let level_idc = r.read_bits(8)? as u8;
@@ -180,10 +210,14 @@ pub fn parse_sps(nal_with_header: &[u8]) -> Option<SpsInfo> {
         chroma_format_idc: chroma_format_idc as u8,
         profile_idc,
         level_idc,
+        constraint_set1,
         constraint_set4,
+        frame_rate_rational: None,
         constraint_set5,
         color: None,
         frame_rate: None,
+        pixel_aspect: None,
+        scan_type: Some(if frame_mbs_only { "progressive" } else { "interlaced" }),
     };
 
     // The VUI is best-effort: a short read leaves colour/frame_rate as `None`
@@ -203,8 +237,14 @@ fn parse_vui(r: &mut BitReader, info: &mut SpsInfo) -> Option<()> {
         // aspect_ratio_info_present_flag
         let idc = r.read_bits(8)?;
         if idc == 255 {
-            r.skip_bits(16)?; // sar_width
-            r.skip_bits(16)?; // sar_height
+            // Extended_SAR: the pair rides the bitstream directly.
+            let w = r.read_bits(16)?;
+            let h = r.read_bits(16)?;
+            if w > 0 && h > 0 {
+                info.pixel_aspect = Some((w, h));
+            }
+        } else {
+            info.pixel_aspect = crate::hevc::sps::sar_from_idc(idc);
         }
     }
     if r.read_bit()? == 1 {
@@ -215,13 +255,16 @@ fn parse_vui(r: &mut BitReader, info: &mut SpsInfo) -> Option<()> {
         // video_signal_type_present_flag
         r.skip_bits(3)?; // video_format
         let full_range = r.read_bit()? == 1;
-        if r.read_bit()? == 1 {
-            // colour_description_present_flag
-            let primaries = r.read_bits(8)? as u8;
-            let transfer = r.read_bits(8)? as u8;
-            let matrix = r.read_bits(8)? as u8;
-            info.color = Some(VuiColor { primaries, transfer, matrix, full_range });
-        }
+        // `colour_description_present_flag`. When it is 0 the three CICP values
+        // are *inferred* as 2 (unspecified) per H.264 Annex E, but
+        // `video_full_range_flag` was signalled either way and must not be lost
+        // with them: a stream can legally declare full range and nothing else.
+        let (primaries, transfer, matrix) = if r.read_bit()? == 1 {
+            (r.read_bits(8)? as u8, r.read_bits(8)? as u8, r.read_bits(8)? as u8)
+        } else {
+            (UNSPECIFIED_CICP, UNSPECIFIED_CICP, UNSPECIFIED_CICP)
+        };
+        info.color = Some(VuiColor { primaries, transfer, matrix, full_range });
     }
     if r.read_bit()? == 1 {
         // chroma_loc_info_present_flag
@@ -233,9 +276,17 @@ fn parse_vui(r: &mut BitReader, info: &mut SpsInfo) -> Option<()> {
         let num_units_in_tick = r.read_bits(32)?;
         let time_scale = r.read_bits(32)?;
         // AVC: a clock tick is num_units_in_tick/time_scale and a frame spans two
-        // ticks (fields), so the frame rate is time_scale / (2 * tick).
+        // ticks (fields), so the frame rate is time_scale / (2 * tick). Both
+        // terms are unvalidated 32-bit fields; the shared bound keeps a
+        // misread pair from stating millions of fps.
         if num_units_in_tick > 0 && time_scale > 0 {
-            info.frame_rate = Some(time_scale as f64 / (2.0 * num_units_in_tick as f64));
+            info.frame_rate = crate::container::plausible_fps(
+                time_scale as f64 / (2.0 * num_units_in_tick as f64),
+            );
+            info.frame_rate_rational = info
+                .frame_rate
+                .is_some()
+                .then_some((u64::from(time_scale), 2 * u64::from(num_units_in_tick)));
         }
     }
     Some(())
@@ -260,11 +311,21 @@ mod tests {
 
     #[test]
     fn profile_label_high_variants() {
-        assert_eq!(avc_profile_label(100, 42, false, false), "High @ L4.2");
-        assert_eq!(avc_profile_label(100, 42, true, false), "Progressive High @ L4.2");
-        assert_eq!(avc_profile_label(100, 42, true, true), "Constrained High @ L4.2");
-        assert_eq!(avc_profile_label(77, 40, false, false), "Main @ L4");
-        assert_eq!(avc_profile_label(66, 31, false, false), "Baseline @ L3.1");
+        assert_eq!(avc_profile_label(100, 42, false, false, false), "High @ L4.2");
+        assert_eq!(avc_profile_label(100, 42, false, true, false), "Progressive High @ L4.2");
+        assert_eq!(avc_profile_label(100, 42, false, true, true), "Constrained High @ L4.2");
+        assert_eq!(avc_profile_label(77, 40, false, false, false), "Main @ L4");
+        assert_eq!(avc_profile_label(66, 31, false, false, false), "Baseline @ L3.1");
+    }
+
+    #[test]
+    fn constrained_baseline_is_66_gated() {
+        // H.264 (06/2019) §A.2.1.1: profile_idc 66 + constraint_set1_flag is
+        // Constrained Baseline. cs1 on Main must NOT relabel it: x264 writes
+        // constraints 0x40 on ordinary Main encodes (measured), and ffprobe
+        // and MediaInfo both keep "Main" for them.
+        assert_eq!(avc_profile_label(66, 13, true, false, false), "Constrained Baseline @ L1.3");
+        assert_eq!(avc_profile_label(77, 13, true, false, false), "Main @ L1.3");
     }
 
     #[test]
@@ -277,14 +338,19 @@ mod tests {
             0x01, 0x01, 0x40, 0x00, 0x00, 0x03, 0x00, 0x40, 0x00, 0x00, 0x0c, 0x03, 0xc6, 0x0c,
             0x92,
         ];
-        let info = parse_sps(&sps).expect("valid SPS");
+        let mut info = parse_sps(&sps).expect("valid SPS");
         assert_eq!((info.width, info.height), (1920, 1080));
         assert_eq!(info.bit_depth, 8);
-        assert_eq!(info.chroma_str(), "4:2:0");
+        assert_eq!(info.chroma_str(), Some("4:2:0"));
         assert_eq!(info.profile_idc, 100);
         assert_eq!(info.profile_label(), "High @ L4");
         let c = info.color.expect("VUI colour present");
         assert_eq!((c.primaries, c.transfer, c.matrix), (1, 1, 1)); // BT.709
         assert!(!c.full_range); // limited range
+
+        // A reserved chroma_format_idc names no format, so the field is
+        // omitted rather than a placeholder printed.
+        info.chroma_format_idc = 4;
+        assert_eq!(info.chroma_str(), None);
     }
 }

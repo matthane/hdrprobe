@@ -9,6 +9,9 @@ mod dv;
 mod hdr;
 mod hevc;
 mod model;
+mod mjpeg;
+mod mpeg2;
+mod mpeg4part2;
 mod prefetch;
 mod progress;
 mod prores;
@@ -16,13 +19,14 @@ mod render;
 mod sample;
 mod shell;
 mod sidecar;
+mod theora;
+mod vc1;
 mod vp9;
 
 use std::fs::File;
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
@@ -75,6 +79,13 @@ struct Cli {
     /// terminal, json emits one machine-readable event per stderr line.
     #[arg(long, value_enum, default_value_t = ProgressWhen::Auto)]
     progress: ProgressWhen,
+
+    /// Include per-file error objects in the machine output (--json / --format
+    /// ndjson): a failed file contributes {"file", "error"} beside the reports,
+    /// so a scanner learns which files failed without parsing stderr. Off by
+    /// default; text output and exit codes are unchanged either way.
+    #[arg(long)]
+    errors: bool,
 
     /// One-line summary per file.
     #[arg(short, long)]
@@ -135,7 +146,21 @@ enum ProgressWhen {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Not `Cli::parse()`: clap's own exit path uses code 2 for a malformed
+    // command line, which the exit-code contract (SCHEMA.md "Exit codes")
+    // reserves for unreadable *input* — a usage error is 1, like the tool's
+    // own usage checks below. `--help`/`--version` stay clap's success exit.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                e.exit()
+            }
+            let _ = e.print();
+            return ExitCode::from(1);
+        }
+    };
 
     // Shell integration is an action-and-exit path: register/remove the Explorer
     // context-menu verb, then return without touching the file pipeline. Its
@@ -270,13 +295,13 @@ fn main() -> ExitCode {
     if show_banner {
         let banner = render::render_banner(cli.theme);
         if banner_eager {
-            print!("{banner}");
-            let _ = std::io::stdout().flush();
+            write_stdout(&banner);
         } else {
             out_buf.push_str(&banner);
         }
     }
 
+    let mut stdout_gone = false;
     for (i, path) in paths.iter().enumerate() {
         let progress = progress::Progress::new(progress_mode, path, i + 1, paths.len());
         let result = if path.as_os_str() == "-" {
@@ -323,8 +348,13 @@ fn main() -> ExitCode {
                     }
                 }
                 if stream_reports {
-                    print!("{piece}");
-                    let _ = std::io::stdout().flush();
+                    if !write_stdout(&piece) {
+                        // The consumer stopped reading (`| head`). Nothing left
+                        // to say, and continuing would scan files whose reports
+                        // no one will see.
+                        stdout_gone = true;
+                        break;
+                    }
                 } else {
                     out_buf.push_str(&piece);
                 }
@@ -335,6 +365,36 @@ fn main() -> ExitCode {
                 drop(progress);
                 had_error = true;
                 eprintln!("error: {}: {:#}", path.display(), e);
+                // Under --errors the failure also joins the machine stream as
+                // an error object (see SCHEMA.md "Error objects"), so an
+                // NDJSON consumer learns which files failed without parsing
+                // stderr. The stderr line above stays either way, and text
+                // output is untouched.
+                if cli.errors && format != Format::Text {
+                    let err = model::ErrorReport {
+                        hdrprobe_schema_version: model::SCHEMA_VERSION,
+                        file: path.display().to_string(),
+                        error: format!("{e:#}"),
+                    };
+                    match format {
+                        Format::Json => {
+                            json_reports.push(serde_json::to_value(&err).unwrap())
+                        }
+                        Format::Ndjson => {
+                            let mut piece = serde_json::to_string(&err).unwrap();
+                            piece.push('\n');
+                            if stream_reports {
+                                if !write_stdout(&piece) {
+                                    stdout_gone = true;
+                                    break;
+                                }
+                            } else {
+                                out_buf.push_str(&piece);
+                            }
+                        }
+                        Format::Text => unreachable!("gated above"),
+                    }
+                }
             }
         }
     }
@@ -353,9 +413,11 @@ fn main() -> ExitCode {
     // so a clear here would wipe output the user is already reading. The
     // decorated interactive path stays clean anyway — `finish_erased` above
     // removes each file's progress display before its report prints.
-    if let Err(e) = write_output(&cli.output, &out_buf) {
-        eprintln!("error: writing output: {e}");
-        return ExitCode::from(1);
+    if !stdout_gone {
+        if let Err(e) = write_output(&cli.output, &out_buf) {
+            eprintln!("error: writing output: {e}");
+            return ExitCode::from(1);
+        }
     }
 
     if had_error {
@@ -513,7 +575,6 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         return Ok(report);
     }
 
-    let started = Instant::now();
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     // SAFETY: file is read-only inspected; we accept the usual mmap caveat that
@@ -526,9 +587,10 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     let remote = prefetch::is_remote(&file);
     let warmed_head = prefetch::warm_metadata(remote, &file, path, &mmap);
 
-    // A Blu-ray ISO is probed through its BDMV main feature: locate the
-    // playlist-selected clip's contiguous byte range, then run the ordinary
-    // TS/M2TS pipeline over that *subslice*, so every slice-relative
+    // A video disc ISO is probed through its main feature: locate the
+    // feature's contiguous byte range (the playlist-selected clip on a
+    // Blu-ray, the byte-largest title VOB set on a DVD), then run the
+    // ordinary pipeline over that *subslice*, so every slice-relative
     // mechanism (head/tail windows, streaming positions, bitrate
     // denominators, progress) is correct by construction. Extension-gated: a
     // UDF image under another name takes the ordinary demux path below.
@@ -537,17 +599,24 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("iso"));
     let feature = if is_iso && bdiso::is_udf_iso(&mmap) {
-        let f = bdiso::locate_main_feature(&mmap, remote.then_some(&file))
-            .context("locating the BDMV main feature")?;
-        // The clip's TS head/tail windows, translated to its range in the
-        // image: the ISO counterpart of `warm_metadata`'s TS branch.
-        prefetch::warm_ts_windows(remote, &file, f.clip_start, f.clip_len);
+        let f = bdiso::locate_feature(&mmap, remote.then_some(&file))
+            .context("locating the disc's main feature")?;
+        // The feature's head/tail windows, translated to its range in the
+        // image: the ISO counterpart of `warm_metadata`'s TS and PS branches.
+        let (start, len) = f.clip_range();
+        match &f {
+            bdiso::DiscFeature::Bd(_) => prefetch::warm_ts_windows(remote, &file, start, len),
+            bdiso::DiscFeature::Dvd(_) => prefetch::warm_ps_windows(remote, &file, start, len),
+        }
         Some(f)
     } else {
         None
     };
     let data: &[u8] = match &feature {
-        Some(f) => &mmap[f.clip_start as usize..(f.clip_start + f.clip_len) as usize],
+        Some(f) => {
+            let (start, len) = f.clip_range();
+            &mmap[start as usize..(start + len) as usize]
+        }
         None => &mmap,
     };
 
@@ -561,7 +630,10 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     // relative and the reads must land at `clip_start + pos` in the image.
     let frontier = if cli.full && prefetch::is_remote_strict(&file, path) {
         match &feature {
-            Some(f) => prefetch::Frontier::new_at(&file, f.clip_start, f.clip_len),
+            Some(f) => {
+                let (start, len) = f.clip_range();
+                prefetch::Frontier::new_at(&file, start, len)
+            }
             None => prefetch::Frontier::new(&file, size),
         }
     } else {
@@ -569,14 +641,37 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
     };
 
     let demux = match &feature {
-        // The main feature is M2TS by construction (the locator's sync-lock
-        // gate); extension dispatch would misroute the `.iso` name.
-        Some(_) => container::ts::demux(data, cli.full, progress, &frontier)
+        // A BDMV feature is M2TS by construction (the locator's sync-lock
+        // gate) and a DVD feature is an MPEG program stream by the format's
+        // definition; extension dispatch would misroute the `.iso` name.
+        Some(bdiso::DiscFeature::Bd(_)) => container::ts::demux(data, cli.full, progress, &frontier)
             .context("demuxing the BDMV main-feature clip")?,
+        Some(bdiso::DiscFeature::Dvd(_)) => {
+            container::ps::demux(data).context("demuxing the DVD main-feature title set")?
+        }
         None => {
             container::demux(path, data, cli.full, progress, &frontier).context("demux failed")?
         }
     };
+    let mut demux = demux;
+
+    // A DVD ISO's duration authority is the IFO's declared runtime — the
+    // MKV/MP4 declared-duration convention, because unlike a bare program
+    // stream a DVD *does* declare one, and the PS backend's measured PTS span
+    // is structurally unreliable here: a cell or layer-break PTS reset
+    // between the head and tail windows is invisible to both (the documented
+    // concatenation limit), and the real dual-layer reference pressing
+    // measured 33 minutes of a declared 109-minute feature exactly that way.
+    // The overall bitrate divides by the duration, so it moves with it.
+    // No parsed IFO leaves the measured span standing, with its limits.
+    if let Some(bdiso::DiscFeature::Dvd(f)) = &feature {
+        if let Some(declared) = f.title_duration_secs {
+            demux.duration_secs = Some(declared);
+            if let [track] = demux.tracks.as_mut_slice() {
+                track.bitrate = model::Bitrate::overall(data.len() as u64, Some(declared));
+            }
+        }
+    }
 
     // The sampled access units are scattered across the whole file (worst for
     // MP4, whose sample index spans a multi-GB mdat), so warm exactly the
@@ -596,7 +691,6 @@ fn process_file(path: &Path, cli: &Cli, progress: &progress::Progress) -> Result
         cli,
         progress,
         &frontier,
-        started,
     ))
 }
 
@@ -617,7 +711,6 @@ fn process_stdin(cli: &Cli, progress: &progress::Progress) -> Result<Report> {
         bail!("stdin is a terminal; pipe stream data in or pass a file path");
     }
 
-    let started = Instant::now();
     let (buf, truncated) = read_stdin_head(stdin.lock()).context("reading stdin")?;
     if buf.is_empty() {
         bail!("no data on stdin");
@@ -640,7 +733,6 @@ fn process_stdin(cli: &Cli, progress: &progress::Progress) -> Result<Report> {
         cli,
         progress,
         &frontier,
-        started,
     ))
 }
 
@@ -655,12 +747,39 @@ fn process_stdin(cli: &Cli, progress: &progress::Progress) -> Result<Report> {
 /// stand. Keyed on the container label — never thread a truncation flag into
 /// the backends.
 fn suppress_prefix_derived_facts(demux: &mut container::Demux) {
-    if demux.container.starts_with("MPEG-2 TS") {
+    // A program stream's duration is the video PTS span from a head window to a
+    // tail window, so over a prefix the "tail" is just the cut point — the same
+    // reasoning as the TS head-to-tail PCR delta beside it.
+    //
+    // Ogg's is the same shape once more: it records no duration field, so the
+    // number comes from the last granule position a bounded tail window holds,
+    // and a prefix's "tail" is the cut point rather than the end of the stream.
+    use container::ps::{MPEG1_SYSTEM_LABEL, MPEG2_PROGRAM_LABEL, PES_ONLY_LABEL};
+    // Raw DV's duration is the payload length ÷ the frame size, so over a
+    // stdin prefix it would describe the buffered bytes rather than the file.
+    if demux.container.starts_with("MPEG-2 TS")
+        || matches!(
+            demux.container,
+            MPEG2_PROGRAM_LABEL
+                | MPEG1_SYSTEM_LABEL
+                | PES_ONLY_LABEL
+                | container::ogg::CONTAINER_LABEL
+                | container::dif::CONTAINER_LABEL
+        )
+    {
         demux.duration_secs = None;
     }
-    let mp4 = matches!(demux.container, "MP4 (ISOBMFF)" | "QuickTime (MOV)");
+    // Two containers keep a video-stream rate over a prefix: MP4/MOV, whose
+    // stsz/trun table sums are exact regardless of truncation, and RealMedia,
+    // whose MDPR rate is a header *declaration* — both are facts the buffered
+    // head carries whole, unlike MKV's summed block index.
+    let declared_rate = matches!(
+        demux.container,
+        "MP4 (ISOBMFF)" | "QuickTime (MOV)" | container::rm::CONTAINER_LABEL
+    );
     for t in &mut demux.tracks {
-        t.bitrate = t.bitrate.filter(|b| mp4 && b.scope == model::BitrateScope::VideoStream);
+        t.bitrate =
+            t.bitrate.filter(|b| declared_rate && b.scope == model::BitrateScope::VideoStream);
     }
 }
 
@@ -729,15 +848,20 @@ fn assemble_report(
     size_bytes: u64,
     data: &[u8],
     demux: &container::Demux,
-    feature: Option<bdiso::MainFeature>,
+    feature: Option<bdiso::DiscFeature>,
     truncated: bool,
     cli: &Cli,
     progress: &progress::Progress,
     frontier: &prefetch::Frontier,
-    started: Instant,
 ) -> Report {
     let opts = sample::Options { samples: cli.samples, full: cli.full, no_rpu: cli.no_rpu };
     let scan = sample::scan(demux, data, &opts, progress, frontier);
+
+    // `--full` is a promise that every access unit was read, and the report
+    // keeps its sampled footnote off on that basis. A backend whose chunk index
+    // covers only a bounded head window cannot keep that promise however many
+    // of its chunks the scan visits, so the marks stay on for it.
+    let complete_scan = cli.full && !demux.bounded_index;
 
     // Raw AV1 `--full`: duration (frames ÷ fps) exists only after the fused
     // walk counted the frames, so it lands here instead of demux.
@@ -750,7 +874,7 @@ fn assemble_report(
         let is_av1 = matches!(track.codec, container::Codec::Av1);
         let mut dv = scan
             .dv
-            .finalize(track.width, track.height, track.dv_config.as_ref(), cli.full, is_av1, track.dv_dual_track)
+            .finalize(track.width, track.height, track.dv_config.as_ref(), complete_scan, is_av1, track.dv_dual_track)
             .or_else(|| track.dv_config.as_ref().map(|c| dv::levels::container_only(c, track.dv_dual_track)));
 
         // The reported frame rate. The `--full` streaming walks recover what
@@ -762,6 +886,72 @@ fn assemble_report(
             (Some(n), Some(d)) if n > 0 && d > 0.0 => Some(n as f64 / d),
             _ => None,
         });
+
+        // Aspect: a format signals the pixel ratio *or* the display ratio,
+        // and the missing one is arithmetic against the coded size — never a
+        // guess, so both floats exist exactly when a rational was signalled
+        // (plus the coded size where the derivation needs it).
+        let aspect: Option<(f64, f64)> = match (track.pixel_aspect, track.display_aspect) {
+            (Some((pn, pd)), Some((dn, dd))) if pn > 0 && pd > 0 && dn > 0 && dd > 0 => {
+                Some((f64::from(pn) / f64::from(pd), f64::from(dn) / f64::from(dd)))
+            }
+            (Some((pn, pd)), None)
+                if pn > 0 && pd > 0 && track.width > 0 && track.height > 0 =>
+            {
+                let par = f64::from(pn) / f64::from(pd);
+                Some((par, par * f64::from(track.width) / f64::from(track.height)))
+            }
+            (None, Some((dn, dd)))
+                if dn > 0 && dd > 0 && track.width > 0 && track.height > 0 =>
+            {
+                let dar = f64::from(dn) / f64::from(dd);
+                Some((dar * f64::from(track.height) / f64::from(track.width), dar))
+            }
+            _ => None,
+        };
+        // The same signalled rationals, exact: presence mirrors the floats
+        // (both come from the one match above — when `aspect` is Some every
+        // input below is nonzero, so `reduced` cannot refuse). The floats are
+        // untouched; a derived rational and its float can differ in the last
+        // binary digit, which is why the doc ties them loosely.
+        let (par_rational, dar_rational) = if aspect.is_some() {
+            match (track.pixel_aspect, track.display_aspect) {
+                (Some((pn, pd)), Some((dn, dd))) => (
+                    model::Rational::reduced(pn.into(), pd.into()),
+                    model::Rational::reduced(dn.into(), dd.into()),
+                ),
+                (Some((pn, pd)), None) => (
+                    model::Rational::reduced(pn.into(), pd.into()),
+                    model::Rational::reduced(
+                        u64::from(pn) * u64::from(track.width),
+                        u64::from(pd) * u64::from(track.height),
+                    ),
+                ),
+                (None, Some((dn, dd))) => (
+                    model::Rational::reduced(
+                        u64::from(dn) * u64::from(track.height),
+                        u64::from(dd) * u64::from(track.width),
+                    ),
+                    model::Rational::reduced(dn.into(), dd.into()),
+                ),
+                (None, None) => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        // The base layer's *effective* colour: what the container or coded
+        // stream signalled, with the HLG/PQ alt-transfer SEI override applied.
+        // Built here, before the Dolby Vision post-passes, because the
+        // compatibility-id inference reads it — see `fill_inferred_compat`.
+        let mut color = track.color.clone();
+        let mut color_source = track.color_source;
+        if let Some(pt) = scan.sei.preferred_transfer {
+            if let Some(t) = container::cicp_transfer(pt as u16) {
+                color.transfer = Some(t.to_string());
+                color_source.transfer = Some(model::ColorSource::Sei);
+            }
+        }
 
         // The two grade-vs-base-layer verdicts (FEL brightness expansion,
         // mastering primaries mismatch) are only decidable here on the video
@@ -781,6 +971,18 @@ fn assemble_report(
             // frame rate — a metadata sidecar has neither (assumed canvas,
             // authoring-declared rate).
             dv::levels::fill_derived_level(dv, track.width, track.height, fps);
+            // Likewise the last rung of compatibility-id resolution: deducing
+            // the id from the base layer's colour needs a base layer. It reads
+            // the *effective* colour, with the alt-transfer SEI already applied,
+            // because that SEI is what distinguishes the two streams Dolby's
+            // table separates: a transfer characteristic of 14 is CCID 4 only
+            // "when used with the alternative_transfer_characteristic SEI
+            // message ... with the preferred_transfer_function set to 18". A
+            // bare 14 with no such SEI is an ordinary SDR wide-gamut curve and
+            // must resolve nothing.
+            dv::levels::fill_inferred_compat(dv, &color);
+            // And the base-layer transfer fact that rides the resolved id.
+            dv::levels::flag_pq_reshaping(dv);
         }
 
         let hdr10plus = scan.sei.hdr10plus.map(|info| Hdr10Plus {
@@ -796,6 +998,18 @@ fn assemble_report(
         // declares them all, where a sampled SEI shows one); the SEI supplies
         // the data-set type and target set and is the sole source everywhere
         // else. Either alone is presence. The published versions are all X.0.
+        // Coverage mirrors dolby_vision's: `none` when no frame was read at
+        // all (--no-rpu, where only the cuvv declaration can detect), `full`
+        // for a complete scan, else `sampled` — including a box-only default
+        // run whose sample spread found no SEI (frames *were* read, and a
+        // mid-title-only SEI could sit outside them).
+        let vivid_coverage = if cli.no_rpu {
+            model::Coverage::None
+        } else if complete_scan {
+            model::Coverage::Full
+        } else {
+            model::Coverage::Sampled
+        };
         let hdr_vivid = match (track.cuvv_version_map, scan.sei.hdr_vivid.as_ref()) {
             (Some(map), sei) => Some(model::HdrVivid {
                 version: format!("{}.0", 16 - map.leading_zeros()),
@@ -803,15 +1017,13 @@ fn assemble_report(
                 target_max_luminances: sei
                     .map(|s| hdr::pq_targets_to_nits(&s.target_pq))
                     .unwrap_or_default(),
-                // Like dolby_vision.sampled: false under --no-rpu (a box-only
-                // detection sampled nothing) and under --full.
-                sampled: !cli.full && sei.is_some(),
+                coverage: vivid_coverage,
             }),
             (None, Some(s)) => Some(model::HdrVivid {
                 version: format!("{}.0", s.version),
                 system_start_code: Some(s.system_start_code),
                 target_max_luminances: hdr::pq_targets_to_nits(&s.target_pq),
-                sampled: !cli.full,
+                coverage: vivid_coverage,
             }),
             (None, None) => None,
         };
@@ -832,28 +1044,34 @@ fn assemble_report(
                 .and_then(|c| container::cicp_primaries(c as u16))
                 .map(str::to_string),
             target_max_luminance: sl.target_max_nits.map(u32::from),
-            source_mastering: sl.source_mastering.clone(),
+            source_mastering_display: sl.source_mastering.clone(),
         });
 
         let hdr = Some(hdr::assemble(track, dv.as_ref(), &scan.sei));
 
-        // Reflect the HLG/PQ alt-transfer SEI override in the displayed colour line.
-        let mut color = track.color.clone();
-        if let Some(pt) = scan.sei.preferred_transfer {
-            if let Some(t) = container::cicp_transfer(pt as u16) {
-                color.transfer = Some(t.to_string());
-            }
+        // Last: the base-layer colour a Dolby Vision profile and compatibility
+        // id define outright, for the fields nothing signalled. Video path only
+        // — a metadata sidecar has no base layer to describe. After
+        // `hdr::assemble`, which reads the demuxed colour: nothing derived here
+        // may feed back into classification.
+        if let Some(dv) = dv.as_ref() {
+            dv::levels::fill_derived_color(&mut color, &mut color_source, dv);
         }
 
         video_tracks.push(model::VideoTrack {
             track_number: track.track_number,
             program: track.program,
             default: track.default_flag,
-            codec: track.codec.label(),
+            codec: Some(track.codec.label()),
+            codec_id: track.codec_id.clone(),
             codec_profile: track.codec_profile.clone(),
             width: if track.width > 0 { Some(track.width) } else { None },
             height: if track.height > 0 { Some(track.height) } else { None },
             fps,
+            fps_rational: track
+                .fps_rational
+                .and_then(|(n, d)| model::Rational::reduced(n, d)),
+            duration_secs: track.duration_secs,
             // A container-known rate wins (MKV statistics tags); the `--full`
             // streaming walks (TS ES bytes, MKV block bytes) fill the gap with
             // the exact per-track sum their demux could no longer compute —
@@ -865,8 +1083,14 @@ fn assemble_report(
             }),
             bit_depth: track.bit_depth,
             chroma: track.chroma.clone(),
+            pixel_aspect_ratio: aspect.map(|a| a.0),
+            pixel_aspect_ratio_rational: par_rational,
+            display_aspect_ratio: aspect.map(|a| a.1),
+            display_aspect_ratio_rational: dar_rational,
+            scan_type: track.scan_type.map(str::to_string),
             stereo: track.stereo.clone(),
             color,
+            color_source,
             hdr,
             dolby_vision: dv,
             hdr10plus,
@@ -875,38 +1099,69 @@ fn assemble_report(
         });
     }
 
-    // The ISO report describes the probed clip (duration, bitrate, tracks)
-    // under the ISO's own name and size; the `Main feature` line carries the
-    // selected playlist/clip and the playlist's edit duration.
+    // The ISO report describes the probed feature (duration, bitrate, tracks)
+    // under the ISO's own name and size; the `Main feature` line carries what
+    // was selected and its own declared duration (a Blu-ray playlist's edit
+    // duration, a DVD title set's IFO runtime).
     let container = match &feature {
-        Some(_) => "Blu-ray ISO (BDMV)".to_string(),
+        Some(bdiso::DiscFeature::Bd(_)) => "Blu-ray ISO (BDMV)".to_string(),
+        Some(bdiso::DiscFeature::Dvd(_)) => "DVD-Video ISO (VIDEO_TS)".to_string(),
         None => demux.container.to_string(),
     };
-    let bd_iso = feature.map(|f| model::BdIso {
-        playlist: f.playlist,
-        playlist_duration_secs: f.playlist_duration_secs,
-        clip: f.clip,
-        clip_index: f.clip_index,
-        clip_count: f.clip_count,
-    });
+    let (mut bd_iso, mut dvd_iso) = (None, None);
+    match feature {
+        Some(bdiso::DiscFeature::Bd(f)) => {
+            bd_iso = Some(model::BdIso {
+                playlist: f.playlist,
+                playlist_duration_secs: f.playlist_duration_secs,
+                clip: f.clip,
+                clip_index: f.clip_index,
+                clip_count: f.clip_count,
+            });
+        }
+        Some(bdiso::DiscFeature::Dvd(f)) => {
+            dvd_iso = Some(model::DvdIso {
+                vts: f.vts,
+                vob_count: f.vob_count,
+                title_duration_secs: f.title_duration_secs,
+            });
+        }
+        None => {}
+    }
 
     Report {
         hdrprobe_schema_version: model::SCHEMA_VERSION,
         file,
         size_bytes,
-        input_truncated: truncated,
+        // A stdin stream cut by the head budget, or a *file* whose container
+        // declares more bytes than it holds (`Demux::declared_short`) — the
+        // flag names why an AVI/ASF/FLV prefix's numbers cannot all describe
+        // one file. Only the stdin case feeds the prefix-suppression table
+        // (`suppress_prefix_derived_facts`); the backends behind
+        // `declared_short` already withheld their own prefix-invalid facts.
+        input_truncated: truncated || demux.declared_short,
         container,
         bd_iso,
+        dvd_iso,
         format_version: None,
         duration_secs,
         video_tracks,
-        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     }
 }
 
+/// Extensions a directory scan picks up. Every extension `container::demux`
+/// dispatches on belongs here or the format is unreachable in bulk — probing one
+/// file by name would work while `hdrprobe rips/` silently skipped it.
+///
+/// `.bin` is the deliberate omission: the raw-HEVC dispatch accepts it, but it
+/// is far too generic a name to claim in a directory of mixed files. `.wma`,
+/// `.ogg` and `.oga` are omitted for the sibling reason — all three dispatch
+/// when named, because each can carry video, but each is overwhelmingly an
+/// audio extension, and a scanned music library would print an error per track.
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "ts", "m2ts", "mts", "hevc", "h265", "265", "ivf", "obu",
-    "iso",
+    "iso", "mpg", "mpeg", "vob", "m2p", "evo", "m2v", "m1v", "mpv", "avi", "wmv", "asf", "flv",
+    "ogv", "dv", "dif", "rm", "rmvb",
 ];
 
 fn collect_paths(inputs: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
@@ -953,10 +1208,35 @@ fn write_output(output: &Option<PathBuf>, buf: &str) -> Result<()> {
             f.write_all(buf.as_bytes())?;
         }
         None => {
-            print!("{buf}");
+            write_stdout(buf);
         }
     }
     Ok(())
+}
+
+/// Write a piece of the report stream to stdout, treating a closed pipe as the
+/// consumer having read its fill rather than as a failure.
+///
+/// `hdrprobe … | head` and `| less` (quit early) are ordinary use, and the
+/// `print!` macro *panics* on the write error they produce — printing a Rust
+/// backtrace over the user's terminal and exiting 101, a code outside this
+/// tool's contract entirely (0 ok, 1 usage, 2 unreadable). This is the same
+/// convention the stdin path already documents from the other end of the pipe:
+/// when the far side stops, that is a success signal, not an error.
+///
+/// Returns `false` once stdout is gone, so callers stop writing rather than
+/// repeating the failure once per remaining file. A genuine write error (a full
+/// disk on a redirect) still reports itself and stops the stream.
+fn write_stdout(buf: &str) -> bool {
+    let mut out = std::io::stdout().lock();
+    match out.write_all(buf.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => false,
+        Err(e) => {
+            eprintln!("error: writing output: {e}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1030,8 +1310,12 @@ mod tests {
 
     #[test]
     fn truncation_suppresses_span_derived_facts_only() {
-        use model::{Bitrate, BitrateScope};
-        let overall = Some(Bitrate { bits_per_sec: 1.0, scope: BitrateScope::Overall });
+        use model::{Bitrate, BitrateScope, BitrateSource};
+        let overall = Some(Bitrate {
+            bits_per_sec: 1.0,
+            scope: BitrateScope::Overall,
+            source: BitrateSource::Measured,
+        });
         let stream = Some(Bitrate::video_stream_bps(1.0));
 
         // TS: the PCR-span duration and the overall rate are prefix-derived.
@@ -1052,5 +1336,26 @@ mod tests {
         suppress_prefix_derived_facts(&mut d);
         assert_eq!(d.duration_secs, Some(3600.0));
         assert!(d.tracks[0].bitrate.is_some());
+
+        // Ogg: the duration is the last granule position a tail window holds,
+        // so over a prefix it describes the cut point rather than the stream.
+        let mut d = demux_with(container::ogg::CONTAINER_LABEL, Some(7200.0), overall);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, None);
+        assert!(d.tracks[0].bitrate.is_none());
+
+        // RealMedia: the duration and the stream rate are both header
+        // declarations the buffered prefix carries whole, so both stand —
+        // matching the file-probe path, where a declared-short .rm keeps them.
+        let mut d = demux_with(container::rm::CONTAINER_LABEL, Some(7286.037), stream);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, Some(7286.037));
+        assert!(d.tracks[0].bitrate.is_some(), "a declared rate survives a prefix");
+
+        // And the label match is a constant pattern, not a catch-all binding:
+        // a container not in the list keeps its declared duration.
+        let mut d = demux_with("AVI (RIFF)", Some(7200.0), stream);
+        suppress_prefix_derived_facts(&mut d);
+        assert_eq!(d.duration_secs, Some(7200.0), "only listed labels suppress");
     }
 }

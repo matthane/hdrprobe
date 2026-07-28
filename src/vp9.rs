@@ -104,13 +104,15 @@ const CS_BT_2020: u32 = 5;
 const CS_RGB: u32 = 7;
 
 fn chroma_str(ss_x: u32, ss_y: u32) -> &'static str {
+    // Two one-bit flags, four combinations, all defined — including vertical
+    // subsampling alone, 4:4:0, which the header admits though real encoders
+    // never write it. A total mapping, so no reserved arm exists here (the
+    // CodecPrivate feature byte below is the one with reserved values).
     match (ss_x, ss_y) {
         (1, 1) => "4:2:0",
         (1, 0) => "4:2:2",
         (0, 0) => "4:4:4",
-        // 4:4:0 — legal in the header but unused by real encoders; the schema's
-        // reserved-signalling rendering.
-        _ => "?",
+        _ => "4:4:0",
     }
 }
 
@@ -133,7 +135,7 @@ fn color_info(color_space: u32, full_range: bool) -> ColorInfo {
         primaries: None,
         transfer: None,
         matrix: cicp.and_then(crate::container::cicp_matrix).map(str::to_string),
-        range: Some(if full_range { "full" } else { "limited" }.to_string()),
+        range: Some(crate::container::cicp_range(full_range).to_string()),
     }
 }
 
@@ -166,12 +168,14 @@ pub fn parse_webm_codec_private(data: &[u8]) -> Vp9CodecPrivate {
             (2, Some(v)) if v > 0 => out.level = Some(v),
             (3, Some(v)) => out.bit_depth = Some(v),
             (4, Some(v)) => {
-                out.chroma = Some(match v {
-                    0 | 1 => "4:2:0",
-                    2 => "4:2:2",
-                    3 => "4:4:4",
-                    _ => "?",
-                })
+                // 0/1 are the two 4:2:0 sitings; values past 3 are reserved
+                // and name nothing, so the field stays absent for them.
+                out.chroma = match v {
+                    0 | 1 => Some("4:2:0"),
+                    2 => Some("4:2:2"),
+                    3 => Some("4:4:4"),
+                    _ => None,
+                }
             }
             _ => {}
         }
@@ -191,6 +195,21 @@ pub fn profile_label(profile: u8, level: Option<u8>) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The frame header's two subsampling bits form a total mapping — the
+    /// fourth combination is 4:4:0, defined though never written by real
+    /// encoders — while the CodecPrivate feature byte has genuinely reserved
+    /// values (> 3), which name nothing and leave the field absent.
+    #[test]
+    fn chroma_mappings_are_total_or_honestly_absent() {
+        assert_eq!(super::chroma_str(0, 1), "4:4:0");
+        // Feature 4 (chroma) with a reserved value: absent, not a placeholder.
+        let private = [4u8, 1, 7];
+        assert_eq!(super::parse_webm_codec_private(&private).chroma, None);
+        // The defined values still resolve.
+        let private = [4u8, 1, 2];
+        assert_eq!(super::parse_webm_codec_private(&private).chroma, Some("4:2:2"));
+    }
+
     use super::*;
 
     /// Build a keyframe header bit-by-bit (MSB first) and pad to bytes.

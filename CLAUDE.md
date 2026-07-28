@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 219 unit tests
+cargo test                     # 547 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -76,8 +76,17 @@ never parse bytes native-endian.
   then the video pipeline), exit codes (0 ok / 1 usage / 2 unreadable).
 - `container/` — one hand-rolled demuxer per format: `mp4.rs`, `mkv.rs`, `ts.rs`, `annexb.rs`,
   `av1.rs` (which also owns the IVF wrapper's FourCC dispatch: `VP90` → the VP9 IVF demux,
-  `VP80` → an honest error, else AV1); `mod.rs` holds `Demux`/`Chunk`/`DvConfig` and the shared
-  dvcC/hvcC/CICP decoders.
+  `VP80` → an honest error, else AV1), `mpegv.rs` (raw MPEG-1/2 video elementary stream, the
+  thinnest backend in the tree: a bounded head read fills the General fields and `chunks` stays
+  empty, per the metadata-only contract on `TrackDemux::chunks`; under `--full` a count-only
+  fused walk — `RawFullStream::Mpegv`, the Ogg shape — counts picture start codes so duration
+  is frames ÷ the sequence header's rate and the bitrate is the file's bytes over it, at
+  `video_stream` scope, reproducing MediaInfo byte-exactly on both corpus raw streams), `ps.rs` (below); `mod.rs` holds
+  `Demux`/`Chunk`/`DvConfig`, the shared dvcC/hvcC/CICP decoders, `fill_nal_config_fields` (an
+  `avcC`/`hvcC` record to a `TrackDemux`, shared because AVI, ASF and FLV all hand one over and
+  each reaches it through a different carriage's framing test), and — since TS and PS both
+  reassemble an elementary stream out of packet payloads and then have to read the picture out
+  of the bitstream — the shared in-band SPS search (`SpsCommon`, `best_sps`, `sps_fields`).
 - `hevc/` — `nal.rs` (Annex-B + length-prefixed NAL split), `sps.rs` (dims + VUI colour + VUI
   timing/frame rate).
 - `avc/` — the H.264 analogue, for Dolby Vision **Profile 9** (`dvav.09`: 8-bit AVC, single-layer,
@@ -113,7 +122,391 @@ never parse bytes native-endian.
   carries no `colr` box at all, leaving the frame header's CICP as the only colour signal
   (verified: without the fill such a PQ master classifies SDR). ProRes RAW (`aprn`/`aprh`)
   is a different codec family and stays on the `Other` fallback.
-- `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation).
+- `mpeg2.rs` — MPEG-1 (ISO/IEC 11172-2) and MPEG-2 (ITU-T H.262 | ISO/IEC 13818-2) video, read
+  from the `sequence_header` and its two sequence extensions through the same gap-filler shape
+  (`container::fill_mpeg2_stream_fields`). The module doc carries the carriage details; four
+  facts are invariants a later change would otherwise undo silently, each pinned by a test naming
+  its spec table. **Colour has no defaults**: H.262 leaves an absent `sequence_display_extension`
+  "implicitly defined by the application", so nothing is filled and the fields stay genuinely
+  unsignalled (D4 of `dev/sdr-coverage-plan.md`); filling BT.601 would fabricate. **Colour value
+  0 is Forbidden, not CICP 0**, so a stray 0 reads as unsignalled rather than decoding to
+  "RGB"/"Identity". **Bit depth is not signalled** and is the spec constant 8 for every defined
+  profile, like ProRes's family depth; `intra_dc_precision` is *not* a depth field (values 8..11,
+  DC inverse-quantisation scaling) and reporting it would print "11-bit" on an 8-bit stream. And
+  **frame-rate codes 9..15 are reserved**, yielding `None`; ffmpeg's `ff_mpeg12_frame_rate_tab`
+  fills 9..13 with Xing and libmpeg3 economy rates, so mirroring it invents a frame rate. Codec
+  identity in a raw stream comes from the *absence* of a `sequence_extension`, which is what makes
+  a stream 11172-2; in a container the container says. Two carriage gates are load-bearing
+  elsewhere: the TS descriptor-less multi-PID merge is **HEVC-only** (it is the Dolby Vision
+  Profile 7 shape, and MPEG has no enhancement layer, so two MPEG-2 video PIDs are two tracks),
+  and MPEG groups are excluded from `ts::sps_rescue` (no SPS exists to find, and hunting one runs
+  the walk to EOF, making `--full` two passes over the file).
+- `mpeg4part2.rs` — ISO/IEC 14496-2 "MPEG-4 Visual" (Xvid, DivX 4/5/6, 3ivx), read from the
+  VOS/VisualObject/VideoObjectLayer headers through the same gap-filler shape
+  (`container::fill_mpeg4part2_stream_fields`, which tries the container's own copy of those
+  headers before touching a chunk — Matroska CodecPrivate, an `esds` DecoderSpecificInfo, a
+  `BITMAPINFOHEADER`'s extradata all hold them verbatim). Three facts are invariants.
+  **Colour has spec-defined defaults, unlike MPEG-2**: an absent `video_signal_type()` or a
+  clear `colour_description` means BT.709 primaries, transfer *and* matrix plus limited range,
+  a genuine `ColorSource::Spec` fill — and the range bit sits one level above the
+  `colour_description` flag, so the two halves carry different provenance and are built
+  separately. **The frame rate is absent unless `fixed_vop_rate` is set**, which ffmpeg's
+  encoder never sets; reporting `vop_time_increment_resolution` instead (what ffmpeg's
+  *decoder* surfaces) prints "30000 fps" on ordinary content. And **every marker bit on the
+  path is checked rather than skipped** — the VOL is bit-packed with no byte alignment, one
+  missed conditional desynchronises every field after it, and the markers are the only
+  structural evidence the walk is still aligned. The parser is not a sniffer: `00 00 01 B3` is
+  an MPEG-4 group-of-VOP header *and* an MPEG-1/2 sequence header, so it runs only on bytes a
+  container already identified as Part 2. The studio VOL layout is sourced to ffmpeg alone and
+  says so at the code site (it is the only Part 2 variant signalling a depth above 8 or a
+  chroma format other than 4:2:0), and a sprite-coded layer stops the walk rather than guessing
+  a block this project has no primary source for.
+- `vc1.rs` — SMPTE ST 421 (VC-1). Read against **ST 421:2013**, not the freely circulating
+  "VC-9" Committee Draft, whose sequence header has a different layout. Two facts dominate.
+  **VC-1's colour fields are not CICP**: the value spaces are narrower, the defaults are
+  *not* all 1 (`MATRIX_COEF` defaults to **6**, BT.601, over BT.709 primaries and transfer —
+  a mixed combination, and the common case, since every real VC-1 file observed clears
+  `COLOR_FORMAT_FLAG`), and **`TRANSFER_CHAR` 8 is BT.1361 where CICP 8 is Linear**, so the
+  module translates into CICP codes rather than passing them through. ffmpeg's whitelist both
+  drops defined values and admits reserved ones, and GStreamer copies it; the published tables
+  win. **And there are two profile numberings.** The in-band sequence header's `PROFILE` is
+  2 bits, 0/1/3 for Simple/Main/Advanced. Everything in SMPTE RP 2025-2007's `dvc1` box is
+  4 bits, 0/4/12 — §8.1 for `VC1DecSpecStruc.profile`, and §8.3 says `VC1SequenceHeader_C`
+  (STRUCT_C) "shall be set to the same value", so **STRUCT_C inside a `dvc1` uses 0/4/12 too**,
+  which reads like the bitstream field and is not. `profile_from_config` is the one place that
+  numbering lives. VC-1 is also the only codec in this corner of the tree that **does** use
+  emulation prevention, so the payload between start codes is unescaped before any bit is read.
+- `theora.rs` — Theora (Xiph.Org), read from the 42-byte identification header that sits alone in
+  its logical stream's first page, so the whole parse is one page. Ogg records no colour, no
+  dimensions and no frame rate of its own, which makes this header the *only* source for every
+  picture fact the report carries — a gap-filler with no gap. **`CS` is not CICP**: three values
+  (0 undefined, 1 Rec.470M, 2 Rec.470BG) whose primaries and matrix map onto code points, and whose
+  **transfer fills as CICP 1 by the field's own definition** — H.273's `transfer_characteristics`
+  is the source's opto-electronic function, which Theora fixes at Rec.709's curve for both colour
+  spaces; the Rec.470 *display* gammas it also states (2.2 and 2.67) are EOTF-side facts no SDR
+  CICP code carries, so they are not evidence against the fill. ffprobe reads the field to the same
+  value (bt709 for both defined codes) and MediaInfo reports no Theora colour at all. Plan decision
+  D8 originally shipped the transfer unset as the open question's reversible answer; settled and
+  reversed with sign-off 2026-07-26. The reserved values above 2 still fill nothing at all, since
+  passing them through as CICP would read 5 as "BT.601 (PAL)" and 9 as "BT.2020". CS 1 takes
+  matrix code **6** and CS 2 code
+  **5** — numerically identical coefficients, so only the label is at stake, and each takes the one
+  naming the system its own primaries name. **Display size is not coded size**: `FMBW`/`FMBH` count macroblocks, so an
+  854-wide video is coded 864 wide, and `PICW`/`PICH` are used only within 16 pixels of the coded
+  size — the spec's own construction rule and ffmpeg's guard. **The granule position is two fields,
+  not a shift**: `KFGSHIFT` splits it into a keyframe index and an offset, and the frame count is
+  their *sum*, with streams older than 3.2.1 storing the index rather than the count (libtheora's
+  own `th_granule_frame` adjustment). Bit depth is the spec constant 8 (§1.2 says wider "is not
+  planned"), like MPEG-2's and ProRes's family depth; `NOMBR` is a stated hint and is never a
+  bitrate (MediaInfo reports it as one — 200000 on every corpus file against a measured 198868).
+- `mjpeg.rs` — Motion JPEG (ITU-T T.81), the plainest gap-filler: depth and chroma from the
+  first frame's own `SOF` marker segment, reached by a bounded declared-length marker walk that
+  stops at `SOS` (entropy-coded data would otherwise read as markers). Two facts are invariants,
+  both pinned by tests. **Depth and chroma are signalled, not family constants** — `SOF`
+  precision is 8 only for baseline, and real capture hardware writes 4:2:2 — so they are read,
+  never assumed (unlike the WMV/MS-MPEG-4 constants in `container::fill_constant_depth_chroma`).
+  And **subsampling is the ratio of luma to chroma factors, not the factors themselves**:
+  ffmpeg's 4:4:4 encodes write a uniform `0x12` on all three components, which a raw-factor
+  table misreads as nothing. MJPEG records no colour anywhere this tree reads (JFIF's BT.601
+  full-range is an interchange-format definition, not a signal), so the Color line stays empty.
+  Carriages: VfW `MJPG` (AVI/ASF/MKV — ASF indexes no payload, so its MJPEG reports no
+  depth/chroma, honestly), Matroska `V_MJPEG`, QuickTime `jpeg`, MP4 `esds` OTI `0x6C`. Apple's
+  `mjpa`/`mjpb` field-split variants and the vendor VfW tags (`dmb1`, `AVRn`, `LJPG`) alter the
+  frame layout or lack a witness and stay on the honest-FourCC fallback.
+- `container/dif.rs` — raw DV (DIF) tape streams (`.dv`/`.dif`), IEC 61834 / SMPTE 314M/370M:
+  fixed-size frames of 80-byte DIF blocks, so every fact is a system constant keyed by two
+  header discriminators (the DSF bit, byte 3 bit 7; the VAUX video-source `stype`, byte 451 low
+  5 bits) through the table transcribed from ffmpeg's `dv_profile.c` and verified against
+  encoded fixtures. Duration and bitrate are exact arithmetic on the file length (whole frames
+  ÷ system rate; **`overall` scope, because DV interleaves audio inside the video frame** —
+  ffprobe's stream rate and MediaInfo's `OverallBitRate` are this same number, and MediaInfo's
+  separate video-only rate is an internal constant nothing here reproduces). Three traps:
+  **APT is not IEC-vs-DVCPRO evidence on 525-60** (ffmpeg writes APT=1 on its own IEC NTSC
+  encodes and both families are 4:1:1 there; APT decides exactly one thing — 625-50 DV25
+  4:2:0 IEC vs 4:1:1 DVCPRO), **the 16:9 flag is searched at two per-sequence VAUX
+  video-control positions** (even and odd DIF sequences place the pack differently, and code
+  `0x07` counts as 16:9 only under APT 0), and **scan type is deliberately unreported**
+  (ffprobe abstains with `field_order=unknown`, MediaInfo asserts Interlaced/BFF from VSC bits
+  with no primary spec on hand — signalled-only says abstain). ffmpeg's wrong-DSF PAL hack is
+  declined structurally: it fires only on a caller-supplied whole-frame buffer that neither a
+  head probe nor ffmpeg's own raw-.dv demuxer ever passes. `chunks` stays empty (the
+  mpegv/asf contract — DV has no SEI/RPU/T.35 side channel) and `--full` changes nothing,
+  every fact being exact on the default path.
+- `container/rm.rs` — RealMedia (`.rm`/`.rmvb`), read against ffmpeg's `rmdec.c` (the only
+  complete public description) and verified on encoded RV10/RV20 fixtures plus a real-world
+  RV40 `.rmvb`. The ASF shape: big-endian chunks (FourCC + u32 size + u16 version) walked
+  from the head, every fact declared before `DATA`, `chunks` empty by design (packets
+  interleave like ASF's; RealVideo has no bitstream side channel), colour honestly absent.
+  Facts that are easy to get wrong: **the `VIDO` fps field is 16.16 fixed point**
+  (`fps/65536` — ffmpeg's `av_reduce(..., 0x10000, fps, ...)`; the real RV40 sample declares
+  1,571,294 = 23.976, so an integer or two-u16 reading corrupts every non-integer rate);
+  **the video `MDPR`'s own duration wins over `PROP`'s** (ffmpeg discards the file duration
+  the moment a stream declares one — the two differ by 7 ms on the real sample and ffprobe
+  reports the MDPR value); the reported rate is the `MDPR` declared average at
+  `video_stream` scope (MediaInfo's Video `BitRate` and ffprobe's stream `bit_rate`), never
+  `PROP`'s whole-file average; depth/chroma are the family constants 8-bit 4:2:0 (normative
+  for the H.263-design RV10/RV20, single-witness for the proprietary RV30/RV40 — ffmpeg's
+  decoders emit yuv420p alone, MediaInfo abstains); and **complete ffmpeg muxes declare the
+  `DATA` chunk exactly 10 bytes past EOF** (measured on both fixtures), so the
+  `declared_short` comparison carries a small slack or every remux reads as a partial
+  download — a real cut misses by megabytes. `MLTI` multirate blocks are unwrapped
+  (rule table, then u32-sized nested codec-data blocks); RealAudio-only files and the
+  ancient `.ra\xfd` format error honestly rather than reporting no video.
+- `container/bmih.rs` — `BITMAPINFOHEADER`, the Video for Windows description block, plus the
+  FourCC-to-codec table. It lives in `container/` rather than a backend because three carriages
+  hand one over: AVI's `strf`, ASF's type-specific data, and **Matroska's `V_MS/VFW/FOURCC`**,
+  which is the only carriage VC-1 has in an MKV. Two traps: **`biBitCount` is display bits per
+  pixel and never a bit depth** (a 4:2:0 8-bit stream routinely writes 24), so the field is not
+  exposed at all; and **`biHeight` is signed**, negative meaning top-down, so the absolute value
+  is the height (`unsigned_abs`, because `i32::MIN.abs()` panics). Extradata is bounded by the
+  *caller's* slice, never by `biSize`, which real muxers write inconsistently — the corpus VC-1
+  MKV declares 71 over a 72-byte CodecPrivate. The FourCC table names AVC and HEVC, so **every
+  caller must pair it with `is_config_record`**: a VfW-wrapped H.264 is length-prefixed with an
+  `avcC` in the extradata in one common mux and raw Annex-B in another, the FourCC does not
+  separate them (`ffmpeg -c:v copy` from MP4 writes `avc1`, a fresh encode writes `H264`), and
+  handing the sampler the wrong framing feeds it bytes that are not NAL units. The test is the
+  first extradata byte — a configuration record opens with `configurationVersion == 1`, Annex-B
+  with a start code's `0x00` — which is ffmpeg's own discriminator. The length prefix size is
+  *not* read there: it lives at a different offset in each record (byte 4 of an `avcC`, byte 21
+  of an `hvcC`), so it comes from `parse_avcc_record`/`parse_hvcc_record`, which both MKV arms
+  and the AVI backend reach through `mkv::nal_config`'s shape.
+- `container/avi.rs` — AVI (RIFF / OpenDML), `.avi`. Everything is a `ckID`/`ckSize` pair, so
+  every position is arithmetic on declared sizes and the default path **scans nothing**: the
+  `hdrl` is structurally at the head and both index forms are seek-addressable from it (a 1.07 GiB
+  two-segment file reports in 29 ms). Six facts are invariants, each pinned by a test.
+  **The frame-rate signal is a stream *unit* rate, not a picture rate** — `strh.dwRate/dwScale`
+  counts whatever `dwLength` counts, and an `ffmpeg -i x.mp4 -c:v copy out.avi` remux (a very
+  common operation) declares 1200 units at 600/1 for a 2 s 25 fps clip, 1150 of them zero-length
+  padding chunks. MediaInfo reports 600.000 fps for it. So the *coded stream's* own rate wins
+  where it has one and the container's is the fallback, which is why `demux` fills `fps` only
+  `if td.fps.is_none()` after the bitstream parsers have run; the duration is unaffected either
+  way, since both halves of `dwLength / (dwRate/dwScale)` count the same units.
+  **`avih.dwTotalFrames` is wrong on every OpenDML file** and is never read; `strh.dwLength` is
+  the whole-file count on both ffmpeg and VirtualDub. **The `odml` LIST is written as a `JUNK`
+  chunk with a zero frame count on a single-RIFF file** — ffmpeg reserves the block and rewrites
+  the id to `LIST` only on rollover, so all ten corpus AVIs (including the one *named*
+  `h264_odml.avi`) carry a `JUNK`-wrapped `dmlh` reading 0 while a real two-segment file reads
+  5000. `dmlh` must therefore be reached by descending a genuine `LIST odml`, never by searching
+  for its FourCC. **The two index forms use opposite offset conventions**: `idx1` entries address
+  the chunk *header* relative to the `movi` FOURCC (so entry 0 reads 4), while OpenDML `ix##`
+  entries address the chunk *data* relative to `qwBaseOffset`; both bases are derived and then
+  *validated* against the chunk actually at that position, because Microsoft documents an
+  absolute-offset `idx1` variant (VirtualDub before build 4936) and nothing else would catch a
+  misread. **`idx1` covers only the first RIFF segment**, a 22% byte undercount on a real
+  two-segment file, so summing it is gated on the file being single-segment; multi-segment files
+  sum the `ix##` chunks the `indx` super-index points at. **`idx1` entry 0 need not be video** —
+  it is `01wb` on the corpus's video+MP3 file — so entries are filtered by the two-digit
+  stream-index prefix and the base comes from entry 0's own chunk id (unfiltered, that file's
+  rate is 12.5% high). Deliberately not parsed: `vprp` (it carries only display aspect ratio and
+  field order, both out of scope plan-wide, plus a refresh rate and geometry that duplicate
+  `strh`/`strf`), `dwMaxBytesPerSec` (a whole-file maximum including audio) and `biBitCount`.
+- `container/asf.rs` — ASF / Windows Media (`.wmv`, `.asf`, and a `.wma` carrying video), a flat
+  tree of `GUID` + `u64 size` objects walked from byte 0. The Header Object declares its own size
+  and holds every reported field, so the parse is a bounded head read and **`chunks` stays empty
+  by design**, not by omission: ASF Data Packets carry a length-encoded payload header with
+  several payloads per packet and payloads split across packets, so a video access unit is not a
+  byte range in the file, and nothing in the report needs one (VC-1 publishes its sequence header
+  into codec-private data by every carriage spec that defines one, the Windows Media codecs signal
+  nothing in band, and the bitrate and duration are stated outright). Five facts are invariants.
+  **GUIDs are mixed-endian and are generated, never hand-typed** (`guid()` does
+  `struct.pack('<IHH', d1, d2, d3) + bytes[8:16]` at compile time) — the reference records three
+  being mistyped while it was written, each reporting an object as absent from a file that plainly
+  contains it. **The tree must be walked, never searched**: real files are multi-stream and the
+  audio stream is routinely first, so the first `Stream Properties Object` is the wrong one, and
+  there is one `Extended Stream Properties Object` *per stream*, correlated by `Stream Number`.
+  **Play Duration is offset by Preroll and the units differ** (100-nanosecond ticks against
+  milliseconds); Microsoft's encoder writes a 5000 ms preroll and ffmpeg 3100 ms, so skipping the
+  subtraction overstates a 2-second clip by 155%. **`Maximum Bitrate` is a whole-file ceiling and
+  is never read**; the per-video-stream rate is the ESP `Data Bitrate` (the leak rate "excluding
+  all ASF Data Packet overhead"), with `Stream Bitrate Properties` as the ~1%-higher fallback that
+  the spec says *should* include that overhead — MediaInfo prefers the same one. And **ASF records
+  no colour anywhere**, so a WVC1 track's colour comes from the VC-1 sequence header in the
+  extradata and `WMV1`/`WMV2`/`WMV3` correctly report none. Two smaller traps: the object walk is
+  *recursive* (into the Header Extension) and a Header Extension costs 46 bytes, so it is
+  depth-bounded — a stack overflow is an abort, outside the 0/1/2 exit contract and outside
+  `catch_unwind`; and the WVC1 extradata does **not** begin at its start code (both
+  Microsoft-authored corpus files write one leading byte before `00 00 01 0F`), which is why
+  `vc1::parse_sequence_header` locates the EBDU instead of reading from offset 0, exactly as
+  ffmpeg's `vc1_decode_init` does.
+- `container/flv.rs` — FLV (Adobe Flash Video) and Enhanced FLV / E-RTMP, `.flv`: a 9-byte header
+  then a flat chain of `11-byte header + DataSize payload + 4-byte back-pointer` tags, so the walk
+  is declared-size arithmetic like AVI's, without an index. **Big-endian throughout**, the
+  opposite of every other byte-oriented container here. Seven facts are invariants.
+  **`TimestampExtended` is the high byte** (`(byte 7 << 24) | u24(bytes 1..4)`), not a fourth low
+  byte, and **`TagType` is `byte & 0x1F`** (the top bits are reserved plus the `Filter` encrypted
+  flag, whose payload must not be handed to a parser). **`onMetaData` is a hint**: FLV's habitat is
+  RTMP ingest, its `duration` is routinely absent or zero, and ffmpeg gates width/height/codec from
+  it behind a `trust_metadata` option — so the coded stream wins every field it states and the
+  metadata fills what is left. Its `filesize`, when declared, is what tells a truncated file from a
+  complete one. **The ecma-array count is documented as approximate and must never bound the
+  parse** — writers emit 0 over a populated array — so the property list ends on its `00 00 09`
+  terminator with the tag's `DataSize` as the outer bound, and the AMF reader additionally carries
+  a *node budget*, because a property list costs three bytes per entry while each entry allocates a
+  `String`: that product is the bounded quantity, the same shape as the AVI index defect.
+  **`videodatarate` is in units of 1024 bits/s, not 1000** (7812.5 and 29296.875 on the two real
+  corpus files recover exactly 8 and 30 Mbit/s; x1000 is 2.4% low and not round), and it is
+  muxer-declared rather than measured, which is why a `--full` walk's exact sum replaces it.
+  **The Enhanced header must be detected before the CodecID is read** (bit 7 of the first payload
+  byte), a **`ModEx` packet type prefixes a variable-length block and re-states the type** so the
+  FourCC is not at a fixed offset, and **the 3-byte composition time is present only on
+  `CodedFrames` (1) *and* only for `avc1`/`hvc1`/`vvc1`** — `CodedFramesX` (3) never has it and
+  `av01`/`vp08`/`vp09` never have it, so a fixed payload start shifts an access unit by three
+  bytes, which for AV1 lands past the metadata OBUs that open the unit and costs the entire
+  dynamic report (RPU, HDR10+ T.35, CLL/MDCV). Reference §6 describes packet type 1 as "with s24
+  CTS" without the codec gate and is wrong. A **`videoFrameType` of 5 (Command) carries a command
+  byte where the FourCC would be**, except inside a Metadata packet — which is exactly the
+  combination the corpus's own `colorInfo` tag uses, so the two conditions must be tested
+  together. And **Enhanced `colorInfo` luminance is in nits where ST.2086's is 0.0001 cd/m²**, a
+  deliberate departure the E-RTMP spec calls out; reading it as ST.2086 misreports min luminance by
+  10000x. That last one has **no real-bytes fixture** — ffmpeg's muxer writes only
+  `colorConfig.matrixCoefficients`, by two independent routes — so it is spec-derived and pinned by
+  a unit test alone. Unlike ASF a video access unit *is* a byte range, so the chunk index is real
+  and the sampler runs: the corpus's Enhanced FLV reports a mastering display and MaxCLL that exist
+  only in the HEVC bitstream's SEI messages. E-RTMP **multitrack** (packet type 6) is detected and
+  confined — the first track's FourCC still names the codec, and nothing from such a tag is
+  indexed, because what follows the FourCC depends on the multitrack type and blending several
+  tracks' access units would be worse than reporting fewer facts. A `vp08`/`vp09` `SequenceStart`
+  body is a `VPCodecConfigurationRecord` — the same bytes MP4 puts in a `vpcC` — and reaching it
+  is not optional: VP9's bitstream names no transfer and no primaries at all, so that record is
+  the only place such a track's colour exists and a BT.2020/PQ stream would otherwise classify
+  SDR with nothing able to correct it (hence `container::parse_vpcc_record`, shared with MP4).
+  A file whose tag chain names no codec anywhere falls back to `onMetaData.videocodecid` — a
+  legacy id as a small integer, an Enhanced FourCC as a big-endian `u32` — which covers an
+  encrypted chain, whose `onMetaData` the spec guarantees stays in the clear; with neither, the
+  file is refused rather than reporting a placeholder track.
+  Three bounding rules earn their own mention because each was a live defect.
+  **Every read in a tag header is bounded by the tag, not the buffer**: a `DataSize` of 0 puts the
+  video header exactly on the following 4-byte `PreviousTagSize`, and a *well-formed* empty video
+  tag writes `00 00 00 0B` there — read as legacy codec id 0. Since the codec gate is first-wins
+  and `Codec::Other` has no sampler arm, one such tag makes every later real video tag inert and
+  silently costs the whole dynamic report (reproduced on the corpus Enhanced FLV: its mastering
+  display and MaxCLL vanished). **The `vpcC` arm names its codecs exactly rather than matching
+  `Other(_)`**, because `parse_vpcc_record`'s only structural test is a leading `0x01` — which is
+  `configurationVersion` in an `avcC` and an `hvcC` too, so a wildcard reads those records'
+  constraint bytes as VP9 fields and fabricates a full CICP description tagged `Container`, i.e.
+  an HDR10 verdict invented from an unrelated record. And **`videodatarate` is range-checked
+  after it is scaled, not before**: a declared rate above `f64::MAX / 1024` multiplies to
+  infinity, which serialises as JSON `null` and breaks the schema's "always a float" guarantee for
+  `bits_per_sec` — the same product-versus-factor shape as the AVI index defect, a third time.
+- `container/ogg.rs` — Ogg (`.ogv`, `.ogg`, `.oga`, `.ogm`, `.ogx`), read against **RFC 3533**,
+  carrying Theora ([`theora.rs`]) and VP8. A flat chain of pages each declaring its own length in a
+  segment table, so the walk is arithmetic on declared sizes, and everything the report states sits
+  in one packet alone on its stream's first page — a bounded head read plus, for the duration
+  alone, a bounded tail read. `chunks` stays **empty by design**: neither codec has a bitstream
+  side channel this project reads, so there is nothing to sample (the `mpegv`/`asf` contract).
+  Seven facts are invariants. **Endianness flips at the page/payload seam** — page headers are
+  little-endian (§6, "LSB first") while both codec mappings are big-endian and Vorbis in the same
+  file is LSb-first bit-packed, so one `.ogv` carries three conventions. **A granule position of
+  -1 means no packet finishes on that page**, ordinary mid-stream for a packet spanning pages, and
+  read as a count it makes the last page an enormous frame total. **The physically last page need
+  not be the video's** — a Theora+Vorbis mux routinely ends on audio, so the tail is scanned for
+  the last page *of the video serial*. **A chained file's tail describes only its final link**
+  (Ogg permits concatenation with fresh serials, and it is Theora's documented way to change frame
+  rate mid-file), so any serial the head's BOS run did not declare, or a BOS flag past that run,
+  yields `None` — hdrprobe is the only one of the three tools that neither invents a duration here
+  nor a bitrate from it. **The two windows must stay disjoint, and "file smaller than the window"
+  is only half of it**: a file a *little larger* starts its tail scan inside its own BOS run and
+  reads those pages as a second link, so the start is clamped past `bos_end` — the same
+  `tail_start.max(head_end)` the program-stream backend carries, and a band as wide as the last BOS
+  page's offset. **A tail anchor is believed only when its run tiles the rest of the file**: two
+  27-byte pages satisfy any fixed-depth chain check, so 54 bytes planted at the scan's start
+  position redirect it and their declared granule becomes the duration; `chain_holds` is therefore
+  only a cheap filter ahead of
+  `tiles_to_end`, whose page-parse budget is shared across candidates so their product cannot grow.
+  And **the header packets are not video payload** — a comment header may carry cover art — so
+  `--full`'s exact byte sum skips each stream's first packets by counting lacing values rather than
+  by assuming where pages divide. Two more traps in the `--full` walk: **a broken chain is not
+  truncation**, and the stream-structure-version byte is the one page-header field whose failure
+  `parse_page` reports identically to a short final page — read as truncation it returns a short sum
+  that main.rs divides by the whole file's duration, measured at 805 kb/s against a true 2.31 Mb/s
+  (a 1.7 MiB Theora file with one mid-file page's version byte flipped); and
+  the walk plan is set **only for a single-video file**, because `sample::scan` returns one
+  `TrackScan` per raw-stream walk and main.rs zips it against the tracks, so a plan on a two-video
+  file would drop the second entirely. `track_number` is the logical bitstream's **serial number**,
+  a random 32-bit value rather than a small ordinal. `duration_secs` is the **video** stream's, not
+  the longest stream's: for every ordinary file they agree, but a mux whose audio far outlasts its
+  video reports the video's length and an `overall` rate computed against it (3 s and 630 kb/s on a
+  fixture holding 3 s of video and 90 s of audio, where ffprobe says 90 s) — knowing the true
+  length means decoding audio granule positions, which is out of scope plan-wide, and risk 15 in
+  `dev/sdr-coverage-plan.md` records the alternatives and why each was declined. Only `.ogv` is in
+  `main::VIDEO_EXTS`: `.ogg`
+  and `.oga` are overwhelmingly audio (the `.wma` reasoning), and `.ogm`/`.ogx` are left out because
+  OGM video has no parser here, so a scan of them could only ever print one error per file.
+- `container/ps.rs` — MPEG program stream / MPEG-1 system stream (`.mpg`, `.mpeg`, `.vob`,
+  `.m2p`, `.evo`), read against **ITU-T H.222.0 (10/2014) | ISO/IEC 13818-1**, which is free
+  from ITU and is the normative source for the pack header (Table 2-39), the PES packet
+  (Table 2-21) and the stream_id assignments (Table 2-22); the MPEG-1 pack and PES layouts are
+  11172-1's, are *not* in H.222.0, and come from ffmpeg plus corpus validation. Structurally the
+  TS backend's twin — a bounded head window reassembles the video elementary stream out of
+  scattered PES payloads, a bounded tail window closes the timeline — so the pieces both need
+  live in `mod.rs`. Five facts are invariants. **The stream id names a stream number, not a
+  codec**: Table 2-22's `1110 xxxx` row covers H.262, 11172-2, 14496-2, H.264 *and* H.265, so
+  ffmpeg's habit of writing H.264 at `0xE2` is a muxer convention and routing on it would be
+  wrong. **The reassembled ES is routed by a whole-head start-code census, never by its first
+  byte** (`classify_es`): a video PES payload often opens on a picture start code, `00 00 01 00`,
+  whose `0x00` passes `looks_like_nal_header`'s HEVC reading about seven times in eight, so
+  first-byte routing has no verdict to give at all on 96% of mid-file cuts (measured: the
+  reassembled stream opens mid-picture, with no start code). The census is sound
+  rather than probabilistic — emulation prevention means a conforming H.264/H.265 stream cannot
+  contain `00 00 01` followed by a byte `>= 0x80`, so one such code refutes Annex-B outright —
+  and the MPEG readings are tried first because the reverse order lets a DVD's tens of thousands
+  of slice start codes eventually yield a byte run that decodes as a valid SPS (the documented
+  way a VOB once reported a full HEVC profile). **The decisive Part 2 codes are `B0`/`B1`/`B6`
+  and must never include the VOL range `20`..`2F`**: that range is also MPEG-2's
+  `slice_start_code` space, where the value is `slice_vertical_position`, so slice `0x20` is
+  macroblock row 32 — every format above standard definition emits it, and it is *also* where
+  HEVC's IRAP NAL headers (`26`/`28`/`2A`) and H.264's `nal_ref_idc == 1` slices (`21`) land.
+  Including it misread PAL and HD MPEG-2, HEVC-in-PS and H.264-in-PS alike, the last of those
+  fabricating a complete `1639x6058 · 0.692 fps · BT.709 limited` report out of slice bytes.
+  Nothing is lost by excluding it: `B6` (VOP) rides every Part 2 frame. **`PES_packet_length` is
+  the only legal way to
+  advance**: a byte scan that resumes inside a packet reads audio and private payload as
+  structure, which on the corpus DVD invents seven Program Stream Maps on a disc that has none.
+  **An access unit is cut at the payload's first start code, never at its first byte**: §2.4.3.7
+  ties a timestamp to the unit whose first picture start code *commences in* that packet, which
+  need not be at offset 0, and the flag that would guarantee alignment
+  (`data_alignment_indicator`) is clear on every file observed — on ffmpeg-written program
+  streams only 1 to 3 of 42 to 50 timestamped packets open on a start code. Cutting at the first
+  byte hands `split_annexb` a chunk starting mid-slice, and since it reads a chunk's offset 0 as
+  an implicit NAL boundary it mints a NAL from compressed payload: reproduced growing a
+  *signalled* 396272 cd/m² mastering display and MaxCLL 44200 on a stream carrying neither.
+  **The SCR is not a duration** — see the duration invariant below. And **the pack variant names
+  the container, never the codec**: `ffmpeg -f mpeg` writes an 11172-1 system stream carrying
+  MPEG-2 video, so the corpus `mpeg2.mpg` is correctly `MPEG-1 System Stream` + `MPEG-2 Video`.
+  The head census (`looks_like_program_stream`) is a faithful transcription of ffmpeg's
+  `mpegps_probe`, thresholds and payload-skip arithmetic included, on the reasoning that those
+  thresholds encode two decades of misidentification reports; it is also the backend's own head
+  gate, which a backend reachable by extension needs. **A scrambled video PES in the head walk
+  errors as CSS before anything reads payload** (`PES_scrambling_control` after the `'10'`
+  marker): CSS leaves every pack and PES header clear, so a scrambled DVD rip *parses* while
+  its video bytes are ciphertext — the census would be routing on noise. Decrypters clear the
+  bits, so decrypted backups (and every ordinary file) are untouched. There is deliberately **no program stream
+  map parser**: it is absent from DVDs, from consumer `.mpg` and from ffmpeg's own muxer, the
+  content routing above covers every case it would answer, and a mis-parsed one could only
+  override a correct verdict. **HD DVD `.evo` video rides the extended stream id 0xFD** and is
+  admitted by its PES-extension `stream_id_extension` (H.222.0 Table 2-21's walk,
+  `ps::pes_stream_id_extension`): extensions 0x55..0x5F are VC-1 video — the HD DVD assignment,
+  sourced to ffmpeg's `0xfd55..0xfd5f` mapping — and become the substream's codec *and* its
+  reported track number directly, while every other 0xFD extension (the audio codecs) is
+  excluded so nothing blends into a video ES; the census never runs over a VC-1 substream's
+  bytes, whose thousands of low-value EBDU codes are exactly the SPS-hunt hazard the census
+  rules exist to avoid (open-items B8a, validated against a fixture packetized from real VC-1
+  frames that ffprobe and MediaInfo read identically).
+- `dv/` — `rpu.rs` (libdovi wrapper + panic guard), `levels.rs` (title-stable aggregation),
+  `ccid.rs` (the Dolby "Profiles and Levels" tables as data: profile -> admitted CCID(s),
+  CCID -> the five-part base-layer VUI as **CICP code points**, the reverse lookup
+  `infer_ccid`, the `hdr10_base` gate, the CCID label set, and the withdrawn 8.3/8.5
+  pairings). **Every CCID/profile/VUI fact resolves here** — the change that created it
+  existed to delete six hand-rolled projections of these tables, so a seventh is a
+  regression, not a shortcut. (Profile 8's `8.1` convention default is *not* one of those
+  facts: it is ecosystem practice rather than a spec-table row, which is why it legitimately
+  lives in `levels.rs` — in `resolve_compat` and `dv_profile_label` — and nowhere in the
+  tables.) Rows hold codes, never display labels, and names come from
+  the shared `container::cicp_*` decoders so a derived label can't drift from a signalled
+  one. The admitted-CCID sets are the **union across spec revisions** (v1.5 narrowed P8 to
+  {1,4} and P10 to {0,1,4}; 8.2 content is everywhere) — narrowing would refuse to name
+  legal streams. Sources and page cites are in the module docs; every row is pinned by a
+  test naming its table.
 - `hdr/` — `mod.rs` (format classification + `primaries_label`, the chromaticity→gamut matcher
   behind the Mastering line's tag), `sei.rs` (ST.2086/CLL/HDR10+/SL-HDR/HDR Vivid/
   alt-transfer; the T.35 dynamic formats are told apart by country + provider code —
@@ -144,19 +537,37 @@ never parse bytes native-endian.
   every input kind. The XML's Level-0 primaries (tagged `[L0]`) are the
   mastering-gamut fallback for a CM v2.9 XML, which has no L9; a recognized L9 wins when present,
   so CM v4.0 output is unchanged.
-- `bdiso/` — Blu-ray ISO (`.iso`) main-feature probing: `udf.rs` (read-only ECMA-167/UDF 2.50
-  walker over the ISO mmap, both plain type-1 partition maps and the 2.50 Metadata Partition,
-  bounds-checked with `mp4.rs` discipline; UDF is little-endian, explicit LE reads), `mpls.rs`
-  (playlist header + PlayItems only, big-endian; STN tables and angle blocks are skipped by the
-  item length field), `mod.rs` (`is_udf_iso` VRS gate, `locate_main_feature`, the `select_main`
+- `bdiso/` — video disc ISO (`.iso`) main-feature probing, Blu-ray (BDMV) *and* DVD-Video
+  (VIDEO_TS); the directory keeps its historical name. `udf.rs` (read-only ECMA-167/UDF
+  walker over the ISO mmap — UDF 1.02 through 2.50, both plain type-1 partition maps and the
+  2.50 Metadata Partition, bounds-checked with `mp4.rs` discipline; UDF is little-endian,
+  explicit LE reads), `mpls.rs` (playlist header + PlayItems only, big-endian; STN tables and
+  angle blocks are skipped by the item length field), `dvd.rs` (VIDEO_TS: title VOBs
+  `VTS_nn_1..9.VOB` grouped by set, menu VOBs excluded, byte-largest set wins, slices must be
+  consecutive-from-1 and their extents coalesce to one range; the set's `VTS_nn_0.IFO` yields
+  the declared runtime — `vts_pgcit` sector pointer at 0xCC, longest PGC `playback_time`,
+  BCD with the frame-rate flag in the frame byte's top bits, layout per libdvdread and
+  validated against the reference pressing's IFO to MediaInfo's exact 6547.500), `mod.rs`
+  (`is_udf_iso` VRS gate; `locate_feature` opens the volume once, reads the root once, and
+  dispatches `DiscFeature::Bd`/`Dvd` on which directory exists; the BD `select_main`
   heuristic: longest deduped-segment duration wins, ties by referenced clip bytes, identical
   playlists collapse, missing-clip playlists drop; probe clip = the winner's largest clip,
   extents coalesced to one contiguous range). `main.rs` owns the orchestration: the extension
-  gate, the clip subslice, the based Frontier, the `"Blu-ray ISO (BDMV)"` container label, and
-  `model::BdIso` (the `Main feature` line). The synthetic UDF image builder for tests lives in
-  `udf.rs::testimg` (in-memory, path-portable; type-1 images use short_ad file data and
-  extent-recorded directories, metadata images use long_ad data and inline directories, so
-  both descriptor forms stay exercised).
+  gate, the feature subslice, the based Frontier, the container labels
+  (`"Blu-ray ISO (BDMV)"` / `"DVD-Video ISO (VIDEO_TS)"`), `model::BdIso`/`model::DvdIso`
+  (the `Main feature` line), and — DVD only — the duration authority: **a DVD ISO's
+  `duration_secs` is the IFO's declared runtime when one parsed** (the MKV/MP4
+  declared-duration convention; the overall bitrate moves with it), because the PS backend's
+  measured PTS span is structurally blind to a cell/layer-break reset between its windows —
+  the real dual-layer reference pressing measured 33 minutes of a declared 109-minute
+  feature. The synthetic UDF image builder for tests lives in `udf.rs::testimg` (in-memory,
+  path-portable; type-1 images use short_ad file data and extent-recorded directories,
+  metadata images use long_ad data and inline directories, so both descriptor forms stay
+  exercised; **all file data is allocated before any File Entry**, so consecutive files'
+  runs stay mutually adjacent — the real mastering layout the DVD multi-VOB coalescing
+  depends on, and an interleaved allocator can never produce). The `dvdiso.iso` corpus
+  fixture regenerates via the env-gated `write_dvd_fixture_image` test (see
+  `testfiles/sdr/README.md`).
 - `sample.rs` (parallel sampling), `model.rs` (serde report tree), `render.rs`, `bits.rs`.
   The JSON output is an external contract documented field-by-field in `docs/SCHEMA.md` and
   versioned by `model::SCHEMA_VERSION` (the `hdrprobe_schema_version` field on every report,
@@ -204,7 +615,11 @@ never parse bytes native-endian.
 ## Invariants that are easy to violate
 
 - **Zero-copy mmap `Chunk` model.** A `Chunk { offset, size }` is a byte range into the mmap;
-  payloads are never copied up front. **Every container backend is hand-rolled on purpose** —
+  payloads are never copied up front. A backend may leave `chunks` **empty**: `sample::scan`
+  returns early when every track's list is, so a metadata-only backend needs no chunk index and no
+  sampler arm on the default path, though a `--full` walk that must read payload still needs its
+  own streaming plan on `Demux` (the `ts_stream`/`mkv_stream`/`raw_stream` shape below). The full
+  contract is on the field's own doc comment. **Every container backend is hand-rolled on purpose** —
   do *not* add `matroska-demuxer`/`mp4`/etc.; they copy frame data and hide byte offsets, which
   breaks this model. The **one exception is TS/M2TS**, which scatters the elementary stream
   across packets: it fills `Demux::reassembled: Option<Vec<u8>>` (the bounded head window only)
@@ -238,13 +653,18 @@ never parse bytes native-endian.
 - **Report title-stable DV levels only.** Show profile/level/compat, L254 (CM version), L6, L9,
   L11, and the *set* of L2/L8 trim targets. Never emit L1 or per-shot trim *values*.
   **MaxCLL/MaxFALL is HDR10 (CTA-861.3) signaling whose only consumer is an HDR10 base**
-  (compat id 1, or 6 for UHD Blu-ray). Every other base still carries L6 on every frame but it
-  is inert there: on IPT-PQ-c2 (compat 0: P5/P20/AV1 10.0) and HLG (compat 4: 8.4/10.4) the CLL
+  (compat id 1, or 6 for UHD Blu-ray) — one gate, `ccid::hdr10_base`, shared by
+  `hdr::assemble`'s mastering/CLL fallbacks and the text report's own L6 line, which used to
+  carry a second copy of the rule that could drift. Every other base still carries L6 on every frame but it
+  is inert there: on IPT-PQ-C2 (compat 0: P5/P20/AV1 10.0) and HLG (compat 4: 8.4/10.4) the CLL
   half is a zeroed placeholder (corpus-verified, including Dolby's own P5 demo and the 8.4/10.4
   samples), and an SDR base signals no static metadata either (the P9 corpus file's *filled* L6
   is not counter-evidence: it is a frankenstein built from a real HDR title's RPU, not Dolby P9
   tooling output). So unless the base is HDR10 the text report drops the L6 line (`render.rs`;
-  with no compat id the profile major decides: P7/P8 default to HDR10, P4/P5 do not) and the HDR
+  **with no *resolvable* id the profile major decides: P7/P8 default to HDR10, P4/P5 do not** —
+  after the spec and inferred rungs that state is reachable only for a P8 admitting CCID 1, 2
+  and 4 with nothing to separate them, and the heuristic must stay explicit: it gates the
+  corpus-verified L6/MaxCLL suppression, so losing it would be an invisible regression) and the HDR
   section's CLL *and* Mastering lines never fall back to L6 (`hdr::assemble`, both gated on
   `hdr10_base`; the L6 mastering half is just the grade's display, already on the DV Mastering
   line); a *signalled* MDCV/CLL box or SEI still shows, and the JSON keeps `dolby_vision.l6`
@@ -298,7 +718,16 @@ never parse bytes native-endian.
   from the coded stream's resolution and reported frame rate against the Dolby P&L table
   (`levels::fill_derived_level`, a main.rs-only post-pass like the Mastering badges; JSON-only
   via `dolby_vision.level_derived`, never text-rendered): the smallest level admitting the pixel
-  rate and width, a pixel-rate floor only (the bitrate/tier axis is not probed). A declared
+  rate and width, a pixel-rate floor only (the bitrate/tier axis is not probed — the level ID has
+  no tier field, so a bitrate cap can only ever say a stream is non-conformant *at* its level, and
+  feeding it to the selector would push a high-bitrate 1080p24 up to level 6; the axis is also
+  unavailable exactly where the derivation runs, since raw ES has no bitrate at all and TS has
+  only an `overall` one that counts audio). **`DV_LEVEL_LIMITS`' two columns come from two
+  different spec columns and disagree**: the rate is the row's anchor format (`w × h × fps`), but
+  the width is the row's own *Maximum decoded bitstream video width*, which is deliberately wider
+  than the anchor on levels 4 and 5 (2560 and 3840 against a 1920-wide anchor). Deriving the width
+  from the anchor instead reads plausible and silently pushes ultrawide-but-low-rate content up
+  two levels — take each column from the spec, never one from the other. A declared
   level always wins, sidecars never derive (assumed canvas), and no fps means no level — never
   a guess. The DV Mastering line's **luminance** is the DM header's
   `source_min_pq`/`source_max_pq` (present in every CM version); its **gamut** comes only from a
@@ -322,9 +751,10 @@ never parse bytes native-endian.
   descriptor through the ISOBMFF parser reads the compat nibble 16 bits early (P7 dual-PID showed
   a bogus `8` instead of `6`). The compat id becomes the profile's minor digit
   (`levels::dv_profile_label`: `7.6`, `8.1`, `10.4`, …). **Profile 4 is dual-layer** (like P7): its EL presence and MEL/FEL tag come from
-  the config + RPU the same way, and its **SDR base is inferred from the profile** in
-  `hdr::assemble` (P4 is SDR-compatible by definition) since old P4 muxes carry neither a compat
-  id nor a base-layer transfer VUI. The **reconstructed bit depth**
+  the config + RPU the same way, and its **SDR base comes from the spec rung**
+  (`ccid::spec_ccid(4)` is 2, P4 being SDR-compatible by definition), which is what covers old
+  P4 muxes carrying neither a compat id nor a base-layer transfer VUI — `hdr::assemble` itself
+  only reads the resolved id. The **reconstructed bit depth**
   (`model::DolbyVision::reconstructed_bit_depth`, the report's `Reconstruction` line) is the RPU
   header's signaled `vdr_bit_depth` read verbatim — **never assumed from the profile**: P7 FEL
   signals 12 but P4 FEL signals 14 (corpus-verified on every frame, in both the header and the DM
@@ -363,9 +793,27 @@ never parse bytes native-endian.
   quantization — never re-compare coordinates with a second tolerance). Hard gates: L9
   provenance only (`primaries_level == 9`, so a DV XML's L0 never fires), a signalled BL label
   only (never the L6 fallback, whose primaries *are* the L9 — self-comparison), both sides
-  recognized (unmatched coordinates suppress the verdict, never guess). The classic trigger is
-  re-encode drift (a BT.2020-claiming MDCV over a P3-D65 grade), so the badge is a provenance
-  observation, not an error claim. The third sibling is the **`Unconverted RPU` chip**
+  recognized (unmatched coordinates suppress the verdict, never guess). **Both sides are a mastering
+  display, but from different pipeline stages, so a difference does not make either one wrong.**
+  Dolby's "Dolby Vision Metadata Levels" defines L9 as "the color primaries and white point of the
+  Mastering Monitor/Display used for the project", calculated from the display "selection made by
+  the colorist *during the Dolby Vision content creation process*" — the DV pass, a step after the
+  base layer's own grade and often in a different suite with a different colorist working from a
+  delivered master. The base layer's ST.2086 describes *its* grade's display. Two accurate values
+  can therefore disagree, which is exactly why no spec requires them to match. (L0's Mastering
+  Display is the same DV-pass selection as L9, so the `[L9]`/`[L0]` tags on the DV Mastering line
+  are not a conflation.) Do not re-derive L9's meaning from observed
+  values: `<SourceColorPrimary>`, libdovi's per-shot `parse_level9_trim`, and the studio spec's
+  separate "Colour Encoding Primaries" row all *suggest* an encoding quantity, and that reading is
+  wrong — the encoding primaries are the VUI/container ones, and the RPU carries no such field.
+  **A difference is a quirk, not a spec violation**: the two values come from different
+  specifications written by different tools (L9 by the DV authoring tool, ST.2086 by the encoder or
+  muxer), nothing requires them to match, and Dolby's studio spec pointedly attaches "must match
+  corresponding video content" to colour *encoding* primaries while attaching no matching rule at
+  all to the mastering display primaries. So the badge is a provenance observation, not an error
+  claim — and **both directions occur**: the corpus's only firings are a P3-D65 base layer against
+  a BT.2020 L9 (the reverse of re-encode drift), in the `dv7fel_dt` frankenfile *and* in Dolby's
+  own OTT reference streams, so never re-document it as one-directional. The third sibling is the **`Unconverted RPU` chip**
   (`levels::finalize`, rendered on the Profile line, JSON
   `dolby_vision.unconverted_dual_layer_rpu`): the RPU carries the dual-layer NLQ composer
   payload (`el_type` is Some — that fingerprint exists only in P4/P7-authored RPUs) while the
@@ -379,13 +827,24 @@ never parse bytes native-endian.
   to 10 but derives the dvvC compat id from the RPU-guessed profile (6 exactly when the guess
   is 7). The stray payload is inert for playback (a MEL residual contributes nothing), so this
   too is a provenance observation, not an error claim.
-- **A Blu-ray ISO is probed as a clip subslice, never as offset fix-ups.** The ISO path
+- **A disc ISO is probed as a feature subslice, never as offset fix-ups.** The ISO path
   (`main.rs`, gated on the `.iso` extension *and* `bdiso::is_udf_iso`) resolves the main
   feature to one contiguous byte range and hands `&mmap[clip_start..clip_start+clip_len]` to
-  `ts::demux` **and** `sample::scan`: the TS backend is fully slice-relative (packet phase
+  the feature's own pipeline — `ts::demux` for a BDMV clip, `ps::demux` for a DVD title VOB
+  set — **and** `sample::scan`: both backends are fully slice-relative (packet phase/anchor
   re-derived, head/tail windows addressed from the slice ends, chunks index the reassembled
   heap buffer), so bitrate denominators, `--full` streaming positions, and progress totals are
   all clip-correct by construction. Never pass the whole ISO mmap with offsets patched in.
+  The DVD half's own gates: menu VOBs (`VTS_nn_0.VOB`, `VIDEO_TS.VOB`) never join the title
+  set (the reference pressing's menu sits 136 MB before the feature, non-adjacent — including
+  it would kill the coalesce on every disc); the set's slices must be consecutive from 1 (a
+  missing middle VOB with adjacent survivors would splice the stream); **CSS is detected in
+  the PS backend, not the locator** (`PES_scrambling_control` on a video PES in the head walk
+  errors before the census can read ciphertext — per-packet because that is where DVD signals
+  encryption; decrypters clear the bits, so backups probe normally; this also gates bare
+  scrambled `.vob` files reached by extension); and the IFO duration authority is
+  `main.rs`-only, like the Mastering badges (no parsed IFO leaves the PS span standing with
+  its documented limits).
   The `--full` frontier is the one base-aware piece: `Frontier::new_at(file, clip_start,
   clip_len)` keeps walk positions slice-relative and translates only the reads. Related
   gates, all deliberate: the **AACS verdict** is "`ts::detect_layout` fails on the clip head
@@ -398,16 +857,52 @@ never parse bytes native-endian.
   `looks_like_iso` is extension-only on purpose (a content sniff would fault the sector-16..64
   VRS window on every remote non-ISO file), `ISO_HEAD_WARM` (1 MiB) covers VRS + front VDS +
   the anchor at byte 512 KiB, the locator warms the metadata-partition and playlist extents
-  exactly (`warm: Option<&File>`, remote only), and `prefetch::warm_ts_windows` replays the TS
-  head/tail warm at `clip_start`/clip EOF (keep it in sync with `ts::HEAD_SCAN_BYTES`/
-  `TAIL_SCAN_BYTES` like the byte-0 TS branch). The report keeps the ISO's `size_bytes` and
+  exactly (`warm: Option<&File>`, remote only), and `prefetch::warm_ts_windows` /
+  `prefetch::warm_ps_windows` replay the feature pipeline's head/tail warm at
+  `clip_start`/clip EOF — TS windows for a BDMV clip, PS windows for a DVD title set (keep
+  each in sync with its backend's `HEAD_SCAN_BYTES`/`TAIL_SCAN_BYTES` like the byte-0
+  branches). The report keeps the ISO's `size_bytes` and
   the clip's PCR `duration_secs`; the playlist's own edit duration renders on the
   `Main feature` line, never on the Duration line.
+- **Adding a backend means adding its extensions to `main::VIDEO_EXTS`, and that is outward-facing.**
+  `container::demux`'s extension map decides what a *named* file dispatches to; `VIDEO_EXTS`
+  decides what a **directory scan** picks up, and they are separate lists that have silently
+  disagreed before — Phase 1 shipped `.m2v`/`.m1v`/`.mpv` support that worked when a file was
+  named and was invisible to `hdrprobe rips/`, which is precisely the goal statement's failure
+  mode. `shell.rs` builds the Windows context-menu verb's file-type list from the same constant
+  (plus `SIDECAR_EXTS`), so every addition also registers those extensions in the user's registry
+  on the next `--install-shell`; that is intended, and worth naming in a commit message rather
+  than discovering later. Two deliberate omissions, both because the extension is claimed by
+  something a directory of mixed files is full of: `.bin`, which the raw-HEVC dispatch accepts,
+  and **`.wma`**, which the ASF backend accepts because a `.wma` may legitimately carry video —
+  putting it in `VIDEO_EXTS` would make a scan of a music library open every track and print an
+  error per file.
 - **Extension dispatch falls back to content sniffing only on error.** `container::demux` picks a
   backend by extension and returns immediately on success — sniffing never runs on the happy path
   (no latency cost). If the extension-matched backend *errors* (e.g. a TS misnamed `.mkv`),
   `sniff_demux` re-probes by magic bytes and is adopted only if a sniffed backend actually
   succeeds; otherwise the original, more specific error is surfaced.
+- **A leading `00 00 01` is not evidence of Annex-B, and nothing may treat it as such.** The
+  three-byte prefix is shared by H.264/H.265, MPEG-1/2 and MPEG-4 Part 2 video, and the MPEG system
+  layer, so `container::classify_start_code` routes on the byte *after* it: H.264/H.265 open their
+  NAL header with `forbidden_zero_bit`, which must be 0, while every MPEG start code sets bit 7, so
+  `>= 0x80` refutes Annex-B structurally rather than heuristically. Only the sub-`0x80` space needs
+  validating, and `looks_like_nal_header` is deliberately permissive there (measured: roughly 98% of
+  a *cut* MPEG stream's low start codes pass), so **three independent guards** stand behind it and
+  none is redundant. It ORs an AVC and an HEVC reading and must keep both, since a VPS-first HEVC
+  stream survives only on the HEVC arm and an H.264 AUD only on the AVC arm. `hevc::nal`/`avc::nal`
+  reject `forbidden_zero_bit` again while splitting Annex-B, though the *length-prefixed* splitters
+  deliberately do not: there the container already declared the codec and each NAL's length, so no
+  start-code scan can mint NAL units from unrelated bytes. And `annexb::demux` refuses a head that
+  positively classifies as MPEG, which is the only guard covering a **misnamed** file, since one
+  reaching the backend by extension never passes the sniffer at all. That last one is not
+  theoretical: before it, a retail DVD VOB renamed `.hevc` printed a *fully populated* profile,
+  tier, level and bit depth, and under `--full` it still did after the splitter guard landed,
+  because `annexb::rescue_sps` hunts the whole file and one of a DVD's tens of thousands of slice
+  start codes eventually decodes as an SPS header whose payload parses. `try_sps` is held to
+  H.265 §7.4.2.2 (TemporalId 0) for the same reason. Deciding a mid-file MPEG cut properly needs a
+  whole-head start-code census (ffmpeg's `mpegps_probe` thresholds), which belongs with a program
+  stream backend, not in the sniffer.
 - **Stdin input (`hdrprobe -`) is head-only, sniff-dispatched, and lives entirely in main.rs.**
   `process_stdin` reads a bounded head into a heap buffer (`read_stdin_head`: a 64 KiB sniff
   block, then the format's budget + 1 byte — the extra byte is how truncation is detected) and
@@ -419,7 +914,10 @@ never parse bytes native-endian.
   walks). EOF within the budget ⇒ the input is complete and reports exactly like a file probe
   (no flag); past it ⇒ `Report::input_truncated` plus `suppress_prefix_derived_facts`, a
   post-demux fixup in main.rs keyed on the `Demux::container` label — **never thread a
-  truncation flag into backends**: it drops the TS PCR-span duration and every non-MP4 bitrate
+  truncation flag into backends**: it drops the TS PCR-span duration, the MPEG-PS PTS-span
+  duration (both are head-to-tail derivations, and a prefix's "tail" is just the cut point —
+  every label `ps.rs` can emit is in that match, so renaming one means editing here too) and
+  every non-MP4 bitrate
   (MP4/MOV `video_stream` rates are stsz/trun table sums, exact over any prefix; MKV/MP4
   declared header durations stand). Skipped for stdin by construction: the sidecar gate
   (extension-based), mmap, all prefetch, the ISO branch, and `--full` (a per-file error — a
@@ -444,8 +942,14 @@ never parse bytes native-endian.
   multi-track arm ever sets a nonzero indent). A second video track/PID is a DV
   enhancement layer **only when its own config says so**: an MP4 trak / MKV TrackEntry whose
   dvcC has `bl_present == 0`, or a TS PID whose 0xB0 descriptor says `bl_present == 0` (its
-  `dependency_pid` names the BL PID it folds into) or that is DV-flagged with no video
-  stream_type (the bare EL/RPU PID shape). Such an EL folds into its base layer's track — chunks
+  `dependency_pid` names the BL PID it folds into). **A present 0xB0 descriptor is authoritative
+  and the stream type is not consulted**: §7.1.2 of the Dolby TS spec signals a legal single-PID
+  Profile 5 stream with PES-private `stream_type` 0x06 (its BL isn't SDR/HDR compliant, so it may
+  not claim 0x1B/0x24) *and* `bl_present_flag == 1`, so that PID is a base layer wearing a private
+  stream type. Only with **no** descriptor is the shape inferred — a DV-flagged PID carrying no
+  video stream_type is the bare EL/RPU PID. (Inferring it regardless was benign for a lone PID,
+  which the "only EL-shaped PIDs" fallback rescued, and merged two tracks into one when a sibling
+  video PID shared the program.) Such an EL folds into its base layer's track — chunks
   concatenated so the RPU is scanned, dvcC donated, per-track `dv_dual_track` set, rendering the
   `Structure` line's `Dual track, dual layer` (still gated behind `el_present` via
   `structure_str` in `levels::{finalize,container_only}`); anything else is an independent
@@ -462,39 +966,82 @@ never parse bytes native-endian.
   mmap-backed multi-track files scan one merged file-ordered pass over `select_track_chunks`,
   the same selection `prefetch::warm_sample_chunks` replays) — never one pass per track, never
   a parallel reduce.
+- **The DVB form of CCID 4 is defined by an SEI, so inference reads the *effective* colour.**
+  Dolby's Table 2 gives CCID 4 a second row for Profile 8, transfer characteristic 14 — but the
+  defining sentence (v1.5 p10) is "a transfer characteristic VUI value of 14 ... (and optionally
+  1, 6, or 15) ... **when used with the alternative_transfer_characteristic SEI message, at every
+  random access point, with the preferred_transfer_function set to 18**". The SEI is
+  constitutive: 14 is chosen precisely so an SDR receiver reads the stream as SDR BT.2020, and
+  the SEI is the only thing that says otherwise, so a bare 14 is an ordinary SDR wide-gamut
+  curve and must resolve to *nothing*. `ccid::vui_rows` therefore omits the DVB row entirely
+  (it stays pinned by a test as documentation) and `main.rs` hands `fill_inferred_compat` the
+  colour with the SEI override already applied — a real DVB stream then reads transfer 18 and
+  matches the ARIB row, the same answer by the same table, and all four transfers the spec
+  admits for the variant are covered by one rule. Reading the raw VUI instead resolved a bare
+  14 to `8.4`, printing a report whose Color line said SDR while its Format line said HLG.
 - **Profile number authority.** libdovi's `dovi_profile` can't express AV1 P10 (returns 5/8),
   so `levels::finalize` takes the profile number from the container dvcC when present, else 10
   for AV1. Don't trust the RPU's profile field for the number.
-- **The compat *minor* digit is container-only; a bare RPU can only assume it.** `get_dovi_profile`
-  gives the *major* (5/7/8) from the RPU header, but the minor is `dv_bl_signal_compatibility_id`
-  (the base-layer type: 8.1 HDR10 vs 8.4 HLG), which lives only in the dvcC/dvvC — the RPU can't
-  distinguish them. A metadata-only sidecar has no dvcC: a **DV XML declares its profile**
-  (`dv_xml.rs` maps `GenerateProfile` -> compat via `DvAggregate::set_compat_id`, so the minor is
-  real), but a **raw RPU bin has nothing**, so its minor is a convention default (P8 -> .1,
-  P7 -> .6, P4 -> .2) recorded as `model::profile_compat_assumed`. That JSON pair is the whole
-  story for a sidecar: the **text report drops the Profile line for metadata-only sidecars
-  entirely** (`render.rs`) — an RPU is profile-agnostic (dovi_tool's blanket "8" for extracted
-  RPUs is remux convention, not a definition) and a DV XML's `GenerateProfile` is an authoring
-  target, so a rendered profile reads as a fact the metadata doesn't carry. The P7 default
-  also covers the common *video* case of an untouched BDMV M2TS, which has **no `0xB0` DV
-  descriptor at all** — Blu-ray signals DV via the HDMV registration descriptor and the playlist
-  STN table; only remuxes (tsMuxeR etc.) add the descriptor. That flag is gated to metadata-only
-  sidecars via `DvAggregate::mark_metadata_only`: a video input — **even a raw HEVC/AV1 elementary
-  stream with no dvcC** — has a base-layer VUI that officially backs the inference, so it's never
-  flagged. Don't widen the flag to `cfg.is_none()`; raw bitstreams share that state but aren't
-  metadata-only. **A bare Profile 5/10's compat digit is display-completed; the JSON stays
-  verbatim.** A raw elementary stream has no dvcC/dvvC to declare the minor, and neither profile
-  has a `dv_profile_label` convention default, so `render.rs::dv_profile_display` completes the
-  digit for the text report and `-q` line when it is certain: a bare "5" ⇒ "5.0" definitionally
-  (compat 0 is the only value the P&L spec admits for P5); a bare "10" (P10's compat set is
-  {0,1,2,4}) from the base layer's signalled CICP only when the deduction is airtight
-  (`infer_p10_compat`): IPT-PQ-c2 matrix ⇒ .0, explicit SDR gamma transfer ⇒ .2, PQ/HLG ⇒ .1/.4
-  but only over BT.2020 primaries *and* an explicit non-IPT matrix — IPT is itself PQ-encoded and
-  its convention (from P5) leaves CICP unspecified, so PQ alone can't exclude a 10.0 base;
-  anything less explicit stays a bare "10". Display only: the JSON
-  `profile`/`bl_compatibility_id`/`compatibility` keep the mux's declaration (the bare number /
-  null) so machine consumers get raw facts and draw their own inferences — never move this into
-  `levels.rs`/`model.rs`.
+- **The compat *minor* digit resolves on four rungs, and the report says which.** The RPU header
+  gives the *major* (5/7/8); the minor is `dv_bl_signal_compatibility_id`, which the RPU cannot
+  carry at all. `levels::resolve_compat` walks: **declared** (container dvcC/dvvC/TS descriptor,
+  or a DV XML's `GenerateProfile` via `DvAggregate::set_compat_id`) -> **spec**
+  (`ccid::spec_ccid` — Dolby's profile table fixes exactly one id for P4/P5/P7/P9 and the legacy
+  P0-3/P6, so a raw elementary stream with no dvcC still has a *real* id) -> **inferred**
+  (`levels::fill_inferred_compat`, a main.rs post-pass because it needs the track's signalled
+  `ColorInfo`: `ccid::infer_ccid` matches the VUI against the profile's candidate Table 2 rows
+  and answers only when exactly one survives) -> **assumed** (P8's ecosystem `8.1` convention,
+  and *only* P8's — P10/P20 admit several ids with no convention, so they keep a bare major).
+  The rung lands on `model::compat_source`; the old boolean `profile_compat_assumed` is gone.
+  **The `assumed` rung fills the label only** — `bl_compatibility_id` and `compatibility` stay
+  `None`, keeping the older invariant that an absent compat nibble reads as unknown and never as
+  a guessed value. Everything else does fill them, which is why a raw P5 now reports `5.0`/id 0
+  and a raw P10 HDR10 stream reports `10.1`/id 1 in **JSON as well as text** (the old
+  `render::dv_profile_display` completion is deleted; the renderer states no opinion about
+  profile digits or colour any more). The metadata-only gate is likewise gone: `assumed`
+  discloses its own lack of evidence, which is what made a separate flag redundant, so a raw
+  video P8 whose VUI can't separate CCID 1/2/4 is `assumed` for the same reason a sidecar is. The **text report still drops the Profile line for metadata-only
+  sidecars** (`render.rs`) — an RPU is profile-agnostic and a DV XML's `GenerateProfile` is an
+  authoring target, so a rendered profile would read as a fact the metadata doesn't carry. The
+  P7 spec rung also covers the common *video* case of an untouched BDMV M2TS, which has **no
+  `0xB0` DV descriptor at all** — Blu-ray signals DV via the HDMV registration descriptor and
+  the playlist STN table; only remuxes (tsMuxeR etc.) add the descriptor.
+- **The base-layer colour a profile defines is filled into the model, with per-field
+  provenance.** `ColorInfo` is omitted per field when *neither signalled nor defined*, and
+  `model::ColorSources` says which of `container`/`stream`/`sei`/`spec` produced each value it
+  does carry (per field, not per object: a P5 stream signals its range and derives the other
+  three). `levels::fill_derived_color` is a main.rs post-pass alongside `fill_derived_level`,
+  video inputs only, and has **three** hard gates. **Signalled always wins** — the fill only ever
+  touches an absent field, so the corpus's declared 8.4 signalling full range against the
+  table's limited keeps `full`. And it runs on a **declared or spec id only, never an
+  inferred one**: an inferred id was deduced *from* this colour description, so filling it back
+  would launder a deduction into three fields that read as facts (and would add nothing — an
+  inferable id implies the signal was largely present). Third, it requires a **base layer**
+  (`bl_present`): a Table B row describes a base layer's VUI, and a P4 EL's own VUI is
+  byte-identical to a P5 base layer, so stating it over an EL-only track would describe a
+  stream that is not there. `dolby_vision.pq_reshaping` deliberately
+  does *not* share that gate: it fires on a resolved CCID 0 from any rung, because it is new
+  information rather than a back-fill, and Dolby's footnote keys on exactly that condition.
+  Order matters in `main.rs`: `hdr::assemble` runs on the *demuxed* colour before any of this,
+  so nothing derived can feed back into classification. **"Absent" has to mean *unsignalled*,
+  not merely unnamed.** A `ColorInfo` field is `None` both when the source carried nothing (or
+  the explicit "unspecified" code 2, which is the case the fill exists for) and when it carried
+  a real CICP code no shared table names — and filling the second overwrites a genuine signal,
+  then labels it `spec`, i.e. "not signalled anywhere". So **every** colour producer builds
+  `ColorInfo` and `ColorSources` together through `container::color_from_cicp`, the one place
+  that still sees the raw codes, and an unnamed code is marked `ColorSource::UnnamedCode` for
+  the fill to skip. That marker is internal: `model::hidden` keeps it out of the report, so the
+  documented guarantee that `color` and `color_source` carry the same key set still holds. The
+  `cicp_*` tables name every code H.273 defines, which keeps this class small — it now covers
+  only reserved values and code points added to the standard after this build — but *small is
+  not empty*, and the failure mode is silent: a wrong value reported as though nothing was
+  signalled. There is deliberately no constructor deriving provenance from a finished
+  `ColorInfo`; it could not make the distinction, and a caller using one would relabel fields
+  it never wrote. **The HEVC/AVC SPS parsers keep
+  `video_full_range_flag` even when `colour_description_present_flag` is 0**, decoding the
+  three CICP values as the 2 (unspecified) that H.264/H.265 Annex E infers for them: a stream
+  may legally declare full range and nothing else, and dropping the flag with the description
+  would let the spec fill state the *opposite* range as though nothing had been signalled.
 - **AVC (Profile 9) RPU is found by *content*, not by NAL number.** The DV RPU rides in an H.264
   *unspecified* NAL (Dolby uses type 28; the range is 24..=31), payload = the RPU EBSP beginning
   with the `rpu_nal_prefix` byte `0x19`. `sample.rs` treats an unspecified-range NAL as an RPU only
@@ -504,14 +1051,39 @@ never parse bytes native-endian.
   strips the **1-byte** AVC header, clears emulation prevention (`bits::ebsp_to_rbsp`), and calls
   `DoviRpu::parse_rpu` (which locates the `0x19` prefix). Don't route AVC through
   `parse_unspec62_nalu` — that strips a **2-byte** HEVC header. **Codec authority:** MP4 from the
-  sample entry (`avc1`/`avc3`/`dva1`/`dvav` → `Codec::Avc`), MKV from the `V_MPEG4/ISO/AVC` CodecID
+  sample entry (`avc1`/`avc3`/`avc2`/`avc4`/`dva1`/`dvav` → `Codec::Avc`; `avc2`/`avc4` are
+  AVC2SampleEntry, which the Dolby ISOBMFF spec lists beside `avc1`/`avc3` as a dvcC container),
+  MKV from the `V_MPEG4/ISO/AVC` CodecID
   (CodecPrivate is an `avcC`; `parse_avcc_record`'s embedded SPS supplies depth/chroma/profile —
   also what gives an SDR AVC MKV its 8-bit / Hi10P 10-bit report), TS from PMT `stream_type`
   (`0x1B` AVC vs
   `0x24` HEVC), falling back to DV profile 9 ⇒ AVC only when no video `stream_type` is present (a
-  bare DV/EL PID). P9 has no EL and an SDR base (CCID 2 ⇒ `SDR (fallback)` in `hdr::assemble`, the
+  bare DV/EL PID). P9 has no EL and an SDR base (CCID 2 ⇒ `SDR` in `hdr::assemble`, the
   same branch Profile 4 uses); its Rec.709 VUI (`0,1,1,1,0`) collapses to a single `BT.709` label
   because primaries == transfer (unlike P5, whose encoding differs from its colour space).
+- **An unrecognized sample-entry FourCC silently costs the whole dynamic report.** `Codec::Other`
+  has no arm in `sample.rs`, so the track is never scanned for RPUs: container facts survive
+  (`dvcC`/`hvcC`/`avcC` parse by box type) while every sampled DV level, the trim set, the cadence
+  verdict and the EL type vanish, and the codec renders as the raw FourCC. The MP4 sample-entry
+  match is therefore a correctness surface, not a cosmetic one. Two forms feed it that aren't the
+  obvious four: **`avc2`/`avc4`** (AVC2SampleEntry — the Dolby ISOBMFF spec's §3.1 container list,
+  §8.1.1 and box hierarchy all name it as a `dvcC`/`dvvC` container beside `avc1`/`avc3`), and
+  **`encv`**, the ISO/IEC 23001-7 common-encryption form, whose real FourCC is preserved in
+  `sinf`/`frma` and recovered by `mp4::original_format` *before* the codec match runs (both Dolby
+  streaming specs state the substitution outright). Reading an encrypted track is sound rather than
+  opportunistic: those same specs require the NAL length fields, the `nal_unit_type` bytes and the
+  **whole RPU** to stay unencrypted, so only slice payload is ciphertext, and `sinf` is an *added*
+  child so the original `hvcC`/`dvcC` sit where the walk already expects them. An incomplete chain
+  (no `sinf`, no `frma`, a truncated `frma`) stays on the fallback rather than guessing a codec.
+  Only `encv` is unwrapped — `enca`/`encs`/`enct` are media types this backend never reports.
+- **A DV enhancement layer folds by its `tref`/`vdep` reference, not by picture size.** §8.2.2 of
+  the Dolby ISOBMFF spec requires a dual-track file to name the dependency there, and it is the
+  exact analogue of the TS backend's `dependency_pid` — keep both carriage paths resolving the
+  fact the same way. ELs bucket per target, so a mux with several base traks routes each residual
+  by what it references. The widest-independent-trak heuristic stays as the fallback (plenty of
+  muxes omit `tref`) but must never outrank a resolvable reference, and a `vdep` naming a track the
+  file lacks falls back rather than dropping the EL. `vdep` carries no count field, so its entry
+  total is implied by the box extent and bounded by `MAX_TREF_REFS`.
 - **`--full` changes demux behaviour, not just sampling.** It threads into `container::demux(..,
   full)`: TS streams the whole video ES through the sampler in bounded `ts::STREAM_WINDOW_BYTES`
   windows — demux itself stays a head-window metadata pass, plus an SPS-rescue walk only when the
@@ -567,11 +1139,66 @@ never parse bytes native-endian.
   a packet budget sized to `HEAD_SCAN_BYTES` (24 MiB, ~2× the observed SPS depth), so the read
   isn't cut short before that IDR. Don't "optimize" this down to a few MiB (drops resolution/colour, and L5 falls
   back to raw offsets) or reintroduce the old whole-file window spread (defeats the remote win).
-  **Duration is the one exception that also reads the tail:** TS has no duration box, so — like
-  MediaInfo — it comes from `last_PCR - first_PCR` on the PCR PID. The first PCR is free from the
-  head window; the last comes from a *bounded* trailing window (`ts::TAIL_SCAN_BYTES`, 4 MiB). Head
-  + tail only, never the middle. A discontinuity flag in the sampled tail, a missing PCR, or an
-  implausible span yields `None` rather than a wrong number (`ts::pcr_duration`).
+  **Duration is the one exception that also reads the tail:** TS has no duration box, so it comes
+  from the same head window plus a *bounded* trailing window (`ts::TAIL_SCAN_BYTES`, 4 MiB). Head
+  + tail only, never the middle. **The video PTS span wins, the PCR span is the fallback**
+  (`ts::clock_duration`, open-items B1): the PCR times byte *arrival* and the muxer flushes the
+  tail without one — 11.6% of the corpus `mpeg2.ts` carries no PCR at all, reading 1.92 s against
+  a true 2.000 and pushing the overall bitrate 4.2% high — while the PTS closes when the last
+  picture is shown, which is what the report calls duration. The span is completed with one frame
+  interval (`container::whole_frame_duration`, shared with the PS backend, whose PTS-over-arrival
+  design this mirrors guard for guard). The PTS route's hard gates: single program and single
+  video group only (sibling programs ride independent STCs), forward discontinuity-free PCRs in
+  both windows with the tail's clock after the head's, each window's presentation span credible
+  against its own PCR span (one stray timestamp cannot set a min/max answer), disjoint windows
+  (`tail_start.max(head_end)` — overlap makes the reset guard fire on every mid-size file), a
+  contiguous tail falling back to the head's own maximum (between them they read the whole file),
+  one wrap folded through the shared modulus, and the shared 26-hour ceiling. A discontinuity
+  flag, a missing PCR, or an implausible span downgrades to the PCR route or to `None`, never a
+  wrong number. On real content the two routes agree within a frame or two; the reference tools
+  themselves spread wider (the 1.49 GB corpus M2TS: ffprobe 119.840, MediaInfo General 119.878,
+  MediaInfo per-video-track 119.911, hdrprobe 119.953 = that span plus the final frame's display
+  time — i.e. frames × frame duration, matching MediaInfo's video-track semantics).
+- **A program stream's duration is the video PTS span plus one frame, and the SCR is not a
+  fallback.** The span itself is one frame short by arithmetic, not approximation: frame `k` of
+  `N` is presented at `start + k/f`, so first-to-last is `(N-1)/f` while the stream occupies
+  `N/f`. `ps::whole_frame_duration` adds the interval when the frame rate is known (nothing to
+  add without one, and the bare span stands), which reproduces MediaInfo **exactly** on all four
+  corpus program streams — including the overall bitrate to the byte on three of them, since the
+  rate divides by this. The span is `ps::pts_span`: smallest PTS in the head window to largest in
+  the tail, min/max rather than first/last because a PTS is a presentation time and B-frame
+  reordering makes it non-monotonic in stream order; when the two windows *meet* a timestampless
+  tail falls back to the head's own maximum (they have read the whole file between them), and
+  when they don't it must not, or the answer would describe the head window alone.
+  The **pack clock is never a duration**: it times byte *arrival*, so it closes when the mux ends
+  rather than when the last picture is shown, measured at −11.0% on the 2 s corpus clips, −0.47%
+  on the 60 s retail DVD and **+3.2%** on an ffmpeg-muxed VOB — neither the size nor the
+  direction of the error is predictable, which is also why there is no span-comparison
+  cross-check: any tolerance wide enough to accept that spread catches nothing. What the SCR *is*
+  for is spotting a clock reset, the one way a plausible-looking span can be wholly wrong — a
+  backward step inside either window, or a tail whose clock starts before the head's ended.
+  **That second check is partial and the limit is structural**: it catches `cat a.vob b.vob` only
+  when the appended segment is short enough (~17 s at DVD rate) that its tail clock still sits
+  below the head window's last; append more and both windows are internally monotonic, each
+  wholly inside one segment, and the join is invisible — ffprobe and MediaInfo report the same
+  wrong number there, so it bounds head-and-tail probing rather than this backend. The reverse
+  order and any join inside the head window *are* caught. `None` also covers an absent timestamp,
+  a span over 26 h (the 33-bit clock's own range, one wrap being handled) and a non-positive one.
+  **The two windows must stay disjoint** (`tail_start.max(head_end)`): overlapping them makes the
+  tail's clock start before the head's by construction, so the reset guard fires on every
+  ordinary file in the 8–12 MiB band and silently drops its duration *and* its bitrate.
+  One more comparison earns its place, and it is the *same* one that fails against concatenation:
+  within a single window the two clocks measure the same bytes, so a presentation span exceeding
+  the arrival span by more than the decoder buffer delay is impossible rather than merely odd
+  (real files: at most 0.2 s over; `Walk::pts_within` allows half again or two seconds). That is
+  what stops one stray timestamp from setting the answer — the span is a min/max over a window,
+  unlike the transport backend's first-and-last pair, and a single non-conforming packet was
+  measured turning a real file into "25 h 55 m at 1.26 kb/s". The distinction is worth keeping
+  straight: the cross-check catches an *impossible* span, never a plausible-but-wrong one.
+  Bitrate is `overall` scope only (the byte count includes audio and packet
+  overhead) and `None` with more than one *reported track*; **`program_mux_rate` is never read for
+  it** — H.222.0 §2.5.3.4 defines it as a per-pack ceiling that "may vary from pack to pack",
+  and a real retail DVD writes 32964, i.e. 13.2 Mbit/s against an actual 6.6.
 - **The sampler always pins the SPS-carrying AU (`Demux::sps_chunk`).** Per-GOP prefix SEIs (HLG
   alt-transfer, ST.2086 mastering, CLL) ride only RAP access units, and a TS capture (or a raw ES
   cut) often starts mid-GOP: chunk 0 is then a pre-IDR picture and the sparse sample spread rarely
@@ -605,7 +1232,7 @@ never parse bytes native-endian.
   AU faults arrive warm — it skips ranges inside `warm_metadata`'s return, the *coalesced*
   contiguous warmed prefix from byte 0 (an MKV head that merges into its block span counts
   whole). The chunk warm is skipped under `--full` (every chunk is read anyway; its `--full`
-  counterpart is the `Frontier` below), under `--no-rpu` (no chunk is read), and for TS
+  counterpart is the `Frontier` below), under `--no-rpu` (no chunk is *sampled* — the demux-time gap-fillers still read up to 32 chunks for the codec's own headers, which is where an AVI's whole cost lives), and for TS
   (chunks index into `reassembled`, not the file). **`--full` on a strict-remote volume
   tailgates `prefetch::Frontier`**, a bounded look-ahead warm riding the progress-tick sites:
   each whole-file walk calls `ensure(pos)`/`ensure_to(end)` so the file crosses the wire once,
@@ -614,7 +1241,7 @@ never parse bytes native-endian.
   known spans — an MKV cluster, a scan batch, a TS window — warmed whole since they're consumed
   immediately), and the frontier is monotonic per file. Every container is single-pass under
   `--full` (fused or moov-indexed) — MKV/TS stream in windows, MP4 scans its moov-indexed
-  chunks in file order, and raw HEVC/AV1 fuse their whole-stream walk with extraction in
+  chunks in file order, and raw HEVC/AV1 *and FLV* fuse their whole-stream walk with extraction in
   `sample::scan_raw_full` — so one transfer covers any file size; the only whole-file demux
   walks left are the rare metadata rescues (no SPS / no sequence header in the head window).
   Gating is `is_remote_strict`, not `is_remote`: the plain verdict errs remote off-Windows
@@ -631,7 +1258,16 @@ never parse bytes native-endian.
   <= `prefetch::HEAD_WARM`, so the generic head warm covers the whole walked span; **TS/M2TS** —
   the warmed head (chosen by `looks_like_ts`) is exactly `ts::HEAD_SCAN_BYTES`, the demux's
   packet budget is sized to stay within it (`HEAD_SCAN_BYTES / 192`, the larger stride), and the
-  warmed tail is exactly `ts::TAIL_SCAN_BYTES` for the last-PCR duration read; **MKV without a
+  warmed tail is exactly `ts::TAIL_SCAN_BYTES` for the last-PCR duration read; **MPEG-PS** —
+  the same head/tail pair, `ps::HEAD_SCAN_BYTES` <= `HEAD_WARM` (so the generic head covers the
+  walk, no branch needed) and the warmed tail exactly `ps::TAIL_SCAN_BYTES` for the last-PTS
+  read, routed by a `looks_like_ps` whose content half is **byte 0 only** — a pack start code
+  plus a valid discriminator, never the head census `ps::demux` runs, because faulting a
+  megabyte in *before* the warm is the round-trip storm warming exists to prevent; **FLV** —
+  the same shape again, `flv::HEAD_SCAN_BYTES` <= `HEAD_WARM` so the generic head covers the
+  bounded tag walk, plus exactly `flv::TAIL_SCAN_BYTES` for the duration fallback that follows
+  the file's final `PreviousTagSize` back to the last tag; **ASF** needs no entry at all, its
+  Header Object being at byte 0 and tens of KiB at most; **MKV without a
   Cluster SeekHead entry** falls back to the old handshake, `prefetch::HEAD_WARM` >= the first
   block's offset + `mkv::HEAD_SPAN_BYTES` (with a resolved cluster the coupling is structural:
   `MKV_HEAD_WARM` holds only the front metadata, and the block span is warmed by exact extent).
@@ -639,7 +1275,13 @@ never parse bytes native-endian.
   `Mmap::advise` (memmap2's advise is `#[cfg(unix)]`, a no-op on the Windows/SMB target).
 - **Malformed-input safety in `mp4.rs`.** `read_u32/u16/u64` are bounds-safe (return 0 on OOB);
   any box-declared count fed to a loop/alloc must go through `clamp_count`. Apply the same
-  discipline to new table parsing.
+  discipline to new table parsing. **`iter_boxes` additionally rejects a box whose declared size
+  undercuts its own header** (a 32-bit `size` of 2..=7, or a 64-bit `largesize` under 16), which
+  would make `payload > end`: every consumer slices `payload..end`, so admitting one *panics*
+  rather than erroring, and a panic is exit 101, outside the tool's 0/1/2 contract, which in a
+  directory scan aborts the whole run and prints nothing at all. The guard belongs in the walk,
+  not at the call sites: it was originally spot-checked at two of seven and the other five were
+  live crashes. Keep new sample-entry children on the walk rather than re-deriving extents.
 - `split_annexb` treats the buffer start as an implicit NAL boundary (chunks begin at a NAL
   header, not a start code) — relied upon by the length-prefixed and head-window paths.
 - **Average bitrate is per-backend and correct-or-labelled, never a wrong number.** Each backend
@@ -654,7 +1296,16 @@ never parse bytes native-endian.
   streamed completed-AU bytes (`sample::Scan::es_bytes`, applied as the report's rate in `main.rs`
   since the total exists only after the streaming scan — demux leaves `bitrate` unset on that
   path, and `Some(0)` bytes still yields `None`, never 0 b/s; `--full --no-rpu` still walks the
-  stream count-only so the exact rate survives). Otherwise an *overall* rate (file length ÷
+  stream count-only so the exact rate survives). **AVI sums its own index** — `idx1` on a
+  single-segment file, the OpenDML `ix##` chunks otherwise — over the *video stream's* declared
+  duration, which reproduces MediaInfo's video rate byte-for-byte on eight of the nine corpus
+  files; and it emits **no rate at all when the first RIFF segment declares more bytes than the
+  file holds**, because a truncated AVI's numerator is the bytes present while its denominator is
+  the whole declared runtime. That case is not theoretical or cosmetic: a 5 MiB file cut inside
+  its own `idx1` reported 331 kb/s *labelled as an exact video-stream rate* against a true 752,
+  since a cut index reads as a shorter well-formed one. MediaInfo reports the same wrong number;
+  ffmpeg instead rescales the *duration*, which is a guess about where the cut landed. The
+  declared duration is a header fact and stands. Otherwise an *overall* rate (file length ÷
   duration, labelled distinctly because it
   counts audio + overhead) or `None` (no duration: raw HEVC/AV1). Never divide a bounded head-window
   index by the full runtime. **MKV reads the statistics `Tags` via one bounded tail seek**: mkvmerge
@@ -665,6 +1316,16 @@ never parse bytes native-endian.
   mirroring the TS tail-PCR warm; keep the two in sync). Under `--full` the walk reaches `Tags`
   naturally. A track may carry several `Tag`s for one UID (e.g. SOURCE_ID before the statistics), so
   select the first entry with a usable value, not the first UID match.
+- **A closed stdout is a success signal, not an error.** `hdrprobe … | head` and `| less` (quit
+  early) are ordinary use, and `print!` *panics* on the write failure they produce — a Rust
+  backtrace over the user's terminal and exit 101, a code outside the tool's contract (0 ok,
+  1 usage, 2 unreadable) and outside the fuzz gate's asserted `{0,2}`. Every report write
+  therefore goes through `main::write_stdout`, which treats `ErrorKind::BrokenPipe` as the
+  consumer having read its fill: the streaming loop stops scanning (nobody is left to read the
+  remaining reports), the buffered tail write is skipped, and the run exits 0. This is the same
+  convention the *stdin* path documents from the other end — there hdrprobe is the reader and
+  the upstream writer sees the broken pipe, which `docs/INTEGRATION-STDIN.md` already calls the
+  normal success signal. Don't reintroduce a bare `print!` on the report path.
 - **Progress is `--full`-only, stderr-only, and single-threaded by design.** `main` resolves
   every `--progress` mode to `Off` unless `--full` is set (the fast path never reports), and
   nothing progress-related may ever write to stdout — SCHEMA.md promises stdout is the pure
@@ -687,6 +1348,51 @@ never parse bytes native-endian.
   is emitted only for a file that produced a report. The hot `nal::split_annexb` stays
   tick-free: the no-op-closure monomorphization of `split_annexb_impl` compiles the gate out;
   only `split_annexb_streamed` (the raw-HEVC `--full` fused walk) pays for it.
+- **Aspect and scan are signalled-only, and the text line shows only what would otherwise
+  mislead.** `TrackDemux` carries the signalled rational (`pixel_aspect` *or* `display_aspect` —
+  never mixed across sources, since a container DAR paired with a stream PAR derives nonsense)
+  plus `scan_type`; main.rs derives the missing ratio from the coded size, exactly, and both
+  floats appear in JSON whenever a rational was signalled. Authority mirrors colour: MP4 `pasp`
+  and MKV `DisplayWidth`:`DisplayHeight` win over the coded stream's SAR; AVI's `vprp` is the
+  *fallback* like its frame rate (its aspect field is HIWORD:LOWORD = w:h, measured `0x00040003`
+  on the 4:3 fixture; `nbFieldPerFrame` 1/2 is the scan). Sources: H.264/H.265 VUI
+  `aspect_ratio_idc` through the one shared Table E-1 (`hevc::sps::sar_from_idc`, read verbatim
+  from the spec PDFs in `dev/`; VC-1's codes 1..13 and Part 2's 1..5 are numerically the same
+  rows), MPEG-2's DAR codes vs MPEG-1's pel table (indices 8/12 = 0.9375/1.1250 per the format
+  reference §1, *not* ffmpeg's draft-era pair), Theora `PARN`:`PARD`. Scan is affirmative or
+  structural, never inferred from permission: MPEG-2's clear `progressive_sequence` fills
+  *nothing* (a film DVD is progressive under a clear flag and both reference tools say so —
+  measured, the first A3 draft got this wrong), AVC reads `frame_mbs_only_flag`, HEVC the PTL
+  source-flag pair with `field_seq_flag` overriding, MPEG-1/Theora are structural constants.
+  The text report renders `DAR <ratio>` only when pixels are non-square and an `interlaced`
+  marker only when declared — square-pixel progressive lines stay byte-identical (the whole
+  corpus moved exactly one text line, the DVD's), the same presentation policy as the Color
+  line's matrix rule below.
+- **The Color line suppresses the matrix, except where suppressing it would state something
+  false.** `render::build_color_line` prints primaries and transfer but drops `color.matrix`,
+  because every matrix except Dolby's IPT-PQ-C2 restates what the primaries already said. That
+  reasoning fails in two ways, and each has its own escape.
+  **(1) There may be no primaries to restate.** With primaries *and* transfer both absent,
+  suppressing the matrix empties the line, and the report then reads "nothing was signalled" over a
+  stream that signalled something. MPEG-2 is where this became ordinary (ffmpeg's encoder writes
+  `colour_description` set with primaries and transfer at the explicit "unspecified" code 2, matrix
+  real), but it applies to any track whose only colour signal is a matrix, VP9 and ProRes included.
+  **(2) The matrix may name a different system than the primaries.** VC-1's spec defaults are
+  BT.709 primaries and transfer over a **BT.601** matrix, and a stream clearing
+  `COLOR_FORMAT_FLAG` — every VC-1 file observed — is *defined* to be that, so collapsing the line
+  to "BT.709" states the opposite of the matrix half. The comparison is by name (`!m.starts_with(p)`)
+  because the labels are the value space, and a matrix whose name extends the primaries' is the
+  restatement the rule is about: BT.2020's NCL and CL rows are the only such pair in the CICP
+  tables, and **renaming `cicp_primaries(9)` to anything longer than `"BT.2020"` would silently
+  start printing a matrix on every HDR file** — the two tables are coupled here and nothing else
+  enforces it.
+  A matrix shown under either escape is placed **after** the primaries/transfer pair and suffixed
+  ` matrix`, because the line's first slot is where a reader parses primaries and matrix labels
+  share that namespace (`BT.601 (NTSC)` is `cicp_primaries(6)` as well as `cicp_matrix(6)`, so
+  leading with it reads as the exact inverse of the truth). IPT-PQ-C2 keeps its bare leading
+  position: it names a colour space no primaries label spells, so it cannot be misread.
+  The JSON always carried the matrix; only the text line changed. No corpus file is affected in
+  any mode, which is why the byte-identity gate did not move.
 - **Value-line reflow is terminal-only and byte-neutral everywhere else.** kv rows longer than
   the terminal wrap at their part separators (trailing ` ·`/`,`/` +`, or the unstyled double
   space before a warning chip — never mid-part, never inside a chip) with continuations
@@ -708,7 +1414,37 @@ never parse bytes native-endian.
 
 ## Verifying changes
 
+**Review subagents get a resource budget, in the brief, every time.** Parallel finders are worth
+their cost on this codebase — hand-rolled byte parsers over untrusted input fail in ways a green
+test suite cannot see — but four unbudgeted ones filled 64 GB of RAM and pegged the CPU at 100%,
+halting the dev machine. Three workloads stacked: six concurrent `cargo build --release` runs (each
+agent forked its own `--target-dir` to dodge the project's lock), concurrent x264/x265 encodes of
+1 GB+ fixtures, and ~250,000 process spawns for fuzzing. So: **finders never build** — build once
+and hand them the binary path, forbidding `cargo build`/`test`/`clippy` and `--target-dir`; **at
+most two at a time**; **fixtures under ~50 MB**, deleted in the step that measures them (a size
+regression shows at 50 MB as plainly as at 350 MB — what exposes an unbounded per-chunk walk is
+chunk *count*); **fuzz budgets in the low thousands**, since structure-aware enumeration of
+declared size/length fields is what finds defects and 170k random runs found nothing 20k had not.
+Watch memory while they run, not after.
+
 Cross-check against `mediainfo --Output=JSON` / `ffprobe` / `dovi_tool info` (the ground truth
 used throughout). The corpus lives in `testfiles/integration/` (the whole `testfiles/` tree is
 local-only and gitignored — nothing under it is committed). For robustness work, byte-mutation
 fuzz the release binary over the corpus and assert no `panicked`/exit codes outside {0,2}.
+
+# Fable family (think / act / prove) — HARD GATES, not style guidance
+- ENTRY GATE: when a message asks you to investigate, debug, fix, implement, build,
+  or change something, invoke the Skill tool with `fable:fable-method` BEFORE your
+  first tool call. Following the loop "in spirit" without loading the skill does not
+  count. If a turn that started as a question escalates into edits, run the gate
+  before the first Edit/Write.
+  When a message contains an instruction to present your investigation results, show
+  them first, before continuing and await confirmation from the user.
+- EXIT GATE: work that produced an artifact (code change, commit, PR/issue/reply
+  text, config change) is NOT DONE until a `fable:fable-judge` pass has run on it.
+  Do not commit and do not present work as finished before the judge pass.
+  "Did that actually work?" = fable-judge.
+- Skipping either gate is allowed only for trivial work and only by writing one
+  explicit line in the reply: `fable gate skipped: <reason>`. A silent skip is a
+  false-completion claim.
+- Unattended or subagent-fanout tasks: `fable:fable-loop` instead of fable-method.

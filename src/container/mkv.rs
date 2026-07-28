@@ -24,7 +24,7 @@
 use anyhow::{Context, Result};
 
 use crate::container::{Chunk, Codec, Demux, DvConfig, NalFormat, TrackDemux};
-use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
+use crate::model::{Bitrate, ColorInfo, ColorSource, ColorSources, ContentLight, MasteringDisplay};
 use crate::prefetch::Frontier;
 
 // --- EBML element IDs (stored with their length-descriptor marker retained). ---
@@ -54,6 +54,9 @@ const ID_CODEC_PRIVATE: u32 = 0x63A2;
 const ID_DEFAULT_DURATION: u32 = 0x0023_E383;
 const ID_VIDEO: u32 = 0xE0;
 const ID_PIXEL_WIDTH: u32 = 0xB0;
+const ID_DISPLAY_WIDTH: u32 = 0x54B0;
+const ID_DISPLAY_HEIGHT: u32 = 0x54BA;
+const ID_FLAG_INTERLACED: u32 = 0x9A;
 const ID_PIXEL_HEIGHT: u32 = 0xBA;
 const ID_COLOUR: u32 = 0x55B0;
 const ID_MATRIX: u32 = 0x55B1;
@@ -404,13 +407,30 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
     let mut tracks = Vec::with_capacity(groups.len());
     for ((g, chunks), t35_chunks) in groups.into_iter().zip(outs).zip(t35_outs) {
         let track = g.info;
-        let fps = match (track.default_duration_ns, duration_secs, chunks.len()) {
-            (Some(dd), _, _) if dd > 0 => Some(1_000_000_000.0 / dd as f64),
+        // Both derivations divide file-supplied integers and take the shared
+        // plausibility bound: a `DefaultDuration` of 1 ns is a billion fps.
+        let (fps, fps_rational) = match (track.default_duration_ns, duration_secs, chunks.len())
+        {
+            (Some(dd), _, _) if dd > 0 => {
+                // A `DefaultDuration` that is bit-exactly the ns encoding of
+                // a standard rate decodes to that rate — 41708333 *is*
+                // 24000/1001 on this clock (`nominal_rate_from_period`).
+                // Anything else keeps the raw nanosecond ratio; the count
+                // fallback below is a measurement and gets no ratio at all.
+                if let Some((n, d)) = super::nominal_rate_from_period(dd, 1_000_000_000) {
+                    (Some(n as f64 / d as f64), Some((n, d)))
+                } else {
+                    let f = super::plausible_fps(1_000_000_000.0 / dd as f64);
+                    (f, f.is_some().then_some((1_000_000_000u64, dd)))
+                }
+            }
             // Frame-count / duration fallback is only valid when we indexed every
             // block; a bounded head window would divide a partial count by the full
             // runtime and report a nonsensically low fps.
-            (_, Some(d), n) if d > 0.0 && n > 0 && !stopped_early => Some(n as f64 / d),
-            _ => None,
+            (_, Some(d), n) if d > 0.0 && n > 0 && !stopped_early => {
+                (super::plausible_fps(n as f64 / d), None)
+            }
+            _ => (None, None),
         };
 
         // Per-stream video bitrate, preferring the mkvmerge statistics tag for
@@ -431,10 +451,20 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
                 .filter(|s| s.track_uid == Some(uid))
                 .find(|s| s.bps.is_some() || s.number_of_bytes.is_some())
         });
+        // The track's own statistics duration, same first-usable-value rule
+        // (a `DURATION` may ride a different Tag entry than the byte stats).
+        let vstat_duration = track.track_uid.and_then(|uid| {
+            stat_tags
+                .iter()
+                .filter(|s| s.track_uid == Some(uid))
+                .find_map(|s| s.duration_secs)
+        });
         let bitrate = if let Some(bps) = vstat.and_then(|s| s.bps) {
             Some(Bitrate::video_stream_bps(bps))
         } else if let Some(bytes) = vstat.and_then(|s| s.number_of_bytes) {
-            Bitrate::video_stream(bytes, duration_secs)
+            // The numerator is a header-declared byte count, not bytes this
+            // walk summed, so the rate is tagged declared like `BPS` above.
+            Bitrate::video_stream(bytes, duration_secs).map(Bitrate::declared)
         } else if full {
             // No statistics tag: the streaming scan sums the exact block bytes
             // (`sample::Scan::es_bytes`, applied in main.rs — the same value the
@@ -452,13 +482,22 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         let mut td = TrackDemux {
             track_number: Some(track.track_number),
             default_flag: Some(track.default_flag),
+            codec_id: Some(track.codec_id),
+            duration_secs: vstat_duration,
             width: track.width,
             height: track.height,
             fps,
+            fps_rational,
             bit_depth: track.bit_depth,
             chroma: track.chroma,
+            // Container authority, like colour: a signalled display size wins
+            // and the coded stream's SAR fills only the gap.
+            display_aspect: track.display_aspect,
+            pixel_aspect: track.display_aspect.is_none().then_some(track.pixel_aspect).flatten(),
+            scan_type: track.scan_type,
             codec_profile: track.codec_profile,
             color: track.color,
+            color_source: track.color_source,
             dv_config: track.dv_config,
             dv_dual_track: g.dv_dual_track,
             mastering: track.mastering,
@@ -485,6 +524,37 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         if td.codec == Codec::ProRes {
             super::fill_prores_stream_fields(&mut td, data);
         }
+        // MPEG-1/2 is the same shape again, and the most dependent on it: a
+        // `V_MPEG1`/`V_MPEG2` track has no CodecPrivate at all, so dimensions
+        // aside, the sequence header in the first block is the only thing that
+        // describes the video.
+        if matches!(td.codec, Codec::Mpeg1 | Codec::Mpeg2) {
+            super::fill_mpeg2_stream_fields(&mut td, data);
+        }
+        // MPEG-4 Part 2 and VC-1 both keep their headers in CodecPrivate — the
+        // `V_MPEG4/ISO/ASP` header set directly, VC-1's sequence header behind
+        // the VfW `BITMAPINFOHEADER` — so `codec_headers` already points at the
+        // right bytes and neither costs a block read. Part 2 keeps a block
+        // fallback for muxes that leave CodecPrivate empty; VC-1 has none,
+        // because a sequence header absent from the configuration is absent
+        // from an Advanced Profile stream too.
+        let headers = data.get(track.codec_headers.clone()).unwrap_or(&[]);
+        if td.codec == Codec::Mpeg4Part2 {
+            super::fill_mpeg4part2_stream_fields(&mut td, headers, data);
+        }
+        if td.codec == Codec::Vc1 {
+            super::fill_vc1_stream_fields(&mut td, headers);
+        }
+        // MJPEG is the VP9/ProRes shape once more: nothing but the frames
+        // themselves states depth or chroma, and the first block's SOF sits in
+        // the warmed head window.
+        if td.codec == Codec::Mjpeg {
+            super::fill_mjpeg_stream_fields(&mut td, data);
+        }
+        // Then the families whose depth and chroma are format constants
+        // (WMV3's ST 421 pair, the WMV1/WMV2 and MS-MPEG-4 witnessed
+        // constants), filled only where the reads above left both absent.
+        super::fill_constant_depth_chroma(&mut td);
         tracks.push(td);
     }
 
@@ -495,6 +565,8 @@ pub fn demux(data: &[u8], full: bool) -> Result<Demux> {
         ts_stream: None,
         mkv_stream,
         raw_stream: None,
+        bounded_index: false,
+        declared_short: false,
     })
 }
 
@@ -730,6 +802,28 @@ struct TrackStats {
     track_uid: Option<u64>,
     number_of_bytes: Option<u64>,
     bps: Option<f64>,
+    /// The mkvmerge statistics `DURATION` tag, parsed to seconds.
+    duration_secs: Option<f64>,
+}
+
+/// Longest statistics duration accepted; the tag is unvalidated text and a
+/// consumer divides by nothing here, but an absurd value would still be a
+/// wrong report line. Matches the FLV backend's declared-duration ceiling.
+const MAX_TAG_DURATION_SECS: f64 = 48.0 * 3600.0;
+
+/// mkvmerge's statistics `DURATION` form, `"HH:MM:SS.nnnnnnnnn"`, to seconds.
+/// Anything that does not parse as exactly that three-part shape — or that
+/// parses to zero, a negative, a non-finite, or an implausible value — yields
+/// `None` rather than a number the report would state as fact.
+fn parse_tag_duration(v: &str) -> Option<f64> {
+    let mut it = v.splitn(3, ':');
+    let h: f64 = it.next()?.parse().ok()?;
+    let m: f64 = it.next()?.parse().ok()?;
+    let s: f64 = it.next()?.parse().ok()?;
+    let secs = h * 3600.0 + m * 60.0 + s;
+    (h >= 0.0 && m >= 0.0 && s >= 0.0 && secs.is_finite() && secs > 0.0
+        && secs <= MAX_TAG_DURATION_SECS)
+        .then_some(secs)
 }
 
 /// Scan a `SeekHead`, returning the absolute offset of the `Tags` element if it
@@ -831,7 +925,8 @@ fn parse_tags(data: &[u8], start: usize, end: usize, out: &mut Vec<TrackStats>) 
 }
 
 fn parse_tag(data: &[u8], start: usize, end: usize) -> Option<TrackStats> {
-    let mut st = TrackStats { track_uid: None, number_of_bytes: None, bps: None };
+    let mut st =
+        TrackStats { track_uid: None, number_of_bytes: None, bps: None, duration_secs: None };
     let mut p = start;
     while p < end {
         let (id, p1) = read_id(data, p)?;
@@ -844,6 +939,8 @@ fn parse_tag(data: &[u8], start: usize, end: usize) -> Option<TrackStats> {
                     match name {
                         "NUMBER_OF_BYTES" => st.number_of_bytes = value.trim().parse().ok(),
                         "BPS" => st.bps = value.trim().parse().ok(),
+                        // mkvmerge's statistics duration, "HH:MM:SS.nnnnnnnnn".
+                        "DURATION" => st.duration_secs = parse_tag_duration(value.trim()),
                         _ => {}
                     }
                 }
@@ -907,17 +1004,35 @@ struct TrackInfo {
     /// FlagDefault (0x88); the EBML default is true when the element is absent.
     default_flag: bool,
     codec: Codec,
+    /// The CodecID string, sanitized; a `V_MS/VFW/FOURCC` track appends the
+    /// inner `biCompression` FourCC (`"V_MS/VFW/FOURCC / WVC1"`), MediaInfo's
+    /// rendering of the same pair.
+    codec_id: String,
     nal_format: NalFormat,
     bit_depth: Option<u8>,
     chroma: Option<String>,
     codec_profile: Option<String>,
     width: u32,
     height: u32,
+    /// DisplayWidth:DisplayHeight when both were present — the display aspect
+    /// in any DisplayUnit, since only the ratio is consumed.
+    display_aspect: Option<(u32, u32)>,
+    /// The config record's embedded-SPS sample aspect (used only when the
+    /// container states no display size).
+    pixel_aspect: Option<(u32, u32)>,
+    /// FlagInterlaced's two declarations (1/2); 0 (undetermined) is `None`.
+    scan_type: Option<&'static str>,
     color: ColorInfo,
+    color_source: ColorSources,
     mastering: Option<MasteringDisplay>,
     content_light: Option<ContentLight>,
     dv_config: Option<DvConfig>,
     default_duration_ns: Option<u64>,
+    /// Byte range of this track's codec headers inside the mmap: CodecPrivate,
+    /// advanced past a `BITMAPINFOHEADER` where there is one. Empty for every
+    /// codec whose fields come from a config record rather than a bitstream
+    /// header, and for a track with no CodecPrivate at all.
+    codec_headers: std::ops::Range<usize>,
 }
 
 /// Every video TrackEntry we can handle, in TrackNumber order (the report
@@ -949,10 +1064,14 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     let mut default_flag = true; // EBML default when FlagDefault is absent
     let mut codec_id: &[u8] = &[];
     let mut codec_private: &[u8] = &[];
+    let mut codec_private_span = 0..0;
     let mut default_duration_ns: Option<u64> = None;
     let mut width = 0u32;
     let mut height = 0u32;
+    let mut display = (0u32, 0u32);
+    let mut scan_type: Option<&'static str> = None;
     let mut color = ColorInfo::default();
+    let mut color_source = ColorSources::default();
     let mut mastering = None;
     let mut content_light = None;
     let mut dv_config = None;
@@ -969,7 +1088,10 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
             ID_TRACK_TYPE => track_type = read_uint(data, p2, s),
             ID_FLAG_DEFAULT => default_flag = read_uint(data, p2, s) != 0,
             ID_CODEC_ID => codec_id = &data[p2..cend],
-            ID_CODEC_PRIVATE => codec_private = &data[p2..cend],
+            ID_CODEC_PRIVATE => {
+                codec_private = &data[p2..cend];
+                codec_private_span = p2..cend;
+            }
             ID_DEFAULT_DURATION => {
                 let v = read_uint(data, p2, s);
                 if v > 0 {
@@ -983,8 +1105,11 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
                 &mut width,
                 &mut height,
                 &mut color,
+                &mut color_source,
                 &mut mastering,
                 &mut content_light,
+                &mut display,
+                &mut scan_type,
             ),
             ID_BLOCK_ADDITION_MAPPING => {
                 if let Some(dv) = parse_block_addition_mapping(data, p2, cend) {
@@ -1003,6 +1128,22 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
 
     let cc = classify_codec(codec_id, codec_private);
 
+    // A Video for Windows wrapper states the picture size itself. Matroska's own
+    // Video element normally does too and keeps authority; this only fills a
+    // track that carried none, which is the one case where the wrapper is the
+    // only source.
+    // The CodecID test comes first because it is a byte compare and the parse
+    // is not: nested the other way round, every track missing a PixelWidth
+    // reads its CodecPrivate as a `BITMAPINFOHEADER` before the result is
+    // thrown away, and an `hvcC` clears the `biSize >= 40` gate often enough
+    // for that to be a real read rather than a hypothetical one.
+    if (width == 0 || height == 0) && codec_id.starts_with(b"V_MS/VFW/FOURCC") {
+        if let Some(b) = super::bmih::parse(codec_private) {
+            width = b.width;
+            height = b.height;
+        }
+    }
+
     // No container Colour element? Recover colour from the parameter set in
     // CodecPrivate — the SPS in hvcC/avcC, the sequence header in av1C — with
     // the codec's own record parser (same fallback MP4 applies to a missing
@@ -1011,17 +1152,33 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
     // the container's authority over primaries/transfer/matrix — the MP4
     // nclc-colr treatment.
     if color.transfer.is_none() || color.range.is_none() {
+        // Past the `BITMAPINFOHEADER` for a `V_MS/VFW/FOURCC` track, and the
+        // whole blob for every CodecID that stores its record directly. Handing
+        // the record parsers a VfW-prefixed buffer would have them read the
+        // bitmap header as a configuration record — `biSize` 40 even clears
+        // `parse_hvcc_record`'s length gate.
+        let rec = codec_private.get(cc.extradata_offset..).unwrap_or_default();
         let stream_color = match cc.codec {
-            Codec::Hevc => super::color_from_hvcc(codec_private),
-            Codec::Avc => super::color_from_avcc(codec_private),
-            Codec::Av1 => super::color_from_av1c(codec_private),
+            // The AVC and HEVC record readers start at a fixed offset and walk
+            // declared-length arrays without checking `configurationVersion`,
+            // so raw Annex-B extradata — which a `V_MS/VFW/FOURCC` track may
+            // legitimately carry — could be walked as a record and yield a
+            // false SPS, reported as colour tagged `stream`. `classify_codec`
+            // already gates on this; the gate has to hold here too, and an
+            // `av1C` is deliberately not subject to it (its first byte is the
+            // marker/version 0x81, not 1).
+            Codec::Hevc if super::bmih::is_config_record(rec) => super::color_from_hvcc(rec),
+            Codec::Avc if super::bmih::is_config_record(rec) => super::color_from_avcc(rec),
+            Codec::Av1 => super::color_from_av1c(rec),
             _ => None,
         };
-        if let Some(c) = stream_color {
+        if let Some((c, c_src)) = stream_color {
             if color.transfer.is_none() {
                 color = c;
+                color_source = c_src;
             } else if color.range.is_none() {
                 color.range = c.range;
+                color_source.range = c_src.range;
             }
         }
     }
@@ -1031,17 +1188,24 @@ fn parse_track_entry(data: &[u8], start: usize, end: usize) -> Option<TrackInfo>
         track_uid,
         default_flag,
         codec: cc.codec,
+        codec_id: codec_id_label(codec_id, codec_private),
         nal_format: cc.nal_format,
         bit_depth: cc.bit_depth,
         chroma: cc.chroma,
         codec_profile: cc.codec_profile,
         width,
         height,
+        display_aspect: (display.0 > 0 && display.1 > 0).then_some(display),
+        pixel_aspect: cc.pixel_aspect,
+        scan_type: scan_type.or(cc.scan_type),
         color,
+        color_source,
         mastering,
         content_light,
         dv_config,
         default_duration_ns,
+        codec_headers: (codec_private_span.start + cc.extradata_offset)
+            .min(codec_private_span.end)..codec_private_span.end,
     })
 }
 
@@ -1051,6 +1215,111 @@ struct CodecConfig {
     bit_depth: Option<u8>,
     chroma: Option<String>,
     codec_profile: Option<String>,
+    /// From the config record's embedded SPS, where one exists.
+    pixel_aspect: Option<(u32, u32)>,
+    scan_type: Option<&'static str>,
+    /// Where this codec's own headers begin inside CodecPrivate. Zero for every
+    /// CodecID that stores them directly, and 40 for `V_MS/VFW/FOURCC`, whose
+    /// CodecPrivate opens with a `BITMAPINFOHEADER`. Only the codecs whose
+    /// fields come from a bitstream header rather than a config record read it.
+    extradata_offset: usize,
+}
+
+impl CodecConfig {
+    /// A codec with no config record: everything comes from the blocks, or from
+    /// codec-private bytes a bitstream parser reads later. The `nal_format` is a
+    /// placeholder in every such case — the blocks are raw access units, never
+    /// NAL streams, and the sampler's arm for these codecs is a no-op.
+    fn bare(codec: Codec) -> Self {
+        CodecConfig {
+            codec,
+            nal_format: NalFormat::LengthPrefixed(4),
+            bit_depth: None,
+            chroma: None,
+            codec_profile: None,
+            pixel_aspect: None,
+            scan_type: None,
+            extradata_offset: 0,
+        }
+    }
+}
+
+/// Config for a track whose parameters live in an `avcC`/`hvcC` decoder
+/// configuration record: the NAL length prefix, profile, depth and chroma all
+/// come out of it. `rec` is the record itself and `extradata_offset` says where
+/// it began inside CodecPrivate — zero for the native CodecIDs, past the
+/// `BITMAPINFOHEADER` for a Video for Windows wrapper — so the colour fallback
+/// in `parse_track_entry` re-slices to the same bytes.
+///
+/// `on_failure` is the framing to keep when the record does not parse, and the
+/// two carriages need different answers. For the native CodecIDs CodecPrivate
+/// *is* definitionally an `avcC`/`hvcC`, so a failed parse means a damaged
+/// record and the conventional 4-byte prefix stands — which is what those arms
+/// did before this was shared. For a Video for Windows wrapper only the first
+/// byte was ever tested, so a failed parse is positive evidence the extradata
+/// was **not** a configuration record, and the blocks are far more likely
+/// Annex-B; keeping a length prefix there would hand `split_length_prefixed` —
+/// which deliberately has no `forbidden_zero_bit` guard — bytes that are not
+/// NAL units, the exact route by which a stream once grew a signalled mastering
+/// display it did not carry.
+fn nal_config(
+    codec: Codec,
+    rec: &[u8],
+    extradata_offset: usize,
+    on_failure: NalFormat,
+) -> CodecConfig {
+    let mut cfg = CodecConfig {
+        codec,
+        nal_format: on_failure,
+        bit_depth: None,
+        chroma: None,
+        codec_profile: None,
+        pixel_aspect: None,
+        scan_type: None,
+        extradata_offset,
+    };
+    let parsed = match cfg.codec {
+        Codec::Hevc => super::parse_hvcc_record(rec).map(|h| {
+            (h.nal_len, h.bit_depth, h.chroma.map(str::to_string), h.profile_str)
+        }),
+        _ => super::parse_avcc_record(rec)
+            .map(|a| (a.nal_len, a.bit_depth, a.chroma.map(str::to_string), a.profile_str)),
+    };
+    if let Some((nal_len, bit_depth, chroma, profile)) = parsed {
+        cfg.nal_format = NalFormat::LengthPrefixed(nal_len);
+        cfg.bit_depth = Some(bit_depth);
+        cfg.chroma = chroma;
+        cfg.codec_profile = Some(profile);
+        // The record's embedded SPS also states the sample aspect and the
+        // scan signal, exactly as it supplies depth/chroma above.
+        let sps_aspect_scan = match cfg.codec {
+            Codec::Hevc => crate::hevc::sps::find_sps_in_hvcc(rec)
+                .and_then(crate::hevc::sps::parse_sps)
+                .map(|sps| (sps.pixel_aspect, sps.scan_type)),
+            _ => crate::avc::nal::find_sps_in_avcc(rec)
+                .and_then(crate::avc::sps::parse_sps)
+                .map(|sps| (sps.pixel_aspect, sps.scan_type)),
+        };
+        if let Some((pa, sc)) = sps_aspect_scan {
+            cfg.pixel_aspect = pa;
+            cfg.scan_type = sc;
+        }
+    }
+    cfg
+}
+
+/// The reported `codec_id`: the CodecID string (control characters
+/// sanitized — it reaches the terminal and the JSON verbatim), with the
+/// inner VfW FourCC appended for `V_MS/VFW/FOURCC`, whose CodecID alone is
+/// the same six words on every such track.
+fn codec_id_label(codec_id: &[u8], codec_private: &[u8]) -> String {
+    let base = super::sanitize_label(&String::from_utf8_lossy(codec_id));
+    if codec_id.starts_with(b"V_MS/VFW/FOURCC") {
+        if let Some(b) = super::bmih::parse(codec_private) {
+            return format!("{base} / {}", super::bmih::fourcc_label(&b.compression));
+        }
+    }
+    base
 }
 
 /// Map a Matroska CodecID (+ CodecPrivate) to codec, NAL framing and codec config.
@@ -1058,39 +1327,13 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
     if codec_id.starts_with(b"V_MPEGH/ISO/HEVC") {
         // CodecPrivate is an HEVCDecoderConfigurationRecord; blocks are
         // length-prefixed NAL units per its lengthSizeMinusOne.
-        let mut cfg = CodecConfig {
-            codec: Codec::Hevc,
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-        };
-        if let Some(h) = super::parse_hvcc_record(codec_private) {
-            cfg.nal_format = NalFormat::LengthPrefixed(h.nal_len);
-            cfg.bit_depth = Some(h.bit_depth);
-            cfg.chroma = Some(h.chroma.to_string());
-            cfg.codec_profile = Some(h.profile_str);
-        }
-        cfg
+        nal_config(Codec::Hevc, codec_private, 0, NalFormat::LengthPrefixed(4))
     } else if codec_id.starts_with(b"V_MPEG4/ISO/AVC") {
         // CodecPrivate is an AVCDecoderConfigurationRecord; depth/chroma/profile
         // come from its embedded SPS (not fixed header fields — see
         // `parse_avcc_record`). Covers SDR AVC muxes (8-bit, or 10-bit Hi10P)
         // and DV Profile 9, whose RPU the sampler finds by content.
-        let mut cfg = CodecConfig {
-            codec: Codec::Avc,
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-        };
-        if let Some(a) = super::parse_avcc_record(codec_private) {
-            cfg.nal_format = NalFormat::LengthPrefixed(a.nal_len);
-            cfg.bit_depth = Some(a.bit_depth);
-            cfg.chroma = Some(a.chroma.to_string());
-            cfg.codec_profile = Some(a.profile_str);
-        }
-        cfg
+        nal_config(Codec::Avc, codec_private, 0, NalFormat::LengthPrefixed(4))
     } else if codec_id.starts_with(b"V_VP9") {
         // CodecPrivate is the WebM VP9 feature list (profile/level/depth/
         // chroma) — optional, and colour-less by definition; whatever it
@@ -1105,6 +1348,9 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth: p.bit_depth,
             chroma: p.chroma.map(str::to_string),
             codec_profile: p.profile.map(|pr| crate::vp9::profile_label(pr, p.level)),
+            pixel_aspect: None,
+            scan_type: None,
+            extradata_offset: 0,
         }
     } else if codec_id.starts_with(b"V_PRORES") {
         // CodecPrivate is void per the Matroska codec spec, and the profile
@@ -1113,18 +1359,26 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
         // first block's frame header via `fill_prores_stream_fields` after the
         // blocks are indexed. The nal_format is a placeholder: blocks are raw
         // frames (the 8-byte size+'icpf' atom stripped), never NAL streams.
-        CodecConfig {
-            codec: Codec::ProRes,
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-        }
+        CodecConfig::bare(Codec::ProRes)
+    } else if codec_id.starts_with(b"V_MPEG1") || codec_id.starts_with(b"V_MPEG2") {
+        // Neither CodecID carries a CodecPrivate: the Matroska codec spec says
+        // the sequence header rides the blocks themselves. So everything comes
+        // from `fill_mpeg2_stream_fields` after the blocks are indexed, which
+        // is also the only colour source, since ffmpeg writes no Colour element
+        // for these tracks. The nal_format is a placeholder: blocks are raw
+        // MPEG access units, never NAL streams, and the sampler's arm is a
+        // no-op. Match on `V_MPEG1`/`V_MPEG2` rather than a `V_MPEG` prefix,
+        // which would also swallow `V_MPEG4/*`.
+        CodecConfig::bare(if codec_id.starts_with(b"V_MPEG1") {
+            Codec::Mpeg1
+        } else {
+            Codec::Mpeg2
+        })
     } else if codec_id.starts_with(b"V_AV1") {
         // CodecPrivate is an AV1CodecConfigurationRecord (same layout as `av1C`),
         // which carries profile/tier/level and bit depth.
         let (bit_depth, chroma, codec_profile) = match super::parse_av1c_record(codec_private) {
-            Some((bd, ch, prof)) => (Some(bd), Some(ch.to_string()), Some(prof)),
+            Some((bd, ch, prof)) => (Some(bd), ch.map(str::to_string), prof),
             None => (None, None, None),
         };
         CodecConfig {
@@ -1133,15 +1387,85 @@ fn classify_codec(codec_id: &[u8], codec_private: &[u8]) -> CodecConfig {
             bit_depth,
             chroma,
             codec_profile,
+            pixel_aspect: None,
+            scan_type: None,
+            extradata_offset: 0,
+        }
+    } else if codec_id.starts_with(b"V_MPEG4/ISO/SP")
+        || codec_id.starts_with(b"V_MPEG4/ISO/ASP")
+        || codec_id.starts_with(b"V_MPEG4/ISO/AP")
+    {
+        // The three ISO Part 2 CodecIDs — Simple, Advanced Simple and Advanced.
+        // All carry the same bitstream, and CodecPrivate holds its
+        // VOS/VisualObject/VOL header set verbatim, so
+        // `fill_mpeg4part2_stream_fields` reads it with no block access at all.
+        // The reported profile comes from that header rather than from the id,
+        // which is why one arm serves all three. `V_MPEG4/ISO/AVC` is checked
+        // above and cannot reach here.
+        CodecConfig::bare(Codec::Mpeg4Part2)
+    } else if codec_id.starts_with(b"V_MJPEG") {
+        // Registry MJPEG: no CodecPrivate; every block is a whole JPEG image,
+        // so depth and chroma come from the first block's SOF header via
+        // `fill_mjpeg_stream_fields` after the blocks are indexed.
+        CodecConfig::bare(Codec::Mjpeg)
+    } else if codec_id.starts_with(b"V_MPEG4/MS/V3") {
+        // Microsoft's pre-standard v3. Its CodecPrivate is a `BITMAPINFOHEADER`
+        // in some muxes and empty in others, and either way the bitstream
+        // signals no colour, depth or profile — the container facts are the
+        // whole report.
+        CodecConfig::bare(Codec::MsMpeg4(3))
+    } else if codec_id.starts_with(b"V_MS/VFW/FOURCC") {
+        // The Video for Windows wrapper: CodecPrivate is a `BITMAPINFOHEADER`
+        // whose `biCompression` names the real codec, with that codec's own
+        // headers as trailing extradata. It is the only carriage VC-1 has in
+        // Matroska.
+        //
+        // AVC and HEVC additionally need their NAL framing decided, because VfW
+        // extradata is a configuration record in some muxes and raw Annex-B in
+        // others and the FourCC does not separate them
+        // (`bmih::is_config_record`). A record also states the length prefix,
+        // profile and depth outright, so it is parsed here exactly as an MP4
+        // `avcC`/`hvcC` would be; Annex-B extradata leaves those to the
+        // bitstream, where `codec_headers` already points.
+        let bmih = super::bmih::parse(codec_private);
+        let fourcc = bmih.as_ref().map(|b| b.compression);
+        let extradata = codec_private.get(super::bmih::HEADER_LEN..).unwrap_or_default();
+        match fourcc.as_ref().and_then(super::bmih::codec_from_fourcc) {
+            Some(c @ (Codec::Avc | Codec::Hevc)) => {
+                if super::bmih::is_config_record(extradata) {
+                    nal_config(c, extradata, super::bmih::HEADER_LEN, NalFormat::AnnexB)
+                } else {
+                    // Raw Annex-B parameter sets, or no extradata at all: the
+                    // blocks are Annex-B access units, and nothing in the
+                    // wrapper states depth, chroma or profile. Naming the codec
+                    // is the whole gain, and it is a real one — such a track
+                    // used to report the bare FourCC.
+                    CodecConfig {
+                        nal_format: NalFormat::AnnexB,
+                        extradata_offset: super::bmih::HEADER_LEN,
+                        ..CodecConfig::bare(c)
+                    }
+                }
+            }
+            Some(c @ (Codec::Mpeg4Part2 | Codec::Vc1 | Codec::MsMpeg4(_) | Codec::Mjpeg)) => {
+                CodecConfig { extradata_offset: super::bmih::HEADER_LEN, ..CodecConfig::bare(c) }
+            }
+            // The FourCC is the identifier a user recognises; the CodecID is the
+            // same six words on every such track. Only printable ASCII is
+            // adopted, because this string reaches the terminal verbatim and
+            // `biCompression` is not always text: `BI_RGB` is the integer 0,
+            // which would print four NUL bytes, and four attacker-chosen bytes
+            // could spell an ANSI escape. Anything else keeps the CodecID, which
+            // is what these tracks reported before this arm existed.
+            _ => CodecConfig::bare(Codec::Other(
+                match fourcc.filter(|f| f.iter().all(|b| (0x20..=0x7E).contains(b))) {
+                    Some(f) => String::from_utf8_lossy(&f).trim_end().to_string(),
+                    None => String::from_utf8_lossy(codec_id).to_string(),
+                },
+            ))
         }
     } else {
-        CodecConfig {
-            codec: Codec::Other(String::from_utf8_lossy(codec_id).to_string()),
-            nal_format: NalFormat::LengthPrefixed(4),
-            bit_depth: None,
-            chroma: None,
-            codec_profile: None,
-        }
+        CodecConfig::bare(Codec::Other(String::from_utf8_lossy(codec_id).to_string()))
     }
 }
 
@@ -1181,9 +1505,15 @@ fn fill_vp9_stream_fields(track: &mut TrackDemux, data: &[u8]) {
         && track.color.matrix.is_none();
     if signalled_nothing {
         track.color.matrix = f.color.matrix.clone();
+        if track.color.matrix.is_some() {
+            track.color_source.matrix = Some(ColorSource::Stream);
+        }
     }
     if track.color.range.is_none() {
         track.color.range = f.color.range.clone();
+        if track.color.range.is_some() {
+            track.color_source.range = Some(ColorSource::Stream);
+        }
     }
 }
 
@@ -1195,8 +1525,11 @@ fn parse_video(
     width: &mut u32,
     height: &mut u32,
     color: &mut ColorInfo,
+    color_source: &mut ColorSources,
     mastering: &mut Option<MasteringDisplay>,
     content_light: &mut Option<ContentLight>,
+    display: &mut (u32, u32),
+    scan: &mut Option<&'static str>,
 ) {
     let mut p = start;
     while p < end {
@@ -1207,7 +1540,24 @@ fn parse_video(
         match id {
             ID_PIXEL_WIDTH => *width = read_uint(data, p2, s) as u32,
             ID_PIXEL_HEIGHT => *height = read_uint(data, p2, s) as u32,
-            ID_COLOUR => parse_colour(data, p2, cend, color, mastering, content_light),
+            // Present in any DisplayUnit: the pair's *ratio* is the display
+            // aspect regardless of whether the unit is pixels, centimetres or
+            // the ratio itself. Absent elements default to the pixel size,
+            // which is why only a present pair sets anything.
+            ID_DISPLAY_WIDTH => display.0 = read_uint(data, p2, s) as u32,
+            ID_DISPLAY_HEIGHT => display.1 = read_uint(data, p2, s) as u32,
+            // 1 = interlaced, 2 = progressive, 0 = undetermined (the EBML
+            // default) — only the two declarations fill.
+            ID_FLAG_INTERLACED => {
+                *scan = match read_uint(data, p2, s) {
+                    1 => Some("interlaced"),
+                    2 => Some("progressive"),
+                    _ => None,
+                }
+            }
+            ID_COLOUR => {
+                parse_colour(data, p2, cend, color, color_source, mastering, content_light)
+            }
             _ => {}
         }
         p = cend;
@@ -1219,6 +1569,7 @@ fn parse_colour(
     start: usize,
     end: usize,
     color: &mut ColorInfo,
+    color_source: &mut ColorSources,
     mastering: &mut Option<MasteringDisplay>,
     content_light: &mut Option<ContentLight>,
 ) {
@@ -1232,19 +1583,33 @@ fn parse_colour(
         let s = size.unwrap_or(0) as usize;
         let cend = (p2 + s).min(end);
         match id {
-            ID_MATRIX => color.matrix = super::cicp_matrix(read_uint(data, p2, s) as u16).map(str::to_string),
+            // Each CICP element carries its own provenance, so a code the
+            // Colour element signalled but this build cannot name stays
+            // distinguishable from one it never carried.
+            ID_MATRIX => {
+                let code = read_uint(data, p2, s) as u16;
+                let name = super::cicp_matrix(code);
+                color.matrix = name.map(str::to_string);
+                color_source.matrix = super::cicp_source(code, name, ColorSource::Container);
+            }
             ID_TRANSFER => {
-                color.transfer = super::cicp_transfer(read_uint(data, p2, s) as u16).map(str::to_string)
+                let code = read_uint(data, p2, s) as u16;
+                let name = super::cicp_transfer(code);
+                color.transfer = name.map(str::to_string);
+                color_source.transfer = super::cicp_source(code, name, ColorSource::Container);
             }
             ID_PRIMARIES => {
-                color.primaries = super::cicp_primaries(read_uint(data, p2, s) as u16).map(str::to_string)
+                let code = read_uint(data, p2, s) as u16;
+                let name = super::cicp_primaries(code);
+                color.primaries = name.map(str::to_string);
+                color_source.primaries = super::cicp_source(code, name, ColorSource::Container);
             }
             ID_RANGE => {
                 color.range = match read_uint(data, p2, s) {
-                    1 => Some("limited".to_string()),
-                    2 => Some("full".to_string()),
+                    v @ (1 | 2) => Some(super::cicp_range(v == 2).to_string()),
                     _ => None,
-                }
+                };
+                color_source.range = color.range.as_ref().map(|_| ColorSource::Container);
             }
             ID_MAX_CLL => max_cll = Some(read_uint(data, p2, s)),
             ID_MAX_FALL => max_fall = Some(read_uint(data, p2, s)),
@@ -1506,6 +1871,183 @@ mod tests {
         assert_eq!(read_size(&[0x7F, 0xFF], 0), Some((None, 2)));
     }
 
+    /// The statistics `DURATION` value is unvalidated text; only the exact
+    /// `HH:MM:SS.nnnnnnnnn` shape with a plausible positive value parses.
+    #[test]
+    fn tag_duration_parses_the_mkvmerge_form_only() {
+        assert_eq!(parse_tag_duration("00:02:00.480000000"), Some(120.48));
+        assert_eq!(parse_tag_duration("01:00:00.000000000"), Some(3600.0));
+        assert_eq!(parse_tag_duration("120.48"), None, "no colon-parts shape");
+        assert_eq!(parse_tag_duration("00:00:00.000000000"), None, "zero is no duration");
+        assert_eq!(parse_tag_duration("-1:00:00"), None);
+        assert_eq!(parse_tag_duration("00:00:1e309"), None, "non-finite");
+        assert_eq!(parse_tag_duration("99:00:00.0"), None, "past the ceiling");
+        assert_eq!(parse_tag_duration("garbage"), None);
+    }
+
+    /// `codec_id` is the CodecID itself; a VfW wrapper appends the inner
+    /// FourCC (MediaInfo's rendering), and control characters in a crafted
+    /// CodecID render as U+FFFD like the codec label's own fallback.
+    #[test]
+    fn codec_id_label_appends_the_vfw_fourcc() {
+        assert_eq!(codec_id_label(b"V_MPEGH/ISO/HEVC", &[]), "V_MPEGH/ISO/HEVC");
+        let private = vfw_private(b"WVC1", &[]);
+        assert_eq!(codec_id_label(b"V_MS/VFW/FOURCC", &private), "V_MS/VFW/FOURCC / WVC1");
+        assert_eq!(codec_id_label(b"V_\x1b[31m", &[]), "V_\u{FFFD}[31m");
+    }
+
+    #[test]
+    fn classify_codec_mpeg_video() {
+        // `V_MPEG1`/`V_MPEG2` carry no CodecPrivate: the sequence header rides
+        // the blocks, so classification settles the codec and leaves every
+        // other field for `fill_mpeg2_stream_fields`.
+        for (id, want) in [
+            (b"V_MPEG1".as_slice(), Codec::Mpeg1),
+            (b"V_MPEG2".as_slice(), Codec::Mpeg2),
+        ] {
+            let cc = classify_codec(id, &[]);
+            assert_eq!(cc.codec, want, "{}", String::from_utf8_lossy(id));
+            assert_eq!(cc.bit_depth, None);
+            assert_eq!(cc.chroma, None);
+            assert_eq!(cc.codec_profile, None);
+        }
+        // The match is on `V_MPEG1`/`V_MPEG2`, not a `V_MPEG` prefix, which
+        // would swallow every `V_MPEG4/*` id. Those must keep their own arms.
+        assert_eq!(classify_codec(b"V_MPEG4/ISO/AVC", &[]).codec, Codec::Avc);
+        assert_eq!(classify_codec(b"V_MPEGH/ISO/HEVC", &[]).codec, Codec::Hevc);
+        assert_eq!(classify_codec(b"V_MPEG4/ISO/ASP", &[]).codec, Codec::Mpeg4Part2);
+        assert_eq!(classify_codec(b"V_MPEG4/MS/V3", &[]).codec, Codec::MsMpeg4(3));
+        assert_eq!(classify_codec(b"V_MPEG4/ISO/SP", &[]).codec, Codec::Mpeg4Part2);
+        assert_eq!(classify_codec(b"V_MPEG4/ISO/AP", &[]).codec, Codec::Mpeg4Part2);
+        // And an unrecognized MPEG-4 id still falls through verbatim.
+        assert_eq!(
+            classify_codec(b"V_MPEG4/ISO/XYZ", &[]).codec,
+            Codec::Other("V_MPEG4/ISO/XYZ".to_string())
+        );
+    }
+
+    /// A `V_MS/VFW/FOURCC` CodecPrivate: 40-byte `BITMAPINFOHEADER` naming
+    /// `fourcc`, then `extradata`.
+    fn vfw_private(fourcc: &[u8; 4], extradata: &[u8]) -> Vec<u8> {
+        let mut b = vec![0u8; super::super::bmih::HEADER_LEN];
+        b[0..4].copy_from_slice(&40u32.to_le_bytes());
+        b[4..8].copy_from_slice(&640i32.to_le_bytes());
+        b[8..12].copy_from_slice(&360i32.to_le_bytes());
+        b[16..20].copy_from_slice(fourcc);
+        b.extend_from_slice(extradata);
+        b
+    }
+
+    #[test]
+    fn a_vfw_wrapped_h264_takes_its_framing_from_the_extradata() {
+        // Both framings are common and the FourCC does not separate them, so
+        // the first extradata byte decides. Guessing wrong hands
+        // `split_length_prefixed` — which has no `forbidden_zero_bit` guard —
+        // bytes that are not NAL units.
+        let annexb = classify_codec(
+            b"V_MS/VFW/FOURCC",
+            &vfw_private(b"H264", &[0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0D]),
+        );
+        assert_eq!(annexb.codec, Codec::Avc);
+        assert!(matches!(annexb.nal_format, NalFormat::AnnexB), "{:?}", annexb.nal_format);
+        // Empty extradata is the fresh-encode case and is Annex-B too.
+        let bare = classify_codec(b"V_MS/VFW/FOURCC", &vfw_private(b"H264", &[]));
+        assert!(matches!(bare.nal_format, NalFormat::AnnexB));
+
+        // A real `avcC` (from `testfiles/sdr/h264_avcc.avi`) takes the record
+        // path and states its own prefix size, profile and depth.
+        let rec: [u8; 46] = [
+            0x01, 0x64, 0x00, 0x0D, 0xFF, 0xE1, 0x00, 0x19, 0x67, 0x64, 0x00, 0x0D, 0xAC, 0xD9,
+            0x41, 0x41, 0xFB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03,
+            0x20, 0xF1, 0x42, 0x99, 0x60, 0x01, 0x00, 0x06, 0x68, 0xEB, 0xE3, 0xCB, 0x22, 0xC0,
+            0xFD, 0xF8, 0xF8, 0x00,
+        ];
+        let cfg = classify_codec(b"V_MS/VFW/FOURCC", &vfw_private(b"avc1", &rec));
+        assert!(matches!(cfg.nal_format, NalFormat::LengthPrefixed(4)));
+        assert_eq!(cfg.codec_profile.as_deref(), Some("High @ L1.3"));
+        assert_eq!(cfg.bit_depth, Some(8));
+        assert_eq!(cfg.extradata_offset, super::super::bmih::HEADER_LEN);
+
+        // **Extradata whose first byte is 0x01 but which is not a valid record
+        // must not keep a length prefix.** Only that one byte was ever tested,
+        // so a failed parse is evidence it was never a record — unlike the
+        // native `V_MPEG4/ISO/AVC` id, where CodecPrivate is definitionally one
+        // and a damaged record keeps the conventional 4-byte prefix.
+        let junk = classify_codec(b"V_MS/VFW/FOURCC", &vfw_private(b"H264", &[0x01, 0x02, 0x03]));
+        assert!(matches!(junk.nal_format, NalFormat::AnnexB), "{:?}", junk.nal_format);
+        let native = classify_codec(b"V_MPEG4/ISO/AVC", &[0x01, 0x02, 0x03]);
+        assert!(matches!(native.nal_format, NalFormat::LengthPrefixed(4)));
+    }
+
+    /// `testfiles/sdr/h264_odml.avi`'s SPS verbatim (27 bytes, NAL type 7). Its
+    /// VUI carries a full colour description — BT.601 NTSC, limited range —
+    /// which is what makes it usable as *evidence* below: if it is ever read,
+    /// colour appears where none was signalled.
+    const SPS_WITH_COLOUR: [u8; 27] = [
+        0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0xF0, 0x11, 0x7E, 0xE6, 0xA0, 0xC0, 0xC0, 0xC8,
+        0x00, 0x00, 0x1F, 0x48, 0x00, 0x07, 0x53, 0x00, 0x78, 0xC1, 0x8C, 0xB0,
+    ];
+
+    /// Wrap `SPS_WITH_COLOUR` in an `avcC` record.
+    fn avcc_with_colour() -> Vec<u8> {
+        let mut r = vec![0x01, 0x64, 0x00, 0x1F, 0xFF, 0xE1];
+        r.extend_from_slice(&(SPS_WITH_COLOUR.len() as u16).to_be_bytes());
+        r.extend_from_slice(&SPS_WITH_COLOUR);
+        r.extend_from_slice(&[0x01, 0x00, 0x00]); // zero-length PPS
+        r
+    }
+
+    /// Build a one-video-track TrackEntry with the given CodecID and
+    /// CodecPrivate, and parse it.
+    fn track_from(codec_id: &[u8], codec_private: &[u8]) -> TrackInfo {
+        let mut e = el(&[0xD7], &[1]);
+        e.extend_from_slice(&el(&[0x83], &[1]));
+        e.extend_from_slice(&el(&[0x86], codec_id));
+        e.extend_from_slice(&el(&[0x63, 0xA2], codec_private));
+        parse_track_entry(&e, 0, e.len()).expect("a video track")
+    }
+
+    #[test]
+    fn a_vfw_config_record_is_found_past_the_bitmap_header() {
+        // The positive half of the pair below: the colour fallback must slice
+        // CodecPrivate at the codec's own `extradata_offset`, or a VfW-wrapped
+        // `avcC` is never seen at all and a real signal is lost. Feed it the
+        // whole blob and byte 0 is `biSize`, not `configurationVersion`.
+        let t = track_from(b"V_MS/VFW/FOURCC", &vfw_private(b"avc1", &avcc_with_colour()));
+        assert_eq!(t.codec, Codec::Avc);
+        assert_eq!(t.color.primaries.as_deref(), Some("BT.601 (NTSC)"));
+        assert_eq!(t.color.transfer.as_deref(), Some("BT.601"));
+        assert_eq!(t.color.range.as_deref(), Some("limited"));
+    }
+
+    #[test]
+    fn annex_b_vfw_extradata_is_never_read_as_a_configuration_record() {
+        // The colour fallback recovers a stream's VUI from the SPS inside an
+        // `avcC`/`hvcC`. Those readers start at a fixed offset and walk
+        // declared-length arrays **without checking `configurationVersion`**,
+        // so handing them raw Annex-B bytes — which a Video for Windows wrapper
+        // may legitimately carry — could yield a false SPS reported as colour
+        // tagged `stream`, i.e. a fabricated signal. `classify_codec` gates on
+        // the first byte; this asserts the fallback does too.
+        // Extradata that is *not* a record — byte 0 is a start code's `0x00` —
+        // but whose bytes 5..8 happen to read as an `avcC`'s SPS count and
+        // length, so an unguarded reader finds `SPS_WITH_COLOUR` and reports
+        // its BT.601 description. Nothing here signalled any colour.
+        let mut annexb = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0xE1];
+        annexb.extend_from_slice(&(SPS_WITH_COLOUR.len() as u16).to_be_bytes());
+        annexb.extend_from_slice(&SPS_WITH_COLOUR);
+        let t = track_from(b"V_MS/VFW/FOURCC", &vfw_private(b"H264", &annexb));
+        assert_eq!(t.codec, Codec::Avc, "the FourCC still names the codec");
+        assert!(matches!(t.nal_format, NalFormat::AnnexB));
+        // Nothing signalled colour, so nothing may be reported. Drop the
+        // `is_config_record` guard on the fallback and these bytes are walked
+        // as a record.
+        assert!(t.color.primaries.is_none(), "{:?}", t.color);
+        assert!(t.color.transfer.is_none(), "{:?}", t.color);
+        assert!(t.color.matrix.is_none(), "{:?}", t.color);
+        assert!(t.color_source.primaries.is_none(), "{:?}", t.color_source);
+    }
+
     #[test]
     fn classify_codec_avc() {
         // The same real Profile-9 `avcC` record `container::tests` parses:
@@ -1705,6 +2247,28 @@ mod tests {
         el(&[0xAE], &b)
     }
 
+    #[test]
+    fn implausible_default_duration_yields_no_fps() {
+        // A `DefaultDuration` of 1 ns states a billion fps; the shared
+        // `plausible_fps` bound drops it, while an ordinary 40 ms frame
+        // period still reads 25 fps through the same arithmetic.
+        for (dd, want) in [(1u32, None), (40_000_000, Some(25.0))] {
+            let mut b = el(&[0xD7], &[1]); // TrackNumber
+            b.extend(el(&[0x73, 0xC5], &[0x11])); // TrackUID
+            b.extend(el(&[0x83], &[1])); // TrackType = video
+            b.extend(el(&[0x86], b"V_MPEGH/ISO/HEVC")); // CodecID
+            b.extend(el(&[0x23, 0xE3, 0x83], &dd.to_be_bytes())); // DefaultDuration
+            let mut video = el(&[0xB0], &1920u16.to_be_bytes());
+            video.extend(el(&[0xBA], &1080u16.to_be_bytes()));
+            b.extend(el(&[0xE0], &video));
+            let entry = el(&[0xAE], &b);
+            let seg = el_wide(&ID_TRACKS.to_be_bytes(), &entry);
+            let data = el_wide(&ID_SEGMENT.to_be_bytes(), &seg);
+            let d = demux(&data, false).expect("demuxes");
+            assert_eq!(d.tracks[0].fps, want, "DefaultDuration {dd}");
+        }
+    }
+
     /// A statistics `Tag` (Targets>TagTrackUID + BPS SimpleTag) for one track.
     fn bps_tag(uid: u8, bps: &str) -> Vec<u8> {
         let mut body = el(&[0x63, 0xC0], &el(&[0x63, 0xC5], &[uid]));
@@ -1756,17 +2320,23 @@ mod tests {
             track_uid: None,
             default_flag: true,
             codec: Codec::Hevc,
+            codec_id: "V_MPEGH/ISO/HEVC".to_string(),
             nal_format: NalFormat::LengthPrefixed(4),
             bit_depth: None,
             chroma: None,
             codec_profile: None,
             width: w,
             height: w / 2,
+            display_aspect: None,
+            pixel_aspect: None,
+            scan_type: None,
             color: ColorInfo::default(),
+            color_source: ColorSources::default(),
             mastering: None,
             content_light: None,
             dv_config: dv,
             default_duration_ns: None,
+            codec_headers: 0..0,
         };
         let el_cfg = DvConfig {
             profile: 7,

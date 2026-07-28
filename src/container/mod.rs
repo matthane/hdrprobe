@@ -3,9 +3,18 @@
 //! read-only; never decodes pictures.
 
 pub mod annexb;
+pub mod asf;
 pub mod av1;
+pub mod avi;
+pub mod bmih;
+pub mod dif;
+pub mod flv;
 pub mod mkv;
 pub mod mp4;
+pub mod mpegv;
+pub mod ogg;
+pub mod ps;
+pub mod rm;
 pub mod ts;
 
 use std::path::Path;
@@ -13,7 +22,7 @@ use std::path::Path;
 use anyhow::{bail, Result};
 
 use crate::bits::BitReader;
-use crate::model::{Bitrate, ColorInfo, ContentLight, MasteringDisplay};
+use crate::model::{Bitrate, ColorInfo, ColorSource, ColorSources, ContentLight, MasteringDisplay};
 use crate::prefetch::Frontier;
 use crate::progress::Progress;
 
@@ -24,6 +33,26 @@ pub enum Codec {
     Av1,
     Vp9,
     ProRes,
+    /// ISO/IEC 11172-2. Told apart from MPEG-2 by the container's own codec id
+    /// where there is one, and otherwise by the absence of a
+    /// `sequence_extension`, which 11172-2 does not define at all.
+    Mpeg1,
+    /// ITU-T H.262 | ISO/IEC 13818-2.
+    Mpeg2,
+    /// ISO/IEC 14496-2, "MPEG-4 Visual" — Xvid, DivX 4/5/6, 3ivx and the rest.
+    Mpeg4Part2,
+    /// SMPTE ST 421 (VC-1), all three profiles.
+    Vc1,
+    /// Xiph.Org Theora, whose only carriage is Ogg.
+    Theora,
+    /// Microsoft's pre-standard MPEG-4 variants, carrying their version (1, 2 or
+    /// 3). Not [`Codec::Mpeg4Part2`]: DivX 3 and its relatives predate the
+    /// standard and their frame headers differ, so they get an honest name and
+    /// no parser — they signal no colour, depth or profile in any case.
+    MsMpeg4(u8),
+    /// Motion JPEG: a sequence of ITU-T T.81 images. Depth and chroma come
+    /// from the first frame's own `SOF` header ([`crate::mjpeg`]).
+    Mjpeg,
     Other(String),
 }
 
@@ -35,9 +64,32 @@ impl Codec {
             Codec::Av1 => "AV1".to_string(),
             Codec::Vp9 => "VP9".to_string(),
             Codec::ProRes => "ProRes".to_string(),
-            Codec::Other(s) => s.clone(),
+            Codec::Mpeg1 => "MPEG-1 Video".to_string(),
+            Codec::Mpeg2 => "MPEG-2 Video".to_string(),
+            Codec::Mpeg4Part2 => "MPEG-4 Visual".to_string(),
+            Codec::Vc1 => "VC-1".to_string(),
+            Codec::Theora => "Theora".to_string(),
+            Codec::MsMpeg4(v) => format!("MS-MPEG-4 v{v}"),
+            Codec::Mjpeg => "MJPEG".to_string(),
+            // The one arm whose text comes from the file: a Matroska CodecID
+            // or an MP4 sample-entry FourCC prints verbatim (the VfW path is
+            // already printable-gated), so an ANSI escape in a crafted file
+            // would otherwise reach the terminal as a control sequence. Every
+            // control character — C0, DEL, C1, all of which can open an
+            // escape — renders as U+FFFD, the same mark `from_utf8_lossy`
+            // already uses for invalid bytes on this path.
+            Codec::Other(s) => sanitize_label(s),
         }
     }
+}
+
+/// Sanitize file-supplied identifier text for display: every control
+/// character — C0, DEL, C1, all of which can open an ANSI escape — renders as
+/// U+FFFD, the same mark `from_utf8_lossy` uses for invalid bytes. Shared by
+/// the `Codec::Other` fallback label and every backend's `codec_id`, both of
+/// which reach the terminal and the JSON verbatim.
+pub(crate) fn sanitize_label(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +153,28 @@ pub struct Demux {
     /// sampler ignores the track's `chunks` (the head metadata window). Every
     /// other backend, and the raw default paths, leave it `None`.
     pub raw_stream: Option<RawFullStream>,
+    /// True when the tracks' `chunks` index only a bounded head window **and**
+    /// no `--full` streaming plan above covers the rest — so a `--full` scan
+    /// reads every chunk that exists and still has not seen the whole stream.
+    ///
+    /// The report uses it to keep the sampled footnote on: `--full` normally
+    /// means "every access unit was read", and an absent mark reads as
+    /// complete. A backend with an exhaustive index (MP4's `stbl`) or a
+    /// streaming plan leaves this `false`; one with an empty `chunks` list
+    /// (`mpegv`) never reaches a sampler at all and leaves it `false` too. The
+    /// program-stream backend is the one case that needs it, until D7's
+    /// whole-file walk lands.
+    pub bounded_index: bool,
+    /// True when the container itself declares more bytes than the file holds
+    /// — AVI's RIFF segment sizes, ASF's `File Properties.File Size`, FLV's
+    /// `onMetaData.filesize` — i.e. a partial download or a capture that never
+    /// closed. The backends already withhold what a prefix cannot support
+    /// (overall rates; ASF also its duration); this surfaces the *why* as the
+    /// report's `input_truncated`, which used to be a stdin-only fact
+    /// (open-items B6). Never set from a mere absence of a declaration, and
+    /// never triggers the stdin prefix-suppression table in `main.rs` — the
+    /// backend's own withholding is already format-aware.
+    pub declared_short: bool,
 }
 
 impl Demux {
@@ -113,6 +187,8 @@ impl Demux {
             ts_stream: None,
             mkv_stream: None,
             raw_stream: None,
+            bounded_index: false,
+            declared_short: false,
         }
     }
 }
@@ -132,17 +208,57 @@ pub struct TrackDemux {
     /// container has no such flag (MP4/TS/raw).
     pub default_flag: Option<bool>,
     pub codec: Codec,
+    /// The container's own codec identifier, verbatim (sanitized for
+    /// display): the MP4/MOV sample-entry FourCC (post-`encv`/`frma`
+    /// recovery), the Matroska CodecID (with the inner VfW FourCC appended
+    /// for `V_MS/VFW/FOURCC`), a TS PMT `stream_type` in hex, an AVI/ASF/FLV
+    /// FourCC or FLV legacy id, RealMedia's VIDO FourCC, an Ogg mapping
+    /// name. `None` where no container-level identifier exists (raw
+    /// elementary streams, program streams — whose PES id is already
+    /// `track_number` — and DIF).
+    pub codec_id: Option<String>,
     pub nal_format: NalFormat,
     pub width: u32,
     pub height: u32,
     pub fps: Option<f64>,
+    /// The frame rate as the exact integer ratio it was signalled as, set
+    /// beside `fps` only where the float was computed from integers — never
+    /// reconstructed from a float. Unreduced; reduction happens at report
+    /// assembly.
+    pub fps_rational: Option<(u64, u64)>,
+    /// This track's own duration, where the container states one per track
+    /// (MP4 media duration, the mkvmerge `DURATION` statistics tag, AVI's
+    /// per-stream declared length, RealMedia's MDPR duration).
+    pub duration_secs: Option<f64>,
     pub bit_depth: Option<u8>,
     pub chroma: Option<String>,
+    /// Pixel (sample) aspect ratio as the signalled rational, width:height of
+    /// one pixel. From the coded stream (H.264/HEVC VUI `aspect_ratio_idc`,
+    /// Part 2 / MPEG-1 PAR codes, Theora `PARN`/`PARD`, VC-1 `ASPECT_RATIO`)
+    /// or the container (MP4 `pasp`), whichever the authority model resolves —
+    /// container wins, stream fills gaps, like colour. `None` when nothing
+    /// signals one; never a guessed 1:1.
+    pub pixel_aspect: Option<(u32, u32)>,
+    /// Display aspect ratio as the signalled rational (MPEG-2's DAR codes,
+    /// MKV `DisplayWidth`:`DisplayHeight`, AVI `vprp`). Kept separate from
+    /// `pixel_aspect` because formats signal one *or* the other and the
+    /// missing one is derived with the coded size only at report assembly.
+    pub display_aspect: Option<(u32, u32)>,
+    /// `"progressive"` / `"interlaced"`, from a sequence-level coded-stream
+    /// signal (MPEG-2 `progressive_sequence`, AVC `frame_mbs_only_flag`, HEVC
+    /// PTL source flags / `field_seq_flag`, Part 2 and VC-1 `INTERLACE`).
+    /// `None` when the format has no such signal or the stream states none.
+    pub scan_type: Option<&'static str>,
     pub codec_profile: Option<String>,
     /// Stereoscopic/multiview view structure (MP4 `vexu`/`stri`); `None` for
     /// ordinary monoscopic video. Only MV-HEVC (DV Profile 20) sets it today.
     pub stereo: Option<String>,
     pub color: ColorInfo,
+    /// Per-field provenance for `color`, tagged as each backend assembles it in
+    /// precedence order (container box/element first, then the coded stream's
+    /// own parameter set). The SEI override and the Dolby Vision spec fill are
+    /// added later, in `main.rs`, where those inputs exist.
+    pub color_source: ColorSources,
     pub dv_config: Option<DvConfig>,
     /// True when the base layer and Dolby Vision enhancement layer are carried on
     /// separate tracks/streams (MP4 dual-`trak`, TS dual-PID) rather than
@@ -161,6 +277,21 @@ pub struct TrackDemux {
     /// stated rate) is known, else a file-length overall rate. `None` without a
     /// usable duration.
     pub bitrate: Option<Bitrate>,
+    /// Video access units as byte ranges, in file order.
+    ///
+    /// **A backend may leave this empty.** `sample::scan` returns early when
+    /// every track's list is, so a metadata-only backend (one whose whole
+    /// report is served by container headers, with no bitstream side channel to
+    /// sample) needs no chunk index, no sampler arm, and no progress or
+    /// frontier plumbing at all on the default path. A backend that *can*
+    /// cheaply name its first frame's byte range should still fill a one-entry
+    /// list, because the codec header parsers run over it.
+    ///
+    /// That contract stops at the default path. A `--full` walk that has to
+    /// read payload the default path never touches (an exact video-stream byte
+    /// count, say) still needs its own streaming plan on `Demux`, in the
+    /// `ts_stream`/`mkv_stream`/`raw_stream` shape, driven by `sample::scan`
+    /// ahead of the empty-chunks early return.
     pub chunks: Vec<Chunk>,
     /// Container-carried ITU-T T.35 payload ranges (absolute file offsets):
     /// MKV `BlockAdditional` payloads with `BlockAddID == 4` — the HDR10+
@@ -196,15 +327,22 @@ impl TrackDemux {
             program: None,
             default_flag: None,
             codec,
+            codec_id: None,
             nal_format,
             width: 0,
             height: 0,
             fps: None,
+            fps_rational: None,
+            duration_secs: None,
             bit_depth: None,
             chroma: None,
+            pixel_aspect: None,
+            display_aspect: None,
+            scan_type: None,
             codec_profile: None,
             stereo: None,
             color: ColorInfo::default(),
+            color_source: ColorSources::default(),
             dv_config: None,
             dv_dual_track: false,
             mastering: None,
@@ -219,20 +357,41 @@ impl TrackDemux {
     }
 }
 
-/// Which raw-stream walk `sample::scan` must drive under `--full`. The walkers
+/// Which whole-file walk `sample::scan` must drive under `--full`. The walkers
 /// themselves live with their formats (`annexb::walk_aus`, `av1::walk_obu_tus`,
-/// `av1::walk_ivf_frames`); this only carries what demux already parsed and the
-/// walk cannot cheaply rediscover.
+/// `av1::walk_ivf_frames`, `flv::walk_tags`); this only carries what demux
+/// already parsed and the walk cannot cheaply rediscover.
+///
+/// Named for the raw elementary streams it was introduced for, and FLV joins
+/// them because it has the same shape: one video track, no index, and a walk
+/// that is the index — so demux keeps its bounded head window and the scan
+/// fuses discovery with extraction in one pass.
 #[derive(Debug, Clone, Copy)]
 pub enum RawFullStream {
     HevcAnnexB,
     Av1Obu,
+    /// FLV tag walk. `data_start` is the first tag's offset (past the file
+    /// header and `PreviousTagSize0`), which demux resolved from the header's
+    /// declared length.
+    Flv { data_start: usize },
+    /// Ogg page walk. `serial` names the video logical bitstream whose payload
+    /// bytes are summed, and `header_packets` is how many of its leading
+    /// packets are metadata rather than video (Theora's three, VP8's two).
+    /// Set only for a single-video file — `sample::scan` produces one
+    /// `TrackScan` per raw-stream walk, which `main.rs` zips against the
+    /// demuxed tracks, so a plan on a two-video file would drop the second.
+    Ogg { serial: u32, header_packets: u8 },
     /// IVF frame walk, shared by AV1 and VP9 (the wrapper is codec-agnostic;
     /// extraction dispatches on the track's codec). `data_start` is the first
     /// frame header's offset (past the IVF file header); `ticks_per_sec` is
     /// the header's rate/scale time base, needed to turn the walk's timestamp
     /// span into the stream's true average fps.
     Ivf { data_start: usize, ticks_per_sec: f64 },
+    /// Raw MPEG-1/2 elementary stream: a count-only picture-start-code walk
+    /// (`mpegv::walk_pictures`) — nothing to extract, like the Ogg walk. The
+    /// count feeds duration (÷ the sequence header's rate) and the file's own
+    /// length is the byte sum, a raw ES being video payload end to end.
+    Mpegv,
 }
 
 /// Detect the container type and demux it. `full` requests an exhaustive scan
@@ -259,6 +418,27 @@ pub fn demux(
         "mkv" | "webm" | "mka" => Some(mkv::demux(data, full)),
         "hevc" | "h265" | "265" | "bin" => Some(annexb::demux(data, full, progress, frontier)),
         "ivf" | "obu" => Some(av1::demux(data, full, progress, frontier)),
+        "m2v" | "m1v" | "mpv" => Some(mpegv::demux(data, full)),
+        "dv" | "dif" => Some(dif::demux(data)),
+        "rm" | "rmvb" => Some(rm::demux(data)),
+        // `.evo` (HD DVD) is a program stream too. Its video often rides the
+        // extended stream id `0xFD`, which this walker treats as non-video, so
+        // such a file declines with the backend's own message rather than
+        // "unrecognized container" — and one whose video sits in the ordinary
+        // range reports normally.
+        "mpg" | "mpeg" | "vob" | "m2p" | "evo" => Some(ps::demux(data)),
+        "avi" => Some(avi::demux(data)),
+        // `.wma` is here but deliberately *not* in `main::VIDEO_EXTS`: a named
+        // `.wma` that carries video reports, while a directory scan does not
+        // try to open a music library and print an error per track.
+        "wmv" | "asf" | "wma" => Some(asf::demux(data)),
+        "flv" => Some(flv::demux(data, full)),
+        // Only `.ogv` is in `main::VIDEO_EXTS`, for the same reason `.wma` is
+        // not: `.ogg` and `.oga` are overwhelmingly Vorbis or Opus audio, so a
+        // music library scanned as a directory would print an error per track.
+        // Named individually they still report, because `.ogg` carried Theora
+        // video for years before `.ogv` existed.
+        "ogv" | "ogg" | "oga" | "ogm" | "ogx" => Some(ogg::demux(data, full)),
         "ts" | "m2ts" | "mts" => Some(ts::demux(data, full, progress, frontier)),
         _ => None,
     };
@@ -301,16 +481,42 @@ fn sniff_demux(
     if starts_with_ebml(data) {
         return Some(mkv::demux(data, full));
     }
+    if avi::is_avi(data) {
+        return Some(avi::demux(data));
+    }
+    if asf::is_asf(data) {
+        return Some(asf::demux(data));
+    }
+    if flv::is_flv(data) {
+        return Some(flv::demux(data, full));
+    }
+    if ogg::is_ogg(data) {
+        return Some(ogg::demux(data, full));
+    }
+    if dif::is_dif(data) {
+        return Some(dif::demux(data));
+    }
+    if rm::is_rm(data) {
+        return Some(rm::demux(data));
+    }
     if av1::is_ivf(data) || av1::is_obu_stream(data) {
         return Some(av1::demux(data, full, progress, frontier));
     }
     if ts::detect_layout(data).is_some() {
         return Some(ts::demux(data, full, progress, frontier));
     }
-    if starts_with_start_code(data) {
-        return Some(annexb::demux(data, full, progress, frontier));
+    match classify_start_code(data) {
+        Some(StreamFamily::AnnexB) => Some(annexb::demux(data, full, progress, frontier)),
+        // A raw MPEG video elementary stream. `mpegv::demux` errors honestly
+        // when it finds no sequence header, which is what a raw MPEG-4 Part 2
+        // stream gets: Part 2 shares this family (`0xB0`/`0xB6` are its own
+        // start codes), and `mpeg4part2` runs only on bytes a container
+        // already identified — it is deliberately not a sniffer, so raw
+        // Part 2 elementary streams stay undispatched.
+        Some(StreamFamily::MpegVideoEs) => Some(mpegv::demux(data, full)),
+        Some(StreamFamily::ProgramStream) => Some(ps::demux(data)),
+        None => None,
     }
-    None
 }
 
 /// True when `sniff_demux` would route this head to the TS/M2TS backend: the
@@ -320,15 +526,147 @@ fn sniff_demux(
 pub(crate) fn sniffs_as_ts(data: &[u8]) -> bool {
     let earlier_check_wins = (data.len() >= 12 && &data[4..8] == b"ftyp")
         || starts_with_ebml(data)
+        || avi::is_avi(data)
+        || asf::is_asf(data)
+        || flv::is_flv(data)
+        || ogg::is_ogg(data)
+        || dif::is_dif(data)
+        || rm::is_rm(data)
         || av1::is_ivf(data)
         || av1::is_obu_stream(data);
     !earlier_check_wins && ts::detect_layout(data).is_some()
 }
 
-fn starts_with_start_code(data: &[u8]) -> bool {
-    data.len() >= 4
-        && ((data[0] == 0 && data[1] == 0 && data[2] == 1)
-            || (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1))
+/// Which stream family owns a head that begins with an MPEG-style start code.
+/// The three-byte prefix `00 00 01` is shared by H.264/H.265 Annex-B, MPEG-1/2
+/// and MPEG-4 Part 2 video, and the MPEG-1 system / MPEG-2 program stream
+/// layers, so the byte *after* the prefix is what tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFamily {
+    /// H.264 / H.265 Annex-B elementary stream.
+    AnnexB,
+    /// MPEG-1 system stream or MPEG-2 program stream: a pack, a system header,
+    /// or (on a mid-file cut) a bare PES packet.
+    ProgramStream,
+    /// Raw MPEG-1/2 or MPEG-4 Part 2 video elementary stream. Deliberately one
+    /// verdict for both, because the byte after the prefix cannot always split
+    /// them: `0xB0`/`0xB1`/`0xB6` are Part 2 and reserved in MPEG-2, `0xB7`/
+    /// `0xB8` the reverse, but `0xB3` and `0xB5` are genuinely ambiguous, and
+    /// resolving those needs a scan for the first unambiguous code. The backend
+    /// that parses the stream makes that call.
+    MpegVideoEs,
+}
+
+impl StreamFamily {
+    /// Human-readable name, so every backend that has to decline a stream of
+    /// this family declines it in the same words.
+    fn label(self) -> &'static str {
+        match self {
+            StreamFamily::AnnexB => "H.264/H.265 Annex-B elementary stream",
+            StreamFamily::ProgramStream => "MPEG program stream (MPEG-1 system / MPEG-2 PS)",
+            StreamFamily::MpegVideoEs => "MPEG-1/2 or MPEG-4 Part 2 video elementary stream",
+        }
+    }
+}
+
+/// Route a head beginning with a start code to the family that owns it.
+/// `None` when it does not begin with one, or when the bytes contradict the
+/// only reading their start code allows.
+///
+/// The load-bearing rule: **H.264 and H.265 both open their NAL header with
+/// `forbidden_zero_bit`, which must be 0 (H.264 §7.3.1, H.265 §7.3.1.2), while
+/// every MPEG-1/2, MPEG-4 Part 2 and MPEG system start code has bit 7 set
+/// (ISO/IEC 13818-2 Table 6-1, 13818-1 Table 2-18).** So a value `>= 0x80`
+/// rules out Annex-B structurally rather than heuristically, and that half of
+/// the range is decided, not guessed. Below `0x80` the two spaces genuinely
+/// overlap, and the answer is only as good as [`looks_like_nal_header`]; the
+/// caveat lives there.
+fn classify_start_code(data: &[u8]) -> Option<StreamFamily> {
+    // MPEG-1/2 systems and video always write the 3-byte prefix, so the 4-byte
+    // form is Annex-B's alone; classifying both through one rule costs nothing
+    // and leaves no gap for a stream that leads with a zero byte.
+    let sc = if data.starts_with(&[0, 0, 1]) {
+        3
+    } else if data.starts_with(&[0, 0, 0, 1]) {
+        4
+    } else {
+        return None;
+    };
+    let value = *data.get(sc)?;
+    let next = data.get(sc + 1).copied();
+    Some(match value {
+        // pack_start_code. The next byte pins the variant: `01xxxxxx` is an
+        // MPEG-2 pack (ISO/IEC 13818-1 §2.5.3.4), `0010xxxx` an MPEG-1 one
+        // (ISO/IEC 11172-1 §2.4.3.2). Anything else is not a pack header — but
+        // it need not be the whole story either, since a stream cut just before
+        // a pack, or one whose first pack is damaged, still has intact
+        // structure behind it. Asking the head census settles it on evidence
+        // rather than on one byte, which is what the earlier "say nothing"
+        // rule could not do while no program-stream backend existed.
+        0xBA => match next {
+            Some(b) if b & 0xC0 == 0x40 || b & 0xF0 == 0x20 => StreamFamily::ProgramStream,
+            _ if ps::looks_like_program_stream(&data[..ps::CENSUS_SPAN.min(data.len())]) => {
+                StreamFamily::ProgramStream
+            }
+            _ => return None,
+        },
+        // program_end, system header, program stream map, or any PES packet:
+        // the system layer, or a cut that starts inside one.
+        0xB9 | 0xBB..=0xFF => StreamFamily::ProgramStream,
+        // Video-layer start codes (`0xB0`..`0xB8`: VOS, sequence header, GOP,
+        // extension and so on) plus the high slice codes, since ISO/IEC 13818-2
+        // Table 6-1 runs `slice_start_code` from `0x01` all the way to `0xAF`.
+        0x80..=0xB8 => StreamFamily::MpegVideoEs,
+        // `forbidden_zero_bit` is clear, so this could be a NAL header. MPEG's
+        // picture start code (`0x00`) and its low slice codes (`0x01`..`0x7F`)
+        // live here too, so validate, and read a failure as MPEG rather than
+        // dispatching a backend that would invent metadata.
+        _ => {
+            if looks_like_nal_header(value, next) {
+                StreamFamily::AnnexB
+            } else {
+                StreamFamily::MpegVideoEs
+            }
+        }
+    })
+}
+
+/// Whether `b0` (with `b1`, the byte after it) can open an H.265 or H.264 NAL
+/// header. Called only where `forbidden_zero_bit` is already clear.
+///
+/// **Permissive by construction, and the margin is the point.** The two codecs
+/// read the same byte differently and a value need satisfy only one of them, so
+/// the AVC reading alone admits every `b0` except `{0x00, 0x20, 0x40, 0x60}`.
+/// Measured by simulating a cut at every start code in `mpeg2.m2v`, `mpeg1.m1v`
+/// and a retail DVD VOB, 97.8% to 98.8% of an MPEG stream's sub-`0x80` start
+/// codes pass here.
+///
+/// Both readings must stay, and neither may be tightened casually: a VPS-first
+/// HEVC stream (`b0 == 0x40`) survives only on the HEVC arm, and an H.264 AUD
+/// (`0x09`, whose `b1` is usually `primary_pic_type << 5`) only on the AVC arm,
+/// so requiring both would reject both.
+///
+/// What keeps this honest is that a whole file's first start code is not an
+/// arbitrary draw: a raw MPEG video stream opens on a sequence header (`0xB3`)
+/// or a VOS (`0xB0`), a program stream on a pack (`0xBA`), and an Annex-B
+/// stream on an AUD, VPS or SPS, so the overlap is reachable only by a stream
+/// cut mid-picture. For that case `hevc::nal` and `avc::nal` reject
+/// `forbidden_zero_bit` a second time while splitting, so a stream slipping
+/// through here still reports nothing rather than something invented. Deciding
+/// a mid-file cut properly needs a whole-head start-code census, over the
+/// thresholds ffmpeg encodes in `libavformat/mpeg.c::mpegps_probe`; that
+/// belongs with a program stream backend, not here.
+fn looks_like_nal_header(b0: u8, b1: Option<u8>) -> bool {
+    // HEVC: forbidden_zero(1) nal_unit_type(6) nuh_layer_id(6)
+    // nuh_temporal_id_plus1(3). Types 41..=47 are reserved and never written,
+    // and the temporal id is stored plus one, so a zero field is illegal. With
+    // no second byte to read the HEVC arm cannot answer, so it declines.
+    let hevc_type = (b0 >> 1) & 0x3F;
+    let hevc = (hevc_type <= 40 || hevc_type >= 48) && b1.is_some_and(|b| b & 0x07 != 0);
+    // AVC: forbidden_zero(1) nal_ref_idc(2) nal_unit_type(5). Type 0 is
+    // unspecified and never written.
+    let avc = b0 & 0x1F != 0;
+    hevc || avc
 }
 
 fn starts_with_ebml(data: &[u8]) -> bool {
@@ -403,7 +741,10 @@ fn parse_dovi_record(rec: &[u8], ts_descriptor: bool) -> Option<(DvConfig, Optio
 
 pub(crate) struct HvccInfo {
     pub bit_depth: u8,
-    pub chroma: &'static str,
+    /// `None` for a reserved `chroma_format_idc`: a code H.265 does not
+    /// define names nothing, so the field stays honestly absent rather than
+    /// printing a placeholder.
+    pub chroma: Option<&'static str>,
     pub nal_len: u8,
     pub profile_str: String,
 }
@@ -431,11 +772,11 @@ pub(crate) fn parse_hvcc_record(rec: &[u8]) -> Option<HvccInfo> {
         chroma_idc = sps.chroma_format_idc;
     }
     let chroma = match chroma_idc {
-        0 => "monochrome",
-        1 => "4:2:0",
-        2 => "4:2:2",
-        3 => "4:4:4",
-        _ => "?",
+        0 => Some("monochrome"),
+        1 => Some("4:2:0"),
+        2 => Some("4:2:2"),
+        3 => Some("4:4:4"),
+        _ => None,
     };
     Some(HvccInfo {
         bit_depth,
@@ -447,7 +788,8 @@ pub(crate) fn parse_hvcc_record(rec: &[u8]) -> Option<HvccInfo> {
 
 pub(crate) struct AvccInfo {
     pub bit_depth: u8,
-    pub chroma: &'static str,
+    /// `None` for a reserved `chroma_format_idc`, like `HvccInfo::chroma`.
+    pub chroma: Option<&'static str>,
     pub nal_len: u8,
     pub profile_str: String,
 }
@@ -467,8 +809,11 @@ pub(crate) fn parse_avcc_record(rec: &[u8]) -> Option<AvccInfo> {
 }
 
 /// Parse an AV1CodecConfigurationRecord (`av1C` box payload / MKV AV1
-/// CodecPrivate). Returns `(bit_depth, chroma, codec_profile_label)`.
-pub(crate) fn parse_av1c_record(rec: &[u8]) -> Option<(u8, &'static str, String)> {
+/// CodecPrivate). Returns `(bit_depth, chroma, codec_profile_label)`; the
+/// inner options are `None` for reserved subsampling / profile codes.
+pub(crate) fn parse_av1c_record(
+    rec: &[u8],
+) -> Option<(u8, Option<&'static str>, Option<String>)> {
     // byte 0: marker+version; byte 1: seq_profile(3) + seq_level_idx_0(5); byte 2:
     // seq_tier_0(1)+high_bitdepth(1)+twelve_bit(1)+mono(1)+ss_x(1)+ss_y(1)+pos(2).
     if rec.len() < 3 {
@@ -494,19 +839,199 @@ pub(crate) fn parse_av1c_record(rec: &[u8]) -> Option<(u8, &'static str, String)
     Some((bit_depth, chroma, crate::av1::seq::av1_profile_label(seq_profile, seq_tier, seq_level_idx)))
 }
 
-/// Build a `ColorInfo` from SPS VUI CICP signalling.
-pub(crate) fn color_from_vui(vui: &crate::hevc::sps::VuiColor) -> ColorInfo {
-    ColorInfo {
-        primaries: cicp_primaries(vui.primaries as u16).map(str::to_string),
-        transfer: cicp_transfer(vui.transfer as u16).map(str::to_string),
-        matrix: cicp_matrix(vui.matrix as u16).map(str::to_string),
-        range: Some(if vui.full_range { "full" } else { "limited" }.to_string()),
+/// The provenance tag for one decoded CICP field.
+///
+/// Three outcomes, and the middle one is why this exists: a code that decoded
+/// to a name is tagged with its source; a code the source carried but this
+/// build cannot name is tagged `UnnamedCode`, which keeps the Dolby Vision spec
+/// fill from overwriting a real signal; and "unspecified" (2), or no code at
+/// all, is left untagged, which is exactly the state the fill is *for*.
+/// What a `VPCodecConfigurationRecord` states.
+pub(crate) struct VpccInfo {
+    pub bit_depth: u8,
+    /// `None` for a reserved `chromaSubsamplingIdc`, like `HvccInfo::chroma`.
+    pub chroma: Option<&'static str>,
+    pub profile_str: String,
+    pub color: (ColorInfo, ColorSources),
+}
+
+/// Parse a `VPCodecConfigurationRecord`: version(1)+flags(3), then profile u8,
+/// level u8, `bitDepth(4)+chromaSubsamplingIdc(3)+videoFullRangeFlag(1)`, and
+/// the CICP colourPrimaries / transferCharacteristics / matrixCoefficients
+/// bytes.
+///
+/// Shared with the other config-record decoders here because two carriages hand
+/// one over: the MP4 `vpcC` box, and an Enhanced FLV `SequenceStart` tag whose
+/// FourCC is `vp08`/`vp09`. That second one matters more than it looks — a bare
+/// VP9 stream signals **no transfer and no primaries at all** (see
+/// [`crate::vp9`]), so this record is the only place such a track's colour
+/// exists, and a `vp09` FLV that could not reach it would classify every
+/// BT.2020/PQ stream as SDR with nothing else able to correct it.
+pub(crate) fn parse_vpcc_record(rec: &[u8]) -> Option<VpccInfo> {
+    let r = rec.get(..10)?;
+    if r[0] != 1 {
+        return None; // only version 1 has this layout
     }
+    let packed = r[6];
+    let chroma = match (packed >> 1) & 0x07 {
+        0 | 1 => Some("4:2:0"),
+        2 => Some("4:2:2"),
+        3 => Some("4:4:4"),
+        _ => None,
+    };
+    Some(VpccInfo {
+        bit_depth: packed >> 4,
+        chroma,
+        profile_str: crate::vp9::profile_label(r[4], (r[5] > 0).then_some(r[5])),
+        // The record carries the CICP triplet and range flag directly, so it is
+        // Container-sourced rather than stream-sourced.
+        color: color_from_cicp(
+            r[7] as u16,
+            r[8] as u16,
+            r[9] as u16,
+            Some(packed & 1 == 1),
+            ColorSource::Container,
+        ),
+    })
+}
+
+/// The authored rate behind a clock-quantized frame period, decoded exactly.
+///
+/// Matroska's `DefaultDuration` (nanoseconds) and ASF's `Average Time Per
+/// Frame` (100 ns ticks) store the authored rate's *period* rounded to an
+/// integer tick count — a 23.976 mux writes exactly 41708333 ns — so the
+/// quantization is deterministic, which makes it invertible. If `period` is
+/// the floor or ceiling of `ticks_per_sec × den / num` for a standard
+/// broadcast/cinema rate, that rate is what the muxer encoded, and the exact
+/// `(num, den)` comes back. This is a decode of a quantized field (the
+/// CICP-code-to-name move, and the PQ-code-to-nits snap's sibling), **not**
+/// a tolerance snap: a period matching no standard rate's encoding returns
+/// `None` and the caller keeps the raw tick ratio, so genuinely nonstandard
+/// content stays honest. ffmpeg instead snaps within a tolerance band; the
+/// bit-exact test is stricter and cannot relabel an off-rate stream.
+/// (RealMedia's 16.16 field quantizes the *rate*, not the period, and real
+/// encoders write values a couple of code points off the exact encoding, so
+/// it deliberately does not route through this.)
+pub(crate) fn nominal_rate_from_period(period: u64, ticks_per_sec: u64) -> Option<(u64, u64)> {
+    /// The 1001-family pairs plus the integer rates real muxers author. No
+    /// two entries' encodings collide on either supported clock (pinned by
+    /// test); order is immaterial.
+    const STANDARD_RATES: &[(u64, u64)] = &[
+        (24000, 1001),
+        (24, 1),
+        (25, 1),
+        (30000, 1001),
+        (30, 1),
+        (48000, 1001),
+        (48, 1),
+        (50, 1),
+        (60000, 1001),
+        (60, 1),
+        (100, 1),
+        (120000, 1001),
+        (120, 1),
+        (15, 1),
+        (12, 1),
+        (10, 1),
+    ];
+    if period == 0 {
+        return None;
+    }
+    for &(num, den) in STANDARD_RATES {
+        let exact = ticks_per_sec.checked_mul(den)?;
+        let floor = exact / num;
+        // floor == ceil when the division is exact: one past an exact
+        // encoding is *not* that rate.
+        let ceil = floor + u64::from(exact % num != 0);
+        if period == floor || period == ceil {
+            return Some((num, den));
+        }
+    }
+    None
+}
+
+/// Highest frame rate any backend accepts from a declared field. Every carriage
+/// that states a rate states it as a ratio of unvalidated integers, so a single
+/// misread byte computes millions of frames per second; anything past a
+/// high-speed camera's range is a misread field rather than a fast stream.
+const MAX_FPS: f64 = 1000.0;
+
+/// Lowest frame rate accepted, and the bound is not symmetric decoration:
+/// `fps > 0.0` is no bound at all against a 32- or 64-bit divisor, because
+/// `1 / 2^32` is a positive float. Such a value renders as **`0.000 fps`**,
+/// which reads as a stated rate of zero rather than as the misread field it is.
+/// This is the finest rate the report's own three decimals can tell from zero,
+/// so anything below it could only ever print a lie.
+const MIN_FPS: f64 = 0.001;
+
+/// A declared frame rate, or `None` when it is outside the range any real
+/// stream occupies.
+///
+/// Shared rather than re-derived per backend: ASF computes it from
+/// `Average Time Per Frame`, Theora and the OggVP8 mapping from their own
+/// numerator/denominator pairs, `avi::Stream::fps` from `dwRate/dwScale` (and
+/// its `dwMicroSecPerFrame` fallback), and Matroska from the `DefaultDuration`
+/// reciprocal and its whole-index count ÷ duration fallback — every backend
+/// that divides two file-supplied integers into a frame rate now routes here
+/// (open-items B5, closed 2026-07-26, widened past the plan's five container
+/// sites to the AVC/HEVC VUI timing pair, the MP4 `stts`/count fallbacks, the
+/// FLV `onMetaData.framerate` double and Part 2's `fixed_vop_rate` quotient).
+/// The one deliberate exception is AV1 (`av1::seq` and the IVF header), whose
+/// sites carry their own tighter 480 fps bound, pinned by their own tests.
+pub(crate) fn plausible_fps(fps: f64) -> Option<f64> {
+    (MIN_FPS..=MAX_FPS).contains(&fps).then_some(fps)
+}
+
+pub(crate) fn cicp_source(code: u16, decoded: Option<&str>, src: ColorSource) -> Option<ColorSource> {
+    match decoded {
+        Some(_) => Some(src),
+        None if code == crate::hevc::sps::UNSPECIFIED_CICP as u16 => None,
+        None => Some(ColorSource::UnnamedCode),
+    }
+}
+
+/// Decode a CICP triplet plus an optional range flag into a colour description
+/// and its per-field provenance together. Kept as one step so the raw codes are
+/// still in scope when the provenance is decided — `ColorInfo` alone cannot
+/// distinguish "unspecified" from "signalled something we have no name for".
+pub(crate) fn color_from_cicp(
+    primaries: u16,
+    transfer: u16,
+    matrix: u16,
+    full_range: Option<bool>,
+    src: ColorSource,
+) -> (ColorInfo, ColorSources) {
+    let (p, t, m) = (cicp_primaries(primaries), cicp_transfer(transfer), cicp_matrix(matrix));
+    let color = ColorInfo {
+        primaries: p.map(str::to_string),
+        transfer: t.map(str::to_string),
+        matrix: m.map(str::to_string),
+        range: full_range.map(|f| cicp_range(f).to_string()),
+    };
+    let sources = ColorSources {
+        primaries: cicp_source(primaries, p, src),
+        transfer: cicp_source(transfer, t, src),
+        matrix: cicp_source(matrix, m, src),
+        range: full_range.map(|_| src),
+    };
+    (color, sources)
+}
+
+/// Build a `ColorInfo` and its provenance from SPS VUI CICP signalling. A VUI is
+/// always the coded stream's own signalling, so the source is never in doubt.
+pub(crate) fn color_from_vui(vui: &crate::hevc::sps::VuiColor) -> (ColorInfo, ColorSources) {
+    color_from_cicp(
+        vui.primaries as u16,
+        vui.transfer as u16,
+        vui.matrix as u16,
+        Some(vui.full_range),
+        ColorSource::Stream,
+    )
 }
 
 /// Recover colour info from the SPS embedded in an `hvcC` record, for HEVC files
 /// whose container carries no explicit colour box/element.
-pub(crate) fn color_from_hvcc(hvcc: &[u8]) -> Option<ColorInfo> {
+pub(crate) fn color_from_hvcc(hvcc: &[u8]) -> Option<(ColorInfo, ColorSources)> {
     let sps = crate::hevc::sps::find_sps_in_hvcc(hvcc)?;
     let info = crate::hevc::sps::parse_sps(sps)?;
     info.color.as_ref().map(color_from_vui)
@@ -515,7 +1040,7 @@ pub(crate) fn color_from_hvcc(hvcc: &[u8]) -> Option<ColorInfo> {
 /// Recover colour info from the SPS embedded in an `avcC` record, for AVC files
 /// whose container carries no explicit `colr` box (Profile 9's Rec.709 SDR base
 /// signals its VUI here).
-pub(crate) fn color_from_avcc(avcc: &[u8]) -> Option<ColorInfo> {
+pub(crate) fn color_from_avcc(avcc: &[u8]) -> Option<(ColorInfo, ColorSources)> {
     let info = crate::avc::sps::parse_sps(crate::avc::nal::find_sps_in_avcc(avcc)?)?;
     info.color.as_ref().map(color_from_vui)
 }
@@ -530,12 +1055,309 @@ pub(crate) fn color_from_avcc(avcc: &[u8]) -> Option<ColorInfo> {
 /// `color_description` (the analogue of the SPS VUI's
 /// `colour_description_present_flag`), so a CICP-unspecified stream never
 /// overwrites container colour with defaults.
-pub(crate) fn color_from_av1c(av1c: &[u8]) -> Option<ColorInfo> {
+pub(crate) fn color_from_av1c(av1c: &[u8]) -> Option<(ColorInfo, ColorSources)> {
     let config_obus = av1c.get(4..)?;
     let seq = crate::av1::obu::obus(config_obus)
         .find(|o| o.obu_type == crate::av1::obu::OBU_SEQUENCE_HEADER)?;
     let info = crate::av1::seq::parse_sequence_header(seq.payload)?;
     info.color_description_present.then_some(info.color)
+}
+
+// --- shared PES clock arithmetic, for the two packetized-mux backends --------
+//
+// TS and MPEG-PS both close their timeline from bounded head and tail windows
+// over the same 90 kHz 33-bit presentation timestamps, so the decode, the wrap
+// modulus, the span ceiling and the whole-frame completion live here — a fix
+// to any of them must reach both carriages.
+
+/// A PTS is a 33-bit value at 90 kHz (H.222.0 §2.4.3.7, equation 2-11), so it
+/// wraps every `2^33 / 90000` seconds — about 26 h 30 min.
+pub(crate) const PTS_MODULUS: u64 = 1 << 33;
+
+/// Largest duration either backend reports rather than rejecting as an
+/// undetected second wrap. A deliberately conservative floor under the clock's
+/// own range, not that range itself: `2^33 / 90000` is 95443.7 s
+/// (26 h 30 m 43 s), and the 43-minute gap is the only thing separating
+/// "wrapped once" from "went backwards".
+pub(crate) const MAX_SPAN_SECS: f64 = 26.0 * 3600.0;
+
+/// Floor on the margin allowed between a window's presentation span and its
+/// own arrival clock (the PS pack SCR, the TS PCR). Absolute rather than
+/// proportional, so a short window whose two clocks differ by a fixed
+/// decoder-buffer delay is not failed for being short.
+pub(crate) const SPAN_SLACK_SECS: f64 = 2.0;
+
+/// Decode the 5-byte 33-bit timestamp form at `at`
+/// (H.222.0 Table 2-21: `'0010'` PTS[32..30] m PTS[29..15] m PTS[14..0] m).
+///
+/// The three marker bits are checked: they are the only structural evidence
+/// that these five bytes are a timestamp rather than payload, and the value
+/// they carry is the one the whole head/tail machinery exists to get right or
+/// refuse.
+pub(crate) fn parse_timestamp(data: &[u8], at: usize) -> Option<u64> {
+    let b = data.get(at..at + 5)?;
+    if b[0] & 0x01 == 0 || b[2] & 0x01 == 0 || b[4] & 0x01 == 0 {
+        return None;
+    }
+    Some(
+        (((b[0] & 0x0E) as u64) << 29)
+            | ((b[1] as u64) << 22)
+            | (((b[2] >> 1) as u64) << 15)
+            | ((b[3] as u64) << 7)
+            | ((b[4] >> 1) as u64),
+    )
+}
+
+/// Turn a presentation span into a duration by adding the last picture's own
+/// display time.
+///
+/// **The span is one frame short of the duration, by arithmetic rather than by
+/// approximation.** Frame `k` of `N` is presented at `start + k/f`, so the
+/// first picture's timestamp to the last picture's is `(N-1)/f` while the
+/// stream occupies `N/f`. Reporting the bare span makes every duration one
+/// frame low and — because the bitrate divides by it — every overall rate
+/// correspondingly high, which is 2% on a two-second clip. Adding the interval
+/// reproduces MediaInfo exactly (it reaches the same number from the other
+/// direction, by counting frames and dividing by the rate). Without a frame
+/// rate there is nothing to add and the bare span stands, which is the honest
+/// fallback rather than a second guess.
+pub(crate) fn whole_frame_duration(span: Option<f64>, fps: Option<f64>) -> Option<f64> {
+    let span = span?;
+    Some(match fps {
+        Some(f) if f > 0.0 => span + 1.0 / f,
+        _ => span,
+    })
+}
+
+// --- in-band SPS metadata, for the backends with no container box ------------
+//
+// TS and MPEG-PS both reassemble an elementary stream out of scattered packet
+// payloads and then have to read the picture's parameters out of the bitstream,
+// because their container layers carry no video description at all. These live
+// here rather than in either backend so the two cannot drift: a fix to how an
+// SPS is chosen would otherwise land in one carriage and not the other.
+
+/// Common SPS-derived metadata, codec-independent, so the HEVC and AVC scans
+/// converge on one shape.
+pub(crate) struct SpsCommon {
+    pub width: u32,
+    pub height: u32,
+    pub bit_depth: u8,
+    pub chroma: Option<String>,
+    /// The VUI rate as the exact signalled ratio, beside `frame_rate`.
+    pub frame_rate_rational: Option<(u64, u64)>,
+    pub profile: String,
+    pub color: (ColorInfo, ColorSources),
+    pub frame_rate: Option<f64>,
+    pub pixel_aspect: Option<(u32, u32)>,
+    pub scan_type: Option<&'static str>,
+    /// Index of the chunk the SPS was found in — a RAP access unit, which is
+    /// where the per-GOP prefix SEIs ride (see `Demux::sps_chunk`).
+    pub chunk: usize,
+}
+
+/// Recover the widest SPS in a reassembled buffer (the base layer outranks a
+/// smaller enhancement layer). With no container box, both colour and frame rate
+/// come only from the in-band SPS VUI — parsed with the codec's own SPS reader.
+pub(crate) fn best_sps(buf: &[u8], chunks: &[Chunk], codec: &Codec) -> Option<SpsCommon> {
+    match codec {
+        Codec::Avc => best_avc_sps(buf, chunks),
+        // MPEG-1/2 and MPEG-4 Part 2 have no SPS at all: their metadata rides
+        // the sequence header or visual object layer, which the gap-fillers
+        // below read from the same reassembled buffer once the track exists.
+        // Running an Annex-B NAL search over MPEG bytes would find nothing at
+        // best and something invented at worst.
+        Codec::Mpeg1 | Codec::Mpeg2 | Codec::Mpeg4Part2 => None,
+        _ => best_hevc_sps(buf, chunks),
+    }
+}
+
+/// Unpack the winning SPS into the demux metadata fields.
+#[allow(clippy::type_complexity)]
+pub(crate) type SpsFieldsTuple = (
+    u32,
+    u32,
+    Option<u8>,
+    Option<String>,
+    Option<String>,
+    (ColorInfo, ColorSources),
+    Option<f64>,
+    Option<(u64, u64)>,
+    Option<(u32, u32)>,
+    Option<&'static str>,
+);
+
+pub(crate) fn sps_fields(best: Option<SpsCommon>) -> SpsFieldsTuple {
+    match best {
+        Some(c) => (
+            c.width,
+            c.height,
+            Some(c.bit_depth),
+            c.chroma,
+            Some(c.profile),
+            c.color,
+            c.frame_rate,
+            c.frame_rate_rational,
+            c.pixel_aspect,
+            c.scan_type,
+        ),
+        None => (
+            0,
+            0,
+            None,
+            None,
+            None,
+            (ColorInfo::default(), ColorSources::default()),
+            None,
+            None,
+            None,
+            None,
+        ),
+    }
+}
+
+fn best_hevc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
+    use crate::hevc::nal::{self, NalRef};
+    let mut best: Option<(usize, crate::hevc::sps::SpsInfo)> = None;
+    let mut nals: Vec<NalRef> = Vec::new();
+    for (ci, c) in chunks.iter().enumerate() {
+        let s = c.offset as usize;
+        let e = (c.offset + c.size) as usize;
+        if e > buf.len() {
+            continue;
+        }
+        // Bounded per chunk, not just per chunk *count*. A caller's cap on how
+        // many access units to try says nothing about how big each one claims
+        // to be: an AVI index may declare 32 chunks each spanning the whole
+        // file, which read 32x the file on the *default* path (measured at
+        // 2.09 s for 45 MB). Parameter sets ride the head of an access unit by
+        // construction, so scanning past this span could only find a set that
+        // is not the AU's own. Same constant and same reasoning as the MPEG and
+        // Part 2 gap-fillers, which have always capped this way.
+        let e = e.min(s.saturating_add(HEADER_SCAN_SPAN));
+        nals.clear();
+        nal::split_annexb(&buf[s..e], &mut nals);
+        for n in &nals {
+            if n.nal_type == nal::NAL_SPS {
+                if let Some(sps) = crate::hevc::sps::parse_sps(&buf[s + n.start..s + n.end]) {
+                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
+                        best = Some((ci, sps));
+                    }
+                }
+            }
+        }
+        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
+            break;
+        }
+    }
+    best.map(|(chunk, sps)| SpsCommon {
+        width: sps.width,
+        height: sps.height,
+        bit_depth: sps.bit_depth,
+        chroma: sps.chroma_str().map(str::to_string),
+        frame_rate_rational: sps.frame_rate_rational,
+        profile: sps.profile_label(),
+        color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
+        frame_rate: sps.frame_rate,
+        pixel_aspect: sps.pixel_aspect,
+        scan_type: sps.scan_type,
+        chunk,
+    })
+}
+
+fn best_avc_sps(buf: &[u8], chunks: &[Chunk]) -> Option<SpsCommon> {
+    use crate::avc::nal as avc_nal;
+    let mut best: Option<(usize, crate::avc::sps::SpsInfo)> = None;
+    let mut nals: Vec<avc_nal::NalRef> = Vec::new();
+    for (ci, c) in chunks.iter().enumerate() {
+        let s = c.offset as usize;
+        let e = (c.offset + c.size) as usize;
+        if e > buf.len() {
+            continue;
+        }
+        // Capped exactly as the HEVC scan above is, and for the same reason.
+        let e = e.min(s.saturating_add(HEADER_SCAN_SPAN));
+        nals.clear();
+        avc_nal::split_annexb(&buf[s..e], &mut nals);
+        for n in &nals {
+            if n.nal_type == avc_nal::NAL_SPS {
+                if let Some(sps) = crate::avc::sps::parse_sps(&buf[s + n.start..s + n.end]) {
+                    if best.as_ref().is_none_or(|(_, b)| sps.width > b.width) {
+                        best = Some((ci, sps));
+                    }
+                }
+            }
+        }
+        if best.as_ref().is_some_and(|(_, b)| b.width >= 3840) {
+            break;
+        }
+    }
+    best.map(|(chunk, sps)| SpsCommon {
+        width: sps.width,
+        height: sps.height,
+        bit_depth: sps.bit_depth,
+        chroma: sps.chroma_str().map(str::to_string),
+        frame_rate_rational: sps.frame_rate_rational,
+        profile: sps.profile_label(),
+        color: sps.color.as_ref().map(color_from_vui).unwrap_or_default(),
+        frame_rate: sps.frame_rate,
+        pixel_aspect: sps.pixel_aspect,
+        scan_type: sps.scan_type,
+        chunk,
+    })
+}
+
+#[cfg(test)]
+mod sps_scan_tests {
+    use super::*;
+
+    /// A chunk's declared size is validated only against the buffer end, so a
+    /// container index may claim an access unit spanning the whole file — and
+    /// an AVI one legitimately can, 32 times over. The scan is therefore capped
+    /// per chunk as well as per chunk count; the observable consequence is that
+    /// a parameter set placed beyond the cap is not found, which is exactly
+    /// right, since parameter sets ride the head of an access unit.
+    #[test]
+    fn the_parameter_set_scan_is_bounded_per_chunk_not_only_per_chunk_count() {
+        // `testfiles/sdr/h264_odml.avi`'s SPS, in Annex-B framing.
+        const SPS: [u8; 31] = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0xF0, 0x11, 0x7E,
+            0xE6, 0xA0, 0xC0, 0xC0, 0xC8, 0x00, 0x00, 0x1F, 0x48, 0x00, 0x07, 0x53, 0x00, 0x78,
+            0xC1, 0x8C, 0xB0,
+        ];
+        // At the head of the chunk it is found, which is the real-file case.
+        let mut near = SPS.to_vec();
+        near.extend(std::iter::repeat_n(0xAAu8, 4096));
+        let one = [Chunk { offset: 0, size: near.len() as u64 }];
+        assert_eq!(best_avc_sps(&near, &one).map(|s| s.width), Some(960));
+
+        // Past the cap it is not — and, decisively, the bytes before it are
+        // never walked either: this buffer is larger than the cap, and the run
+        // completes in the time a bounded scan takes rather than a full one.
+        let mut far = vec![0xAAu8; HEADER_SCAN_SPAN + 4096];
+        far.extend_from_slice(&SPS);
+        let big = [Chunk { offset: 0, size: far.len() as u64 }];
+        assert_eq!(best_avc_sps(&far, &big).map(|s| s.width), None, "beyond the cap");
+
+        // The HEVC scan is capped the same way, and needs its own SPS to show
+        // it — `testfiles/sdr/hevc.avi`'s, NAL type 33.
+        const HSPS: [u8; 42] = [
+            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
+            0x00, 0x03, 0x00, 0x3C, 0xA0, 0x0A, 0x08, 0x0F, 0x16, 0x59, 0x59, 0xA4, 0x93, 0x2B,
+            0xC0, 0x5A, 0x02, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x32, 0x10,
+        ];
+        let mut hnear = vec![0x00, 0x00, 0x00, 0x01];
+        hnear.extend_from_slice(&HSPS);
+        hnear.extend(std::iter::repeat_n(0xAAu8, 4096));
+        let h1 = [Chunk { offset: 0, size: hnear.len() as u64 }];
+        assert_eq!(best_hevc_sps(&hnear, &h1).map(|s| s.width), Some(320), "at the head");
+
+        let mut hfar = vec![0xAAu8; HEADER_SCAN_SPAN + 4096];
+        hfar.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        hfar.extend_from_slice(&HSPS);
+        let h2 = [Chunk { offset: 0, size: hfar.len() as u64 }];
+        assert!(best_hevc_sps(&hfar, &h2).is_none(), "beyond the cap");
+    }
 }
 
 /// Fill a ProRes track's config/colour gaps from the first frame's header
@@ -571,42 +1393,529 @@ pub(crate) fn fill_prores_stream_fields(track: &mut TrackDemux, data: &[u8]) {
         track.chroma = Some(f.chroma.to_string());
     }
     if signalled_nothing {
-        track.color.primaries = f.color.primaries;
-        track.color.transfer = f.color.transfer;
-        track.color.matrix = f.color.matrix;
+        // Field by field, and never `range`: the frame header has none, so a
+        // container-supplied range must keep its own value and provenance.
+        let (fc, fs) = f.color;
+        track.color.primaries = fc.primaries;
+        track.color.transfer = fc.transfer;
+        track.color.matrix = fc.matrix;
+        track.color_source.primaries = fs.primaries;
+        track.color_source.transfer = fs.transfer;
+        track.color_source.matrix = fs.matrix;
     }
 }
 
+/// How much of one chunk — or of one codec-private blob — a start-code-scanning
+/// header parser may read.
+///
+/// The MPEG fills below hand a *scanning* parser a buffer, unlike the ProRes and
+/// VP9 fills whose parsers read a header at the buffer's own head and bail. A
+/// chunk whose declared size is huge and whose bytes hold no header would
+/// otherwise read to EOF, up to 32 times over — turning a malformed file into a
+/// whole-mmap read on the *default* path, which on a network volume is the
+/// whole-file transfer the bounded head walks exist to avoid. The same applies
+/// to a container's own copy of the headers, which is bounded only by the file:
+/// a Matroska CodecPrivate may legally declare a gigabyte. A well-formed file
+/// never pays: the header sits at the buffer's offset 0 and the search stops on
+/// the first hit.
+const HEADER_SCAN_SPAN: usize = 1 << 20;
+
+/// Fill a track's fields from an `avcC`/`hvcC` decoder configuration record:
+/// the NAL length prefix, the profile, the depth and chroma, and — from the
+/// parameter set embedded in the record — the colour and the coded picture
+/// size. The same treatment MP4 gives the same bytes.
+///
+/// Shared because three carriages hand one over inside a Video for Windows
+/// wrapper, exactly as [`bmih`] describes: AVI's `strf`, ASF's Stream
+/// Properties type-specific data, and Matroska's `V_MS/VFW/FOURCC`. Callers
+/// must have decided the extradata really is a configuration record first
+/// ([`bmih::is_config_record`]) — a VfW wrapper's bytes are raw Annex-B just as
+/// often, and the FourCC does not separate them.
+///
+/// The SPS's picture size outranks the wrapper's `biWidth`/`biHeight`: those
+/// are the muxer's word and this is the bitstream's.
+pub(crate) fn fill_nal_config_fields(td: &mut TrackDemux, rec: &[u8]) {
+    match td.codec {
+        Codec::Hevc => {
+            let Some(info) = parse_hvcc_record(rec) else { return };
+            td.nal_format = NalFormat::LengthPrefixed(info.nal_len);
+            td.bit_depth = Some(info.bit_depth);
+            td.chroma = info.chroma.map(str::to_string);
+            td.codec_profile = Some(info.profile_str);
+            if let Some(c) = color_from_hvcc(rec) {
+                (td.color, td.color_source) = c;
+            }
+            if let Some(sps) =
+                crate::hevc::sps::find_sps_in_hvcc(rec).and_then(crate::hevc::sps::parse_sps)
+            {
+                td.fps = sps.frame_rate;
+                td.fps_rational = sps.frame_rate_rational;
+                if sps.width > 0 && sps.height > 0 {
+                    (td.width, td.height) = (sps.width, sps.height);
+                }
+                if td.pixel_aspect.is_none() && td.display_aspect.is_none() {
+                    td.pixel_aspect = sps.pixel_aspect;
+                }
+                if td.scan_type.is_none() {
+                    td.scan_type = sps.scan_type;
+                }
+            }
+        }
+        _ => {
+            let Some(info) = parse_avcc_record(rec) else { return };
+            td.nal_format = NalFormat::LengthPrefixed(info.nal_len);
+            td.bit_depth = Some(info.bit_depth);
+            td.chroma = info.chroma.map(str::to_string);
+            td.codec_profile = Some(info.profile_str);
+            if let Some(c) = color_from_avcc(rec) {
+                (td.color, td.color_source) = c;
+            }
+            if let Some(sps) =
+                crate::avc::nal::find_sps_in_avcc(rec).and_then(crate::avc::sps::parse_sps)
+            {
+                td.fps = sps.frame_rate;
+                td.fps_rational = sps.frame_rate_rational;
+                if sps.width > 0 && sps.height > 0 {
+                    (td.width, td.height) = (sps.width, sps.height);
+                }
+                if td.pixel_aspect.is_none() && td.display_aspect.is_none() {
+                    td.pixel_aspect = sps.pixel_aspect;
+                }
+                if td.scan_type.is_none() {
+                    td.scan_type = sps.scan_type;
+                }
+            }
+        }
+    }
+}
+
+/// Fill an MPEG-1/2 track's stream-derived fields from the sequence header at
+/// the head of its first access unit, the MPEG analogue of the ProRes and VP9
+/// fills above. [`crate::mpeg2`]'s module doc says why the bitstream is usually
+/// the only source these codecs have.
+///
+/// `source` is the buffer the track's chunks index into: the mmap for MKV, MP4
+/// and raw streams, the reassembled elementary stream for TS.
+///
+/// Container signalling still wins field by field. Colour is all-or-nothing on
+/// the same `signalled_nothing` gate ProRes uses, so a container that described
+/// the picture keeps its own values and provenance rather than having three
+/// fields half-replaced from a second source.
+pub(crate) fn fill_mpeg2_stream_fields(track: &mut TrackDemux, source: &[u8]) {
+    let signalled_nothing = track.color.primaries.is_none()
+        && track.color.transfer.is_none()
+        && track.color.matrix.is_none();
+    let missing_cfg = track.width == 0
+        || track.height == 0
+        || track.fps.is_none()
+        || track.bit_depth.is_none()
+        || track.chroma.is_none()
+        || track.codec_profile.is_none();
+    if !missing_cfg && !signalled_nothing {
+        return;
+    }
+    // The sequence header opens the first access unit in every mux observed,
+    // but a capture cut mid-GOP puts it further in, so try a few chunks. The
+    // parse scans within each for the header rather than assuming its offset.
+    let s = track.chunks.iter().take(32).find_map(|c| {
+        let start = c.offset as usize;
+        let end = ((c.offset + c.size) as usize)
+            .min(source.len())
+            .min(start.saturating_add(HEADER_SCAN_SPAN));
+        (start < end).then(|| crate::mpeg2::parse_sequence(&source[start..end])).flatten()
+    });
+    let Some(s) = s else { return };
+    if track.width == 0 || track.height == 0 {
+        track.width = s.width;
+        track.height = s.height;
+    }
+    if track.fps.is_none() {
+        track.fps = s.fps;
+        track.fps_rational = s.fps_rational;
+    }
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(s.bit_depth);
+    }
+    if track.chroma.is_none() {
+        track.chroma = s.chroma.map(str::to_string);
+    }
+    if track.codec_profile.is_none() {
+        track.codec_profile = s.profile_level;
+    }
+    // Aspect moves as a pair: mixing a container's pixel ratio with the
+    // stream's display ratio would derive nonsense at report time.
+    if track.pixel_aspect.is_none() && track.display_aspect.is_none() {
+        track.pixel_aspect = s.pixel_aspect;
+        track.display_aspect = s.display_aspect;
+    }
+    if track.scan_type.is_none() {
+        track.scan_type = s.scan_type;
+    }
+    if signalled_nothing {
+        // Field by field, and never `range`: MPEG-2 signals none, so a
+        // container-supplied range keeps its own value and provenance.
+        let (sc, ss) = s.color;
+        track.color.primaries = sc.primaries;
+        track.color.transfer = sc.transfer;
+        track.color.matrix = sc.matrix;
+        track.color_source.primaries = ss.primaries;
+        track.color_source.transfer = ss.transfer;
+        track.color_source.matrix = ss.matrix;
+    }
+}
+
+/// Fill an MJPEG track's depth and chroma from the first readable frame's
+/// `SOF` header, the plainest of the stream-derived fills: every frame is a
+/// whole JPEG image carrying one, and nothing else in the format states either
+/// value ([`crate::mjpeg`]'s module doc has the two facts). No colour arm on
+/// purpose — MJPEG records none anywhere this tree reads.
+pub(crate) fn fill_mjpeg_stream_fields(track: &mut TrackDemux, source: &[u8]) {
+    if track.bit_depth.is_some() && track.chroma.is_some() {
+        return;
+    }
+    // Same first-chunks bound as the MPEG-2 fill beside this: the SOF opens
+    // every chunk in an ordinary file, and 32 tries cover a mux whose head
+    // chunks are damaged without walking the whole index.
+    let sof = track.chunks.iter().take(32).find_map(|c| {
+        let start = c.offset as usize;
+        let end = ((c.offset + c.size) as usize)
+            .min(source.len())
+            .min(start.saturating_add(HEADER_SCAN_SPAN));
+        (start < end).then(|| crate::mjpeg::parse_frame_header(&source[start..end])).flatten()
+    });
+    let Some(s) = sof else { return };
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(s.precision);
+    }
+    if track.chroma.is_none() {
+        track.chroma = s.chroma.map(str::to_string);
+    }
+}
+
+/// Fill depth and chroma for the VfW-carried families whose values are format
+/// constants rather than coded fields, where the track still carries neither.
+///
+/// Two provenances, both stated at their arm. VC-1's is normative: SMPTE
+/// ST 421 defines exactly one chroma format (`COLORDIFF_FORMAT` 1, 4:2:0) and
+/// 8-bit samples for every profile — the same pair [`crate::vc1`]'s
+/// Advanced-profile parse fills from the sequence header, which is why this
+/// arm only ever completes Simple/Main (`WMV3`), whose `STRUCT_C` states
+/// neither. The WMV1/WMV2 and MS-MPEG-4 arm is a witnessed constant, not a
+/// spec row: they are H.263-lineage designs with no other pixel format,
+/// ffmpeg's decoders emit `yuv420p` alone, and MediaInfo states 8 bits for
+/// WMV2 — single-witness and labelled, the studio-VOL convention.
+pub(crate) fn fill_constant_depth_chroma(track: &mut TrackDemux) {
+    let (depth, chroma, scan) = match &track.codec {
+        Codec::Vc1 | Codec::MsMpeg4(_) => (Some(8), Some("4:2:0"), None),
+        Codec::Other(l) => {
+            let l = l.as_str();
+            if l.eq_ignore_ascii_case("WMV1") || l.eq_ignore_ascii_case("WMV2") {
+                (Some(8), Some("4:2:0"), None)
+            } else if l.eq_ignore_ascii_case("H263")
+                || l.eq_ignore_ascii_case("S263")
+                || l == "Sorenson H.263"
+            {
+                // ITU-T H.263 §4.1: every source format is 4:2:0 at 8 bits,
+                // and the format has no field coding — all three are
+                // normative constants (the Sorenson variant inherits the
+                // picture model).
+                (Some(8), Some("4:2:0"), Some("progressive"))
+            } else if l.eq_ignore_ascii_case("dvsd") || l == "dv25" {
+                // DV25 is 8-bit everywhere, but its chroma differs by system
+                // (525-60 is 4:1:1; 625-50 is 4:2:0 for IEC 61834 and 4:1:1
+                // for DVCPRO) and this label names neither, so only the depth
+                // fills.
+                (Some(8), None, None)
+            } else if l == "dvc" {
+                // QuickTime's 525-60 IEC DV25: 4:1:1 (IEC 61834-2). The
+                // FourCC is space-padded ('d','v','c',0x20) and every label
+                // producer trims padding (`bmih::fourcc_label`), so the
+                // trimmed form is the one that arrives here.
+                (Some(8), Some("4:1:1"), None)
+            } else if l == "dvcp" {
+                // 625-50 IEC DV25: 4:2:0.
+                (Some(8), Some("4:2:0"), None)
+            } else if l == "dvpp" || l == "dv5n" || l == "dv5p" {
+                // DVCPRO 625 (4:1:1) and DVCPRO50 (4:2:2) — SMPTE 314M.
+                (Some(8), Some(if l == "dvpp" { "4:1:1" } else { "4:2:2" }), None)
+            } else if l.starts_with("dvh") {
+                // DV100 / DVCPRO HD: 8-bit 4:2:2 (SMPTE 370M).
+                (Some(8), Some("4:2:2"), None)
+            } else {
+                (None, None, None)
+            }
+        }
+        _ => (None, None, None),
+    };
+    if track.bit_depth.is_none() {
+        track.bit_depth = depth;
+    }
+    if track.chroma.is_none() {
+        track.chroma = chroma.map(str::to_string);
+    }
+    if track.scan_type.is_none() {
+        track.scan_type = scan;
+    }
+}
+
+/// Fill an MPEG-4 Part 2 track's stream-derived fields, the Part 2 analogue of
+/// [`fill_mpeg2_stream_fields`].
+///
+/// Two header sources, tried in order. `headers` is whatever the container
+/// copied into its own codec-configuration slot — a Matroska CodecPrivate, an
+/// `esds` DecoderSpecificInfo, a `BITMAPINFOHEADER`'s extradata — and is the
+/// cheap path, since it costs no sample reads at all. When it holds no
+/// VideoObjectLayer (many AVI muxes leave the slot empty and put the headers in
+/// the first chunk instead) the first few access units are scanned. Both spans
+/// are capped by [`HEADER_SCAN_SPAN`], which documents why.
+///
+/// Container signalling still wins field by field, and the three CICP fields are
+/// all-or-nothing on the same `signalled_nothing` gate. That gate matters more
+/// here than for MPEG-2: Part 2 defines colour *defaults*, so this parser always
+/// produces a description, and without the gate a spec-defined BT.709 would
+/// overwrite a container's real signalling. `range` is the exception and fills
+/// on its own — Part 2 is the one codec in this family that signals one.
+pub(crate) fn fill_mpeg4part2_stream_fields(
+    track: &mut TrackDemux,
+    headers: &[u8],
+    source: &[u8],
+) {
+    let signalled_nothing = track.color.primaries.is_none()
+        && track.color.transfer.is_none()
+        && track.color.matrix.is_none();
+    let missing_cfg = track.width == 0
+        || track.height == 0
+        || track.fps.is_none()
+        || track.bit_depth.is_none()
+        || track.chroma.is_none()
+        || track.codec_profile.is_none();
+    // `range` is in the early return as well as in the fill below, because it
+    // fills independently of the three CICP fields: a track with everything else
+    // in hand and only its range missing still has work to do here, and leaving
+    // it out of the test would skip that silently.
+    if !missing_cfg && !signalled_nothing && track.color.range.is_some() {
+        return;
+    }
+    // Capped like the chunk scan below, and for the same reason: `headers` is a
+    // Matroska CodecPrivate or an `esds` DecoderSpecificInfo, both bounded only
+    // by the file, and `parse_visual` *scans*. A CodecPrivate declaring a
+    // gigabyte of bytes that hold no VOL would otherwise be walked end to end on
+    // the default path — measured at 764 ms against a 31 ms control before this
+    // cap, which on a network volume is a whole-file transfer.
+    let headers = &headers[..headers.len().min(HEADER_SCAN_SPAN)];
+    let v = crate::mpeg4part2::parse_visual(headers).or_else(|| {
+        track.chunks.iter().take(32).find_map(|c| {
+            let start = c.offset as usize;
+            let end = ((c.offset + c.size) as usize)
+                .min(source.len())
+                .min(start.saturating_add(HEADER_SCAN_SPAN));
+            (start < end).then(|| crate::mpeg4part2::parse_visual(&source[start..end])).flatten()
+        })
+    });
+    let Some(v) = v else { return };
+    if track.width == 0 || track.height == 0 {
+        track.width = v.width;
+        track.height = v.height;
+    }
+    if track.fps.is_none() {
+        track.fps = v.fps;
+        track.fps_rational = v.fps_rational;
+    }
+    if track.bit_depth.is_none() {
+        track.bit_depth = v.bit_depth;
+    }
+    if track.chroma.is_none() {
+        track.chroma = v.chroma.map(str::to_string);
+    }
+    if track.codec_profile.is_none() {
+        track.codec_profile = v.profile_level;
+    }
+    if track.pixel_aspect.is_none() && track.display_aspect.is_none() {
+        track.pixel_aspect = v.pixel_aspect;
+    }
+    if track.scan_type.is_none() {
+        track.scan_type = v.scan_type;
+    }
+    // The three CICP fields move together on the shared gate; `range` is its own
+    // signal in Part 2 (the one codec here that has one), so it fills
+    // independently and only into an empty field.
+    let (vc, vs) = v.color;
+    if signalled_nothing {
+        track.color.primaries = vc.primaries;
+        track.color.transfer = vc.transfer;
+        track.color.matrix = vc.matrix;
+        track.color_source.primaries = vs.primaries;
+        track.color_source.transfer = vs.transfer;
+        track.color_source.matrix = vs.matrix;
+    }
+    if track.color.range.is_none() {
+        track.color.range = vc.range;
+        track.color_source.range = vs.range;
+    }
+}
+
+/// Fill a VC-1 track's stream-derived fields from its Advanced Profile sequence
+/// header, which every container copies into codec-private data.
+///
+/// Unlike the two fills above there is no chunk fallback, and that is
+/// deliberate: Simple and Main profile have no in-band sequence header to find,
+/// and Advanced Profile's is required to be present in the configuration by
+/// every carriage spec that defines one. Scanning samples could therefore only
+/// ever find what `headers` already held.
+///
+/// `range` is never touched — VC-1 signals none.
+pub(crate) fn fill_vc1_stream_fields(track: &mut TrackDemux, headers: &[u8]) {
+    let signalled_nothing = track.color.primaries.is_none()
+        && track.color.transfer.is_none()
+        && track.color.matrix.is_none();
+    let Some(s) = crate::vc1::parse_sequence_header(headers) else {
+        // Simple/Main carry no sequence header at all — their codec-private
+        // data is a 32-bit STRUCT_C, which states the profile and nothing else
+        // this report wants. Reading it is what makes a `WMV3` track report
+        // `Main` rather than a bare `VC-1`, and it is the shape SCHEMA.md
+        // already documents for these profiles ("the bare profile name … whose
+        // STRUCT_C carries no level"). The parser validates four reserved
+        // fields, which is the only thing that makes four bytes with no magic
+        // and no length trustworthy at all.
+        if track.codec_profile.is_none() {
+            track.codec_profile = crate::vc1::parse_struct_c(headers)
+                .and_then(crate::vc1::profile_from_config)
+                .map(str::to_string);
+        }
+        // Their depth is the same format constant, so the report still says
+        // 8-bit rather than nothing.
+        if track.bit_depth.is_none() {
+            track.bit_depth = Some(crate::vc1::BIT_DEPTH);
+        }
+        return;
+    };
+    if track.width == 0 || track.height == 0 {
+        track.width = s.width;
+        track.height = s.height;
+    }
+    if track.fps.is_none() {
+        track.fps = s.fps;
+        track.fps_rational = s.fps_rational;
+    }
+    if track.pixel_aspect.is_none() && track.display_aspect.is_none() {
+        track.pixel_aspect = s.pixel_aspect;
+    }
+    if track.scan_type.is_none() {
+        track.scan_type = s.scan_type;
+    }
+    if track.bit_depth.is_none() {
+        track.bit_depth = Some(crate::vc1::BIT_DEPTH);
+    }
+    if track.chroma.is_none() {
+        track.chroma = s.chroma.map(str::to_string);
+    }
+    if track.codec_profile.is_none() {
+        track.codec_profile = s.profile_level;
+    }
+    if signalled_nothing {
+        let (sc, ss) = s.color;
+        track.color.primaries = sc.primaries;
+        track.color.transfer = sc.transfer;
+        track.color.matrix = sc.matrix;
+        track.color_source.primaries = ss.primaries;
+        track.color_source.transfer = ss.transfer;
+        track.color_source.matrix = ss.matrix;
+    }
+}
+
+/// ITU-T H.273 `colour_primaries`. Every code the standard defines is named:
+/// an unnamed code is indistinguishable in `ColorInfo` from an unsignalled one,
+/// which is a distinction the report should not have to make often. 2 stays
+/// unnamed on purpose — it *is* "unspecified" — as do the reserved values.
+///
+/// **Coupled to [`cicp_matrix`] by name.** `render::build_color_line` decides
+/// whether a matrix restates the primaries by testing whether the matrix label
+/// *starts with* the primaries label, so the two tables must keep spelling the
+/// same colour system the same way. Today the only pair that relies on it is
+/// BT.2020 (primaries 9 against matrix 9 and 10, "BT.2020 NCL" and "BT.2020
+/// CL"); lengthening `9 => "BT.2020"` here would make every HDR file start
+/// printing its matrix, and nothing but this note would catch it.
 pub(crate) fn cicp_primaries(v: u16) -> Option<&'static str> {
     Some(match v {
         1 => "BT.709",
+        4 => "BT.470M",
         5 => "BT.601 (PAL)",
         6 => "BT.601 (NTSC)",
+        7 => "SMPTE 240M",
+        8 => "Film",
         9 => "BT.2020",
+        10 => "XYZ (SMPTE ST 428-1)",
         11 => "DCI-P3",
         12 => "Display P3",
+        22 => "EBU 3213-E",
         _ => return None,
     })
 }
+/// ITU-T H.273 `transfer_characteristics`, named on the same principle as
+/// [`cicp_primaries`]. Note that no name here may contain "PQ" or "HLG" unless
+/// the curve really is one: `hdr::assemble` classifies on exactly that substring.
 pub(crate) fn cicp_transfer(v: u16) -> Option<&'static str> {
     Some(match v {
         1 => "BT.709",
+        4 => "Gamma 2.2",
+        5 => "Gamma 2.8",
         6 => "BT.601",
+        7 => "SMPTE 240M",
+        8 => "Linear",
+        9 => "Log (100:1)",
+        10 => "Log (316:1)",
+        11 => "xvYCC (IEC 61966-2-4)",
+        12 => "BT.1361",
+        13 => "sRGB (IEC 61966-2-1)",
         14 => "BT.2020 (10-bit)",
         15 => "BT.2020 (12-bit)",
         16 => "PQ (SMPTE ST 2084)",
+        17 => "SMPTE ST 428-1",
         18 => "HLG (ARIB STD-B67)",
         _ => return None,
     })
 }
+/// The `video_full_range_flag` label. Not a CICP code point, but it rides the
+/// same five-part VUI tuple as the three that are, and the DV spec tables in
+/// `dv::ccid` compare against it, so it shares their one decoder namespace.
+pub(crate) fn cicp_range(full_range: bool) -> &'static str {
+    if full_range {
+        "full"
+    } else {
+        "limited"
+    }
+}
+/// The name of CICP matrix coefficient 15, Dolby's IPT-PQ-C2 colour space.
+///
+/// Spelled once because it is compared as a live value, not only printed: the
+/// Color line names this matrix and no other, and the DV spec tables in
+/// `dv::ccid` match against it. SMPTE ST 2128:2023 capitalizes the C, as does
+/// every mention across both revisions of Dolby's Profiles and Levels spec.
+pub(crate) const IPT_PQ_C2: &str = "IPT-PQ-C2";
+
+/// ITU-T H.273 `matrix_coefficients`, named on the same principle as
+/// [`cicp_primaries`]. Codes 5 and 6 carry identical coefficients and differ
+/// only in the document defining them, so they take the same practical names as
+/// the matching primaries.
 pub(crate) fn cicp_matrix(v: u16) -> Option<&'static str> {
     Some(match v {
         0 => "RGB",
         1 => "BT.709",
+        4 => "FCC",
+        5 => "BT.601 (PAL)",
+        6 => "BT.601 (NTSC)",
+        7 => "SMPTE 240M",
+        8 => "YCgCo",
         9 => "BT.2020 NCL",
         10 => "BT.2020 CL",
-        // Dolby's IPT-PQ-c2 colour space, signalled by Profile 20 (MV-HEVC) colr.
-        15 => "IPT-PQ-c2",
+        11 => "SMPTE ST 2085",
+        12 => "Chroma-derived NCL",
+        13 => "Chroma-derived CL",
+        14 => "ICtCp",
+        // Dolby's IPT-PQ-C2 colour space, signalled by Profile 20 (MV-HEVC) colr.
+        15 => IPT_PQ_C2,
+        16 => "YCgCo-Re",
+        17 => "YCgCo-Ro",
         _ => return None,
     })
 }
@@ -645,6 +1954,297 @@ mod tests {
         assert!(!sniffs_as_ts(&[0u8; 1024]));
     }
 
+    /// `testfiles/sdr/mpeg2.m2v` bytes 0..22, plus a display extension carrying
+    /// the corpus's own colour description (primaries and transfer at the
+    /// explicit "unspecified" code 2, matrix 1).
+    fn mpeg2_au() -> Vec<u8> {
+        let mut d = vec![
+            0x00, 0x00, 0x01, 0xB3, 0x14, 0x00, 0xF0, 0x23, 0xFF, 0xFF, 0xE0, 0x18, 0x00, 0x00,
+            0x01, 0xB5, 0x14, 0x8A, 0x00, 0x01, 0x00, 0x00,
+        ];
+        d.extend_from_slice(&[0x00, 0x00, 0x01, 0xB5, 0x2B, 0x02, 0x02, 0x01, 0x14, 0x01, 0xE0]);
+        d.extend_from_slice(&[0x00, 0x00, 0x01, 0xB8, 0x00, 0x08, 0x00, 0x40]);
+        d
+    }
+
+    fn mpeg2_track(chunks: Vec<Chunk>) -> TrackDemux {
+        TrackDemux { chunks, ..TrackDemux::new(Codec::Mpeg2, NalFormat::AnnexB) }
+    }
+
+    #[test]
+    fn mpeg2_fill_supplies_what_the_container_left_absent() {
+        let data = mpeg2_au();
+        let mut t = mpeg2_track(vec![Chunk { offset: 0, size: data.len() as u64 }]);
+        fill_mpeg2_stream_fields(&mut t, &data);
+        assert_eq!((t.width, t.height), (320, 240));
+        assert_eq!(t.fps, Some(25.0));
+        assert_eq!(t.bit_depth, Some(8));
+        assert_eq!(t.chroma.as_deref(), Some("4:2:0"));
+        assert_eq!(t.codec_profile.as_deref(), Some("Main@Main"));
+        assert_eq!(t.color.matrix.as_deref(), Some("BT.709"));
+        assert_eq!(t.color_source.matrix, Some(ColorSource::Stream));
+        // MPEG-2 signals no range, so the field stays for the container.
+        assert!(t.color.range.is_none());
+        assert_eq!(t.color_source.range, None);
+        // The "unspecified" pair is not filled and not tagged.
+        assert!(t.color.primaries.is_none() && t.color.transfer.is_none());
+        assert_eq!(t.color_source.primaries, None);
+    }
+
+    #[test]
+    fn mpeg2_fill_never_overwrites_container_signalling() {
+        // Every field the container already stated keeps its own value and
+        // provenance. Colour is all-or-nothing: a container that described the
+        // picture at all keeps all three of its fields rather than having them
+        // half-replaced from a second source.
+        let data = mpeg2_au();
+        let mut t = mpeg2_track(vec![Chunk { offset: 0, size: data.len() as u64 }]);
+        t.width = 720;
+        t.height = 576;
+        t.fps = Some(50.0);
+        t.chroma = Some("4:2:2".to_string());
+        t.codec_profile = Some("declared".to_string());
+        t.color.matrix = Some("BT.2020 NCL".to_string());
+        t.color_source.matrix = Some(ColorSource::Container);
+        fill_mpeg2_stream_fields(&mut t, &data);
+        assert_eq!((t.width, t.height), (720, 576));
+        assert_eq!(t.fps, Some(50.0));
+        assert_eq!(t.chroma.as_deref(), Some("4:2:2"));
+        assert_eq!(t.codec_profile.as_deref(), Some("declared"));
+        assert_eq!(t.color.matrix.as_deref(), Some("BT.2020 NCL"));
+        assert_eq!(t.color_source.matrix, Some(ColorSource::Container));
+        // Bit depth was absent, so it still fills.
+        assert_eq!(t.bit_depth, Some(8));
+    }
+
+    #[test]
+    fn mpeg2_fill_declines_rather_than_guessing() {
+        let data = mpeg2_au();
+        // No chunks at all: nothing to read, nothing filled.
+        let mut t = mpeg2_track(Vec::new());
+        fill_mpeg2_stream_fields(&mut t, &data);
+        assert_eq!((t.width, t.bit_depth), (0, None));
+
+        // A chunk pointing past the buffer is skipped, not indexed.
+        let mut t = mpeg2_track(vec![Chunk { offset: 9_000, size: 100 }]);
+        fill_mpeg2_stream_fields(&mut t, &data);
+        assert_eq!(t.bit_depth, None);
+
+        // Bytes holding no sequence header fill nothing.
+        let mut t = mpeg2_track(vec![Chunk { offset: 0, size: 64 }]);
+        fill_mpeg2_stream_fields(&mut t, &[0xAAu8; 64]);
+        assert_eq!(t.bit_depth, None);
+    }
+
+    #[test]
+    fn start_code_discriminator_routes_on_the_byte_after_the_prefix() {
+        use StreamFamily::{AnnexB, MpegVideoEs, ProgramStream};
+
+        // Annex-B: an HEVC VPS (type 32 => 0x40, temporal id 1) behind the
+        // 4-byte prefix, and an AVC SPS (0x67) behind the 3-byte one.
+        assert_eq!(classify_start_code(&[0, 0, 0, 1, 0x40, 0x01, 0xFF]), Some(AnnexB));
+        assert_eq!(classify_start_code(&[0, 0, 1, 0x67, 0x42, 0xC0]), Some(AnnexB));
+
+        // Program stream: an MPEG-2 pack (`01xxxxxx`), an MPEG-1 pack
+        // (`0010xxxx`), and a bare video PES packet from a mid-file cut.
+        assert_eq!(classify_start_code(&[0, 0, 1, 0xBA, 0x44, 0x00]), Some(ProgramStream));
+        assert_eq!(classify_start_code(&[0, 0, 1, 0xBA, 0x21, 0x00]), Some(ProgramStream));
+        assert_eq!(classify_start_code(&[0, 0, 1, 0xE0, 0x00, 0x08]), Some(ProgramStream));
+        // `0xBA` whose next byte fits neither pack form is not a pack at all.
+        assert_eq!(classify_start_code(&[0, 0, 1, 0xBA, 0x99, 0x00]), None);
+
+        // Raw MPEG video: an MPEG-1/2 sequence header and a Part 2 VOS. A
+        // zero-padded MPEG head reads as a 4-byte start code and must land here
+        // too, which is why both prefix lengths run the same ladder.
+        assert_eq!(classify_start_code(&[0, 0, 1, 0xB3, 0x02, 0xD0]), Some(MpegVideoEs));
+        assert_eq!(classify_start_code(&[0, 0, 1, 0xB0, 0xF5]), Some(MpegVideoEs));
+        assert_eq!(classify_start_code(&[0, 0, 0, 1, 0xB3, 0x02, 0xD0]), Some(MpegVideoEs));
+
+        // Not a start code, or too short to read the value byte.
+        assert_eq!(classify_start_code(&[0x47, 0, 0, 1]), None);
+        assert_eq!(classify_start_code(&[0, 0, 1]), None);
+        assert_eq!(classify_start_code(&[]), None);
+    }
+
+    #[test]
+    fn an_mpeg_picture_header_fails_the_nal_plausibility_checks() {
+        // `00 00 01 00` opens an MPEG picture header, so bit 7, which is
+        // H.264/H.265's `forbidden_zero_bit`, is clear and the structural rule
+        // does not apply. The plausibility checks are what catch this one: AVC
+        // nal_unit_type 0 is unspecified, and the HEVC reading needs a nonzero
+        // `nuh_temporal_id_plus1`, which a picture header whose
+        // `temporal_reference` is 0 does not supply. These exact bytes are
+        // `testfiles/sdr/mpeg2.m2v[30..38]`.
+        //
+        // This pins one byte pattern, not the whole sub-`0x80` range:
+        // `nal_header_plausible` is documented as permissive, and a picture
+        // header with `temporal_reference % 32 >= 4` does reach the Annex-B
+        // backend. The second line of defence for that case is the
+        // `forbidden_zero_bit` rejection in `hevc::nal` / `avc::nal`.
+        let picture = [0, 0, 1, 0x00, 0x00, 0x0F, 0xFF, 0xF8];
+        assert_eq!(classify_start_code(&picture), Some(StreamFamily::MpegVideoEs));
+        assert!(!looks_like_nal_header(0x00, Some(0x00)));
+
+        // And the sniffer turns that into an error, never a report.
+        let sniffed = sniff_demux(&picture, false, &Progress::off(), &Frontier::off());
+        assert!(matches!(sniffed, Some(Err(_))));
+    }
+
+    #[test]
+    fn sniffer_routes_each_start_code_family_to_its_own_backend() {
+        // All three heads used to be demuxed as `raw HEVC (Annex-B)`.
+
+        // A program stream still has no backend, and its error names the
+        // format rather than shrugging. The message is the whole user-visible
+        // product of that routing, so pin it, not just that some error came.
+        let pack = [0, 0, 1, 0xBA, 0x44, 0x00, 0x04, 0x00];
+        match sniff_demux(&pack, false, &Progress::off(), &Frontier::off()) {
+            Some(Err(e)) => assert!(
+                e.to_string().contains("MPEG program stream"),
+                "expected an error naming the program stream, got {e}"
+            ),
+            other => panic!("a pack header must not produce a report: {other:?}"),
+        }
+
+        // A raw MPEG video elementary stream now reaches its own backend and
+        // reports. These bytes are `testfiles/sdr/mpeg2.m2v` bytes 0..22.
+        let m2v = [
+            0x00, 0x00, 0x01, 0xB3, 0x14, 0x00, 0xF0, 0x23, 0xFF, 0xFF, 0xE0, 0x18, 0x00, 0x00,
+            0x01, 0xB5, 0x14, 0x8A, 0x00, 0x01, 0x00, 0x00,
+        ];
+        match sniff_demux(&m2v, false, &Progress::off(), &Frontier::off()) {
+            Some(Ok(d)) => {
+                assert_eq!(d.container, "raw MPEG-2 Video (ES)");
+                assert_eq!(d.tracks[0].width, 320);
+            }
+            other => panic!("an MPEG-2 sequence header must report: {other:?}"),
+        }
+        // Truncated to less than a sequence header, it declines honestly rather
+        // than reporting an empty video section.
+        let cut = &m2v[..8];
+        assert!(matches!(
+            sniff_demux(cut, false, &Progress::off(), &Frontier::off()),
+            Some(Err(_))
+        ));
+
+        // A genuine Annex-B head still dispatches to the raw HEVC backend.
+        let hevc = [0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];
+        let r = sniff_demux(&hevc, false, &Progress::off(), &Frontier::off());
+        assert!(matches!(&r, Some(Ok(d)) if d.container == "raw HEVC (Annex-B)"));
+    }
+
+    #[test]
+    fn both_nal_readings_are_load_bearing() {
+        // An HEVC VPS-first stream (`0x40`) has AVC nal_unit_type 0 and is
+        // admitted only by the HEVC reading; an H.264 AUD (`0x09`, whose next
+        // byte is `primary_pic_type << 5`) has a zero HEVC temporal id and is
+        // admitted only by the AVC reading. Requiring both would reject both,
+        // which is why `looks_like_nal_header` ORs them.
+        assert!(looks_like_nal_header(0x40, Some(0x01)));
+        assert_eq!(0x40u8 & 0x1F, 0, "the AVC reading alone would reject a VPS");
+        assert!(looks_like_nal_header(0x09, Some(0x10)));
+        assert_eq!(0x10u8 & 0x07, 0, "the HEVC reading alone would reject an AUD");
+    }
+
+    /// Every code ITU-T H.273 defines has a name, cross-checked against
+    /// ffmpeg's own enum tables (`ffmpeg -h full`, the `color_primaries`,
+    /// `color_trc` and `colorspace` options). An unnamed code is
+    /// indistinguishable in `ColorInfo` from an unsignalled one, so the fewer
+    /// of them the better.
+    #[test]
+    fn cicp_tables_name_every_defined_code() {
+        for (code, name) in [
+            (1u16, "BT.709"),
+            (4, "BT.470M"),
+            (5, "BT.601 (PAL)"),
+            (6, "BT.601 (NTSC)"),
+            (7, "SMPTE 240M"),
+            (8, "Film"),
+            (9, "BT.2020"),
+            (10, "XYZ (SMPTE ST 428-1)"),
+            (11, "DCI-P3"),
+            (12, "Display P3"),
+            (22, "EBU 3213-E"),
+        ] {
+            assert_eq!(cicp_primaries(code), Some(name), "primaries {code}");
+        }
+        for (code, name) in [
+            (1u16, "BT.709"),
+            (4, "Gamma 2.2"),
+            (5, "Gamma 2.8"),
+            (6, "BT.601"),
+            (7, "SMPTE 240M"),
+            (8, "Linear"),
+            (9, "Log (100:1)"),
+            (10, "Log (316:1)"),
+            (11, "xvYCC (IEC 61966-2-4)"),
+            (12, "BT.1361"),
+            (13, "sRGB (IEC 61966-2-1)"),
+            (14, "BT.2020 (10-bit)"),
+            (15, "BT.2020 (12-bit)"),
+            (16, "PQ (SMPTE ST 2084)"),
+            (17, "SMPTE ST 428-1"),
+            (18, "HLG (ARIB STD-B67)"),
+        ] {
+            assert_eq!(cicp_transfer(code), Some(name), "transfer {code}");
+        }
+        for (code, name) in [
+            (0u16, "RGB"),
+            (1, "BT.709"),
+            (4, "FCC"),
+            (5, "BT.601 (PAL)"),
+            (6, "BT.601 (NTSC)"),
+            (7, "SMPTE 240M"),
+            (8, "YCgCo"),
+            (9, "BT.2020 NCL"),
+            (10, "BT.2020 CL"),
+            (11, "SMPTE ST 2085"),
+            (12, "Chroma-derived NCL"),
+            (13, "Chroma-derived CL"),
+            (14, "ICtCp"),
+            (15, "IPT-PQ-C2"),
+            (16, "YCgCo-Re"),
+            (17, "YCgCo-Ro"),
+        ] {
+            assert_eq!(cicp_matrix(code), Some(name), "matrix {code}");
+        }
+
+        // 2 is "unspecified" and must stay unnamed: `dv::levels` distinguishes
+        // it from an unnamed code to decide whether the spec fill may run.
+        assert_eq!(cicp_primaries(2), None);
+        assert_eq!(cicp_transfer(2), None);
+        assert_eq!(cicp_matrix(2), None);
+        // Reserved values name nothing either, and never guess.
+        for reserved in [0u16, 3, 13, 21, 23, 255] {
+            assert_eq!(cicp_primaries(reserved), None, "primaries {reserved} is reserved");
+        }
+        for reserved in [0u16, 3, 19, 255] {
+            assert_eq!(cicp_transfer(reserved), None, "transfer {reserved} is reserved");
+        }
+        for reserved in [3u16, 18, 255] {
+            assert_eq!(cicp_matrix(reserved), None, "matrix {reserved} is reserved");
+        }
+    }
+
+    /// `hdr::assemble` classifies a base layer by looking for "PQ" and "HLG" as
+    /// substrings of the transfer name, so no other curve may contain either.
+    #[test]
+    fn only_the_pq_and_hlg_curves_carry_those_substrings() {
+        for code in 0u16..=255 {
+            let Some(name) = cicp_transfer(code) else { continue };
+            assert_eq!(
+                name.contains("PQ"),
+                code == 16,
+                "transfer {code} ({name}) must not read as PQ"
+            );
+            assert_eq!(
+                name.contains("HLG"),
+                code == 18,
+                "transfer {code} ({name}) must not read as HLG"
+            );
+        }
+    }
+
     #[test]
     fn dvwc_decodes_profile_20() {
         // The `dvwC` payload of a real Profile 20 (MV-HEVC) MP4: dv_version_major=3,
@@ -679,7 +2279,9 @@ mod tests {
 
     #[test]
     fn cicp_matrix_names_dolby_ipt() {
-        assert_eq!(cicp_matrix(15), Some("IPT-PQ-c2"));
+        // Spelled out rather than compared to the constant: this pins the
+        // rendered value, per SMPTE ST 2128:2023 and both Dolby revisions.
+        assert_eq!(cicp_matrix(15), Some("IPT-PQ-C2"));
     }
 
     #[test]
@@ -702,13 +2304,86 @@ mod tests {
         ];
         let h = parse_hvcc_record(&hvcc).expect("valid hvcC");
         assert_eq!(h.bit_depth, 10);
-        assert_eq!(h.chroma, "4:2:0");
+        assert_eq!(h.chroma, Some("4:2:0"));
         assert_eq!(h.profile_str, "Main 10, Main tier @ L4");
 
         // With the SPS arrays cut off, the summary bytes are the fallback.
         let head_only = &hvcc[..23];
         let h = parse_hvcc_record(head_only).expect("head-only hvcC");
         assert_eq!(h.bit_depth, 8);
+    }
+
+    /// The decode is an exact inverse of the period quantization: the ns
+    /// encodings mkvmerge writes (floor, and the ceil twin) map back to the
+    /// authored rate, one tick past an exact encoding maps to nothing, and
+    /// a period two off a 1001-family encoding is a different rate, not a
+    /// near-miss to be snapped.
+    #[test]
+    fn quantized_periods_decode_to_their_authored_rate_or_nothing() {
+        assert_eq!(nominal_rate_from_period(41708333, 1_000_000_000), Some((24000, 1001)));
+        assert_eq!(nominal_rate_from_period(41708334, 1_000_000_000), Some((24000, 1001)));
+        assert_eq!(nominal_rate_from_period(41666666, 1_000_000_000), Some((24, 1)));
+        assert_eq!(nominal_rate_from_period(41666667, 1_000_000_000), Some((24, 1)));
+        assert_eq!(nominal_rate_from_period(40000000, 1_000_000_000), Some((25, 1)));
+        // One past an *exact* encoding is not that rate.
+        assert_eq!(nominal_rate_from_period(40000001, 1_000_000_000), None);
+        // Two off the 23.976 encoding: genuinely nonstandard, kept raw.
+        assert_eq!(nominal_rate_from_period(41708331, 1_000_000_000), None);
+        // The ASF 100 ns clock decodes through the same table.
+        assert_eq!(nominal_rate_from_period(417083, 10_000_000), Some((24000, 1001)));
+        assert_eq!(nominal_rate_from_period(417084, 10_000_000), Some((24000, 1001)));
+        assert_eq!(nominal_rate_from_period(400000, 10_000_000), Some((25, 1)));
+        assert_eq!(nominal_rate_from_period(0, 1_000_000_000), None);
+        // No two table entries' encodings collide on either clock: every
+        // decodable period names exactly one rate. (Brute-forced here so a
+        // future table addition that collides fails loudly.)
+        for ticks in [1_000_000_000u64, 10_000_000] {
+            let mut seen = std::collections::HashMap::new();
+            for &(n, d) in &[
+                (24000u64, 1001u64),
+                (24, 1),
+                (25, 1),
+                (30000, 1001),
+                (30, 1),
+                (48000, 1001),
+                (48, 1),
+                (50, 1),
+                (60000, 1001),
+                (60, 1),
+                (100, 1),
+                (120000, 1001),
+                (120, 1),
+                (15, 1),
+                (12, 1),
+                (10, 1),
+            ] {
+                let exact = ticks * d;
+                let floor = exact / n;
+                let ceil = floor + u64::from(exact % n != 0);
+                for p in [floor, ceil] {
+                    if let Some(prev) = seen.insert(p, (n, d)) {
+                        // An exact division makes floor == ceil for one rate;
+                        // only a *cross-rate* collision is a defect.
+                        if prev != (n, d) {
+                            panic!("period {p} encodes both {prev:?} and {:?}", (n, d));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A reserved `chromaSubsamplingIdc` (the 3-bit field defines 0..=3)
+    /// names no format, so the field stays absent rather than a placeholder.
+    #[test]
+    fn vpcc_reserved_chroma_names_nothing() {
+        // Minimal version-1 record: profile 2, level 51,
+        // bitDepth(4)+chromaSubsamplingIdc(3)+range(1), CICP 9/16/9.
+        let mut rec = [1u8, 0, 0, 0, 2, 51, 0, 9, 16, 9];
+        rec[6] = (10 << 4) | (4 << 1) | 1; // idc 4: reserved
+        assert_eq!(parse_vpcc_record(&rec).expect("valid vpcC").chroma, None);
+        rec[6] = (10 << 4) | (2 << 1) | 1; // idc 2: 4:2:2
+        assert_eq!(parse_vpcc_record(&rec).expect("valid vpcC").chroma, Some("4:2:2"));
     }
 
     #[test]
@@ -724,11 +2399,11 @@ mod tests {
         ];
         let a = parse_avcc_record(&avcc).expect("valid avcC");
         assert_eq!(a.bit_depth, 8);
-        assert_eq!(a.chroma, "4:2:0");
+        assert_eq!(a.chroma, Some("4:2:0"));
         assert_eq!(a.nal_len, 4);
         assert_eq!(a.profile_str, "High @ L4");
         // Its embedded SPS also yields the Rec.709 base-layer colour.
-        let c = color_from_avcc(&avcc).expect("VUI colour");
+        let (c, _) = color_from_avcc(&avcc).expect("VUI colour");
         assert_eq!(c.primaries.as_deref(), Some("BT.709"));
         assert_eq!(c.transfer.as_deref(), Some("BT.709"));
         assert_eq!(c.range.as_deref(), Some("limited"));
@@ -740,14 +2415,14 @@ mod tests {
         // record header, then the sequence-header OBU whose color_config carries
         // CICP 9/16/9 limited (BT.2020 / PQ). mkvmerge wrote no MKV Colour
         // element for that file — this OBU is the only colour signal it has, and
-        // missing it misclassified the DV base (no "HDR10 (fallback)").
+        // missing it misclassified the DV base (no "HDR10" base tag).
         let av1c = [
             0x81, 0x0c, 0x4e, 0x00, // marker+version, Main profile L5.0, 10-bit 4:2:0
             0x0a, 0x0f, // OBU header: sequence header, 15-byte payload
             0x00, 0x00, 0x00, 0x62, 0xeb, 0xbf, 0xf2, 0x39, 0xd5, 0xf3, 0xa1, 0x22, 0x01, 0x2a,
             0x80,
         ];
-        let c = color_from_av1c(&av1c).expect("colour description");
+        let (c, _) = color_from_av1c(&av1c).expect("colour description");
         assert_eq!(c.primaries.as_deref(), Some("BT.2020"));
         assert_eq!(c.transfer.as_deref(), Some("PQ (SMPTE ST 2084)"));
         assert_eq!(c.matrix.as_deref(), Some("BT.2020 NCL"));
@@ -760,5 +2435,63 @@ mod tests {
         let mut unspecified = av1c;
         unspecified[16] = 0x81;
         assert!(color_from_av1c(&unspecified).is_none());
+    }
+
+    #[test]
+    fn a_control_character_in_a_fallback_label_never_reaches_the_terminal() {
+        // A crafted Matroska CodecID or MP4 FourCC can carry an ANSI escape;
+        // rendered verbatim it executes in the user's terminal. Every control
+        // class — C0 escape, DEL, C1 CSI — renders as U+FFFD instead.
+        let evil = Codec::Other("\u{1b}[31mV_EVIL\u{7f}\u{9b}0m".to_string());
+        assert_eq!(evil.label(), "\u{FFFD}[31mV_EVIL\u{FFFD}\u{FFFD}0m");
+        // Ordinary fallback labels are untouched.
+        assert_eq!(Codec::Other("V_MPEG4/ISO/SQ".to_string()).label(), "V_MPEG4/ISO/SQ");
+    }
+
+    #[test]
+    fn constant_depth_chroma_fills_only_its_families_and_only_gaps() {
+        // The MS-MPEG-4 family and VC-1 by codec, WMV1/WMV2 by their label —
+        // no fixture can pin the VC-1 arm (Simple/Main has no encoder
+        // anywhere), so this test is that arm's only guard.
+        for codec in [Codec::MsMpeg4(2), Codec::Vc1, Codec::Other("WMV1".into())] {
+            let mut t = TrackDemux::new(codec.clone(), NalFormat::AnnexB);
+            fill_constant_depth_chroma(&mut t);
+            assert_eq!((t.bit_depth, t.chroma.as_deref()), (Some(8), Some("4:2:0")), "{codec:?}");
+        }
+        // A value a real parse already filled is never overwritten.
+        let mut t = TrackDemux::new(Codec::Vc1, NalFormat::AnnexB);
+        t.chroma = Some("4:2:2".to_string());
+        fill_constant_depth_chroma(&mut t);
+        assert_eq!(t.chroma.as_deref(), Some("4:2:2"));
+        // The H.263 and DV families (open-items A4): H.263 is normatively
+        // 8-bit 4:2:0 progressive; QuickTime's DV entries fix the chroma the
+        // bare `dvsd` cannot (its system — and so its chroma — is unknown at
+        // the label, so only the depth fills there).
+        let mut t = TrackDemux::new(Codec::Other("H263".into()), NalFormat::AnnexB);
+        fill_constant_depth_chroma(&mut t);
+        assert_eq!(
+            (t.bit_depth, t.chroma.as_deref(), t.scan_type),
+            (Some(8), Some("4:2:0"), Some("progressive"))
+        );
+        for (label, chroma) in [
+            // The trimmed form is what every producer emits ('dvc ' arrives
+            // through `fourcc_label`); the padded raw form matches nothing.
+            ("dvc", Some("4:1:1")),
+            ("dvcp", Some("4:2:0")),
+            ("dv5p", Some("4:2:2")),
+            ("dvh1", Some("4:2:2")),
+            ("dvsd", None),
+        ] {
+            let mut t = TrackDemux::new(Codec::Other(label.into()), NalFormat::AnnexB);
+            fill_constant_depth_chroma(&mut t);
+            assert_eq!((t.bit_depth, t.chroma.as_deref()), (Some(8), chroma), "{label}");
+        }
+        // Every other codec — including an unrelated FourCC label — is
+        // untouched: these constants are family facts, not defaults.
+        for codec in [Codec::Hevc, Codec::Mjpeg, Codec::Other("XYZW".into())] {
+            let mut t = TrackDemux::new(codec.clone(), NalFormat::AnnexB);
+            fill_constant_depth_chroma(&mut t);
+            assert_eq!((t.bit_depth, t.chroma), (None, None), "{codec:?}");
+        }
     }
 }

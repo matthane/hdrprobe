@@ -14,9 +14,11 @@ use dolby_vision::rpu::rpu_data_nlq::DoviELType;
 use dolby_vision::rpu::vdr_dm_data::VdrDmData;
 
 use crate::container::DvConfig;
+use crate::dv::ccid;
 use crate::model::{
-    ActiveArea, DolbyVision, DvCensus, FelBrightnessExpansion, L6, LevelPresence,
-    MasteringDisplay, MasteringPrimariesMismatch, MetadataCadence, TrimTarget,
+    ActiveArea, ColorSource, CompatSource, Coverage, DolbyVision, DvCensus,
+    FelBrightnessExpansion, L11, L6, LevelPresence, LevelSource, MasteringDisplay,
+    MasteringPrimariesMismatch, MetadataCadence, TrimTarget,
 };
 
 /// Metadata levels we census, in report order.
@@ -78,9 +80,6 @@ pub struct DvAggregate {
     /// profile (so the minor digit is real, not a convention default). `None` for
     /// a raw RPU bin, which carries no compatibility id at all.
     compat_override: Option<u8>,
-    /// Metadata-only sidecar (RPU bin / DV XML): no base layer to back a
-    /// convention-default compat minor, so such a default is flagged as assumed.
-    metadata_only: bool,
     /// Whether folds arrive as *every* frame in stream order (the `--full`
     /// video scan and the raw RPU-bin sidecar), enabling the consecutive-frame
     /// DM comparison behind the metadata-cadence verdict. The sampled default
@@ -101,12 +100,6 @@ impl DvAggregate {
     /// declared profile), so the label's minor digit is real rather than assumed.
     pub fn set_compat_id(&mut self, id: u8) {
         self.compat_override = Some(id);
-    }
-
-    /// Mark this as a metadata-only sidecar (no base layer), enabling the
-    /// `[compat assumed]` flag when the compat minor is a convention default.
-    pub fn mark_metadata_only(&mut self) {
-        self.metadata_only = true;
     }
 
     /// Declare that every frame's RPU will be folded, in stream order, enabling
@@ -308,15 +301,13 @@ impl DvAggregate {
             _ => None,
         };
 
-        // Compat id from the container dvcC/dvvC, else a DV XML's declared profile.
-        // When neither carries it, the label's minor digit is a convention default
-        // (P8 -> .1, P7 -> .6, P4 -> .2). That's only flagged as assumed for a
-        // metadata-only sidecar: a video input's base-layer VUI backs the
-        // inference officially.
-        let compat_id = cfg.and_then(|c| c.bl_compatibility_id).or(self.compat_override);
-        let profile_compat_assumed =
-            self.metadata_only && compat_id.is_none() && matches!(profile, 4 | 7 | 8);
-        let profile_str = dv_profile_label(profile, compat_id, self.el_type.as_ref());
+        // Compat id from the container dvcC/dvvC, else a DV XML's declared
+        // profile, else the profile's own definition. The fourth rung
+        // (inference from the base layer's signalled VUI) needs the track's
+        // colour, so it runs as a main.rs post-pass — `fill_inferred_compat`.
+        let declared = cfg.and_then(|c| c.bl_compatibility_id).or(self.compat_override);
+        let (compat_id, compat_source) = resolve_compat(profile, declared);
+        let profile_str = dv_profile_label(profile, compat_id, el_type.as_deref());
 
         // Presence: prefer explicit container flags (translated to the logical
         // track by `track_presence`), else derive from profile — with the same
@@ -365,7 +356,7 @@ impl DvAggregate {
 
         let cm_version = Some(if self.cm_v40 { "CM v4.0".to_string() } else { "CM v2.9".to_string() });
 
-        let compatibility = compat_id.and_then(compat_str);
+        let compatibility = compat_id.and_then(ccid::compatibility_label).map(str::to_string);
 
         let trim_targets =
             merge_trim_targets(&self.trim_targets, &self.l8_target_indices, &self.l10_targets);
@@ -405,14 +396,19 @@ impl DvAggregate {
 
         Some(DolbyVision {
             profile: profile_str,
-            profile_compat_assumed,
+            compat_source,
+            // Video-path fact: `main.rs` sets it once the base layer is known
+            // to exist (`flag_pq_reshaping`).
+            pq_reshaping: false,
+            deprecated_combination: compat_id
+                .is_some_and(|id| ccid::deprecated_combination(profile, id)),
             structure,
             level: cfg.and_then(|c| c.level),
-            // Filled by `fill_derived_level` (main.rs only) when no config
-            // declared a level: the derivation needs the track's real coded
-            // dimensions and frame rate, which a metadata sidecar (assumed
-            // canvas, declared-not-coded rate) doesn't have.
-            level_derived: false,
+            // `derived` is filled by `fill_derived_level` (main.rs only) when
+            // no config declared a level: the derivation needs the track's
+            // real coded dimensions and frame rate, which a metadata sidecar
+            // (assumed canvas, declared-not-coded rate) doesn't have.
+            level_source: cfg.and_then(|c| c.level).map(|_| LevelSource::Declared),
             bl_present: bl,
             el_present: el,
             rpu_present: rpu,
@@ -432,12 +428,27 @@ impl DvAggregate {
             mastering_primaries_mismatch: None,
             l6: self.l6,
             l9_mastering: l9_label,
-            l11_content: self.l11_content.map(content_type_name),
-            l11_white_point: self.l11_white_point.map(white_point_name),
-            l11_reference_mode: self.l11_ref_mode,
+            // The three L11 fields ride one block and fill together
+            // (`fold_dm`), so the triple is total whenever content is Some.
+            // The reference-mode flag is the block's provenance bit (Dolby
+            // patent US 2022/0264190): set = authored by the original content
+            // creator, so a display may honor the APO metadata even in its
+            // reference picture mode; clear = added downstream, non-reference
+            // modes only. It is bitstream-only — the CM XML carries just
+            // ContentType and IntendedWhitePoint, which is why Dolby's
+            // metadata-levels article lists L11 with two args, not three.
+            // libdovi decodes it out of the white-point byte (value 16+wp).
+            l11: match (self.l11_content, self.l11_white_point, self.l11_ref_mode) {
+                (Some(ct), Some(wp), Some(rm)) => Some(L11 {
+                    content: content_type_name(ct),
+                    white_point: white_point_name(wp),
+                    reference_mode: rm,
+                }),
+                _ => None,
+            },
             trim_targets,
             rpu_count: self.rpu_count,
-            sampled: !full,
+            coverage: if full { Coverage::Full } else { Coverage::Sampled },
             metadata_cadence,
             census,
         })
@@ -512,16 +523,21 @@ fn track_presence(cfg: &DvConfig, dual_track: bool) -> (bool, bool, bool) {
 /// by `--no-rpu`. Static levels are absent since they live in the RPU.
 pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
     // No RPU parse here, so the enhancement-layer kind (FEL/MEL) is unknown.
-    let profile_str = dv_profile_label(cfg.profile, cfg.bl_compatibility_id, None);
+    // The compat id resolves through the same rungs the RPU path uses, so a
+    // legacy Profile-4 descriptor with no compat nibble still reports the id
+    // its profile defines.
+    let (compat_id, compat_source) = resolve_compat(cfg.profile, cfg.bl_compatibility_id);
+    let profile_str = dv_profile_label(cfg.profile, compat_id, None);
     let (bl, el, rpu) = track_presence(cfg, dual_track);
     DolbyVision {
         profile: profile_str,
-        // Container path: the convention-default compat minor is backed by the
-        // base layer, not a metadata-only guess, so it is never flagged assumed.
-        profile_compat_assumed: false,
+        compat_source,
+        pq_reshaping: false,
+        deprecated_combination: compat_id
+            .is_some_and(|id| ccid::deprecated_combination(cfg.profile, id)),
         structure: structure_str(el, dual_track),
         level: cfg.level,
-        level_derived: false,
+        level_source: cfg.level.map(|_| LevelSource::Declared),
         bl_present: bl,
         el_present: el,
         rpu_present: rpu,
@@ -530,8 +546,8 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         // config-only path can never establish it.
         unconverted_dual_layer_rpu: false,
         reconstructed_bit_depth: None,
-        bl_compatibility_id: cfg.bl_compatibility_id,
-        compatibility: cfg.bl_compatibility_id.and_then(compat_str),
+        bl_compatibility_id: compat_id,
+        compatibility: compat_id.and_then(ccid::compatibility_label).map(str::to_string),
         cm_version: None,
         l5_active_areas: Vec::new(),
         l5_assumed_canvas: None,
@@ -540,12 +556,12 @@ pub fn container_only(cfg: &DvConfig, dual_track: bool) -> DolbyVision {
         mastering_primaries_mismatch: None,
         l6: None,
         l9_mastering: None,
-        l11_content: None,
-        l11_white_point: None,
-        l11_reference_mode: None,
+        l11: None,
         trim_targets: Vec::new(),
         rpu_count: 0,
-        sampled: false,
+        // No RPU was read on this path — --no-rpu, or a DV config whose track
+        // yielded no parseable RPU — so the scan coverage is honestly `none`.
+        coverage: Coverage::None,
         metadata_cadence: None,
         census: None,
     }
@@ -607,25 +623,40 @@ pub fn flag_mastering_primaries_mismatch(dv: &mut DolbyVision, bl_primaries: Opt
 }
 
 /// The Dolby Vision level table ("Dolby Vision Profiles and Levels", the
-/// dsigPL table Dolby's own dlb_mp4base muxer derives levels from): each
-/// level's max pixel rate is exactly its anchor format's `width x height x
-/// fps`, plus a max-width axis that splits the equal-rate UHD@120 / 8K@30
-/// pair (levels 10/11). Rows are `(level, max pixels/second, max width)`,
-/// ascending, so the first admitting row is the smallest sufficient level.
+/// dsigPL table Dolby's own dlb_mp4base muxer derives levels from). Rows are
+/// `(level, max pixels/second, max width)`, ascending, so the first admitting
+/// row is the smallest sufficient level.
+///
+/// The two limits come from **different columns of the spec table, and they do
+/// not agree**: the rate is the row's "Maximum pixel rate (pps)", which equals
+/// its anchor format's `width x height x fps`, while the width is the row's own
+/// "Maximum decoded bitstream video width (pixels)" — deliberately *wider* than
+/// the anchor on levels 4 and 5 (2560 and 3840 against a 1920-wide anchor).
+/// Copying the anchor's width into this column instead reads plausible and is
+/// wrong: it pushes ultrawide-but-low-rate content (2560x1080@24, 3840x1600@20)
+/// up two levels, because the rate axis admits the row and the width axis then
+/// rejects it. Take each column from the spec, never derive one from the other.
+/// The width axis also splits the equal-rate UHD@120 / 8K@30 pair (levels
+/// 10/11), which is why it exists at all.
+///
+/// Pinned by `derived_level_is_the_smallest_admitting_pixel_rate_and_width`.
+/// Identical in P&L v1.5 (Dec 2024) and in the "Dolby Vision Streams Within the
+/// HTTP Live Streaming Format" v2.0 / "...MPEG-DASH Format" v2.0 carriage
+/// specs, so it is not a revision-drift question.
 const DV_LEVEL_LIMITS: [(u8, u64, u32); 13] = [
-    (1, 22_118_400, 1280),     // 1280x720x24
-    (2, 27_648_000, 1280),     // 1280x720x30
-    (3, 49_766_400, 1920),     // 1920x1080x24
-    (4, 62_208_000, 1920),     // 1920x1080x30
-    (5, 124_416_000, 1920),    // 1920x1080x60
-    (6, 199_065_600, 3840),    // 3840x2160x24
-    (7, 248_832_000, 3840),    // 3840x2160x30
-    (8, 398_131_200, 3840),    // 3840x2160x48
-    (9, 497_664_000, 3840),    // 3840x2160x60
-    (10, 995_328_000, 3840),   // 3840x2160x120
-    (11, 995_328_000, 7680),   // 7680x4320x30
-    (12, 1_990_656_000, 7680), // 7680x4320x60
-    (13, 3_981_312_000, 7680), // 7680x4320x120
+    (1, 22_118_400, 1280),     // rate 1280x720x24
+    (2, 27_648_000, 1280),     // rate 1280x720x30
+    (3, 49_766_400, 1920),     // rate 1920x1080x24
+    (4, 62_208_000, 2560),     // rate 1920x1080x30, width cap 2560
+    (5, 124_416_000, 3840),    // rate 1920x1080x60, width cap 3840
+    (6, 199_065_600, 3840),    // rate 3840x2160x24
+    (7, 248_832_000, 3840),    // rate 3840x2160x30
+    (8, 398_131_200, 3840),    // rate 3840x2160x48
+    (9, 497_664_000, 3840),    // rate 3840x2160x60
+    (10, 995_328_000, 3840),   // rate 3840x2160x120
+    (11, 995_328_000, 7680),   // rate 7680x4320x30
+    (12, 1_990_656_000, 7680), // rate 7680x4320x60
+    (13, 3_981_312_000, 7680), // rate 7680x4320x120
 ];
 
 /// Fill a missing DV level from the coded stream's shape: the smallest level
@@ -656,39 +687,185 @@ pub fn fill_derived_level(dv: &mut DolbyVision, width: u32, height: u32, fps: Op
         .find(|&&(_, max_rate, max_width)| px_rate <= max_rate as f64 && width <= max_width);
     if let Some(&(level, _, _)) = fit {
         dv.level = Some(level);
-        dv.level_derived = true;
+        dv.level_source = Some(LevelSource::Derived);
     }
+}
+
+/// Resolve the base-layer cross-compatibility id and record where it came from.
+///
+/// Three of the four rungs are reachable without touching the stream's colour:
+/// a `declared` id (container dvcC/dvvC/TS descriptor, or a DV CM XML's
+/// `GenerateProfile`), the id the profile's own definition `spec`-fixes, or —
+/// for Profile 8 alone — the ecosystem's `assumed` convention default.
+///
+/// The `assumed` rung deliberately resolves the *label* only and leaves
+/// `bl_compatibility_id`/`compatibility` empty. The other rungs each have
+/// evidence behind them; a convention has none, and filling the raw id from it
+/// would break the standing rule that an absent compatibility nibble reads as
+/// unknown, never as a guessed value. Profile 8 is the only profile with a
+/// convention to apply: it admits three ids, mandates cross-compatibility
+/// signalling, and everything from dovi_tool to mkvmerge writes `8.1` when
+/// nothing says otherwise. Profiles 10 and 20 also admit several ids but have
+/// no such convention, so an unresolved one keeps its bare major and no
+/// provenance at all.
+///
+/// The fourth rung, `inferred`, needs the base layer's signalled VUI and so
+/// runs later — see [`fill_inferred_compat`].
+fn resolve_compat(profile: u8, declared: Option<u8>) -> (Option<u8>, Option<CompatSource>) {
+    if let Some(id) = declared {
+        return (Some(id), Some(CompatSource::Declared));
+    }
+    if let Some(id) = ccid::spec_ccid(profile) {
+        return (Some(id), Some(CompatSource::Spec));
+    }
+    (None, (profile == 8).then_some(CompatSource::Assumed))
+}
+
+/// Complete the compatibility id from the base layer's *signalled* colour, for
+/// a profile whose definition admits several and whose carriage declared none —
+/// in practice a raw Profile 8 or 10 elementary stream, where no dvcC/dvvC
+/// exists to carry the nibble. `main.rs` is the only caller, on the video path:
+/// the deduction reads a real base layer's VUI, which a metadata-only sidecar
+/// does not have (its `GenerateProfile`, when it has one, already resolved as
+/// `declared`).
+///
+/// A resolved id here is a fact about the stream, so unlike the `assumed` rung
+/// it fills `bl_compatibility_id` and `compatibility` as well as the label. An
+/// ambiguous signal changes nothing, leaving whatever `resolve_compat` decided.
+pub fn fill_inferred_compat(dv: &mut DolbyVision, color: &crate::model::ColorInfo) {
+    if dv.bl_compatibility_id.is_some() {
+        return;
+    }
+    let Some(profile) = profile_major(&dv.profile) else { return };
+    let Some(id) = ccid::infer_ccid(profile, color) else { return };
+    dv.bl_compatibility_id = Some(id);
+    dv.compatibility = ccid::compatibility_label(id).map(str::to_string);
+    dv.compat_source = Some(CompatSource::Inferred);
+    dv.deprecated_combination = ccid::deprecated_combination(profile, id);
+    dv.profile = dv_profile_label(profile, Some(id), dv.el_type.as_deref());
+}
+
+/// Flag the base layer's actual transfer characteristic as Dolby's proprietary
+/// "PQ with reshaping". Two conditions, and only two: the compatibility id
+/// resolves to 0, and the input is a video probe rather than a metadata sidecar
+/// (`main.rs` is the only caller, which is what enforces the second).
+///
+/// The spec states it flatly for CCID 0 — a transfer characteristic of 16
+/// "generally indicates perceptual quantization (PQ)", but "in the context of
+/// Dolby Vision CCID=0 when color_matrix is 15 ... the actual proprietary
+/// transfer characteristic, even when signaled with 16, is 'PQ with reshaping'"
+/// (v1.5 Table 2 footnote [b], repeated in the profile 20 notes and in v1.3.2's
+/// profile 5 notes).
+///
+/// **It does fire on an inferred id**, unlike the colour fill. The distinction
+/// is not arbitrary: the colour fill would be feeding a deduction back into the
+/// very signal it was deduced from, whereas this is new information the footnote
+/// keys on exactly this condition, a bare Profile 10 signalling matrix 15 being
+/// the footnote's own case.
+///
+/// **It does not fire for a metadata sidecar.** It is a fact about a base layer,
+/// and a sidecar has no base layer; a DV XML's `GenerateProfile` resolves the
+/// id but is an authoring target, so asserting a base layer's transfer from it
+/// would state a fact the metadata does not carry.
+pub fn flag_pq_reshaping(dv: &mut DolbyVision) {
+    dv.pq_reshaping = dv.bl_compatibility_id.is_some_and(ccid::pq_with_reshaping);
+}
+
+/// Fill the base layer's colour description from what the Dolby Vision profile
+/// and compatibility id define, for the fields nothing signalled. `main.rs` is
+/// the only caller, on the video path: a metadata-only sidecar has no base layer
+/// whose colour this could describe.
+///
+/// **Signalled always wins; this only fills absences** — and "absent" means the
+/// source carried nothing or carried the explicit "unspecified" code, never that
+/// it carried a code this build cannot name (the decoder marks those, and they
+/// are skipped). A Profile 5 stream
+/// signals its range and nothing else — its colour space cannot be expressed in
+/// CICP at all, so the SPS carries "unspecified" — and a legacy Profile 4 mux
+/// often omits the colour description entirely. Those gaps are what this closes.
+/// Where a stream does signal a field, even one contradicting the table (the
+/// corpus has a declared 8.4 signalling full range against the table's limited),
+/// the signalled value stands untouched.
+///
+/// **Gated to a declared or spec-fixed compatibility id, never an inferred
+/// one.** An inferred id was deduced *from* this very colour description, so
+/// filling the description back from it would launder a deduction into three
+/// fields that read as facts, and would add nothing anyway: an id inferable at
+/// all implies the signal was largely present. The profile label and the colour
+/// fill therefore sit at deliberately different confidence bars.
+pub fn fill_derived_color(
+    color: &mut crate::model::ColorInfo,
+    sources: &mut crate::model::ColorSources,
+    dv: &DolbyVision,
+) {
+    if !matches!(dv.compat_source, Some(CompatSource::Declared | CompatSource::Spec)) {
+        return;
+    }
+    // The table row describes a *base layer*, so require one. A DV enhancement
+    // layer has its own VUI — v1.3.2 gives profile 4's as `1,2,2,2,0`, which is
+    // byte-identical to a profile 5 base layer and so indistinguishable from it
+    // in isolation — and stating the base layer's colour over a track that has
+    // no base layer would describe a stream that is not there. Every real mux
+    // folds an EL into its base layer's track, so this only ever fires on an
+    // EL-only input.
+    if !dv.bl_present {
+        return;
+    }
+    let (Some(profile), Some(id)) = (profile_major(&dv.profile), dv.bl_compatibility_id) else {
+        return;
+    };
+    let Some(vui) = ccid::defined_vui(profile, id) else { return };
+    let fill = |field: &mut Option<String>,
+                    source: &mut Option<ColorSource>,
+                    defined: Option<&str>| {
+        // `ColorInfo` being empty is not enough: it is also empty when the
+        // source signalled a CICP code this build has no name for, which the
+        // decoder records as `UnnamedCode`. Filling over that would overwrite a
+        // real signal and then claim, via `Spec`, that nothing was signalled.
+        if *source == Some(ColorSource::UnnamedCode) {
+            return;
+        }
+        if let (None, Some(v)) = (&*field, defined) {
+            *field = Some(v.to_string());
+            *source = Some(ColorSource::Spec);
+        }
+    };
+    fill(&mut color.primaries, &mut sources.primaries, crate::container::cicp_primaries(vui.primaries));
+    fill(&mut color.transfer, &mut sources.transfer, crate::container::cicp_transfer(vui.transfer));
+    fill(&mut color.matrix, &mut sources.matrix, crate::container::cicp_matrix(vui.matrix));
+    fill(
+        &mut color.range,
+        &mut sources.range,
+        Some(crate::container::cicp_range(vui.range == 1)),
+    );
+}
+
+/// The profile major from a rendered label: `"8.1"` -> 8, `"7.6 (FEL)"` -> 7,
+/// `"10"` -> 10. The label is the only place the number survives on the model,
+/// and its shape is fixed by `dv_profile_label` right above. Shared with the
+/// two consumers of `ccid::hdr10_base`, whose Profile-8 fallback needs it.
+pub(crate) fn profile_major(label: &str) -> Option<u8> {
+    label.split(['.', ' ']).next()?.parse().ok()
 }
 
 /// Format the Dolby Vision profile as `profile.compatibility` (e.g. `5.0`,
 /// `7.6`, `8.1`, `9.2`, `10.4`, `20.0`), tagging the enhancement-layer kind for
-/// the dual-layer profiles (4 and 7). The minor digit is the container's
+/// the dual-layer profiles (4 and 7). The minor digit is the resolved
 /// `dv_bl_signal_compatibility_id`, printed verbatim so an atypical id (e.g. the
 /// Blu-ray Profile 7 value 6) is reported rather than clamped.
 ///
-/// Some inputs carry no container compat id; the minor digit is then taken from
-/// the profile's definition rather than guessed. Profile 8 mandates
-/// cross-compatibility signalling, so a raw P8 RPU (a `.bin`/`.xml` sidecar, or
-/// an AV1 P10 RPU libdovi reports as 8) is labelled `8.1` by convention, matching
-/// dovi_tool. Profile 7 is defined with CCID 6 only (the UHD Blu-ray HDR10 base) —
-/// and its most common carrier, an untouched BDMV M2TS, has *no* DV descriptor to
-/// read (Blu-ray signals DV via the playlist STN table, not the PMT `0xB0`
-/// descriptor a remux would add) — so a descriptor-less P7 is labelled `7.6`.
-/// Profile 4 is SDR-compatible by definition (CCID 2), so a legacy P4
-/// mux whose compact descriptor omits the nibble is labelled `4.2` — consistent
-/// with `hdr::assemble` inferring P4's SDR base from the profile. Any other
-/// profile without a compat id prints its bare number.
-fn dv_profile_label(profile: u8, compat: Option<u8>, el_type: Option<&DoviELType>) -> String {
+/// Only Profile 8 can reach this with no id at all: every profile whose
+/// definition fixes one (4, 5, 7, 9, and the legacy 0-3 and 6) has already been
+/// resolved by `resolve_compat`'s spec rung, and 10/20 have no convention
+/// default, so they print their bare major.
+fn dv_profile_label(profile: u8, compat: Option<u8>, el_type: Option<&str>) -> String {
     let base = match compat {
         Some(id) => format!("{profile}.{id}"),
         None if profile == 8 => "8.1".to_string(),
-        None if profile == 7 => "7.6".to_string(),
-        None if profile == 4 => "4.2".to_string(),
         None => profile.to_string(),
     };
     match (profile, el_type) {
-        (4 | 7, Some(DoviELType::FEL)) => format!("{base} (FEL)"),
-        (4 | 7, Some(DoviELType::MEL)) => format!("{base} (MEL)"),
+        (4 | 7, Some(kind @ ("FEL" | "MEL"))) => format!("{base} ({kind})"),
         _ => base,
     }
 }
@@ -706,19 +883,6 @@ fn structure_str(el_present: bool, dual_track: bool) -> Option<String> {
     } else {
         "Single track, dual layer".to_string()
     })
-}
-
-fn compat_str(id: u8) -> Option<String> {
-    Some(
-        match id {
-            0 => "no cross-compatibility",
-            1 => "HDR10-compatible",
-            2 => "SDR-compatible",
-            4 => "HLG-compatible",
-            _ => return None,
-        }
-        .to_string(),
-    )
 }
 
 /// Resolve an L9 block to a gamut name: a predefined index through the Dolby
@@ -1070,29 +1234,45 @@ mod tests {
             };
             let mut dv = container_only(&cfg, false);
             fill_derived_level(&mut dv, w, h, fps);
-            (dv.level, dv.level_derived)
+            (dv.level, dv.level_source)
         };
+        let derived = Some(LevelSource::Derived);
 
         // The motivating case: a genuine UHD-BD clip (no PMT descriptor),
         // 3840x2160 @ 23.976 — just under level 6's anchor rate.
-        assert_eq!(derive(3840, 2160, Some(24000.0 / 1001.0)), (Some(6), true));
+        assert_eq!(derive(3840, 2160, Some(24000.0 / 1001.0)), (Some(6), derived));
         // Each anchor format sits exactly at its own level's bound.
-        assert_eq!(derive(1280, 720, Some(24.0)), (Some(1), true));
-        assert_eq!(derive(1920, 1080, Some(24.0)), (Some(3), true));
-        assert_eq!(derive(1920, 1080, Some(30000.0 / 1001.0)), (Some(4), true));
-        assert_eq!(derive(3840, 2160, Some(60000.0 / 1001.0)), (Some(9), true));
-        assert_eq!(derive(3840, 2160, Some(120.0)), (Some(10), true));
+        assert_eq!(derive(1280, 720, Some(24.0)), (Some(1), derived));
+        assert_eq!(derive(1920, 1080, Some(24.0)), (Some(3), derived));
+        assert_eq!(derive(1920, 1080, Some(30000.0 / 1001.0)), (Some(4), derived));
+        assert_eq!(derive(3840, 2160, Some(60000.0 / 1001.0)), (Some(9), derived));
+        assert_eq!(derive(3840, 2160, Some(120.0)), (Some(10), derived));
         // The equal-rate UHD@120 / 8K@30 pair splits on the width axis.
-        assert_eq!(derive(7680, 4320, Some(30.0)), (Some(11), true));
-        assert_eq!(derive(7680, 4320, Some(120.0)), (Some(13), true));
-        // Beyond the table: absent, never a guess.
-        assert_eq!(derive(7680, 4320, Some(144.0)), (None, false));
-        // No frame rate / degenerate dimensions: absent, never a guess.
-        assert_eq!(derive(3840, 2160, None), (None, false));
-        assert_eq!(derive(3840, 2160, Some(0.0)), (None, false));
-        assert_eq!(derive(0, 0, Some(24.0)), (None, false));
+        assert_eq!(derive(7680, 4320, Some(30.0)), (Some(11), derived));
+        assert_eq!(derive(7680, 4320, Some(120.0)), (Some(13), derived));
 
-        // A declared container level always wins, unflagged.
+        // Levels 4 and 5 admit pictures *wider* than their rate anchor: their
+        // spec width caps are 2560 and 3840 against a 1920-wide anchor format.
+        // Ultrawide-but-low-rate content is the case that separates the spec's
+        // width column from the anchor's width, so pin all three rows.
+        // 2560x900x24 = 55,296,000 pps, inside level 4's 62,208,000.
+        assert_eq!(derive(2560, 900, Some(24.0)), (Some(4), derived));
+        // 2560x1080x24 = 66,355,200 pps, past level 4, inside level 5's rate.
+        assert_eq!(derive(2560, 1080, Some(24.0)), (Some(5), derived));
+        // 3840x1600x20 = 122,880,000 pps, just inside level 5's 124,416,000,
+        // at exactly its 3840 width cap.
+        assert_eq!(derive(3840, 1600, Some(20.0)), (Some(5), derived));
+        // The width cap is still a real bound: one pixel over level 5's 3840
+        // falls through to level 11, the next row admitting a wider picture.
+        assert_eq!(derive(3841, 1600, Some(20.0)), (Some(11), derived));
+        // Beyond the table: absent, never a guess.
+        assert_eq!(derive(7680, 4320, Some(144.0)), (None, None));
+        // No frame rate / degenerate dimensions: absent, never a guess.
+        assert_eq!(derive(3840, 2160, None), (None, None));
+        assert_eq!(derive(3840, 2160, Some(0.0)), (None, None));
+        assert_eq!(derive(0, 0, Some(24.0)), (None, None));
+
+        // A declared container level always wins, tagged `declared`.
         let cfg = DvConfig {
             profile: 7,
             level: Some(9),
@@ -1103,7 +1283,7 @@ mod tests {
         };
         let mut dv = container_only(&cfg, false);
         fill_derived_level(&mut dv, 3840, 2160, Some(24000.0 / 1001.0));
-        assert_eq!((dv.level, dv.level_derived), (Some(9), false));
+        assert_eq!((dv.level, dv.level_source), (Some(9), Some(LevelSource::Declared)));
     }
 
     #[test]
@@ -1362,6 +1542,247 @@ mod tests {
         agg.add(&real_rpu());
         let dv = agg.finalize(3840, 2160, None, true, false, false).unwrap();
         assert!(dv.metadata_cadence.is_none());
+    }
+
+    /// A `DolbyVision` in whatever compat state a test needs, built the way the
+    /// production paths build one so the field set stays in step.
+    fn dv_stub(profile: &str, ccid: Option<u8>, source: Option<CompatSource>) -> DolbyVision {
+        let cfg = DvConfig {
+            profile: profile_major(profile).unwrap_or(8),
+            level: None,
+            bl_present: true,
+            el_present: false,
+            rpu_present: true,
+            bl_compatibility_id: ccid,
+        };
+        let mut d = container_only(&cfg, false);
+        d.profile = profile.to_string();
+        d.bl_compatibility_id = ccid;
+        d.compatibility = ccid.and_then(ccid::compatibility_label).map(str::to_string);
+        d.compat_source = source;
+        d
+    }
+
+    /// The label is the only place the profile number survives on the model,
+    /// so the two consumers of the HDR10-base gate depend on reading it back.
+    #[test]
+    fn profile_major_reads_back_every_label_shape() {
+        assert_eq!(profile_major("8.1"), Some(8));
+        assert_eq!(profile_major("10.4"), Some(10));
+        assert_eq!(profile_major("20.0"), Some(20));
+        assert_eq!(profile_major("7.6 (FEL)"), Some(7));
+        assert_eq!(profile_major("4.2 (MEL)"), Some(4));
+        // The bare forms `dv_profile_label` can still emit.
+        assert_eq!(profile_major("10"), Some(10));
+        assert_eq!(profile_major("20"), Some(20));
+        assert_eq!(profile_major(""), None);
+    }
+
+    /// The withdrawn-pairing flag reaches the model from every path that can
+    /// resolve a compatibility id.
+    #[test]
+    fn deprecated_combination_reaches_the_model_from_every_path() {
+        let cfg = |ccid| DvConfig {
+            profile: 8,
+            level: None,
+            bl_present: true,
+            el_present: false,
+            rpu_present: true,
+            bl_compatibility_id: Some(ccid),
+        };
+        assert!(container_only(&cfg(5), false).deprecated_combination, "declared 8.5");
+        assert!(container_only(&cfg(3), false).deprecated_combination, "declared 8.3");
+        assert!(!container_only(&cfg(1), false).deprecated_combination, "8.1 is current");
+        // The inferred rung cannot produce one: `profile_ccid` admits only
+        // 1, 2 and 4 for Profile 8, so no withdrawn pairing is inferable.
+        let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
+        fill_inferred_compat(
+            &mut dv,
+            &crate::model::ColorInfo {
+                primaries: Some("BT.2020".to_string()),
+                transfer: Some("HLG (ARIB STD-B67)".to_string()),
+                matrix: Some("BT.2020 NCL".to_string()),
+                range: Some("limited".to_string()),
+            },
+        );
+        assert_eq!(dv.bl_compatibility_id, Some(4));
+        assert!(!dv.deprecated_combination);
+    }
+
+    /// The reshaping flag's two conditions, including the clause the corpus
+    /// cannot reach: it fires on an *inferred* CCID 0, unlike the colour fill.
+    /// The spec footnote keys on precisely that case — a bare Profile 10
+    /// signalling matrix 15 — so firing there applies the footnote literally
+    /// rather than extrapolating from it.
+    #[test]
+    fn pq_reshaping_follows_the_resolved_id_on_any_rung() {
+        for source in [CompatSource::Declared, CompatSource::Spec, CompatSource::Inferred] {
+            let mut dv = dv_stub("5.0", Some(0), Some(source));
+            flag_pq_reshaping(&mut dv);
+            assert!(dv.pq_reshaping, "CCID 0 via {source:?}");
+        }
+        // Every other base layer is signalled as it is encoded.
+        for ccid in [1u8, 2, 4, 6] {
+            let mut dv = dv_stub("8.1", Some(ccid), Some(CompatSource::Declared));
+            flag_pq_reshaping(&mut dv);
+            assert!(!dv.pq_reshaping, "CCID {ccid}");
+        }
+        // An unresolved id asserts nothing.
+        let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
+        flag_pq_reshaping(&mut dv);
+        assert!(!dv.pq_reshaping);
+    }
+
+    /// A CICP code the source signalled but this build cannot name leaves
+    /// `ColorInfo` empty, exactly like a field nothing signalled. The fill must
+    /// tell them apart, or it overwrites a real signal and then claims via
+    /// `Spec` that nothing was signalled. The corpus reaches this: the ProRes
+    /// frame header carries matrix 6, which no shared table names.
+    #[test]
+    fn derived_colour_never_overwrites_an_unnamed_code() {
+        use crate::model::{ColorInfo, ColorSource, ColorSources};
+        let dv = dv_stub("9.2", Some(2), Some(CompatSource::Spec));
+        // Primaries and transfer were never signalled; the matrix carried a
+        // code with no name (CICP 6, BT.601 — a plausible SDR base-layer tag).
+        let mut color = ColorInfo::default();
+        let mut sources =
+            ColorSources { matrix: Some(ColorSource::UnnamedCode), ..Default::default() };
+        fill_derived_color(&mut color, &mut sources, &dv);
+
+        assert_eq!(color.primaries.as_deref(), Some("BT.709"), "genuinely absent, so filled");
+        assert_eq!(color.transfer.as_deref(), Some("BT.709"));
+        assert_eq!(sources.primaries, Some(ColorSource::Spec));
+        assert_eq!(
+            color.matrix, None,
+            "a signalled code must not be replaced by the profile's default"
+        );
+        assert_eq!(
+            sources.matrix,
+            Some(ColorSource::UnnamedCode),
+            "and must not be relabelled as unsignalled"
+        );
+    }
+
+    /// The fill describes a base layer, so a track without one gets nothing —
+    /// the enhancement-layer case, where profile 4's own VUI is byte-identical
+    /// to a profile 5 base layer and would read as one in isolation.
+    #[test]
+    fn derived_colour_needs_a_base_layer() {
+        let mut dv = dv_stub("4.2", Some(2), Some(CompatSource::Spec));
+        dv.bl_present = false;
+        let mut color = crate::model::ColorInfo::default();
+        let mut sources = crate::model::ColorSources::default();
+        fill_derived_color(&mut color, &mut sources, &dv);
+        assert_eq!(color.primaries, None, "no base layer, no base-layer colour");
+
+        dv.bl_present = true;
+        fill_derived_color(&mut color, &mut sources, &dv);
+        assert_eq!(color.primaries.as_deref(), Some("BT.709"));
+        assert_eq!(color.range.as_deref(), Some("limited"));
+    }
+
+    /// The colour fill's circularity gate, from the other side: an inferred id
+    /// must never back-fill the colour description it was inferred from, even
+    /// though the reshaping flag above happily rides the same id.
+    #[test]
+    fn derived_colour_declines_an_inferred_id() {
+        let filled = |source| {
+            let mut dv = dv_stub("5.0", Some(0), Some(source));
+            dv.profile = "5.0".to_string();
+            let mut color = crate::model::ColorInfo {
+                range: Some("full".to_string()),
+                ..Default::default()
+            };
+            let mut sources = crate::model::ColorSources {
+                range: Some(crate::model::ColorSource::Stream),
+                ..Default::default()
+            };
+            fill_derived_color(&mut color, &mut sources, &dv);
+            (color, sources)
+        };
+        // Declared and spec fill; the range the stream signalled is untouched.
+        for source in [CompatSource::Declared, CompatSource::Spec] {
+            let (color, sources) = filled(source);
+            assert_eq!(color.primaries.as_deref(), Some("BT.2020"), "{source:?}");
+            assert_eq!(color.matrix.as_deref(), Some(crate::container::IPT_PQ_C2), "{source:?}");
+            assert_eq!(sources.primaries, Some(crate::model::ColorSource::Spec));
+            assert_eq!(sources.range, Some(crate::model::ColorSource::Stream));
+        }
+        // Inferred does not.
+        let (color, sources) = filled(CompatSource::Inferred);
+        assert_eq!(color.primaries, None);
+        assert_eq!(color.transfer, None);
+        assert_eq!(color.matrix, None);
+        assert_eq!(sources.primaries, None);
+        assert_eq!(color.range.as_deref(), Some("full"));
+    }
+
+    /// Every rung, and the one profile that reaches `assumed`. The assumed rung
+    /// must leave the raw id empty: it is a display convention, not a value the
+    /// stream carries.
+    #[test]
+    fn compat_resolution_rungs_follow_the_evidence() {
+        use CompatSource::{Assumed, Declared, Spec};
+        assert_eq!(resolve_compat(8, Some(4)), (Some(4), Some(Declared)));
+        assert_eq!(resolve_compat(5, Some(0)), (Some(0), Some(Declared)));
+        // Spec-fixed profiles resolve with no stream evidence at all.
+        assert_eq!(resolve_compat(4, None), (Some(2), Some(Spec)));
+        assert_eq!(resolve_compat(5, None), (Some(0), Some(Spec)));
+        assert_eq!(resolve_compat(7, None), (Some(6), Some(Spec)));
+        assert_eq!(resolve_compat(9, None), (Some(2), Some(Spec)));
+        // Profile 8 is the only convention default, and it fills no id.
+        assert_eq!(resolve_compat(8, None), (None, Some(Assumed)));
+        // Profiles 10 and 20 admit several ids and have no convention, so an
+        // unresolved one claims no provenance either.
+        assert_eq!(resolve_compat(10, None), (None, None));
+        assert_eq!(resolve_compat(20, None), (None, None));
+        assert_eq!(resolve_compat(11, None), (None, None));
+    }
+
+    /// The inferred rung relabels and fills together, and never overwrites an
+    /// id an earlier rung already resolved.
+    #[test]
+    fn inferred_compat_fills_only_an_unresolved_id() {
+        let hdr10 = crate::model::ColorInfo {
+            primaries: Some("BT.2020".to_string()),
+            transfer: Some("PQ (SMPTE ST 2084)".to_string()),
+            matrix: Some("BT.2020 NCL".to_string()),
+            range: Some("limited".to_string()),
+        };
+        let hlg = crate::model::ColorInfo {
+            transfer: Some("HLG (ARIB STD-B67)".to_string()),
+            ..hdr10.clone()
+        };
+
+        // A bare Profile 10 resolves and relabels.
+        let mut dv = dv_stub("10", None, None);
+        fill_inferred_compat(&mut dv, &hdr10);
+        assert_eq!(dv.profile, "10.1");
+        assert_eq!(dv.bl_compatibility_id, Some(1));
+        assert_eq!(dv.compatibility.as_deref(), Some("HDR10-compatible"));
+        assert_eq!(dv.compat_source, Some(CompatSource::Inferred));
+
+        // A Profile 8 sitting on the assumed convention is corrected by its own
+        // base layer: an HLG base is 8.4, never 8.1.
+        let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
+        fill_inferred_compat(&mut dv, &hlg);
+        assert_eq!(dv.profile, "8.4");
+        assert_eq!(dv.bl_compatibility_id, Some(4));
+        assert_eq!(dv.compat_source, Some(CompatSource::Inferred));
+
+        // A declared id is never second-guessed, however the base layer reads.
+        let mut dv = dv_stub("8.1", Some(1), Some(CompatSource::Declared));
+        fill_inferred_compat(&mut dv, &hlg);
+        assert_eq!(dv.profile, "8.1");
+        assert_eq!(dv.bl_compatibility_id, Some(1));
+        assert_eq!(dv.compat_source, Some(CompatSource::Declared));
+
+        // An ambiguous signal changes nothing.
+        let mut dv = dv_stub("8.1", None, Some(CompatSource::Assumed));
+        fill_inferred_compat(&mut dv, &crate::model::ColorInfo::default());
+        assert_eq!(dv.profile, "8.1");
+        assert_eq!(dv.bl_compatibility_id, None);
+        assert_eq!(dv.compat_source, Some(CompatSource::Assumed));
     }
 
     #[test]
