@@ -601,7 +601,7 @@ pub(crate) mod testimg {
         p[20..22].copy_from_slice(&0u16.to_le_bytes()); // L_IU
         p.extend_from_slice(&encoded);
         let mut d = tagged(257, &p);
-        while d.len() % 4 != 0 {
+        while !d.len().is_multiple_of(4) {
             d.push(0);
         }
         d
