@@ -20,12 +20,15 @@ pass, and the corpus (`-q`) output is unchanged** unless the change intends to a
 
 ## Branch flow
 
-Each version cycle develops on its own branch (convention: `dev/vX.Y.Z`, named for the
-upcoming version). **Never commit work-in-progress directly to main**: main receives the
-cycle as a single `--no-ff` merge at release time, so pre-release doc/schema edits (README,
-SCHEMA.md "Ships in" notes) never appear on main ahead of the version they describe. The
-project-local `/commit` skill pushes to the development branch only; `/release` performs
-the merge, tag, and push to main. (History before v0.8.0 was committed straight to main.)
+Every version cycle develops on one long-lived `dev` branch. **Never commit
+work-in-progress directly to main**: main receives the cycle as a single `--no-ff` merge at
+release time, so pre-release doc/schema edits (README, SCHEMA.md "Ships in" notes) never
+appear on main ahead of the version they describe. The project-local `/commit` skill pushes
+to `dev` only; `/release` performs the merge, tag, and push to main, and leaves `dev` in
+place rather than deleting it. (History before v0.8.0 was committed straight to main;
+v0.8.0 through v1.0.0 used a per-cycle `dev/vX.Y.Z` branch, renamed to a persistent `dev`
+after v1.0.0 — `dev` and `dev/*` cannot coexist as refs, so the old names are gone rather
+than kept alongside.)
 
 ## Third-party license attribution
 
