@@ -13,10 +13,7 @@ name = "hdrprobe"
 path = "src/main.rs"
 
 [dependencies]
-# Git pin: 3.4.0 is tagged (dovi_tool 2.3.3) but not yet published to crates.io;
-# Cargo.lock pins the tag's exact commit. Switch back to a plain version
-# requirement once the crates.io publish lands (upgrade plan step 8).
-dolby_vision = { git = "https://github.com/quietvoid/dovi_tool", tag = "2.3.3", features = ["xml", "serde"] }
+dolby_vision = { version = "3.4.0", features = ["xml", "serde"] }
 # DM-payload fingerprinting for the metadata-cadence verdict
 # (`dv::levels::dm_fingerprint` serializes extension blocks through
 # `ExtMetadataBlock::write`, whose writer type this crate owns); already in
