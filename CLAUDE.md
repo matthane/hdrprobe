@@ -10,7 +10,7 @@ relevant section and the code it points at before non-trivial changes.
 
 ```sh
 cargo build --release          # binary at target/release/hdrprobe
-cargo test                     # 547 unit tests
+cargo test                     # 550 unit tests
 cargo clippy --release         # must stay at zero warnings
 ./target/release/hdrprobe testfiles/integration/ -q   # one-line report per corpus file
 ```
@@ -20,12 +20,15 @@ pass, and the corpus (`-q`) output is unchanged** unless the change intends to a
 
 ## Branch flow
 
-Each version cycle develops on its own branch (convention: `dev/vX.Y.Z`, named for the
-upcoming version). **Never commit work-in-progress directly to main**: main receives the
-cycle as a single `--no-ff` merge at release time, so pre-release doc/schema edits (README,
-SCHEMA.md "Ships in" notes) never appear on main ahead of the version they describe. The
-project-local `/commit` skill pushes to the development branch only; `/release` performs
-the merge, tag, and push to main. (History before v0.8.0 was committed straight to main.)
+Every version cycle develops on one long-lived `dev` branch. **Never commit
+work-in-progress directly to main**: main receives the cycle as a single `--no-ff` merge at
+release time, so pre-release doc/schema edits (README, SCHEMA.md "Ships in" notes) never
+appear on main ahead of the version they describe. The project-local `/commit` skill pushes
+to `dev` only; `/release` performs the merge, tag, and push to main, and leaves `dev` in
+place rather than deleting it. (History before v0.8.0 was committed straight to main;
+v0.8.0 through v1.0.0 used a per-cycle `dev/vX.Y.Z` branch, renamed to a persistent `dev`
+after v1.0.0 — `dev` and `dev/*` cannot coexist as refs, so the old names are gone rather
+than kept alongside.)
 
 ## Third-party license attribution
 
@@ -1411,6 +1414,25 @@ never parse bytes native-endian.
   floor, since a shrunk rule is safe where a shrunk value column isn't) and keep the fixed
   `RULE_W` fallback on every unprobed stream, so piped text keeps its historical 64-column
   divider byte-for-byte. The masthead stays fixed-width — it's glyph art, not a rule.
+- **A Windows console must be asked before it will render an escape, and the veto for saying no
+  is asymmetric.** Every `--color` decision runs through `main::resolve_color`, whose `enable`
+  argument (`ansi_stdout`/`ansi_stderr`) ORs `ENABLE_VIRTUAL_TERMINAL_PROCESSING` into the
+  handle's console mode and reports whether escapes will now render. A console process inherits
+  that bit **clear** — measured as mode `0x3` under conhost *and* under the `--install-shell`
+  verb's own `cmd /c` window — so v1.0.0, which never asked, printed 82 literal `←[38;2;…m`
+  glyphs into a default report (issue #12) and mangled its own reflow, uninterpreted escapes
+  being real columns. Windows Terminal's ConPTY hands the child `0x7`, which is why the same
+  binary was correct in the one terminal developers use and the defect shipped. `supports-color`
+  is not a guard: its Windows arm assumes every terminal since Windows 10 1511 handles ANSI,
+  true only once *some* process has asked. **The asymmetry in `vt_verdict` is the load-bearing
+  part** — colour is vetoed only when `GetConsoleMode` *succeeds* and the enable then fails (a
+  console pinned to "Use legacy console", Windows 8 and older), never when `GetConsoleMode`
+  fails: a mintty/MSYS pty is a pipe that `IsTerminal` rightly vouches for and the console API
+  rightly rejects, so vetoing there would strip colour from Git Bash to fix conhost. `always`
+  still calls `enable` and then ignores it, which is what keeps `--color always` emitting codes
+  into a pipe. Byte-neutral everywhere else by construction: a non-terminal stdout fails
+  `supports-color` first, so the enable never runs and no console state is touched for machine
+  output.
 
 ## Verifying changes
 

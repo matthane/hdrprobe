@@ -956,7 +956,7 @@ SOFTWARE.
 
 Used by:
 
-- **hdrprobe 1.0.0** — <https://github.com/matthane/hdrprobe>
+- **hdrprobe 1.0.1** — <https://github.com/matthane/hdrprobe>
 
 ```
 MIT License
@@ -987,8 +987,8 @@ SOFTWARE.
 
 Used by:
 
-- **dolby_vision 3.4.0** — <https://github.com/quietvoid/dovi_tool/tree/main/dolby_vision>
 - **bitvec_helpers 4.0.2** — <https://github.com/quietvoid/bitvec_helpers>
+- **dolby_vision 3.4.0** — <https://github.com/quietvoid/dovi_tool/tree/main/dolby_vision>
 
 ```
 MIT License

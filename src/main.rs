@@ -167,11 +167,11 @@ fn main() -> ExitCode {
     // confirmation renders in the report's own styling (masthead + section rule
     // + kv rows), gated by the same --color policy against stdout.
     if cli.install_shell || cli.uninstall_shell {
-        let color = match cli.color {
-            ColorWhen::Always => true,
-            ColorWhen::Never => false,
-            ColorWhen::Auto => supports_color::on(supports_color::Stream::Stdout).is_some(),
-        };
+        let color = resolve_color(
+            cli.color,
+            supports_color::on(supports_color::Stream::Stdout).is_some(),
+            ansi_stdout,
+        );
         if color {
             print!("{}", render::render_banner(cli.theme));
         }
@@ -226,15 +226,13 @@ fn main() -> ExitCode {
     }
 
     let format = if cli.json { Format::Json } else { cli.format };
-    let use_color = match cli.color {
-        ColorWhen::Always => true,
-        ColorWhen::Never => false,
-        ColorWhen::Auto => {
-            cli.output.is_none()
-                && format == Format::Text
-                && supports_color::on(supports_color::Stream::Stdout).is_some()
-        }
-    };
+    let use_color = resolve_color(
+        cli.color,
+        cli.output.is_none()
+            && format == Format::Text
+            && supports_color::on(supports_color::Stream::Stdout).is_some(),
+        ansi_stdout,
+    );
 
     // Progress is `--full`-only (the fast path is over in milliseconds) and
     // lives entirely on stderr — stdout stays the pure report stream. Under
@@ -244,11 +242,11 @@ fn main() -> ExitCode {
     let progress_mode = if !cli.full {
         progress::Mode::Off
     } else {
-        let bar_color = match cli.color {
-            ColorWhen::Always => true,
-            ColorWhen::Never => false,
-            ColorWhen::Auto => supports_color::on(supports_color::Stream::Stderr).is_some(),
-        };
+        let bar_color = resolve_color(
+            cli.color,
+            supports_color::on(supports_color::Stream::Stderr).is_some(),
+            ansi_stderr,
+        );
         let bar = progress::Mode::Bar { color: bar_color.then(|| cli.theme.palette()) };
         match cli.progress {
             ProgressWhen::Auto if std::io::stderr().is_terminal() => bar,
@@ -469,6 +467,112 @@ fn render_opts(
         show_hdr10plus: hp,
         show_sl_hdr: sl,
         show_hdr_vivid: hv,
+    }
+}
+
+/// Resolve the `--color` policy for one stream. `detected` is the capability
+/// probe (`supports-color` plus the caller's own stream-shape gates) and
+/// `enable` puts the stream in a state where escape sequences actually
+/// render, reporting whether that succeeded — see [`ansi_stdout`].
+///
+/// The rule lives here rather than at the three call sites because they used
+/// to carry three copies of it, and the `always` arm is the one a fourth copy
+/// would get wrong: forcing colour is a statement of *intent*, not a claim
+/// that the console is already in the right mode, so it still calls `enable`
+/// and then ignores the answer. Ignoring it is what keeps `--color always`
+/// emitting codes into a pipe or a file, where nothing can be enabled.
+fn resolve_color(when: ColorWhen, detected: bool, enable: impl FnOnce() -> bool) -> bool {
+    match when {
+        ColorWhen::Always => {
+            enable();
+            true
+        }
+        ColorWhen::Never => false,
+        ColorWhen::Auto => detected && enable(),
+    }
+}
+
+/// Windows' `ENABLE_VIRTUAL_TERMINAL_PROCESSING`. With this bit clear a console
+/// screen buffer *stores* an escape sequence as text instead of acting on it.
+#[cfg(windows)]
+const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+/// Whether escapes written to stdout will render, enabling Windows'
+/// virtual-terminal processing as a side effect. Always true off Windows,
+/// where a terminal needs no permission to interpret its own escapes.
+///
+/// A console process inherits VT processing **off** — measured as mode `0x3`
+/// under conhost and under the `--install-shell` verb's own `cmd /c` window —
+/// so before this existed every colour code hdrprobe wrote landed on screen as
+/// literal `←[38;2;…m` text (issue #12: 82 of them in one default report).
+/// Windows Terminal's ConPTY hands the child `0x7` instead, which is why the
+/// identical binary renders correctly there and why this survived a release
+/// cycle: it worked in exactly the terminal developers use. `supports-color`
+/// is no guard — its Windows arm assumes every terminal since Windows 10 1511
+/// handles ANSI, which is true only once *some* process has asked, and nothing
+/// here was asking.
+///
+/// Enabling only ORs the VT bit. The documented precondition
+/// `ENABLE_PROCESSED_OUTPUT` rides every inherited mode observed (`0x3` keeps
+/// it), and forcing it would override a parent that deliberately put the
+/// console in raw mode.
+#[cfg(windows)]
+fn ansi_stdout() -> bool {
+    use std::os::windows::io::AsRawHandle as _;
+    ansi_capable(std::io::stdout().as_raw_handle())
+}
+
+/// Stderr counterpart, gating the `--full` progress bar's colour.
+#[cfg(windows)]
+fn ansi_stderr() -> bool {
+    use std::os::windows::io::AsRawHandle as _;
+    ansi_capable(std::io::stderr().as_raw_handle())
+}
+
+#[cfg(not(windows))]
+fn ansi_stdout() -> bool {
+    true
+}
+
+#[cfg(not(windows))]
+fn ansi_stderr() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn ansi_capable(handle: std::os::windows::io::RawHandle) -> bool {
+    extern "system" {
+        fn GetConsoleMode(handle: *mut core::ffi::c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut core::ffi::c_void, mode: u32) -> i32;
+    }
+    let mut raw = 0u32;
+    let mode =
+        (unsafe { GetConsoleMode(handle, &mut raw) } != 0).then_some(raw);
+    let set_ok = match mode {
+        Some(m) if m & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0 => {
+            unsafe { SetConsoleMode(handle, m | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0 }
+        }
+        _ => false,
+    };
+    vt_verdict(mode, set_ok)
+}
+
+/// The colour verdict for a handle, from the two Win32 outcomes: `mode` is
+/// `None` when `GetConsoleMode` failed, `set_ok` whether the enable took.
+/// Split out so the policy is pinned by tests that need no console.
+///
+/// The asymmetry is the whole point. Colour is vetoed **only** for a genuine
+/// console that provably refuses VT (one pinned to "Use legacy console", or
+/// Windows 8 and older) — there, plain text beats a screen of raw escapes. A
+/// handle that is not a console at all keeps the caller's decision untouched:
+/// a mintty/MSYS pty is a *pipe* that `IsTerminal` correctly vouches for and
+/// `GetConsoleMode` correctly rejects, so vetoing on that failure would strip
+/// colour from Git Bash in order to fix conhost.
+#[cfg(windows)]
+fn vt_verdict(mode: Option<u32>, set_ok: bool) -> bool {
+    match mode {
+        None => true,
+        Some(m) => m & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 || set_ok,
     }
 }
 
@@ -1281,6 +1385,65 @@ mod tests {
         assert_eq!(buf.len(), 100);
         assert!(truncated);
         assert_eq!(pos, 101);
+    }
+
+    #[test]
+    fn color_policy_asks_the_console_before_emitting_escapes() {
+        use std::cell::Cell;
+        let asked = Cell::new(0usize);
+        let refuse = || {
+            asked.set(asked.get() + 1);
+            false
+        };
+        let accept = || {
+            asked.set(asked.get() + 1);
+            true
+        };
+
+        // `auto` over a console that refuses virtual-terminal processing
+        // prints plain text. Emitting the codes anyway is what issue #12 saw.
+        assert!(!resolve_color(ColorWhen::Auto, true, refuse));
+        assert!(resolve_color(ColorWhen::Auto, true, accept));
+        // A stream the caller already ruled out (piped, `--output`, JSON)
+        // short-circuits, so no console state is touched for machine output.
+        assert!(!resolve_color(ColorWhen::Auto, false, accept));
+        assert_eq!(asked.get(), 2);
+
+        // `always` forces colour whatever the console says — that is what
+        // makes `--color always > file` keep its codes — but it still asks,
+        // because a forced run in a conhost window needs the enable too.
+        assert!(resolve_color(ColorWhen::Always, false, refuse));
+        assert_eq!(asked.get(), 3);
+
+        // `never` short-circuits ahead of the probe.
+        assert!(!resolve_color(ColorWhen::Never, true, accept));
+        assert_eq!(asked.get(), 3);
+    }
+
+    /// `cargo test` captures stdout onto a pipe, so this runs the
+    /// not-a-console arm on Windows and the unconditional `true` elsewhere.
+    /// The guarantee it pins is the Git Bash one: a handle that isn't a
+    /// Windows console must never have its colour vetoed.
+    #[test]
+    fn ansi_probe_never_vetoes_a_handle_that_is_not_a_console() {
+        assert!(ansi_stdout());
+        assert!(ansi_stderr());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vt_verdict_vetoes_only_a_console_that_refuses() {
+        // Not a console: a pipe, a redirect, or a mintty/MSYS pty that
+        // `IsTerminal` vouches for. Vetoing here would strip colour from Git
+        // Bash to fix conhost.
+        assert!(vt_verdict(None, false));
+        // Already on — Windows Terminal's ConPTY hands the child 0x7.
+        assert!(vt_verdict(Some(0x7), false));
+        // Off, and the enable took: conhost's 0x3, the issue-12 case.
+        assert!(vt_verdict(Some(0x3), true));
+        // Off, and the enable failed: a console pinned to "Use legacy
+        // console", or Windows 8 and older. Plain beats raw escapes.
+        assert!(!vt_verdict(Some(0x3), false));
     }
 
     #[test]
