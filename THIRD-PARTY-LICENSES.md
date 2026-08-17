@@ -956,7 +956,7 @@ SOFTWARE.
 
 Used by:
 
-- **hdrprobe 1.0.0** — <https://github.com/matthane/hdrprobe>
+- **hdrprobe 1.0.1** — <https://github.com/matthane/hdrprobe>
 
 ```
 MIT License
